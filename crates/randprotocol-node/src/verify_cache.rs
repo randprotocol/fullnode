@@ -79,10 +79,11 @@ impl VerifyCache {
         self.len() == 0
     }
 
-    /// The verdict stored under `key`, counting a hit or a miss. A poisoned lock is a miss.
-    fn get(&self, key: &Hash) -> Option<Verdict> {
+    /// The verdict stored under `key`, projected by `from`, counting a hit or a miss. An entry of
+    /// another variant (which cannot occur, since the tag differs) and a poisoned lock are misses.
+    fn get<T>(&self, key: &Hash, from: fn(Verdict) -> Option<T>) -> Option<T> {
         let found = match self.entries.lock() {
-            Ok(e) => e.map.get(key).cloned(),
+            Ok(e) => e.map.get(key).cloned().and_then(from),
             Err(_) => None,
         };
         let (hits, misses) = if found.is_some() {
@@ -129,19 +130,20 @@ impl KeyBuf {
         Self(vec![tag])
     }
 
-    fn len(mut self, n: usize) -> Self {
+    /// Append `n` as a length prefix.
+    fn prefix(mut self, n: usize) -> Self {
         self.0.extend_from_slice(&(n as u64).to_le_bytes());
         self
     }
 
     fn bytes(self, b: &[u8]) -> Self {
-        let mut s = self.len(b.len());
+        let mut s = self.prefix(b.len());
         s.0.extend_from_slice(b);
         s
     }
 
     fn words(self, w: &[u32]) -> Self {
-        let mut s = self.len(w.len());
+        let mut s = self.prefix(w.len());
         for x in w {
             s.0.extend_from_slice(&x.to_le_bytes());
         }
@@ -149,7 +151,7 @@ impl KeyBuf {
     }
 
     fn u64s(self, w: &[u64]) -> Self {
-        let mut s = self.len(w.len());
+        let mut s = self.prefix(w.len());
         for x in w {
             s.0.extend_from_slice(&x.to_le_bytes());
         }
@@ -162,7 +164,7 @@ impl KeyBuf {
 
     /// The count, then each cover's public values and its bincode-encoded shape.
     fn covered(self, covered: &[CoveredBundle]) -> Self {
-        let mut s = self.len(covered.len());
+        let mut s = self.prefix(covered.len());
         for c in covered {
             s = s.u64s(&c.public_values).ser(&c.shape);
         }
@@ -204,8 +206,8 @@ impl CachingExecutor {
     }
 
     /// The stored verdict for `key` if there is one of the right variant (another variant cannot
-    /// occur, since the tag differs, and is treated as a miss); otherwise `verify` (the inner
-    /// call, made with no lock held), storing an `Ok` answer and never an `Err`.
+    /// occur, since the tag differs, and is counted and treated as a miss); otherwise `verify`
+    /// (the inner call, made with no lock held), storing an `Ok` answer and never an `Err`.
     fn cached<T: Clone>(
         &self,
         key: Hash,
@@ -213,7 +215,7 @@ impl CachingExecutor {
         into: fn(T) -> Verdict,
         verify: impl FnOnce() -> Result<T, ConfidentialError>,
     ) -> Result<T, ConfidentialError> {
-        if let Some(v) = self.cache.get(&key).and_then(from) {
+        if let Some(v) = self.cache.get(&key, from) {
             return Ok(v);
         }
         let v = verify()?;
@@ -786,6 +788,18 @@ mod tests {
         assert_eq!(ex.cache().len(), 8);
     }
 
+    /// A found entry of the wrong variant is a miss, not a hit (the projection decides).
+    #[test]
+    fn a_wrong_variant_entry_counts_as_a_miss() {
+        let cache = VerifyCache::new(4);
+        let key = Hash([1; 32]);
+        cache.insert(key, Verdict::Unit);
+        assert_eq!(cache.get(&key, as_word), None);
+        assert_eq!((cache.hits(), cache.misses()), (0, 1));
+        assert_eq!(cache.get(&key, as_unit), Some(()));
+        assert_eq!((cache.hits(), cache.misses()), (1, 1));
+    }
+
     #[test]
     fn hits_and_misses_count() {
         let (_inner, ex) = setup();
@@ -815,6 +829,7 @@ mod tests {
             (Kind::Auth, "binding", |i| i.binding[7] ^= 1),
             (Kind::Call, "record", |i| i.record.base_pc += 4),
             (Kind::Call, "record public_len", |i| i.record.public_len += 1),
+            (Kind::Call, "record code_hash", |i| i.record.code_hash.push(1)),
             (Kind::Call, "proof", |i| flip_byte(&mut i.call_proof)),
             (Kind::CallHardened, "record", |i| i.record.deployed_at += 1),
             (Kind::CallHardened, "proof", |i| flip_byte(&mut i.hardened_proof)),
