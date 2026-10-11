@@ -123,9 +123,20 @@ The relation, every check folding into one `bad` flag:
 Output slots 0..8: `c` if `bad == 0`, otherwise the guest-sdk panic sentinel. A sentinel never
 equals any `auth_commit`, so the ledger's existing `AuthMismatch` refuses it. No new error path.
 
-**Shape pinning.** The guest's tier is pinned to its worst case (`M_MAX` active slots), as
-`AUTH_TIER` pins the single-key guest, so the proof's tier and heights are the same for every
-policy and every M. The chain learns "multisig-authorised", and nothing else.
+**Shape pinning.** The proof's **tier and every table height** are pinned to the worst case
+(`M_MAX` active slots), as `AUTH_TIER` pins the single-key guest.
+
+- The prover declares `tier(M_MAX)` and floors every height that varies with `M` to its `M_MAX`
+  value. Those are the keccak, modq (phase 3) and memory heights, through
+  `ProveOptions::min_{keccak,modq,mem}_log_height`. The program, input and public heights are already
+  fixed by the guest and `MSAUTH_WORDS`.
+- Fullnode admission compares all of them exactly against the `hc_auth_multisig` record. A proof at
+  any other shape is refused even if it would verify.
+- So every multisig spend, **1-of-N included, pays `M_MAX`'s tier.**
+
+The chain learns "multisig-authorised", and nothing else. (Phase 3's design is
+`docs/superpowers/specs/2026-10-11-rvm-modq-chip-design.md`. Its gate is tier 18: `M_MAX = 3` if it
+fits, otherwise `M_MAX = 2`.)
 
 ## 5. What the chain sees
 

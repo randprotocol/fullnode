@@ -7,7 +7,7 @@
 **Architecture:**
 - Re-vendor circuits at the private-multisig Task 9 merge: the MODQ chip, the `msauth` host model and guest, and the rvm re-pinned on purpose.
 - `ZkExecutor` gets a fourth pinned `Machine` and a `verify_auth` that dispatches on `hc`.
-- `ConfidentialExecutor` gains two required header/warm methods (`auth_proof_shape`, `warm_auth_multisig`). They are forwarded by every wrapper and never cached.
+- `ConfidentialExecutor` gains two required header/warm methods (`auth_header`, `warm_auth_multisig`). They are forwarded by every wrapper and never cached.
 - The ledger's cheap half reads the shape and picks `hc_auth` or `hc_auth_multisig`; the expensive half reuses `verify_auth`, so the verify cache keys it under kind 2 with `hc` in the key.
 - Genesis adds one last-position field, bound last into the hash.
 - The wallet gets a spend-key-less `Wallet` and a proposal file signed offline by each signer.
@@ -24,23 +24,25 @@
   - **Task 9**, the docs, the merge of rVM phase 4 and the single recursion re-pin, on a commit pushed to a remote, since `CUDA_REV` must be fetchable.
 
   Record that commit as `$CIRCUITS` in the Task 1 commit message.
-- **The two values filled in from circuits Task 8:**
-  - **`MSAUTH_TIER`.** The ruling makes it 18. If Task 8 recorded any other tier, stop: the MODQ ruling forbids 19 and 20.
-  - **`M_MAX`.** It is 3 if the tier-18 gate passed at three signatures, otherwise 2.
-
-  Everything else that depends on them is read from the vendored `randprotocol_zkvm::msauth` or printed by a command this plan gives, never typed from an estimate:
-  - `MSAUTH_WORDS`;
-  - the keccak/modq/memory floors in `pinned_options()`;
-  - the msauth program `hc`;
-  - the core mirrors `MSAUTH_KECCAK_LOG_HEIGHT` and `MSAUTH_MODQ_LOG_HEIGHT`.
-
-  With `M_MAX` = 3 the expected values are keccak 14 and modq 16. If `M_MAX` = 2, the mirror tests print the vendored values to write in.
+- **The two values from circuits Task 8, filled in (controller ruling, 2026-10-11): `MSAUTH_TIER = 18`, `M_MAX = 3`.** Task 8's five-fixture gate measured M = 3 at 250 685–252 775 cycles and exactly 1 942 Poseidon2 permutations, inside tier 18 with 9 368 cycles to spare. The pinned heights are program 12, input 12, keccak 14, sha256 0, modq 16, public 7, mem 20. Circuits' `check_pinned_shape_with`/`prove_msauth` hard-error, naming the field, when a witness's natural heights miss a pin. If the vendored commit disagrees with any of these numbers, stop. The msauth program `hc` is the one value still read off the vendored binary (Task 2 Step 3).
+- **Chain-21 gate (before Task 1).** Check whether chain 21 has been cut: `deploy/genesis-chain21.json` is committed, or randprotocol-d7 says so. Task 1 alone already makes this build constraint set 9. If chain 21 has been cut:
+  - add chain 21's hash to `CHAINS_THIS_BUILD_CANNOT_RUN` in Task 1, with `CONSTRAINT_SET_8_REASON` and the wording "chains 18–21";
+  - retarget Task 9 at chain 22's cut script;
+  - change the CHANGELOG description in Task 10 from "chain 21 on" to "chain 22 on".
+- **`CHANGELOG.md` is the user's.** The user is deciding v0.8.0 against v0.9.0 scope. This plan never edits that file. Task 10 writes the proposed text into the PR description and the spec. That text includes the "Rollback to v0.7.1" paragraph (~line 45), which no longer holds across a constraint set.
 - **v0.8.0 decision (blocking).** After Task 1 this build cannot run chains 18–20, because every verifier key and the proof encoding change. Before merging Task 1 to `main`, the user chooses one of two options:
   - **(a)** v0.8.0 becomes chain-21-only and the chain-20 flag-day roll in `CHANGELOG.md` is withdrawn;
   - **(b)** v0.8.0 is tagged first from today's `main`, and this work ships as v0.9.0.
 
-  Task 10's CHANGELOG step writes the chosen form. The default text below is (a), because the tag is being held for this.
-- **Read-only:** circuits; `deploy/cut-chain21-genesis.sh` until Task 9 Step 1's message to randprotocol-d7 is answered; `feat/verify-cache` (fetch only).
+  Task 10 describes both forms for the user; it does not edit `CHANGELOG.md`.
+- **Read-only:**
+  - circuits;
+  - `deploy/cut-chain21-genesis.sh`, until Task 9 Step 1's message to randprotocol-d7 is answered;
+  - `feat/verify-cache`, which belongs to randprotocol-61: message that owner, and never write its spec file;
+  - `CHANGELOG.md`.
+- **Corrected premises:**
+  - `Transaction::binding` blanks both the bundle proof and the auth proof, so signing before proving is sound, and `salt`/`auth_commit` are fixed at `prepare`.
+  - `sync-zkvm.sh` never copies research's `Cargo.toml`, so there is no self dev-dependency to strip.
 - **Every `cargo` is `cargo +1.98.1`.** Real-proof tests take the workspace proving slot (`proving_slot()`) and are `#[ignore]`d when they take more than 5 minutes or 48 GB. Each one carries its run command.
 - **Never `git rebase`.** Every commit ends with the session's `Co-Authored-By:` and `Claude-Session:` trailers.
 - **No new consensus refusal path.** Every refusal is an existing `TxError`: `InvalidAuthProof`, `AuthMismatch`, `AuthGasLimit`, `AuthMissing` or `ProofTooLarge`.
@@ -50,9 +52,11 @@
 ## Review Focus
 
 1. `ZkExecutor::verify_auth` dispatches on `hc`, and each path re-pins its own whole shape. A single-key proof under the msauth `hc`, and the reverse, are refused before a key is built (Task 2).
-2. Both new trait methods have **no default**. `AggExecutor`, `CachingExecutor` (if merged) and every test executor forward them (Task 4).
+2. All three new trait methods (`auth_header`, `warm_auth_multisig`, `auth_multisig_key_ready`) have **no default**. `AggExecutor`, `CachingExecutor` (if merged) and every test executor forward them (Task 4).
 3. A modq-bearing call, bundle, single-key auth or perp proof is refused before any key build (Task 2).
-4. `honest_fri_arities`/`non_canonical` see the modq instance. Otherwise the msauth proof escapes the FRI-arity rule (Task 2).
+4. `honest_fri_arities` **and `non_canonical`'s preprocessed-round count** see the modq instance. Otherwise every honest msauth proof is refused as non-canonical, by the mempool and, under `hardening_v6`, by consensus (Task 2).
+8. The tier-18 msauth key is built once (`OnceLock`); no worker builds it while the mempool defers multisig proofs (Tasks 2, 4).
+9. `sign` checks all four outputs open as sender and that value is conserved against the witness (Task 6).
 5. The genesis hash is unchanged for every committed file, and the new tag is last (Task 3).
 6. `sign` never signs a binding it did not recompute from the transaction, and never signs outputs it could not open as sender (Task 6).
 7. The rvm re-sync is kept, not reverted, and its pins move with circuits Task 9's (Task 1).
@@ -69,6 +73,7 @@
 - Modify: `crates/randprotocol-core/src/gas.rs` (`MODQ_GAS`, `gas_max_with_modq`)
 - Modify: `crates/randprotocol-zkvm/src/executor.rs` (the mirror test only)
 - Modify: `crates/randprotocol-node/src/node.rs` (`BUILD_CONSTRAINT_SET`, `CHAINS_THIS_BUILD_CANNOT_RUN`, `CONSTRAINT_SET_8_REASON`)
+- Modify: `crates/randprotocol-node/src/main.rs` (`chain_18s/19s/20s_genesis_file_builds_chain_N`, `main.rs:4780-4853`, become refusal tests)
 - Modify: `crates/randprotocol-node/fixtures/recursion/Test-{0,1,2}.proof`, `scripts/recursion-fixtures.sh` (pinned digests), `crates/randprotocol-node/src/agg_executor.rs` (pinned vectors)
 - Modify: `.github/workflows/ci.yml` (`CIRCUITS_PIN`, guest rebuild covers `msauth`, `--features cheating --test cheating`)
 
@@ -173,12 +178,25 @@ fn this_build_refuses_chains_18_to_20() {
 }
 ```
 
+In `crates/randprotocol-node/src/main.rs`, convert `chain_18s_genesis_file_builds_chain_18`, `chain_19s_…_19` and `chain_20s_…_20` (each now ends in `.expect("this build runs chain N")`) into refusal tests, in the form the chain-16/17 ones take. Keep every file-content assertion, rename each to `chain_Ns_genesis_file_is_refused_by_this_build`, and replace the build-and-run tail with:
+
+```rust
+let gs = gen.build(&executor_for_profile(FriProfile::Production)).expect("the committed file still validates");
+let (_, hash, _) = node::CHAINS_THIS_BUILD_CANNOT_RUN.iter().find(|(c, _, _)| *c == N).expect("listed");
+assert_eq!(gs.hash().to_hex(), *hash, "the listed hash is the committed file's");
+let e = node::refuse_chains_this_build_cannot_run(&gs).unwrap_err().to_string();
+assert!(e.contains("constraint set 8"), "{e}");
+```
+
+`N` is 18, 19 or 20, and `executor_for_profile` is the constructor those tests already use.
+
 - [ ] **Step 2: Run them to see them fail.**
 
 ```bash
 cargo +1.98.1 test --release -p randprotocol-zkvm --test guest_provenance msauth_guest_and_the_modq 2>&1 | tail -5
 cargo +1.98.1 test --release -p randprotocol-core --lib gas_max_with_modq 2>&1 | tail -5
 cargo +1.98.1 test --release -p randprotocol-node --lib this_build_refuses_chains_18_to_20 2>&1 | tail -5
+cargo +1.98.1 test --release -p randprotocol-node --bin rand-node genesis_file_is_refused_by_this_build 2>&1 | tail -5
 ```
 
 Expected: compile errors: no `msauth`, no `SYS_MODQ`, no `gas_max_with_modq`; `BUILD_CONSTRAINT_SET` is 8.
@@ -187,9 +205,9 @@ Expected: compile errors: no `msauth`, no `SYS_MODQ`, no `gas_max_with_modq`; `B
   1. `deploy/sync-zkvm.sh`:
      - Add `--exclude dilithium_host.rs` to the first (`src`) rsync. Add `--exclude dilithium.rs --exclude modq_reference.rs` to the second (`tests`) rsync.
      - Change the guest loop to `for GUEST in fib keccak256 evm sbpf msauth; do`.
-     - After the `sed` that renames `rand_zkvm`, add the hooks guard:
+     - After the `sed` that renames `rand_zkvm`, add the hooks guard. It covers `tests/common/*.rs` too: circuits is moving `modq_harness` out from behind `cheating`, so the vendored `tests/modq.rs` runs on the real `ModqAir`.
        ```bash
-       if grep -lE 'forge_block|build_traces_forged|ModqAirWithout|call_unchecked|execute_unchecked_modq|memory_trace_forged|range_counts_without' "$DST"/tests/*.rs | grep -v '/cheating.rs$' | grep -q .; then
+       if grep -lE 'forge_block|build_traces_forged|ModqAirWithout|call_unchecked|execute_unchecked_modq|memory_trace_forged|range_counts_without' "$DST"/tests/*.rs "$DST"/tests/common/*.rs | grep -v '/cheating.rs$' | grep -q .; then
          echo "sync-zkvm.sh: a vendored test other than tests/cheating.rs calls a cheating hook; give it its own [[test]] required-features = [\"cheating\"] entry in $DST/Cargo.toml first" >&2; exit 1
        fi
        ```
@@ -282,7 +300,7 @@ Expected: all pass, and the last command prints `0`. Any test that pinned a veri
 
 ```bash
 git add deploy/sync-zkvm.sh crates/randprotocol-zkvm crates/randprotocol-rvm crates/randprotocol-core/src/gas.rs \
-        crates/randprotocol-node/src/node.rs crates/randprotocol-node/src/agg_executor.rs crates/randprotocol-node/fixtures \
+        crates/randprotocol-node/src/node.rs crates/randprotocol-node/src/main.rs crates/randprotocol-node/src/agg_executor.rs crates/randprotocol-node/fixtures \
         scripts/recursion-fixtures.sh vendor/circuits .github/workflows/ci.yml Cargo.lock
 git commit -m "zkvm, rvm: re-vendor circuits $CIRCUITS — the MODQ chip (constraint set 9: every key and the proof encoding move), the msauth host model and guest, the rvm re-pinned with it; the node refuses chains 18-20"
 ```
@@ -296,6 +314,7 @@ git commit -m "zkvm, rvm: re-vendor circuits $CIRCUITS — the MODQ chip (constr
 - Create: `crates/randprotocol-zkvm/tests/auth_msauth.rs` (node-local; the sync's `'auth*.rs'` exclude keeps it)
 - Modify: `crates/randprotocol-zkvm/tests/guest_provenance.rs`, `crates/randprotocol-zkvm/tests/auth_spike.rs`
 - Modify: `crates/randprotocol-core/src/confidential.rs` (only the `AuthShape` enum, which Task 4 uses)
+- Modify: `crates/randprotocol-node/src/agg_executor.rs` (`decode_call`'s own header mirror, `agg_executor.rs:466-512`: the `modq_log_height != 0` refusal)
 
 **Interfaces:**
 - Consumes: Task 1's vendored `msauth`, `machine::*_with_modq`, `ProveOptions`.
@@ -317,8 +336,11 @@ git commit -m "zkvm, rvm: re-vendor circuits $CIRCUITS — the MODQ chip (constr
       pub fn auth_shape_of(proof: &[u8]) -> Result<AuthShape, ConfidentialError>;
       pub fn msauth_proof_commit(&self, proof: &[u8]) -> Result<Word8, ConfidentialError>;
       pub fn verify_msauth_proof(&self, hc: &Word8, proof: &[u8], binding: &[u32; TX_BINDING_WORDS]) -> Result<Word8, ConfidentialError>;
-      pub fn cached_msauth_keys(&self) -> usize;
+      pub fn cached_msauth_keys(&self) -> usize;   // 0 or 1: the OnceLock key
+      pub fn msauth_key_ready(&self) -> bool;
+      pub fn auth_header_of(&self, proof: &[u8]) -> Result<(AuthShape, Word8, Option<u64>), ConfidentialError>;   // one decode
   }
+  // field: msauth_key: std::sync::OnceLock<Arc<CommonData<Config>>>   (single flight; spec §3.5)
   pub fn hash_bearing_mem_log_height_ceiling_with_modq(tier: Tier, keccak_log_height: u8, sha256_log_height: u8, modq_log_height: u8) -> u8;
   pub fn run_msauth(inputs: &[u32], binding: &[u32; TX_BINDING_WORDS]) -> Result<Word8, String>;
   pub fn prove_msauth(profile: FriProfile, inputs: &[u32], binding: &[u32; TX_BINDING_WORDS]) -> Result<(Vec<u8>, Word8, u8), String>;
@@ -415,6 +437,9 @@ fn a_real_msauth_proof_takes_the_pinned_shape_and_every_other_header_is_refused(
         proofs.push(bytes);
     }
     let s = ZkExecutor::msauth_heights();
+    // Privacy: proofs at M = 1, 2, 3 differ in length only by the hiding noise.
+    let (lo, hi) = (proofs.iter().map(Vec::len).min().unwrap(), proofs.iter().map(Vec::len).max().unwrap());
+    assert!((hi - lo) * 100 <= lo, "M leaks through size: {lo}..{hi} bytes");
     for bytes in &proofs {
         let p = decode_canonical(bytes).unwrap();
         // R-hide: every M declares the same header.
@@ -434,28 +459,47 @@ fn a_real_msauth_proof_takes_the_pinned_shape_and_every_other_header_is_refused(
     assert!(ex.verify_auth(&hc, &proofs[1], &[0; 8]).is_err(), "another binding");
     // The single-key path refuses the multisig shape before building a key.
     assert!(matches!(ex.verify_auth(&ZkExecutor::hc_auth(), &proofs[1], &BINDING), Err(ConfidentialError::InvalidProof(_))));
-    // Every header word moved by one is refused by shape, before a key is built.
-    let honest = decode_canonical(&proofs[1]).unwrap();
+    // Every header word (and the tier) moved by one, up and down, is refused by shape before a key is built.
+    // `machine::Proof` is not `Clone`: re-decode the honest bytes for every mutation.
     let fresh = ZkExecutor::new(FriProfile::Test);
-    for (what, edit) in [
-        ("tier", Box::new(|p: &mut randprotocol_zkvm::machine::Proof| p.tier.0 -= 2) as Box<dyn Fn(&mut _)>),
-        ("keccak", Box::new(|p: &mut randprotocol_zkvm::machine::Proof| p.keccak_log_height += 1)),
-        ("modq", Box::new(|p: &mut randprotocol_zkvm::machine::Proof| p.modq_log_height += 1)),
-        ("mem", Box::new(|p: &mut randprotocol_zkvm::machine::Proof| p.mem_log_height += 1)),
-        ("sha256", Box::new(|p: &mut randprotocol_zkvm::machine::Proof| p.sha256_log_height = 7)),
-    ] {
-        let mut p = honest.clone();
-        edit(&mut p);
-        let bytes = p.to_bytes();
-        assert!(ZkExecutor::auth_shape_of(&bytes).is_err(), "{what}");
-        assert!(fresh.verify_auth(&hc, &bytes, &BINDING).is_err(), "{what}");
+    type Edit = fn(&mut randprotocol_zkvm::machine::Proof, i8);
+    let edits: [(&str, Edit); 8] = [
+        ("tier", |p, d| p.tier.0 = (p.tier.0 as i64 + 2 * d as i64) as usize),
+        ("program", |p, d| p.program_log_height = (p.program_log_height as i8 + d) as u8),
+        ("input", |p, d| p.input_log_height = (p.input_log_height as i8 + d) as u8),
+        ("keccak", |p, d| p.keccak_log_height = (p.keccak_log_height as i8 + d) as u8),
+        ("sha256", |p, d| p.sha256_log_height = if d > 0 { 7 } else { 0 }),
+        ("modq", |p, d| p.modq_log_height = (p.modq_log_height as i8 + d) as u8),
+        ("public", |p, d| p.public_log_height = (p.public_log_height as i8 + d) as u8),
+        ("mem", |p, d| p.mem_log_height = (p.mem_log_height as i8 + d) as u8),
+    ];
+    for (what, edit) in edits {
+        for d in [1i8, -1] {
+            if what == "sha256" && d < 0 { continue; }   // 0 is the pin; only "present" is a move
+            let mut p = decode_canonical(&proofs[1]).unwrap();
+            edit(&mut p, d);
+            let bytes = p.to_bytes();
+            assert!(ZkExecutor::auth_shape_of(&bytes).is_err(), "{what} {d:+}");
+            assert!(matches!(fresh.verify_auth(&hc, &bytes, &BINDING), Err(ConfidentialError::InvalidProof(_)) | Err(ConfidentialError::MalformedProof)), "{what} {d:+}");
+        }
     }
     assert_eq!(fresh.cached_msauth_keys(), 0, "no forged header built a key");
-    // FRI arity is pinned for modq-bearing proofs too (VERIFIER-2).
-    let mut forged = honest.clone();
-    let arities = &mut forged.batch.opening_proof.1.commit_phase_log_arities;   // the field `honest_fri_arities` pins
-    if let Some(a) = arities.first_mut() { *a = 1; }
+    // FRI arity is pinned for modq-bearing proofs too (VERIFIER-2): the field `honest_fri_arities` reads (executor.rs:254).
+    let mut forged = decode_canonical(&proofs[1]).unwrap();
+    forged.batch.opening_proof.1.commit_phase_openings[0].log_arity = 1;
     assert!(non_canonical(&forged).is_some(), "a finer FRI schedule on an msauth proof is non-canonical");
+}
+
+/// The Test-profile prove the e2e (Task 8) will pay three times. Record time and peak RSS before Task 8.
+/// Run: `/usr/bin/time -l cargo +1.98.1 test --release -p randprotocol-zkvm --test auth_msauth -- --ignored --nocapture measure_the_msauth_test_profile_prove`
+#[test]
+#[ignore = "one Test-profile tier-18 prove: record time and peak RSS; stop if the peak exceeds 40 GB"]
+fn measure_the_msauth_test_profile_prove() {
+    let f = fixture(3);
+    let inputs = msauth_inputs(&MSK, &SALT, 2, &[slot(&f, 0), slot(&f, 2)]);
+    let t0 = std::time::Instant::now();
+    let (bytes, _, _) = prove_msauth(FriProfile::Test, &inputs, &BINDING).unwrap();
+    eprintln!("MSAUTH-TEST: proof {} B, prove {:?}", bytes.len(), t0.elapsed());
 }
 
 /// The cost a validator pays to warm the msauth key and verify one proof, at Production.
@@ -533,6 +577,25 @@ fn a_modq_table_is_refused_on_every_proof_but_msauth() {
 }
 ```
 
+Add the fast **non-ignored** canonicality test (review finding 1) to `executor.rs`'s `mod tests`. It uses circuits' vendored `tests/common` modq fixture through its library entry point, a tier-10 program making one `MODQ` call:
+
+```rust
+/// Constraint set 9: a modq-bearing proof's preprocessed round includes the modq table's 16
+/// preprocessed columns. Before the fix, `non_canonical` counted `chips(t, k, s)` and named every
+/// honest msauth proof non-canonical: refused by the mempool, and by consensus under hardening_v6.
+#[test]
+fn an_honest_modq_bearing_proof_is_canonical() {
+    let (program, inputs) = crate::modq::one_call_fixture();   // circuits tests/common's tier-10, one-block guest, re-exported for tests
+    let m = Machine::new(FriProfile::Test);
+    let (proof, _) = m.prove_with_options(&program, &inputs, &[], Some(Tier(10)), crate::machine::ProveOptions::default()).unwrap();
+    assert!(proof.modq_log_height != NO_MODQ, "the fixture declares a modq table");
+    assert_eq!(non_canonical(&proof), None);
+    assert!(honest_fri_arities(&proof).is_some(), "a schedule is derived, so the arity rule runs");
+}
+```
+
+If the vendored crate exposes the fixture under another name (circuits' `tests/common/modq.rs`), call that and keep the assertions.
+
 For the `verify_call` half, extend the existing `verify_call` header-cap test that sets `keccak_log_height = 13` (`MAX_CALL_KECCAK_LOG_HEIGHT` + 1). Add a sibling case with `modq_log_height = 10` that expects `InvalidProof` containing `"declares no modq table"`, and `ex.cached_keys()` unchanged.
 
 Add to `crates/randprotocol-core/src/confidential.rs`, beside `ConfidentialError`:
@@ -544,7 +607,7 @@ Add to `crates/randprotocol-core/src/confidential.rs`, beside `ConfidentialError
 pub enum AuthShape { SingleKey, Multisig }
 ```
 
-And to `crates/randprotocol-core/src/types/mod.rs`, after `AUTH_PROOF_TIER`, add the mirrors the shape test reads. These values are for `M_MAX` = 3; if the mirror assertion fails, write the vendored values it prints:
+and to `crates/randprotocol-core/src/types/mod.rs`, after `AUTH_PROOF_TIER`, add the mirrors the shape test reads. These are circuits Task 8's measured pins (keccak 14, modq 16 at `M_MAX` = 3):
 
 ```rust
 /// The one tier a multisig auth proof may declare — `randprotocol_zkvm::executor::MSAUTH_TIER`
@@ -577,7 +640,7 @@ Expected: compile errors (no `run_msauth`, `prove_msauth`, `MSAUTH_TIER`, `msaut
 
 - [ ] **Step 3: Implement** in `crates/randprotocol-zkvm/src/executor.rs`.
   1. Add `const NO_MODQ: u8 = 0;` beside `NO_SHA256`, and the `MSAUTH_TIER`, `MSAUTH_REFUSAL` and `MsauthShape` items. `MSAUTH_TIER`'s doc: "pinned like `AUTH_TIER`; `guest_provenance.rs` pins 18".
-  2. Add the field `msauth_machine: Machine` (doc: "the msauth guest's own `Machine`, one key, for `auth_machine`'s reason"). Initialise it in `new`, and add `cached_msauth_keys()`.
+  2. Add the field `msauth_machine: Machine` (doc: "the msauth guest's own `Machine`, for `auth_machine`'s reason") and `msauth_key: std::sync::OnceLock<Arc<CommonData<Config>>>`. The vendored key cache has no single flight on this path (`executor.rs:489-497`), and four verify workers plus the warm thread must never each build a 1.5–2 GB key. The key is built only through `self.msauth_key.get_or_init(|| self.msauth_machine.verifier_key_with_modq(Tier(MSAUTH_TIER), plh, ilh, klh, 0, mlh, pubh))`, and the msauth verify uses it directly through the vendored `Machine`'s verify-with-key entry point. If there is no such public entry point, add a hand-patched `verify_public_with_key` to `sync-zkvm.sh`'s `machine.rs` patch, next to `log_ext_degrees_pub`. Add `cached_msauth_keys()` (`msauth_key.get().is_some() as usize`) and `msauth_key_ready()`. Add a unit test: eight threads calling `warm_auth_multisig` concurrently leave exactly one build, counted by a `msauth_key_builds: AtomicUsize` incremented inside `get_or_init`.
   3. `check_decoded`: in the exact branch, add `|| proof.modq_log_height != NO_MODQ` to the tier/hash pin, with the message `"tier, hash-table or modq height not the pinned guest's"`. Before the existing `check_declared_heights` call, add `if proof.modq_log_height != NO_MODQ && !exact { return Err(InvalidProof("a call proof declares no modq table".into())) }`, so `verify_call*`, `verify_invoke` and `check_perp` (all `exact = false`) refuse before any key.
   4. `msauth_program()`: an `OnceLock` of `crate::guests::compiled::msauth()`. `hc_auth_multisig()` is its digest. `msauth_heights()`:
      ```rust
@@ -597,11 +660,12 @@ Expected: compile errors (no `run_msauth`, `prove_msauth`, `MSAUTH_TIER`, `msaut
   8. In the trait impl:
      - `auth_proof_digest` and `auth_gas_limit` match `Self::auth_shape_of(proof)?`: `SingleKey` keeps today's path, `Multisig` takes the msauth one (`p.public_values[pv::GAS]`).
      - `verify_auth` dispatches on `hc` as in spec §3.4. The single-key path's existing shape error stays; the msauth path's error text names "not the multisig auth guest's shape".
-     - `auth_proof_shape` is `Self::auth_shape_of`.
-     - `warm_auth_multisig` builds `verifier_key_with_modq(Tier(MSAUTH_TIER), plh, ilh, klh, 0, mlh, pubh)` on `msauth_machine` under `warming`.
+     - `auth_header` is `self.auth_header_of(proof)` (item 12b).
+     - `warm_auth_multisig` fills the `msauth_key` `OnceLock` (item 2) under `warming`; `auth_multisig_key_ready` is `msauth_key_ready()`.
 
      (Task 4 adds the two methods to the trait. Until then, write them as inherent `pub fn`s with the same signatures; Task 4 moves them into the impl.)
-  9. `honest_fri_arities`: replace `crate::machine::chips(…)` with `crate::machine::chips_with_modq(proof.tier, clamped(keccak), clamped(sha256), clamped_hash_log_height(proof.modq_log_height, crate::tables::modq::MAX_LOG_HEIGHT))`.
+  9. **`non_canonical`'s preprocessed-round count** (`executor.rs:276-284`): replace `crate::machine::chips(proof.tier, …)` in the `preprocessed` count with the same `chips_with_modq(…, clamped modq)` as below. Without it `an_honest_modq_bearing_proof_is_canonical` fails. Beside `MAX_HONEST_DEGREE_BITS`, add `const _: () = assert!(crate::tables::modq::MAX_LOG_HEIGHT as usize + 1 <= MAX_HONEST_DEGREE_BITS);`. In `crates/randprotocol-node/src/agg_executor.rs`'s `decode_call` mirror, refuse `proof.modq_log_height != 0` with the same `InvalidProof("a call proof declares no modq table")`, and give it a test beside the existing `decode_call` header tests.
+  9b. `honest_fri_arities`: replace `crate::machine::chips(…)` with `crate::machine::chips_with_modq(proof.tier, clamped(keccak), clamped(sha256), clamped_hash_log_height(proof.modq_log_height, crate::tables::modq::MAX_LOG_HEIGHT))`.
   10. `non_canonical`'s memory rules: the plain rule (`mem == t + 2`) applies only when keccak, sha256 **and** modq are all 0. The hash-bearing rule applies when any is non-zero, and uses
       ```rust
       pub fn hash_bearing_mem_log_height_ceiling_with_modq(tier: Tier, k: u8, s: u8, m: u8) -> u8
@@ -609,6 +673,7 @@ Expected: compile errors (no `run_msauth`, `prove_msauth`, `MSAUTH_TIER`, `msaut
       which is `hash_bearing_mem_log_height_ceiling`'s body plus `rows(m) * 5`: five `MEMORY` interactions per modq row, MODQ spec §0. `hash_bearing_mem_log_height_ceiling(t, k, s)` delegates with `m = 0`.
   11. `run_msauth(inputs, binding)`: refuse `inputs.len() != MSAUTH_WORDS`; run `crate::emulator::execute(Self::msauth_program(), inputs, binding, Tier(MSAUTH_TIER).max_cycles())`; `Err("the multisig auth guest refused this witness (sentinel)")` when `outputs[7] == MSAUTH_REFUSAL` or the run did not halt; otherwise `Ok(outputs[..8])`. The word "refused" is what the test reads.
   12. `prove_msauth(profile, inputs, binding)`: the same length check, then `Machine::new(profile).prove_with_options(Self::msauth_program(), inputs, binding, Some(Tier(MSAUTH_TIER)), crate::msauth::pinned_options())` (CPU; `pinned_options().gas_limit` is `None`), then `Ok((proof.to_bytes(), exec.outputs[..8], proof.tier.0 as u8))`.
+  12b. `auth_header_of(proof)` is one `decode_canonical`. It returns `(shape, published_digest, Some(public_values[pv::GAS]))` after the shape's exact checks; Task 4's trait method `auth_header` forwards to it.
   13. Write the pin. Run `cargo +1.98.1 test --release -p randprotocol-zkvm --test guest_provenance the_multisig_auth_guest_is_pinned -- --nocapture`. The failing `assert_eq!` prints the left side, `hc_auth_multisig()`. Check it equals the `hc` circuits Task 8 recorded in `research/docs/04-guests.md`. If they differ, stop: the vendored binary is not Task 8's. Otherwise write it into `MSAUTH_HC`.
 
 - [ ] **Step 4: Run to see it pass.**
@@ -617,15 +682,20 @@ Expected: compile errors (no `run_msauth`, `prove_msauth`, `MSAUTH_TIER`, `msaut
 cargo +1.98.1 test --release -p randprotocol-zkvm --test auth_msauth --test guest_provenance --test auth_spike --test executor
 cargo +1.98.1 test --release -p randprotocol-zkvm --lib
 cargo +1.98.1 test --release -p randprotocol-zkvm --test auth_msauth -- --ignored --nocapture a_real_msauth_proof
-/usr/bin/time -l cargo +1.98.1 test --release -p randprotocol-zkvm --test auth_msauth -- --ignored --nocapture measure_the_msauth 2>&1 | tee /tmp/msauth-node-prod.log
+/usr/bin/time -l cargo +1.98.1 test --release -p randprotocol-zkvm --test auth_msauth -- --ignored --nocapture measure_the_msauth_verifier 2>&1 | tee /tmp/msauth-node-prod.log
+/usr/bin/time -l cargo +1.98.1 test --release -p randprotocol-zkvm --test auth_msauth -- --ignored --nocapture measure_the_msauth_test_profile_prove 2>&1 | tee /tmp/msauth-test-prove.log
 ```
 
-Expected: all pass. The last command prints `MSAUTH-PROD:` and a maximum resident set size. **If the key build's peak exceeds 1.5 GB above a plain `rand-node` baseline, stop and report** (spec §3.5). If the proof is more than 3 984 588 bytes, Task 3 uses `6 << 20` for `MSAUTH_MIN_PROOF_BYTES` (spec §3.3).
+Expected: all pass. The two measurements print `MSAUTH-PROD:` and `MSAUTH-TEST:` lines with maximum resident set sizes.
+
+Stop rules:
+- **Key memory.** If the key build's peak, **or the resident memory after it** (sample the process RSS after `warm_auth_multisig` returns, before the verify), exceeds 1.5 GB above a plain `rand-node` baseline, stop and report (spec §3.5).
+- **Test-profile prove.** If its peak exceeds 40 GB, stop before Task 8: the e2e runs the node in-process on the 48 GB laptop. Record its time for Task 8's window. If the proof is more than 3 984 588 bytes, Task 3 uses `6 << 20` for `MSAUTH_MIN_PROOF_BYTES` (spec §3.3).
 
 - [ ] **Step 5: Commit.**
 
 ```bash
-git add crates/randprotocol-zkvm/src/executor.rs crates/randprotocol-zkvm/tests/auth_msauth.rs crates/randprotocol-zkvm/tests/guest_provenance.rs \
+git add crates/randprotocol-node/src/agg_executor.rs crates/randprotocol-zkvm/src/executor.rs crates/randprotocol-zkvm/tests/auth_msauth.rs crates/randprotocol-zkvm/tests/guest_provenance.rs \
         crates/randprotocol-zkvm/tests/auth_spike.rs crates/randprotocol-core/src/confidential.rs crates/randprotocol-core/src/types/mod.rs crates/randprotocol-core/src/gas.rs
 git commit -m "zkvm: the msauth path — msauth_machine, the pinned tier-18 shape (every height exact), verify_auth dispatched on hc, run/prove_msauth at the header's gas ceiling; modq refused on every other proof; FRI-arity and memory canonicality see the modq table; hc_auth_multisig pinned"
 ```
@@ -752,25 +822,31 @@ fn a_restart_restores_hc_auth_multisig() {
 }
 ```
 
-Append to `main.rs`'s tests, next to the `--auth-guest` genesis test at `main.rs:4757`. Use that test's own writer helper; it runs `genesis` into a tempdir and reads the file back, and here it is called with `--auth-guest --auth-multisig-guest`:
+The tests at `main.rs:4757`/`4788` read committed files; there is no genesis-writing helper. So add an end-to-end CLI test to `crates/randprotocol-node/tests/genesis_cli.rs`, which already runs the `rand-node` binary. Build its arguments the way that file's `--auth-guest` case does, plus the new flag:
 
 ```rust
 #[test]
 fn genesis_auth_multisig_guest_writes_this_builds_msauth_hc_and_needs_auth_guest() {
-    let gen = genesis_written_with(&["--bundle-guest", "v3", "--auth-guest", "--auth-multisig-guest", "--max-proof-bytes", "4194304", "--max-block-bytes", "20971520"]);
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("g.json");
+    let ok = run_genesis(&dir, &["--bundle-guest", "v3", "--auth-guest", "--auth-multisig-guest",
+                                 "--max-proof-bytes", "4194304", "--max-block-bytes", "20971520", "--out", out.to_str().unwrap()]);
+    assert!(ok.status.success(), "{}", String::from_utf8_lossy(&ok.stderr));
+    let gen = Genesis::from_json(&std::fs::read_to_string(&out).unwrap()).unwrap();
     assert_eq!(gen.hc_auth_multisig.as_deref(), Some(word8_to_hex(&ZkExecutor::hc_auth_multisig()).as_str()));
-    assert!(Cli::try_parse_from(["rand-node", "genesis", "--auth-multisig-guest", "--out", "g.json"]).is_err(), "requires --auth-guest");
+    let bare = run_genesis(&dir, &["--auth-multisig-guest", "--out", dir.path().join("h.json").to_str().unwrap()]);
+    assert!(!bare.status.success(), "requires --auth-guest");
 }
 ```
 
-`genesis_written_with` is the existing helper in that test module that the `--auth-guest` assertions at `main.rs:4757`/`4788` call. If it has another name, use that name.
+`run_genesis` is that file's existing runner, which invokes `rand-node genesis` with its validator and key fixtures and returns the `Output`. Use the name `genesis_cli.rs` defines.
 
 - [ ] **Step 2: Run them to see them fail.**
 
 ```bash
 cargo +1.98.1 test --release -p randprotocol-core --lib hc_auth_multisig 2>&1 | tail -5
 cargo +1.98.1 test --release -p randprotocol-node --lib hc_auth_multisig 2>&1 | tail -5
-cargo +1.98.1 test --release -p randprotocol-node --bin rand-node genesis_auth_multisig_guest 2>&1 | tail -5
+cargo +1.98.1 test --release -p randprotocol-node --test genesis_cli genesis_auth_multisig_guest 2>&1 | tail -5
 ```
 
 Expected: compile errors (no field, variants, accessors or flag).
@@ -778,7 +854,7 @@ Expected: compile errors (no field, variants, accessors or flag).
 - [ ] **Step 3: Implement.**
   1. Add the `Genesis.hc_auth_multisig` field **last**, with spec §2.1's doc, and `hc_auth_multisig: None` in every literal the compiler lists. Add the ledger field (`None` in both `Ledger` constructors) and its accessors, beside `hc_auth`.
   2. In `build`, after `set_hc_auth`, parse into `BadHcAuthMultisig` and call `ledger.set_hc_auth_multisig`. In the hash, after the `aggregation_tree` block, add spec §2.2's three lines with the comment "Private multisig, after `aggregation_tree` — last — tagged, present-only".
-  3. In `validate`, after the split-auth block rule: rules 2–4 of spec §2.3. The `ProofCapTooSmallForMsauth` message is `"max_proof_bytes {proof} cannot hold a multisig auth proof (about 3.6 MB at production FRI): a chain with hc_auth_multisig needs max_proof_bytes ≥ {need}"`. In `gas.rs`, add `pub const MSAUTH_MIN_PROOF_BYTES: usize = 4 << 20;`, documented with spec §3.3's estimate and the 95 % rule. Use `6 << 20` if Task 2's measurement said so.
+  3. In `validate`, after the split-auth block rule: rules 2–4 of spec §2.3. Rule 3 compares the **parsed** `Word8`s (`word8_from_hex` of both), never the strings; the test's `"23"·32` against `"23"·32` case is joined by an upper-case-hex variant of the same digest, which must also be refused. The `ProofCapTooSmallForMsauth` message is `"max_proof_bytes {proof} cannot hold a multisig auth proof (about 3.6 MB at production FRI): a chain with hc_auth_multisig needs max_proof_bytes ≥ {need}"`. In `gas.rs`, add `pub const MSAUTH_MIN_PROOF_BYTES: usize = 4 << 20;`, documented with spec §3.3's estimate and the 95 % rule. Use `6 << 20` if Task 2's measurement said so.
   4. In `node.rs`:
      - `reload_ledger`: `ledger.set_hc_auth_multisig(gs.ledger.hc_auth_multisig());`, with a comment in the `hc_auth` comment's style.
      - `check_build_runs_genesis`: `if let Some(h) = gs.ledger.hc_auth_multisig() { if h != ZkExecutor::hc_auth_multisig() { bail!("the genesis hc_auth_multisig ({}) is not this build's multisig auth guest ({}); rebuild from the chain's pinned commit", …) } }`.
@@ -789,7 +865,7 @@ Expected: compile errors (no field, variants, accessors or flag).
 ```bash
 cargo +1.98.1 test --release -p randprotocol-core --lib genesis
 cargo +1.98.1 test --release -p randprotocol-node --lib startup_ a_restart_restores
-cargo +1.98.1 test --release -p randprotocol-node --bin rand-node genesis
+cargo +1.98.1 test --release -p randprotocol-node --test genesis_cli
 cargo +1.98.1 test --release -p randprotocol-node --lib every_committed_genesis_file
 ```
 
@@ -818,9 +894,11 @@ git commit -m "genesis: hc_auth_multisig — last field, hash-bound last (after 
 - Consumes: Task 2 (`AuthShape`, `ZkExecutor::auth_shape_of`, `warm_auth_multisig`), Task 3 (`Ledger::hc_auth_multisig`), `gas::msauth_gas_limit_pin`.
 - Produces:
   ```rust
-  // ConfidentialExecutor — both REQUIRED (no default):
-  fn auth_proof_shape(&self, proof: &[u8]) -> Result<AuthShape, ConfidentialError>;
+  // ConfidentialExecutor — all three REQUIRED (no default):
+  fn auth_header(&self, proof: &[u8]) -> Result<(AuthShape, Word8, Option<u64>), ConfidentialError>;   // one decode: shape, c, gas
   fn warm_auth_multisig(&self);
+  fn auth_multisig_key_ready(&self) -> bool;
+  // admission (node): a Multisig-shaped auth proof before the key is warm is a retryable deferral, never a permanent refusal
   // StubExecutor
   pub fn make_msauth_proof(hc_auth_multisig: &Word8, c: &Word8, binding: &[u32; TX_BINDING_WORDS]) -> Vec<u8>;
   pub const STUB_MSAUTH_GAS_LIMIT: u64;   // == gas::msauth_gas_limit_pin()
@@ -830,7 +908,7 @@ git commit -m "genesis: hc_auth_multisig — last field, hash-bound last (after 
 
 - [ ] **Step 1: Write the failing tests.**
   - Extend `CountingExecutor` (`ledger/mod.rs:4451`) with a `auth_hcs: std::sync::Mutex<Vec<Word8>>` that `verify_auth` pushes `*hc_auth` onto, and an accessor `fn auth_hcs(&self) -> Vec<Word8>`.
-  - Add `fn auth_proof_shape(&self, p: &[u8]) -> … { StubExecutor.auth_proof_shape(p) }` and `fn warm_auth_multisig(&self) {}` to every test executor in the Files list.
+  - Add `fn auth_header(&self, p: &[u8]) -> … { StubExecutor.auth_header(p) }`, `fn warm_auth_multisig(&self) {}` and `fn auth_multisig_key_ready(&self) -> bool { true }` to every test executor in the Files list.
 
   Then append to `ledger/mod.rs`'s tests, after the split-authorisation block:
 
@@ -931,25 +1009,41 @@ fn an_auth_proof_of_neither_shape_is_invalid() {
 }
 ```
 
-Append to `agg_executor.rs`'s tests:
+Append to `agg_executor.rs`'s tests. `AggExecutor::new(profile)` wraps a concrete `ZkExecutor` (`agg_executor.rs:109-118`), so compare the wrapper with a bare `ZkExecutor`, on junk and on a real single-key proof, as the tests at `agg_executor.rs:1144`/`1185` do:
 
 ```rust
-/// Both phase-4 methods are forwarded, never left at a default: the inner executor's answer
-/// comes back through the node's wrapper.
+/// All three phase-4 methods are forwarded, never left at a default: the wrapper answers exactly
+/// what the bare executor answers.
 #[test]
-fn the_auth_shape_and_the_multisig_warm_are_forwarded() {
-    let ex = AggExecutor::new(Arc::new(StubExecutor), randprotocol_zkvm::machine::FriProfile::Test);
-    let msig = StubExecutor::make_msauth_proof(&[23; 8], &[1; 8], &[0; 8]);
-    let single = StubExecutor::make_auth_proof(&[21; 8], &[1; 8], &[0; 8]);
-    assert_eq!(ex.auth_proof_shape(&msig), Ok(AuthShape::Multisig));
-    assert_eq!(ex.auth_proof_shape(&single), Ok(AuthShape::SingleKey));
-    ex.warm_auth_multisig();
+fn the_phase_4_auth_methods_are_forwarded() {
+    let ex = AggExecutor::new(FriProfile::Test);
+    let bare = ZkExecutor::new(FriProfile::Test);
+    assert_eq!(ex.auth_header(b"junk"), bare.auth_header(b"junk"));
+    let (single, c, _) = randprotocol_zkvm::executor::prove_auth(FriProfile::Test, &randprotocol_zkvm::notes::SpendKey([7; 8]), &[6; 8], &[0; 8], Backend::Cpu).unwrap();
+    assert_eq!(ex.auth_header(&single), bare.auth_header(&single));
+    assert_eq!(ex.auth_header(&single).unwrap().0, AuthShape::SingleKey);
+    assert_eq!(ex.auth_header(&single).unwrap().1, c);
+    assert!(!ex.auth_multisig_key_ready(), "nothing warmed yet, as the bare executor says");
+    assert_eq!(ex.auth_multisig_key_ready(), bare.auth_multisig_key_ready());
 }
 ```
 
-`AggExecutor::new(...)` is written here with the constructor the other `agg_executor` tests use. If its signature differs, use the existing tests' construction.
+Append to `admission.rs`'s tests: until the key is warm, a `Multisig`-shaped auth proof is deferred as **retryable**, not cached as refused.
 
-If `verify_cache.rs` is on `main`, append to its tests:
+```rust
+#[test]
+fn a_multisig_auth_proof_is_deferred_not_refused_until_the_key_is_warm() {
+    struct Cold;   // StubExecutor, with auth_multisig_key_ready() == false; every other method forwards
+    let tx = msig_stub_tx();   // a stub multisig transaction, as ledger::tests::msig_tx_with builds it
+    let r = admission::precheck(&tx, &Cold);
+    assert!(matches!(r, Err(e) if e.is_retryable()), "{r:?}");
+    assert!(admission::precheck(&tx, &StubExecutor).is_ok(), "warm: admitted to verify");
+}
+```
+
+Use the names `admission.rs` already has for its pre-verify step and its retryable error class. The deferral sits where `non_canonical_proofs` runs (`admission.rs:1033`), before the verify queue.
+
+If `verify_cache.rs` is on `main`, add the three forwards to its test executor `Counting` (`feat/verify-cache`, `verify_cache.rs` ~line 522) and append to its tests:
 
 ```rust
 #[test]
@@ -957,8 +1051,9 @@ fn the_phase_4_methods_forward_and_a_multisig_verify_is_its_own_kind_2_entry() {
     let inner = Arc::new(Counting::default());
     let ex = CachingExecutor::new(inner.clone());
     let msig = StubExecutor::make_msauth_proof(&[23; 8], &[1; 8], &[0; 8]);
-    assert_eq!(ex.auth_proof_shape(&msig), Ok(AuthShape::Multisig));
+    assert_eq!(ex.auth_header(&msig).unwrap().0, AuthShape::Multisig);
     ex.warm_auth_multisig();
+    assert!(ex.auth_multisig_key_ready());
     assert_eq!(ex.verify_auth(&[23; 8], &msig, &[0; 8]), Ok([1; 8]));
     assert_eq!(ex.verify_auth(&[23; 8], &msig, &[0; 8]), Ok([1; 8]));
     assert_eq!(inner.auths(), 1, "cached under (hc, proof, binding)");
@@ -973,28 +1068,27 @@ fn the_phase_4_methods_forward_and_a_multisig_verify_is_its_own_kind_2_entry() {
 
 ```bash
 cargo +1.98.1 test --release -p randprotocol-core --lib multisig_auth_proof auth_proof_of_neither 2>&1 | tail -5
-cargo +1.98.1 test --release -p randprotocol-node --lib the_auth_shape_and_the_multisig_warm_are_forwarded 2>&1 | tail -5
+cargo +1.98.1 test --release -p randprotocol-node --lib the_phase_4_auth_methods_are_forwarded a_multisig_auth_proof_is_deferred 2>&1 | tail -5
 ```
 
 Expected: compile errors (no trait methods, `make_msauth_proof` or `STUB_MSAUTH_GAS_LIMIT`).
 
 - [ ] **Step 3: Implement.**
-  1. Trait (`confidential.rs`): add both methods **without** a body, documented as in spec §3.4. Add the line "Every wrapper (`AggExecutor`, `CachingExecutor`) forwards them; they verify nothing and are never cached." Extend the trait's doc note on forwarding to name them.
+  1. Trait (`confidential.rs`): add all three methods **without** a body, documented as in spec §3.4. Add the line "Every wrapper (`AggExecutor`, `CachingExecutor`) forwards them; they verify nothing and are never cached." Extend the trait's doc note on forwarding to name them.
   2. `StubExecutor`:
      - `const STUB_MSAUTH_MARKER: &[u8; 5] = b"msau:";`, with the same layout as the auth stub;
      - `pub const STUB_MSAUTH_GAS_LIMIT: u64` written as the literal value of `gas::msauth_gas_limit_pin()`, which the test pins;
      - `make_msauth_proof` hashes `hc` under `b"rand-stub-auth"` exactly as `make_auth_proof` does, so `verify_auth`'s `WrongProgram` check works for both;
-     - `auth_proof_shape` reads the marker (`auth:` → `SingleKey`, `msau:` → `Multisig`, else `MalformedProof`);
+     - `auth_header` reads the marker (`auth:` → `SingleKey`, `msau:` → `Multisig`, else `MalformedProof`) and returns `(shape, c, Some(gas))` from the one parse;
+     - `auth_multisig_key_ready` answers `true`;
      - `auth_proof_digest`, `verify_auth`, `auth_gas_limit`, `bind_in` and `with_auth_gas` accept either marker;
      - `warm_auth_multisig` is a no-op.
-  3. Ledger. Rewrite `check_auth_fields` to spec §3.2's sequence, returning `Ok(Some(shape))` on a `hc_auth` chain and `Ok(None)` otherwise. The shape refusal is `TxError::InvalidAuthProof(ConfidentialError::InvalidProof("a multisig auth proof on a chain without hc_auth_multisig".into()))`. `verify_auth_proof` takes the shape and selects `hc` as in spec §3.2. `check_bundle_proof` threads the shape from the cheap half to the expensive one, and the verified-set path keeps skipping the expensive half.
-  4. `ZkExecutor`: move `auth_proof_shape` and `warm_auth_multisig` into `impl ConfidentialExecutor`.
-  5. `AggExecutor`, `AsProvedBinding` and the test executors forward to `inner` / `StubExecutor`. In `node.rs`'s warm task, read `let multisig = hs.committed_ledger().hc_auth_multisig().is_some();` beside `split_auth`, and add `if multisig { ex.warm_auth_multisig(); tracing::info!("multisig auth verifier key warmed"); }` after `warm_auth`.
-  6. `verify_cache.rs`. If it is on `main`, add the two forwards to `CachingExecutor`'s "forwarded unchanged" group. If it is not, append to `docs/superpowers/specs/2026-10-11-verify-cache-design.md` §3.2 on **this** branch:
+  3. Ledger. Rewrite `check_auth_fields` to spec §3.2's sequence (one `auth_header` call, no separate digest/gas reads), returning `Ok(Some(shape))` on a `hc_auth` chain and `Ok(None)` otherwise. The shape refusal is `TxError::InvalidAuthProof(ConfidentialError::InvalidProof("a multisig auth proof on a chain without hc_auth_multisig".into()))`. `verify_auth_proof` takes the shape and selects `hc` as in spec §3.2. `check_bundle_proof` threads the shape from the cheap half to the expensive one, and the verified-set path keeps skipping the expensive half.
+  4. `ZkExecutor`: `auth_header` forwards to Task 2's `auth_header_of`; `warm_auth_multisig` and `auth_multisig_key_ready` forward to the `OnceLock` methods.
+  5. `AggExecutor`, `AsProvedBinding` and the test executors forward all three to `inner` / `StubExecutor`. In `node.rs`'s warm task, read `let multisig = hs.committed_ledger().hc_auth_multisig().is_some();` beside `split_auth`, and call `ex.warm_auth_multisig()` **first**, before `warm_bundle` and `warm_auth`, logging `multisig auth verifier key warmed`. Admission: after `non_canonical_proofs` (`admission.rs:1033`), if the bundle's `auth_header` is `Multisig` and `!executor.auth_multisig_key_ready()`, return the existing retryable "not yet" refusal class with the reason "the multisig auth key is still warming". It is never `RefusedCache`d. Block validation needs no change: it reaches `verify_auth`, which waits on the `OnceLock`.
+  6. `verify_cache.rs`. If it is on `main`, add the three forwards to `CachingExecutor`'s "forwarded unchanged" group and to `Counting`. If it is not, write nothing to its files. Message randprotocol-61 (the owner):
 
-     > Phase-4 private multisig adds two required, uncached methods, `auth_proof_shape` and `warm_auth_multisig`. `CachingExecutor` must forward both. Multisig verifies reuse `verify_auth`, kind 2, with `hc` in the key.
-
-     Then send that sentence to the `feat/verify-cache` owner.
+     > Private multisig phase 4 adds three required, uncached `ConfidentialExecutor` methods, `auth_header`, `warm_auth_multisig` and `auth_multisig_key_ready`. `CachingExecutor` and your test executor `Counting` must forward all three. Multisig verifies reuse `verify_auth`, kind 2, with `hc` in the key; nothing new is cached.
 
 - [ ] **Step 4: Run to see it pass.**
 
@@ -1009,8 +1103,8 @@ Expected: all pass, the earlier split-auth tests included and unchanged.
 - [ ] **Step 5: Commit.**
 
 ```bash
-git add crates/randprotocol-core crates/randprotocol-zkvm/src/executor.rs crates/randprotocol-node docs/superpowers/specs/2026-10-11-verify-cache-design.md
-git commit -m "ledger: dispatch the auth proof on its pinned shape — single-key → hc_auth, multisig → hc_auth_multisig, else InvalidAuthProof; the msauth gas pin under the gas section; verify_auth reused (cached by hc); auth_proof_shape and warm_auth_multisig required and forwarded by every wrapper"
+git add crates/randprotocol-core crates/randprotocol-zkvm/src/executor.rs crates/randprotocol-node
+git commit -m "ledger: dispatch the auth proof on its pinned shape — single-key → hc_auth, multisig → hc_auth_multisig, else InvalidAuthProof; the msauth gas pin under the gas section; verify_auth reused (cached by hc); auth_header, warm_auth_multisig and auth_multisig_key_ready required and forwarded; the multisig key warmed first, multisig proofs deferred (retryable) until it is"
 ```
 
 ---
@@ -1021,6 +1115,7 @@ git commit -m "ledger: dispatch the auth proof on its pinned shape — single-ke
 - Modify: `crates/randprotocol-node/src/rpc.rs`, `crates/randprotocol-node/src/node.rs` (status fill)
 - Modify: `crates/randprotocol-client/src/lib.rs` (`ChainLimits.hc_auth_multisig`)
 - Modify: `crates/randprotocol-node/tests/rpc_contract.rs` (if it lists the fields of `rand_getLimits`/`rand_status`)
+- Modify: `crates/randprotocol-node/src/rpc.rs`'s `rpc_max_body_bytes` (`rpc.rs:1056-1083`), and every caller
 
 **Interfaces:**
 - Consumes: Task 3's `Ledger::hc_auth_multisig`.
@@ -1048,10 +1143,24 @@ async fn limits_and_status_serve_hc_auth_multisig() {
 
 `state_with` is the genesis-mutating helper the `hc_auth` test at `rpc.rs:5472` uses (it sets `gs.ledger.set_hc_auth(Some([7; 8]))` on a fresh state); use that test's own construction verbatim.
 
+And the body cap: an msauth proof (~3.6 MB) is no "small fixed shape", so a `Call` on a multisig chain can carry three near-cap proofs.
+
+```rust
+#[test]
+fn the_rpc_body_cap_counts_three_proofs_on_a_multisig_chain() {
+    let (p, e) = (4 << 20, 65_536);
+    assert_eq!(rpc_max_body_bytes(p, e, true) - rpc_max_body_bytes(p, e, false), 2 * p, "one more hex-encoded proof at the cap");
+    let st = state_with(|gs| { gs.ledger.set_hc_auth(Some([7; 8])); gs.ledger.set_hc_auth_multisig(Some([8; 8])); });
+    assert_eq!(st.max_body_bytes, rpc_max_body_bytes(st_max_proof(&st), st_max_env(&st), true));
+}
+```
+
+`st_max_proof`/`st_max_env` stand for the genesis caps the state was built with; read them as the existing `max_body_bytes` test does.
+
 - [ ] **Step 2: Run it to see it fail.**
 
 ```bash
-cargo +1.98.1 test --release -p randprotocol-node --lib limits_and_status_serve_hc_auth_multisig 2>&1 | tail -5
+cargo +1.98.1 test --release -p randprotocol-node --lib limits_and_status_serve_hc_auth_multisig the_rpc_body_cap_counts_three 2>&1 | tail -5
 ```
 
 Expected: compile error (no `set_hc_auth_multisig` on the state, or the key is missing).
@@ -1061,6 +1170,7 @@ Expected: compile error (no `set_hc_auth_multisig` on the state, or the key is m
   - Fill `ChainLimits::of` with `ledger.hc_auth_multisig().map(|h| word8_to_hex(&h))`, and the status refresh in `node.rs` beside `s.hc_auth`.
   - Add `"hc_auth_multisig": s.hc_auth_multisig` to the status JSON at `rpc.rs:2739`.
   - Client `ChainLimits`: `#[serde(default)] pub hc_auth_multisig: Option<String>`.
+  - `rpc_max_body_bytes(max_proof_bytes, max_call_envelope_bytes, three_proofs: bool)`: `(2 + three_proofs as usize) * max_proof_bytes` in place of `2 * max_proof_bytes`. Rewrite the doc's first bullet: "two proofs at the cap, or three on a genesis with `hc_auth_multisig` — the multisig auth proof is ~3.6 MB, not the single-key guest's fixed ~1.36 MB". `RpcState::max_body_bytes` passes `ledger.hc_auth_multisig().is_some()`, and the default-chain constant passes `false`.
   - Fix every JSON fixture in the tests (`"hc_auth": null` blocks at `rpc.rs:5381`/`5413`/`5447`) to add `"hc_auth_multisig": null`.
 
 - [ ] **Step 4: Run to see it pass.**
@@ -1075,7 +1185,7 @@ cargo +1.98.1 test --release -p randprotocol-client --lib
 
 ```bash
 git add crates/randprotocol-node crates/randprotocol-client/src/lib.rs
-git commit -m "rpc: rand_status and rand_getLimits serve hc_auth_multisig (null without it)"
+git commit -m "rpc: rand_status and rand_getLimits serve hc_auth_multisig (null without it); the body cap counts three proofs on a multisig chain"
 ```
 
 ---
@@ -1083,7 +1193,11 @@ git commit -m "rpc: rand_status and rand_getLimits serve hc_auth_multisig (null 
 ### Task 6: Wallet library: spend-key-less `Wallet`, `Policy`, `Proposal`, sign / assemble / prove
 
 **Files:**
-- Modify: `crates/randprotocol-client/src/wallet.rs` (`Wallet.sk: Option<SpendKey>`, `from_viewing_key`, `spend_key`, `AuthWitness`, `pub(crate)` on `Prepared` and `prepare_bundle`)
+- Modify: `crates/randprotocol-client/src/wallet.rs`:
+  - `Wallet.sk: Option<SpendKey>`, `from_viewing_key`, `spend_key`;
+  - `AuthWitness`, including the `#[cfg(test)]` emulated `Proving` paths and `tests::emulated_proof`;
+  - `pub(crate)` on `Prepared`, `prepare_bundle` and `mod tests`;
+  - a `dummy_sender` option on `build_bundle`.
 - Create: `crates/randprotocol-client/src/msig_private.rs`
 - Modify: `crates/randprotocol-client/src/lib.rs` (`pub mod msig_private;`), `crates/randprotocol-client/src/main.rs` and `crates/randprotocol-node/src/main.rs` (every `w.sk` → `w.spend_key()?`, as the compiler lists)
 
@@ -1121,7 +1235,7 @@ git commit -m "rpc: rand_status and rand_getLimits serve hc_auth_multisig (null 
   pub fn save_proposal(p: &Proposal, path: &Path) -> Result<()>; pub fn load_proposal(path: &Path) -> Result<Proposal>;
   ```
 
-- [ ] **Step 1: Write the failing tests.** Create `msig_private.rs` with only `#[cfg(test)] mod tests` first:
+- [ ] **Step 1: Write the failing tests.** Create `msig_private.rs` with only `#[cfg(test)] mod tests` first. (`wallet.rs`'s `mod tests` becomes `pub(crate) mod tests` so the support module can reach its helper.)
 
 ```rust
 #[cfg(test)]
@@ -1206,6 +1320,40 @@ mod tests {
         assert!(sign(&prop, &other, &k[0]).unwrap_err().to_string().contains("auth_commit"));
     }
 
+    /// Review finding 4: a single-key wallet seals dummy outputs under a throwaway key, so signers
+    /// could not open them; a multisig proposal seals every output, dummies included, with the
+    /// account's vk as sender, and `sign` refuses any output it cannot open.
+    #[test]
+    fn every_output_of_a_proposal_opens_as_sender_and_value_is_conserved() {
+        let (p, k) = two_of_three();
+        let prop = proposal(&p);   // one real payment, change and two dummies
+        let tx: Transaction = bincode::deserialize(&hex::decode(&prop.tx).unwrap()).unwrap();
+        let w = p.wallet();
+        let b = tx.bundle.as_ref().unwrap();
+        for (slot, env) in b.envelopes.iter().enumerate() {
+            assert!(env.open_as_sender_with(&b.commitments[slot], &w.scan_key).is_some(), "slot {slot} opens as sender");
+        }
+        // A proposal whose witness spends more than the outputs + fee account for is refused.
+        let mut skim = prop.clone();
+        skim.bundle_words = tests_support::with_input_amount_raised(&prop.bundle_words, 1);
+        assert!(sign(&skim, &p, &k[0]).unwrap_err().to_string().contains("value"), "conservation");
+        // An output sealed to a throwaway sender (the single-key dummy) is refused, not skipped.
+        let mut hidden = prop.clone();
+        hidden.tx = tests_support::with_a_throwaway_sealed_output(&prop.tx);
+        assert!(sign(&hidden, &p, &k[0]).unwrap_err().to_string().contains("open"));
+        // Burns are shown.
+        let (_, shown) = sign(&prop, &p, &k[0]).unwrap();
+        assert!(shown.iter().any(|l| l.starts_with("burn")), "{shown:?}");
+    }
+
+    #[test]
+    fn prepare_does_not_mark_notes_pending() {
+        let (p, _) = two_of_three();
+        let (store, prop) = tests_support::offline_proposal_with_store(&p, 10 * randprotocol_core::UNITS_PER_RAND);
+        assert!(store.notes.iter().all(|n| !n.pending), "an abandoned proposal hides nothing from the next one");
+        drop(prop);
+    }
+
     #[test]
     fn assemble_witness_needs_the_threshold_and_runs_like_the_guest() {
         let (p, k) = two_of_three();
@@ -1231,14 +1379,28 @@ pub(crate) mod tests_support {
     //! fresh address, through the same `build_bundle` the online path calls.
     use super::*;
     pub(crate) fn offline_proposal(p: &Policy, amount: u64) -> Proposal {
-        crate::wallet::tests::offline_v3_proposal_for(&p.wallet(), amount, |prepared, tx, binding| {
+        offline_proposal_with_store(p, amount).1
+    }
+    pub(crate) fn offline_proposal_with_store(p: &Policy, amount: u64) -> (NoteStore, Proposal) {
+        crate::wallet::tests::offline_v3_proposal_for(&p.wallet(), amount, DummySender::Account, |prepared, tx, binding| {
             Proposal::from_prepared(p, prepared, tx, binding, 7, &randprotocol_core::Hash::ZERO, 0, 1_000)
         })
     }
+    /// `bundle_words` with the first real input's amount raised by `by` (the tx unchanged).
+    pub(crate) fn with_input_amount_raised(words_hex: &str, by: u64) -> String { crate::wallet::tests::raise_first_input_amount(words_hex, by) }
+    /// The proposal's tx with output slot 3 re-sealed under a throwaway sender (commitment unchanged).
+    pub(crate) fn with_a_throwaway_sealed_output(tx_hex: &str) -> String { crate::wallet::tests::reseal_slot_with_throwaway_sender(tx_hex, 3) }
 }
 ```
 
-`crate::wallet::tests::offline_v3_proposal_for` is a new `pub(crate)` test helper in `wallet.rs`'s `mod tests`. It takes a `Wallet`, mints one synthetic note of `amount + gas::BUNDLE_BASE` into a one-leaf tree (as the existing `build_bundle` unit tests do), calls `build_bundle` with the v3 guest, wraps the result in `Transaction::shielded(7, …, Action::None)` with binding domain `ChainId`, and hands `(&Prepared, &Transaction, binding)` to the closure. Write it beside the existing `build_bundle` tests, reusing their tree and note setup.
+New `pub(crate)` test helpers in `wallet.rs`'s (now `pub(crate)`) `mod tests`, beside the existing `build_bundle` tests and reusing their tree and note setup:
+- `offline_v3_proposal_for(w, amount, dummy_sender, f) -> (NoteStore, R)`:
+  - mint one synthetic note of `amount + 2·gas::BUNDLE_BASE` into a one-leaf tree and a `NoteStore`;
+  - select through `Plan::select`, as `prepare` does, never marking anything pending;
+  - call `build_bundle` with the v3 guest and `dummy_sender`;
+  - wrap the result in `Transaction::shielded(7, …, Action::None)` with binding domain `ChainId`;
+  - hand `(&Prepared, &Transaction, binding)` to the closure.
+- `raise_first_input_amount` and `reseal_slot_with_throwaway_sender`, which edit the hex the way their names say.
 
 - [ ] **Step 2: Run them to see them fail.**
 
@@ -1254,7 +1416,9 @@ Expected: compile errors (no `Policy`, `Proposal`, `sign`, `assemble_witness`, `
      - `spend_key()` errors with "this wallet is a private multisig account: spend with `rand multisig-private`".
      - Replace the three `&w.sk` uses (`wallet.rs:2054`, `2287`, `2880`) with `w.spend_key()?`. Fix every other use the compiler lists in both `main.rs` files. Tests comparing `.sk` compare `Option`s.
      - Add `AuthWitness`. `prove_auth_locally(prepared, auth: AuthWitness, binding, profile, backend)` dispatches: `Key(sk)` → `prove_auth`; `Multisig(words)` → `run_msauth` (refuse on `Err`), then `prove_msauth` (CPU), then `check_published_auth`. The print line says "tier 18; minutes" for the multisig variant. `Proving::prove` takes `AuthWitness` in place of `&SpendKey`.
+     - The `#[cfg(test)]` `Proving::Emulated`/`EmulatedFee` arms and `tests::emulated_proof` take `AuthWitness` too. `Key` keeps today's emulated auth; `Multisig` runs `run_msauth` and makes `StubExecutor::make_msauth_proof`.
      - Make `Prepared` and its fields `pub(crate)`, plus `prepare_bundle`, `build_bundle`, `prove_transaction_by`, `scanned_binding_domain` and `chain_bundle_guest`.
+     - Give `build_bundle` a `dummy_sender: DummySender` parameter (`enum DummySender { Throwaway, Account }`). Every existing caller passes `Throwaway`, so single-key bundles stay byte-for-byte as today. `Account` seals the `Payee::Nobody` slots with the wallet's own `vk` as sender, so `open_as_sender_with` opens them; the recipient stays a throwaway key, and the amount stays 0.
   2. `msig_private.rs`, every function in the Interfaces block:
      - `Policy::check` applies spec §6.1's rules, with `M_MAX`/`N_MAX` from the vendored `msauth`. `Policy::new` draws `msk` with `wallet::fresh_word()`.
      - The JSON is `{version: 1, threshold, signers: [hex], msk: hex}`. `save` and `load` use the key-file mode rules (`Wallet::load`'s unix check, verbatim).
@@ -1263,16 +1427,18 @@ Expected: compile errors (no `Policy`, `Proposal`, `sign`, `assemble_witness`, `
        - require `rand_status.hc_bundle == hc_hidden_bundle_v3` and `rand_status.hc_auth_multisig == ZkExecutor::hc_auth_multisig()`, else "this chain has no private multisig (hc_auth_multisig) for this build";
        - `scan(rpc, &policy.wallet(), store)`;
        - `Plan::select` with `Spend { asset: 0, to: Some((to, amount)), memo, fee, burn_a: 0, burn_r: 0, prover_fee: None }`;
-       - `rpc.envelope_format(chain_id)`, `prepare_bundle(…, &hc_hidden_bundle_v3())`;
+       - `rpc.envelope_format(chain_id)`, `prepare_bundle(…, &hc_hidden_bundle_v3(), DummySender::Account)`;
+       - do **not** mark the selected notes pending: nothing is spent until a transaction commits, and an abandoned or refused proposal must not hide notes from the next one. A note being in two live proposals is harmless, because the second to commit is refused as a double spend;
        - `Transaction::shielded(chain_id, prepared.bundle.clone(), Action::None)`, `binding = tx.binding(&scanned_binding_domain(…))`;
        - `expires_at = time + limits.proof_window_blocks.unwrap_or(256)`.
-     - `prepare_sweep`: the same, with `amount = store.balance() - fee`; refuse when the plan needs more than two RAND inputs, with "send to yourself first to merge".
+     - `prepare_sweep`: the same, with `amount = store.rand_balance() - fee`; refuse when the plan needs more than two RAND inputs, with "send to yourself first to merge". Doc and CLI help: "moves RAND only; token notes stay (send them with `--to … --asset`), and the old address remains spendable by the old policy for any payment that arrives later".
      - `sign`, per spec §6.5:
        - decode `tx` (bincode hex); rebuild `BindingDomain::for_version(binding_domain, genesis)` (`ChainId` for version 0);
        - compare the recomputed binding with `binding` ("the transaction does not hash to the proposal's binding") and `signing_message`;
        - check `auth_commit == msauth::auth_commit(&policy.nk(), &salt)` ("the proposal's auth_commit is not this policy's account");
-       - open each output envelope with `env.open_as_sender_with(cm, &wallet.scan_key)` and require the opened note's commitment equal the bundle's commitment in that slot;
-       - build the summary lines (`"{n}: {amount} RAND to {fingerprint} memo {memo:?}"`, `"fee {fee} RAND"`) and print them to stderr in the CLI;
+       - open **all four** output envelopes with `env.open_as_sender_with(cm, &wallet.scan_key)` and require each opened note's commitment to equal the bundle's commitment in that slot. An output that does not open is refused ("output {slot} does not open as this account's: refusing to sign value it cannot see"), never skipped;
+       - **value conservation**: decode the input notes from `bundle_words` (the v3 witness layout, `hidden::hidden_input_v3`). Re-derive each one's nullifier with `ViewingKey { nk: policy.nk() }.nullifier(&cm)` and require the four equal `bundle.nullifiers`. Then, per asset, require Σ inputs = Σ opened outputs + fee + (`burn_a` for the private asset, `burn_r` for RAND), else "the witness's value does not match the outputs";
+       - build the summary lines (`"{n}: {amount} {asset} to {fingerprint} memo {memo:?}"`, `"fee {fee} RAND"`, `"burn {burn_a} of asset {burn_asset}, {burn_r} RAND"`) and print them to stderr in the CLI;
        - find the key's index in `policy.signers` (else "this key is not one of the policy's signers") and sign `signing_message` with `Keypair::sign`.
      - `assemble_witness`:
        - parse and sort the shares by index; drop duplicates with an error ("signer {i} appears twice");
@@ -1281,7 +1447,7 @@ Expected: compile errors (no `Policy`, `Proposal`, `sign`, `assemble_witness`, `
        - build `Slot { index, pk, sig, path: paths[index] }` from `signer_tree(&policy.pks())`;
        - return `msauth_inputs(&policy.msk, &salt, threshold, &slots)`.
      - `prove`:
-       - refuse if `rpc` head ≥ `expires_at - 16`. (`prove` takes no rpc; the CLI checks expiry before calling. Add an `expires_at` check in the CLI step of Task 7.)
+       - no expiry check here: the library `prove` takes no RPC. The CLI (Task 7) reads the head and refuses at or past `expires_at - 16` before calling it.
        - rebuild `Prepared` from the proposal (`bundle_words`, `expected`, `salt`, `auth_commit`, v3 guest);
        - `assemble_witness`, then `Proving::prove(&prepared, AuthWitness::Multisig(&words), &binding, profile, cap)`;
        - set `bundle.proof` and `bundle.auth_proof` on the decoded `tx`; recompute `tx.binding(domain)` and require it unchanged; return `tx`.
@@ -1367,7 +1533,7 @@ Expected: compile error (no `MultisigPrivate`).
   - `address`: print `rand1…`, the fingerprint and `policy` hex.
   - `balance`: `scan` into the store (`--store`, default `<policy>.notes.json`) and print it.
   - `prepare`: `prepare` or `prepare_sweep`, `save_proposal` (0600), then print the summary and "gather ≥ T signatures and prove before height {expires_at}".
-  - `sign`: `load_authority_key`, then `sign`. Print the summary lines to stderr and `index:hex` to stdout.
+  - `sign`: `load_authority_key`, then `sign`. Print the summary lines to stderr and `index:hex` to stdout. Warn on stderr ("this looks like a validator's consensus key; a multisig signer key should be its own") when the key's address is in `rand_getValidators`, checked when a node answers at `--rpc`, or when the file's path is a `rand-node` datadir key (`*/node.key.json`).
   - `prove`:
     - read `rand_status.height` and refuse at or past `expires_at - 16` ("prepare again");
     - use `proving_for(cli.prover, cuda, cli.cpu, …)` for the bundle;
@@ -1400,6 +1566,8 @@ git commit -m "cli: rand multisig-private new-policy|address|balance|prepare|sig
 - Consumes: Tasks 1–7; `node::start` via `start_with`; `genesis_v3`; `proving_slot`; `wallet::payout_note_for`; `multisig_pay_tx` (this file).
 - Produces: `a_private_multisig_receives_spends_rotates_and_refuses_one_signature_end_to_end` (ignored).
 
+- [ ] **Step 0: Precondition.** Task 2's `MSAUTH-TEST:` line is recorded, with its prove time and peak RSS. If the peak was over 40 GB, stop. The test runs the node in-process, three msauth proofs are sequential under the proving slot, and the 1 024-block window must exceed (sign + msauth prove + bundle prove) with margin at 3 s blocks.
+
 - [ ] **Step 1: Write the failing test.** Append to `wallet_flow.rs`:
 
 ```rust
@@ -1412,6 +1580,8 @@ fn genesis_private_multisig(validator: &Keypair, public_signers: &[Keypair]) -> 
         hc_auth_multisig: Some(word8_to_hex(&ZkExecutor::hc_auth_multisig())),
         max_proof_bytes: Some(4 << 20),
         max_block_bytes: Some(20 << 20),
+        // 3 s blocks × 256 would leave 12.8 minutes for two signatures, a tier-18 Test prove and a bundle prove.
+        proof_window_blocks: Some(1024),
         gas: Some(gas::GasConfig { gas_price: 100, byte_price: 800, bundle_gas_limit: gas::bundle_gas_limit_pin(), metering: gas::GasMetering::Circuit, dynamic: None }),
         multisig: Some(MultisigConfig {
             create_fee: 0,
@@ -1585,7 +1755,9 @@ git commit -m "test: private multisig end to end with real proofs — a 2-of-3 a
 
   > Private multisig phase 4 needs `hc_auth_multisig` in `deploy/cut-chain21-genesis.sh`: a constant, the `--auth-multisig-guest` gate (DRY_RUN skips loudly), finished-file assertions, the chain-20 `excused` set, a 7th field-probe variant, a check-limits read-back, and five selftest refuse cases. May I edit it now, or do you want to apply the patch yourself?
 
-  Wait for the answer. If d7 applies it, hand over Steps 2–3 as a patch and skip to Step 4. If chain 21 has already been cut, stop: the field goes to chain 22's script, and this task is re-targeted there.
+  Wait for the answer. If d7 applies it, hand over Steps 2–3 as a patch and skip to Step 4. (Whether chain 21 is already cut was settled by the Global Constraints gate before Task 1. If it was, this task targets chain 22's script.)
+
+  Add to the cut record's checklist in the same message: the `rand-prover` fleet (prover.randprotocol.org) and `clients/core`'s vendored fullnode must be on constraint set 9 at the cut.
 
 - [ ] **Step 2: Write the failing selftest cases.** In the selftest block, after the multisig refuse cases at `deploy/cut-chain21-genesis.sh:1716-1718`, add:
 
@@ -1658,6 +1830,7 @@ git commit -m "cut-chain21: hc_auth_multisig — the --auth-multisig-guest gate 
 ### Task 10: Docs and CHANGELOG
 
 **Files:**
+- Not modified: `CHANGELOG.md` (the user's; this task writes the proposed text into the PR description)
 - Modify: `docs/shielded.md` (§2: a "Private multisig: the second auth guest" subsection after "Split authorisation"; §4 RPC fields), `docs/prover.md` (§8: the second auth guest, local-only), `docs/multisig.md` (a "Private accounts" section: private vs public, MultisigPay into a private address, rotation), `docs/rpc.md` (`hc_auth_multisig` on both methods, plus its changelog line), `docs/node-hardware.md` (Task 2's key-build and verify measurement), `docs/zkvm.md` (constraint set 9: the MODQ chip, proof-size deltas), `docs/deploy.md` (the cut's new field), `CHANGELOG.md`
 
 **Interfaces:**
@@ -1678,8 +1851,6 @@ fn the_docs_name_the_multisig_auth_guest() {
     }
     let shielded = std::fs::read_to_string(root.join("docs/shielded.md")).unwrap();
     assert!(shielded.contains(&hc) && shielded.contains("tier 18"), "docs/shielded.md names the guest's digest and tier");
-    let changelog = std::fs::read_to_string(root.join("CHANGELOG.md")).unwrap();
-    assert!(changelog.contains("hc_auth_multisig") && changelog.contains("constraint set 9"), "CHANGELOG v0.8.0 carries the line");
 }
 ```
 
@@ -1697,11 +1868,13 @@ Run: `cargo +1.98.1 test --release -p randprotocol-zkvm --test guest_provenance 
   - **`docs/zkvm.md`:** a "Constraint set 9: the MODQ chip" section. Every key moved; `Proof.modq_log_height`; chip-free proofs +≈1 KB; a modq table only in the msauth guest's proofs; calls refuse it.
   - **`docs/deploy.md`:** the cut's `hc_auth_multisig` and `--auth-multisig-guest`.
 
-- [ ] **Step 3: Write the CHANGELOG line.** Under `## v0.8.0`'s "Chain 21 and later, by genesis section" list, add the spec §8 bullet verbatim, with `M_MAX` written as the Task 8 value and the measured proof size from Task 2. Then rewrite the "**Chain 20, rolled as a flag day**" bullet to the user's v0.8.0 decision (Global Constraints):
-  - **(a):** "**Not for chain 20.** Constraint set 9 changes every verifier key and the proof encoding: this build refuses chains 18–20 at startup (`CHAINS_THIS_BUILD_CANNOT_RUN`). Chain 20 stays on v0.7.x until chain 21's cut."
-  - **(b):** move the whole private-multisig bullet and the constraint-set-9 sentence to a new `## v0.9.0 — TAG_DATE` entry above v0.8.0, and leave v0.8.0's chain-20 bullet as it is.
-
-  Also change the v0.8.0 header's vendoring sentence to name `$CIRCUITS`.
+- [ ] **Step 3: Describe the CHANGELOG change, without editing `CHANGELOG.md`.** Write it into the PR description under "CHANGELOG (for the user)":
+  - The spec §8 bullet, with `M_MAX` 3 and Task 2's measured proof size.
+  - **If v0.8.0 carries this:**
+    - the "Chain 20, rolled as a flag day" bullet becomes "**Not for chain 20.** Constraint set 9 changes every verifier key and the proof encoding: this build refuses chains 18–20 at startup (`CHAINS_THIS_BUILD_CANNOT_RUN`). Chain 20 stays on v0.7.x until chain 21's cut.";
+    - the header's vendoring sentence names `$CIRCUITS`;
+    - the "**Rollback**" paragraph (~`CHANGELOG.md:45`) becomes "going back to v0.7.1 is possible only on a chain v0.7.1 runs (18–20); a chain-21 database cannot be rolled back across constraint set 9".
+  - **If it ships as v0.9.0:** all of the above goes in a new `## v0.9.0` entry, and v0.8.0 is untouched.
 
 - [ ] **Step 4: Run to see it pass.**
 
@@ -1715,6 +1888,6 @@ Expected: all pass.
 - [ ] **Step 5: Commit.**
 
 ```bash
-git add docs CHANGELOG.md crates/randprotocol-zkvm/tests/guest_provenance.rs
-git commit -m "docs: private multisig — the second auth guest (shielded §2, prover §8, multisig private accounts, rpc, zkvm constraint set 9, node-hardware's tier-18 key, deploy); CHANGELOG v0.8.0: hc_auth_multisig and the chain-20 consequence"
+git add docs crates/randprotocol-zkvm/tests/guest_provenance.rs
+git commit -m "docs: private multisig — the second auth guest (shielded §2, prover §8, multisig private accounts, rpc, zkvm constraint set 9, node-hardware's tier-18 key, deploy); CHANGELOG text proposed in the PR, not applied"
 ```

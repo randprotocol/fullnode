@@ -6,6 +6,12 @@
 > (circuits): `docs/superpowers/specs/2026-10-11-rvm-modq-chip-design.md`, §6 "Fork impact".
 > Plan: `docs/superpowers/plans/2026-10-11-private-multisig-phase4.md`.
 >
+> **Amended 2026-10-11 after the pre-flight review** (4 Critical, 9 Important, all folded in; see
+> §10 for the finding-to-section map). Two brief premises were corrected: `Transaction::binding`
+> blanks **both** the bundle proof and the auth proof (so signing before proving is sound, and
+> `salt`/`auth_commit` are fixed at `prepare`), and `deploy/sync-zkvm.sh` never copies research's
+> `Cargo.toml`, so its `cheating` self dev-dependency has nothing to strip.
+>
 > **Starts only after circuits Task 8** (the measured `MSAUTH_TIER` and `M_MAX`, the floors in
 > `msauth::pinned_options()`) **and Task 9** (the merge with rVM phase 4 and the one recursion
 > re-pin). Every number below marked *(Task 8)* is read from that commit, never estimated into code.
@@ -16,12 +22,13 @@
 |---|---|
 | genesis | `hc_auth_multisig: Option<String>`, last struct field, hash-bound last (tag `b"hc_auth_multisig"`, after `aggregation_tree`), present-only. Requires `hc_auth`, must differ from it, and at the Production profile requires `max_proof_bytes ≥ MSAUTH_MIN_PROOF_BYTES` (4 MiB); the existing `3·max_proof_bytes + 1 MiB` block rule then covers bundle + msauth + call |
 | admission | the ledger asks the executor for the auth proof's **shape** (a header decode): single-key → `hc_auth`, multisig → `hc_auth_multisig`, anything else → `InvalidAuthProof`. No wire, txid or binding change |
-| verify | **reuse `verify_auth(hc, proof, binding)`**. `ZkExecutor` dispatches on `hc`: the build's msauth digest → the msauth path, otherwise the single-key path; each path pins its own full shape. The verify cache keys on `hc` (kind 2), so the two guests never share an entry. Two new trait methods, both header/warm-only and **required** (no default): `auth_proof_shape`, `warm_auth_multisig` — forwarded, never cached |
+| verify | **reuse `verify_auth(hc, proof, binding)`**. `ZkExecutor` dispatches on `hc`: the build's msauth digest → the msauth path, otherwise the single-key path; each path pins its own full shape. The verify cache keys on `hc` (kind 2), so the two guests never share an entry. Three new trait methods, all header/warm-only and **required** (no default): `auth_header`, `warm_auth_multisig`, `auth_multisig_key_ready` — forwarded, never cached |
 | gas (R-gas) | the msauth prover keeps the header ceiling; under a `gas` section admission requires `GAS == gas_max_with_modq(pinned header)`, the same function of public header words for every M. The run's exact gas is never required |
 | shape (R-hide) | admission pins tier, program, input, keccak, sha256 (0), modq, public and memory heights exactly to `msauth_heights()`, before any key is built |
 | proof size | ≈ **3.6 MB** at Production FRI (range 3.5–3.8 MB, §3.3); a multisig transfer ≈ 5.1 MB |
 | wallet | `rand multisig-private new-policy / address / balance / prepare / sign / prove / submit`; the msauth proof is made **locally only** (delegated msauth proving is a follow-up, §6.6); the bundle proof may go to a paired prover as today |
-| fork | the MODQ re-vendor changes every verifier key and the `Proof` encoding: this build runs chain 21 on and refuses chains 18–20 (`CHAINS_THIS_BUILD_CANNOT_RUN`, constraint set 9) |
+| fork | the MODQ re-vendor changes every verifier key and the `Proof` encoding: this build refuses chains 18–20 (`CHAINS_THIS_BUILD_CANNOT_RUN`, constraint set 9), and chain 21 too if it is cut before this lands (§9.2, a gate before any code) |
+| key build | the tier-18 msauth key is built **once** (`OnceLock<Arc<CommonData>>`, single flight), warmed first; the mempool defers a multisig-shaped proof (retryable) until it is warm |
 
 ## 1. What is fixed by the circuits side
 
@@ -33,8 +40,16 @@ From the circuits branch `feat/private-multisig` at the Task 9 merge (read-only 
   17 + M_MAX·967`; `leaf`, `signer_tree`, `policy`, `nk`, `auth_commit`, `signing_message`
   (`b"rand-msauth-1" ‖ binding LE` = 45 bytes), `Slot`, `msauth_inputs`; and from Task 8
   `MSAUTH_TIER: Tier` *(Task 8: `Tier(18)`)*, `pinned_options() -> ProveOptions` (the
-  `min_{keccak,modq,mem}_log_height` of a full `M_MAX` run, `gas_limit: None`) and
-  `poseidon2_permutations`.
+  `min_{keccak,modq,mem}_log_height` of a full `M_MAX` run, `gas_limit: None`),
+  `poseidon2_permutations`, and `check_pinned_shape_with` / `prove_msauth`, which refuse before
+  proving (naming the field) when a witness's natural heights differ from the pins.
+- **Task 8's measured values (controller ruling, filled in):** `MSAUTH_TIER = 18`, `M_MAX = 3`.
+  Five-fixture gate: at M = 3, 250 685–252 775 cycles, exactly 1 942 Poseidon2 permutations, the
+  largest fixture inside tier 18 with 9 368 cycles to spare. Pinned heights: program 12, input 12,
+  keccak 14, sha256 0, modq 16, public 7, mem 20. Because the prover hard-errors on any witness
+  whose natural heights miss a pin, a pathological signature (an unusual hint count, say) makes a
+  spend that cannot be proved: stuck and visible, never a leaked shape. Admission refuses any
+  header off by one in any height or the tier (§3.1, tested).
 - `guests-compiled/bin/msauth.bin` (+ `.sha256`): reads the binding with `read_public 0..8`, verifies
   M Dilithium2 signatures over `signing_message(binding)`, publishes `c = H(AUTH, nk ‖ salt)` in
   outputs 0..8; a refused witness publishes the guest-sdk sentinel `0xdead_beef` in output 7.
@@ -85,7 +100,8 @@ In this order, after the `hc_auth` parse:
    `BadHcAuth` is).
 2. `hc_auth` absent → `GenesisError::HcAuthMultisigWithoutHcAuth`. The multisig auth guest
    publishes the same `c` bundle guest v3 folds in, and only an `hc_auth` chain runs v3.
-3. Equal to `hc_auth` → `GenesisError::HcAuthMultisigIsHcAuth`. Dispatch is by shape, and one
+3. Equal to `hc_auth`, compared as parsed `Word8`s (never as hex strings, so case or padding
+   cannot slip one past) → `GenesisError::HcAuthMultisigIsHcAuth`. Dispatch is by shape, and one
    digest cannot have two shapes.
 4. **Proof cap.** At `fri_profile: "production"`, the effective `max_proof_bytes` (2 MiB default)
    must be at least `gas::MSAUTH_MIN_PROOF_BYTES = 4 << 20` →
@@ -107,6 +123,11 @@ The node, which can name guests, adds at startup (`check_build_runs_genesis`, be
 
 - `rand-node genesis --auth-multisig-guest` (requires `--auth-guest`) writes
   `hc_auth_multisig = ZkExecutor::hc_auth_multisig()`, and the summary line prints it.
+- **RPC body cap.** `rpc_max_body_bytes` (`rpc.rs`) counts two proofs at the cap, arguing that the
+  single-key auth proof is a small fixed shape (~1.36 MB). The msauth proof is ~3.6 MB, so on a
+  genesis with `hc_auth_multisig` it counts **three** (bundle + msauth + call, each at
+  `max_proof_bytes`): `rpc_max_body_bytes(max_proof_bytes, max_call_envelope_bytes,
+  three_proofs: bool)`, and its doc says why.
 - `rand_status.hc_auth_multisig` and `rand_getLimits.hc_auth_multisig`: hex, or `null` on a chain
   without it. Always present, like `hc_auth`. A wallet reads it to decide whether a private
   multisig address can spend on this chain at all.
@@ -127,6 +148,15 @@ proofs, and its startup replay would refuse their history. `node::BUILD_CONSTRAI
 `CONSTRAINT_SET_8_REASON`: "its proofs were made under constraint set 8; this build is constraint
 set 9 (the MODQ chip, v0.8.0 and later) and verifies none of them … Use the v0.7.x release for
 chains 18–20."
+
+If chain 21 has been cut (on constraint set 8) before this lands, chain 21 joins the table too, with
+the same reason, and the field goes to chain 22: the plan checks this as a gate **before Task 1**,
+because Task 1 alone already makes the build constraint set 9.
+
+The v0.8.0 draft's "Rollback" paragraph (`CHANGELOG.md`, the `drop-perp-inputs` step back to
+v0.7.1) no longer holds across a constraint set: a database written by a constraint-set-9 build
+holds blocks v0.7.1 cannot verify, so "rollback" to v0.7.1 is only to a chain v0.7.1 runs. The
+plan describes that change; the user edits `CHANGELOG.md`.
 
 **This contradicts the v0.8.0 draft in `CHANGELOG.md`**, which rolls v0.8.0 onto chain 20 as a
 flag day "with no bundle verifier key change". A release cannot do both. The plan's Global
@@ -152,9 +182,16 @@ Every multisig field is compared **exactly**, including `mem_log_height` (R-hide
 proof's memory height would otherwise grow with M). The degree-bits vector must equal
 `log_ext_degrees_with_modq` of the pinned shape (which is also the instance-count check), and
 `public_values.len() == pv::NUM`. All of it runs before any verifier key is built, so a junk header
-costs comparisons, never a tier-18 key build.
+costs comparisons, never a tier-18 key build. A ledger/executor test moves each of the eight
+header words (and the tier) by one and expects `InvalidAuthProof` every time.
 
 ### 3.2 The ledger
+
+The three cheap reads are one decode: a required trait method
+`auth_header(proof) -> Result<(AuthShape, Word8, Option<u64>), ConfidentialError>` returns the
+shape, the published `c` and the declared gas together (finding 14), replacing the separate
+`auth_proof_shape` of the first draft; `auth_proof_digest`/`auth_gas_limit` stay for their
+existing callers and accept either shape.
 
 `Ledger::check_auth_fields` (the cheap half, every path: admission, apply, verified-set hit,
 pruned bundle) becomes:
@@ -162,10 +199,10 @@ pruned bundle) becomes:
 ```text
 hc_auth None:  as today (AuthUnexpected / Ok)
 hc_auth Some:  proof empty → AuthMissing
-               shape = executor.auth_proof_shape(proof)          → InvalidAuthProof on Err
+               (shape, c, gas) = executor.auth_header(proof)    → InvalidAuthProof on Err
                shape == Multisig && hc_auth_multisig None        → InvalidAuthProof(InvalidProof("a multisig auth proof on a chain without hc_auth_multisig"))
-               c = executor.auth_proof_digest(proof); c != auth_commit → AuthMismatch
-               under gas: got = executor.auth_gas_limit(proof);
+               c != auth_commit → AuthMismatch
+               under gas: got = gas;
                           want = match shape { SingleKey => auth_gas_limit_pin(), Multisig => msauth_gas_limit_pin() }
                           got != Some(want) → AuthGasLimit { want, got }
                returns shape
@@ -210,12 +247,12 @@ changed here.
 
 ### 3.4 The executor's dispatch, and the verify cache
 
-`ConfidentialExecutor` gains two **required** methods (no trait default):
+`ConfidentialExecutor` gains three **required** methods (no trait default); the third, `auth_multisig_key_ready`, is in §3.5:
 
 ```rust
-/// Cheap: decode an auth proof canonically and name its pinned shape. `Err(InvalidProof)` for a
-/// header that is neither shape. Verifies nothing.
-fn auth_proof_shape(&self, proof: &[u8]) -> Result<AuthShape, ConfidentialError>;
+/// Cheap: decode an auth proof canonically once, name its pinned shape, and return the `c` it
+/// publishes and its declared `pv::GAS`. `Err(InvalidProof)` for a header of neither shape.
+fn auth_header(&self, proof: &[u8]) -> Result<(AuthShape, Word8, Option<u64>), ConfidentialError>;
 /// Precompute the multisig auth guest's one verifier key. A node calls it only on a chain whose
 /// genesis names `hc_auth_multisig`.
 fn warm_auth_multisig(&self);
@@ -255,21 +292,36 @@ Nothing new is cached, and kind 9 is not used. If `feat/verify-cache` merges fir
 admission task adds the two forwards to `CachingExecutor`. If it merges after, its own merge fails
 to compile until it adds them, and the plan says so in the verify-cache owner's ledger.
 
-### 3.5 Keys and memory
+### 3.5 Keys and memory (single flight)
 
-`ZkExecutor` gets a fourth `Machine`, `msauth_machine`, for the same reason `auth_machine` exists:
-`decode_and_check` pins every component of the key, so this cache holds exactly one key
-(`verifier_key_with_modq(MSAUTH_TIER, plh, ilh, klh, 0, mlh, pubh)`), and nothing a deploy, a
-bundle or a single-key auth proof brings can evict it. `warm_auth_multisig` builds it.
-`node::warm` calls it beside `warm_auth`, only when the committed ledger has `hc_auth_multisig`.
+`ZkExecutor` gets a fourth `Machine`, `msauth_machine`, for the same reason `auth_machine` exists,
+**and** the one msauth key is held in `msauth_key: OnceLock<Arc<CommonData<Config>>>`, built by
+`get_or_init` (`verifier_key_with_modq(MSAUTH_TIER, plh, ilh, klh, 0, mlh, pubh)`). The vendored
+`Machine` cache is FIFO without single flight here (`executor.rs:489-497`): four verify workers
+plus the warm thread could each build a 1.5–2 GB key at once and OOM a 2–4 GB validator, and junk
+msauth proofs with a correct header would trigger exactly that. With the `OnceLock` the key is
+built once and every other caller waits for it. The verify path uses that key directly.
+
+- `node::warm` calls `warm_auth_multisig` **first** (before the bundle and auth keys) when the
+  committed ledger has `hc_auth_multisig`.
+- The mempool: until the key is warm (`ZkExecutor::msauth_key_ready()`, forwarded through the
+  wrappers as part of `warm_auth_multisig`'s family — see below), admission **defers** a
+  transaction whose `auth_header` is `Multisig` as a retryable refusal (never a permanent one, so
+  the `RefusedCache` does not remember it), rather than building the key on a worker.
+- Block validation (`on_proposal`, apply, sync, a restarted follower) waits on the `OnceLock`: the
+  first caller builds, the rest wait; a node never builds two.
+
+`msauth_key_ready` is a third required trait method, `fn auth_multisig_key_ready(&self) -> bool`,
+forwarded like the other two; the stub answers `true`.
 
 Cost, by extrapolation from `executor.rs`'s measured call keys (tier 16 ≈ 13.7 s / 893 MB, tier 20
 ≈ 216 s / 6.5 GB at Production, plus keccak's preprocessed columns): **roughly 60 s and 1.5–2 GB
 peak** for the tier-18 msauth key. The validators are 2–4 GB droplets. The plan's executor task
 includes an ignored Production measurement
 (`measure_the_msauth_verifier_key_build_and_verify_at_the_production_profile`), recorded in
-`docs/node-hardware.md`. **If the peak exceeds 1.5 GB above the node's baseline, stop and report**
-before any cut carries the field.
+`docs/node-hardware.md`. **Stop rule:** if the peak during the build, **or the resident memory after it**
+(the key stays resident for the life of the process), exceeds 1.5 GB above a plain `rand-node`
+baseline, stop and report before any cut carries the field.
 
 ## 4. The executor (`crates/randprotocol-zkvm`)
 
@@ -312,6 +364,16 @@ hand to the hand-maintained `guests.rs`: `Program::from_flat_image(include_bytes
   `modq_log_height != NO_MODQ` with `InvalidProof("a call proof declares no modq table")`
   **before** any key is built. Otherwise any caller could make a validator build modq-bearing call
   keys, which is the DoS the call tier cap closed. No deployed program issues `SYS_MODQ`.
+- **`non_canonical`'s preprocessed-round count** (`executor.rs:276-284`) counts the preprocessed
+  instances via `chips(tier, k, s)`, which omits the modq table's 16 preprocessed columns, so every
+  honest msauth proof would be named non-canonical: refused by the mempool
+  (`mempool.rs:665` → `admission.rs:1033`) and, under `hardening_v6` (chain 21), by consensus. It
+  uses `chips_with_modq(tier, clamped(k), clamped(s), clamped(modq))`. A fast, non-ignored test: a
+  tier-10 Test-profile proof with one modq block (circuits' `tests/common` modq fixture) has
+  `non_canonical == None` and `honest_fri_arities == Some(_)`.
+- `AggExecutor::decode_call` (`agg_executor.rs:466-512`) mirrors the call header checks itself; it
+  gains the same `modq_log_height != 0` refusal.
+- `const` asserts beside `MAX_HONEST_DEGREE_BITS` gain `tables::modq::MAX_LOG_HEIGHT`.
 - `non_canonical` and `honest_fri_arities`: `honest_fri_arities` uses
   `chips_with_modq(tier, k, s, clamped(modq))`. Without that, a modq-bearing proof's instance count
   never matches `chips`, the schedule is `None`, and the FRI-arity rule silently skips the msauth
@@ -364,8 +426,12 @@ there. That commit must be pushed: `CUDA_REV` must be fetchable.
    one vendored test that calls the hooks (`forge_block`, `build_traces_forged`, `ModqAirWithout`,
    `call_unchecked`, `execute_unchecked_modq`, `memory_trace_forged`, `range_counts_without`).
    CI runs `cargo test -p randprotocol-zkvm --features cheating --test cheating`. The script gains
-   a guard: if any vendored test other than `cheating.rs` names a hook, it fails. It also refuses
-   any `features = ["cheating"]` in the copied `crates/randprotocol-rvm/Cargo.toml`.
+   a guard over `tests/*.rs` **and `tests/common/*.rs`**: if any vendored file other than
+   `cheating.rs` names a hook, it fails (circuits is moving `modq_harness` out from behind
+   `cheating` so that this holds). The vendored `tests/modq.rs` therefore runs on the real
+   `ModqAir`, never a hooked one. The guard also refuses any `features = ["cheating"]` in the copied
+   `crates/randprotocol-rvm/Cargo.toml`. (Research's own `Cargo.toml`, with its self
+   dev-dependency, is never copied; there is nothing to strip.)
 5. **Dev-dependency.** `tests/msauth.rs` needs `crystals-dilithium`, so the zkvm crate gains
    `crystals-dilithium = { workspace = true }` under `[dev-dependencies]`. The workspace pins 2.0
    and `Cargo.lock` resolves 2.0.0, the oracle's version.
@@ -432,13 +498,14 @@ and `prove_auth_locally` proves `prove_auth` or `prove_msauth` by variant.
 |---|---|---|
 | `address --policy P` | P | prints `rand1…`, the fingerprint and `policy` hex |
 | `balance --policy P` | P, node | scans as the account; prints balance and notes |
-| `prepare --policy P --to ADDR --amount X [--memo M] [--fee F] --out prop.json`, or `--sweep-to ADDR` | P, node | checks the chain (`rand_status.hc_bundle` is v3, `hc_auth_multisig` is this build's), scans, selects notes, builds the v3 bundle with `nk` from P and a **fresh `salt`**, `auth_commit = msauth::auth_commit(nk, salt)`, places it in `Transaction::shielded(chain_id, bundle, Action::None)`, computes `binding = tx.binding(domain)` and `signing_message(binding)`, and writes the proposal (§6.4) with mode 0600. `--sweep-to` spends every note to ADDR minus the fee, refusing more than two RAND notes ("send to yourself first to merge"); it is how a rotation is done |
-| `sign --proposal prop.json --policy P --key K [--index i]` | P, a signer key file; offline | re-derives everything it signs over (§6.5), prints the summary to stderr, then prints `i:<sig hex>` |
+| `prepare --policy P --to ADDR --amount X [--memo M] [--fee F] --out prop.json`, or `--sweep-to ADDR` | P, node | checks the chain (`rand_status.hc_bundle` is v3, `hc_auth_multisig` is this build's), scans, selects notes, builds the v3 bundle with `nk` from P and a **fresh `salt`**, `auth_commit = msauth::auth_commit(nk, salt)`, places it in `Transaction::shielded(chain_id, bundle, Action::None)`, computes `binding = tx.binding(domain)` and `signing_message(binding)`, and writes the proposal (§6.4) with mode 0600. Every output envelope, **dummies included**, is sealed with the account's `vk` as sender (a single-key wallet seals dummies under a throwaway key; here that would make them unopenable by the signers). `prepare` does **not** mark the selected notes pending: nothing is spent until a transaction commits, and an abandoned proposal must not hide notes from the next one. `--sweep-to` spends every **RAND** note to ADDR minus the fee, refusing more than two ("send to yourself first to merge"); it is how a rotation is done. Token notes are not swept (use `--to … --asset`), and the old address stays spendable by the old policy for any payment that arrives later |
+| `sign --proposal prop.json --policy P --key K [--index i]` | P, a signer key file; offline | re-derives everything it signs over (§6.5), prints the summary to stderr, then prints `i:<sig hex>`. Warns if K is a validator consensus key (the key's address is in `rand_getValidators` when `--rpc` answers, or the file is a `rand-node` node key by path) |
 | `prove --proposal prop.json --policy P --signature i:hex… [--prover]` | P, ≥ T signatures, ≥ 48 GB | checks the shares (§6.5), assembles `msauth_inputs(msk, salt, T, slots)` with slots in ascending index order, each with `pk`, `sig` and the path from `signer_tree`; runs the guest in the emulator (`run_msauth`, refusing the sentinel or a `c ≠ auth_commit`); proves msauth locally (tier 18, minutes); proves the bundle locally or on the paired prover (the witness carries `nk`, as today); writes `prop.tx` (the transaction, bincode hex) |
 | `submit --tx prop.tx [--no-wait]` | node | `rand_sendTransaction`, then the usual settle and rescan |
 
-Both proofs are made against the binding computed at `prepare`. `prove` refuses if the chain head
-is past `expires_at - 16` ("prepare again"). `expires_at` is the bundle's `time` plus the chain's
+Both proofs are made against the binding computed at `prepare`. The **CLI** `prove` reads the head
+and refuses at or past `expires_at - 16` ("prepare again"); the library `prove` takes no RPC and
+does not check (the e2e calls the library). `expires_at` is the bundle's `time` plus the chain's
 `proof_window_blocks`, 1 024 on chain 21, about 20 minutes at 1.17 s blocks. That is the window in
 which signatures must be gathered and both proofs made.
 
@@ -460,11 +527,14 @@ binding.
 - `tx.binding(domain) == binding`, and `signing_message(binding) == signing_message`;
 - the bundle's `auth_commit == msauth::auth_commit(policy.nk(), salt)`, so the proposal spends
   from this policy's account;
-- every output envelope opens **as sender** under the policy's scan key
+- every one of the **four** output envelopes opens **as sender** under the policy's scan key
   (`open_as_sender_with`), and the opened note's commitment is the bundle's commitment in that
-  slot.
+  slot (an unopenable output is refused, never skipped: skipping would let a proposer hide value);
+- **value conservation against the witness:** the input notes decoded from `bundle_words`,
+  re-derived to nullifiers with the policy's `nk`, are exactly the transaction's four nullifiers,
+  and per asset Σ inputs = Σ opened outputs + fee + `burn_a`/`burn_r`.
 
-It shows each output's recipient, amount, asset and memo, and the fee, then signs
+It shows each output's recipient, amount, asset and memo, the fee, and any burn, then signs
 `signing_message` with the Dilithium2 key (`load_authority_key`, a `rand-node keygen` file). The
 key's index is looked up in `policy.signers`, and a key not in the policy is refused.
 
@@ -487,7 +557,7 @@ Phase 4 proves the msauth proof only on the signer's own machine. Reasons:
 
 **Follow-up, specified.** `WitnessKind::MultisigAuth`; the job carries `hc_auth_multisig`, the
 `MSAUTH_WORDS` vector and the binding; the reply carries the proof, checked by
-`ZkExecutor::msauth_proof_commit` against `auth_commit` and by `auth_proof_shape == Multisig`;
+`ZkExecutor::msauth_proof_commit` against `auth_commit` and by `auth_header(..).0 == Multisig`;
 the prover advertises `auth_guests: [hc]`; and `rand multisig-private prove --auth-prover`. The
 bundle proof can already be delegated today (`--prover`).
 
@@ -518,13 +588,21 @@ set:
 - **Selftest refuse cases:** absent (gate on), not chain 20's flag set, equal to `hc_auth`, a
   `max_proof_bytes` under 4 MiB, a wrong digest.
 
+Cut checklist addition: the `rand-prover` fleet (prover.randprotocol.org) and `clients/core`'s
+vendored fullnode must be on constraint set 9 at the cut, or every delegated bundle proof and every
+light wallet fails on chain 21's keys.
+
 ### 7.1 The end-to-end gate (a test chain, real proofs)
 
 `crates/randprotocol-client/tests/wallet_flow.rs`,
 `a_private_multisig_receives_spends_rotates_and_refuses_one_signature_end_to_end`, is `#[ignore]`d
 because it runs about 4 bundle proofs and 3 tier-18 msauth proofs and needs a machine with
 ≥ 48 GB. On a one-validator Test-profile chain with v3, `hc_auth`, `hc_auth_multisig`, a `gas`
-section and a `multisig` section seeding one 2-of-3 public account:
+section, `proof_window_blocks: 1024` (3 s test blocks would otherwise give 12.8 minutes for two
+signatures, a tier-18 Test prove and a bundle prove) and a `multisig` section seeding one 2-of-3
+public account. Before it runs, the Test-profile msauth prove time and peak RSS from the plan's
+Task 2 are recorded; stop if the peak exceeds 40 GB (the node runs in-process on the 48 GB
+laptop):
 
 1. A 2-of-3 private policy (signers K0, K1, K2) gets its address. The faucet mints 100 RAND to it,
    and the account's scan finds the note.
@@ -538,13 +616,16 @@ section and a `multisig` section seeding one 2-of-3 public account:
 5. A rotation: a new policy (K3, K4, threshold 2, fresh `msk`); `prepare --sweep-to <new address>`
    signed by K1 and K2 (a different pair). It commits, the old account's balance is 0, and the new
    one's is the swept amount.
-6. Every committed multisig auth proof's header equals `msauth_heights()`, and its `pv::GAS` equals
+6. Size: the ignored executor test (plan Task 2) asserts M = 1, 2, 3 proofs differ in length only
+   within the hiding noise (≤ 1 %).
+7. Every committed multisig auth proof's header equals `msauth_heights()`, and its `pv::GAS` equals
    `msauth_gas_limit_pin()` for both the 2-signature spends. That is R-gas and R-hide checked on
    the chain's own bytes.
 
-## 8. CHANGELOG (v0.8.0)
+## 8. CHANGELOG (v0.8.0, or v0.9.0)
 
-Under "Chain 21 and later, by genesis section":
+The user decides the release scope and edits `CHANGELOG.md`; this text is the proposal. Under
+"Chain 21 and later, by genesis section":
 
 > - **Private multisig** (`hc_auth_multisig`): an M-of-N Dilithium2 policy hidden inside a second
 >   auth guest (tier 18, the MODQ chip; `M_MAX` *(Task 8)*, `N_MAX` 16). Admission tells the two
@@ -559,10 +640,36 @@ Under "Chain 21 and later, by genesis section":
 1. **v0.8.0 and chain 20** (§2.5): the decision is the user's. Either v0.8.0 becomes chain-21-only
    and the chain-20 flag-day roll is withdrawn, or v0.8.0 is tagged before the re-vendor and this
    ships as v0.9.0 at the cut that carries it.
-2. **Chain-21 timing.** If chain 21 is cut before this lands, `hc_auth_multisig` and the
-   constraint-set change move to chain 22's script. The cut task then edits that script instead.
+2. **Chain-21 timing** (now a gate before Task 1): if chain 21 is cut before this lands, chain 21
+   joins `CHAINS_THIS_BUILD_CANNOT_RUN`, `hc_auth_multisig` moves to chain 22's script, and the
+   CHANGELOG wording changes accordingly.
 3. **The verifier key's memory on 2–4 GB validators** (§3.5): measured, with a stop rule.
 4. **Byte pricing.** Bundle and auth bytes are unpriced, so a multisig transfer uses about 3.5 times
    the block space for the same floor. This is a fees follow-up, not phase 4.
 5. **Proof size above 95 % of 4 MiB**: the constant and chain 21's cap move to 6 MiB (§3.3).
 6. **Delegated msauth proving** (§6.6): a follow-up.
+
+## 10. Pre-flight review (2026-10-11): where each finding landed
+
+| # | finding | section |
+|---|---|---|
+| 1 | preprocessed count omits modq; `decode_call` mirror | §4.2 |
+| 2 | `modq_harness` behind `cheating`; guard `tests/common` | §5 item 4 |
+| 3 | no single flight on the tier-18 key | §3.5 |
+| 4 | dummies unopenable; value conservation | §6.3, §6.5 |
+| 5 | chain-21 gate; rollback paragraph | §2.5, §9.2 |
+| 6 | chain 18–20 genesis tests | plan Task 1 |
+| 7 | floors from one sample; off-by-one header test | §1, §3.1 |
+| 8 | RPC body cap counts three proofs | §2.4 |
+| 9 | `AggExecutor::new`, `Counting`, no spec-file fallback | plan Task 4 |
+| 10 | `Proof` not `Clone`; FRI field path | plan Task 2 |
+| 11 | e2e window, RSS stop rule, `prepare` not pending | §6.3, §7.1 |
+| 13 | size-uniformity assertion | §7.1 item 6 |
+| 14 | one `auth_header` decode | §3.2, §3.4 |
+| 15 | rule 3 compares `Word8`s | §2.3 |
+| 16 | `--sweep-to` scope | §6.3 |
+| 17 | expiry check in the CLI; helpers | §6.3, plan Tasks 3, 6 |
+| 18 | `MAX_HONEST_DEGREE_BITS` asserts | §4.2 |
+| 19 | stale parent-spec copy | replaced with circuits' |
+| 20 | prover fleet and `clients/core` at the cut | §7 |
+| 21 | `sign` warns on a validator key | §6.3 |
