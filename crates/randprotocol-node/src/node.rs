@@ -374,7 +374,8 @@ pub fn snapshot_is_the_head_state(head_block: &Block, reloaded: &Ledger) -> Resu
         anyhow::bail!(
             "the stored ledger snapshot is not the state of the head block: height {} commits to state root {:?} and the \
              snapshot hashes to {:?}. The store is damaged or was altered; do not run this node on it — re-sync it \
-             (from an archive if it is pruned) (audit v6, OPS-5)",
+             (from an archive if it is pruned); on an archive, `--verify-chain replay` rebuilds the state from \
+             history (audit v6, OPS-5)",
             head_block.height(),
             head_block.header.state_root,
             reloaded_root
@@ -581,10 +582,16 @@ pub fn startup_check(storage: &Storage, gs: &GenesisState, mode: VerifyMode, exe
             Ok(head) if m.height != head.height || m.block_hash != head.hash => {
                 WalkReason::HeadMoved { checkpoint: m.height, head: head.height }
             }
-            Ok(head) => {
-                tracing::info!("chain verified: checkpoint at {} (build {}), replay skipped", head.height, &build[..12]);
-                return Ok(StartupCheck { resume: head.height, stored: None, verify: StartupVerify::Skipped { height: head.height } });
-            }
+            // The row vouches for the header (its hash); the tip's body and signature are
+            // re-checked here, one block's work, so a tip altered under an unchanged header
+            // still walks (final review #5).
+            Ok(head) => match tip_fault(storage, gs) {
+                Some(fault) => WalkReason::HeadUnreadable(fault),
+                None => {
+                    tracing::info!("chain verified: checkpoint at {} (build {}), replay skipped", head.height, &build[..12]);
+                    return Ok(StartupCheck { resume: head.height, stored: None, verify: StartupVerify::Skipped { height: head.height } });
+                }
+            },
         },
     };
     tracing::info!("startup verify ({mode:?}): {reason}");
@@ -601,9 +608,11 @@ pub fn startup_check(storage: &Storage, gs: &GenesisState, mode: VerifyMode, exe
                 storage.mark_verified_head()?;
                 Ok(StartupCheck { resume: check.head, stored: check.stored, verify: StartupVerify::Walked(reason) })
             }
-            Some(problem) => anyhow::bail!(
-                "pruned node: {problem}; history cannot be repaired locally — re-sync from the archive"
-            ),
+            Some(problem) => {
+                // A failed walk leaves no checkpoint behind (final review #2).
+                storage.clear_verified_head()?;
+                anyhow::bail!("pruned node: {problem}; history cannot be repaired locally — re-sync from the archive")
+            }
         };
     }
     match &check.problem {
@@ -613,6 +622,9 @@ pub fn startup_check(storage: &Storage, gs: &GenesisState, mode: VerifyMode, exe
             Ok(StartupCheck { resume: check.head, stored: check.stored, verify: StartupVerify::Walked(reason) })
         }
         Some(problem) => {
+            // Cleared before the truncate (which clears it too), so a failure between the two
+            // steps still leaves no checkpoint for the damaged head (final review #2).
+            storage.clear_verified_head()?;
             let resume = if check.genesis_ok { check.last_good } else { 0 };
             tracing::warn!(
                 "CORRUPT CHAIN at height {}: {problem}; truncating {} -> {} and resyncing from peers",
@@ -641,6 +653,48 @@ pub fn startup_check(storage: &Storage, gs: &GenesisState, mode: VerifyMode, exe
 /// [`startup_check`]'s resume height.
 pub fn check_and_repair_chain(storage: &Storage, gs: &GenesisState, mode: VerifyMode, executor: &dyn ConfidentialExecutor) -> Result<u64> {
     Ok(startup_check(storage, gs, mode, executor)?.resume)
+}
+
+/// The tip block's own checks, as `apply_block_for_sync` makes them: the proposer's signature
+/// under the chain's signing domain and the tx root over the stored transactions. `None` when
+/// both hold; otherwise what failed.
+fn tip_fault(storage: &Storage, gs: &GenesisState) -> Option<String> {
+    let tip = match storage.head_block() {
+        Ok(b) => b,
+        Err(e) => return Some(e.to_string()),
+    };
+    // Genesis carries no proposer signature: it is this chain's own block, by hash.
+    if tip.height() == 0 {
+        if tip.hash() != gs.hash() {
+            return Some("block 0 is not this chain's genesis".into());
+        }
+    } else if !tip.verify_signature(&gs.signing_domain()) {
+        return Some(format!("block {} proposer signature does not verify", tip.height()));
+    }
+    if !tip.verify_tx_root() {
+        return Some(format!("block {} tx root does not match its transactions", tip.height()));
+    }
+    None
+}
+
+/// The mode `rand-node verify --repair` repairs with. The repair ignores the checkpoint (final
+/// review #1): `quick` honours a same-build row, so `startup_check` would skip, report the
+/// store repaired and truncate nothing; `replay` is `quick` with the row ignored.
+pub fn repair_mode(mode: VerifyMode) -> VerifyMode {
+    match mode {
+        VerifyMode::Quick => VerifyMode::Replay,
+        other => other,
+    }
+}
+
+/// `rand-node verify`'s walk: [`Storage::verify_chain`], and a problem clears the checkpoint
+/// (final review #2) — with or without `--repair` — so the next `quick` start walks.
+pub fn verify_store(storage: &Storage, gs: &GenesisState, mode: VerifyMode, executor: &dyn ConfidentialExecutor) -> Result<crate::storage::ChainCheck> {
+    let check = storage.verify_chain(gs, mode, executor)?;
+    if check.problem.is_some() {
+        storage.clear_verified_head()?;
+    }
+    Ok(check)
 }
 
 /// The retention window must hold the aggregation window (history pruning spec §5): a cover's
@@ -4934,6 +4988,8 @@ mod tests {
         storage.put_verified_head_for_testing(&stale).unwrap();
         let c = startup(&storage, &gs, VerifyMode::Quick);
         assert_eq!(c.verify, StartupVerify::Walked(WalkReason::HeadMoved { checkpoint: head.height() - 1, head: head.height() }));
+        let row = storage.verified_head().unwrap().expect("the walk rewrote the checkpoint");
+        assert_eq!((row.height, row.block_hash, row.build_sha.as_str()), (head.height(), head.hash(), SHA_A));
     }
 
     #[test]
@@ -4943,6 +4999,9 @@ mod tests {
         startup(&storage, &gs, VerifyMode::Quick);
         storage.delete_meta_for_testing("verified_head").unwrap(); // the crash between walk and write
         assert_eq!(startup(&storage, &gs, VerifyMode::Quick).verify, StartupVerify::Walked(WalkReason::NoCheckpoint));
+        let head = storage.head().unwrap();
+        let row = storage.verified_head().unwrap().expect("the walk rewrote the checkpoint");
+        assert_eq!((row.height, row.block_hash, row.build_sha.as_str()), (head.height, head.hash, SHA_A));
     }
 
     #[test]
@@ -4956,7 +5015,7 @@ mod tests {
     }
 
     #[test]
-    fn off_leaves_the_marker_alone_and_quick_then_walks() {
+    fn off_leaves_the_marker_alone() {
         let (_d, storage, gs, _) = chain_past_a_boundary();
         storage.set_checkpoint_build_for_testing(Some(SHA_A));
         startup(&storage, &gs, VerifyMode::Quick);
@@ -5022,6 +5081,142 @@ mod tests {
             .expect("…but OPS-5 still refuses the altered snapshot")
             .to_string();
         assert!(err.contains("ledger snapshot") && err.contains("state root"), "{err}");
+    }
+
+    #[test]
+    fn repair_mode_ignores_the_checkpoint() {
+        assert_eq!(repair_mode(VerifyMode::Quick), VerifyMode::Replay);
+        for mode in [VerifyMode::Off, VerifyMode::Replay, VerifyMode::Full] {
+            assert_eq!(repair_mode(mode), mode);
+        }
+    }
+
+    /// `rand-node verify --repair --mode quick` on a store whose same-build checkpoint matches
+    /// the head: the repair must walk and truncate, not skip (final review #1).
+    #[test]
+    fn verify_repair_in_quick_mode_truncates_under_a_valid_checkpoint() {
+        let (_d, storage, gs, _) = chain_past_a_boundary();
+        storage.set_checkpoint_build_for_testing(Some(SHA_A));
+        startup(&storage, &gs, VerifyMode::Quick);
+        assert!(storage.verified_head().unwrap().is_some());
+        storage.overwrite_block_bytes_for_testing(1, b"garbage").unwrap();
+        let resume = check_and_repair_chain(&storage, &gs, repair_mode(VerifyMode::Quick), &StubExecutor).unwrap();
+        assert_eq!(resume, 0, "truncated below the damaged block");
+        assert_eq!(storage.head().unwrap().height, 0);
+    }
+
+    #[test]
+    fn check_and_repair_in_replay_truncates_under_a_valid_checkpoint() {
+        let (_d, storage, gs, _) = chain_past_a_boundary();
+        storage.set_checkpoint_build_for_testing(Some(SHA_A));
+        startup(&storage, &gs, VerifyMode::Quick);
+        storage.overwrite_block_bytes_for_testing(1, b"garbage").unwrap();
+        assert_eq!(check_and_repair_chain(&storage, &gs, VerifyMode::Replay, &StubExecutor).unwrap(), 0);
+        assert_eq!(storage.head().unwrap().height, 0);
+    }
+
+    /// A pruned node's failed walk is fatal; the checkpoint it had must not survive it, or the
+    /// next `quick` start would skip straight past the damage (final review #2).
+    #[test]
+    fn a_failed_walk_clears_an_existing_checkpoint() {
+        let (_dir, st, gs, _blocks) = crate::storage::fixtures::timed_chain(12);
+        st.prune_history(u64::MAX, 10, crate::storage::PRUNE_PASS_MAX).unwrap();
+        st.set_checkpoint_build_for_testing(Some(SHA_A));
+        startup(&st, &gs, VerifyMode::Quick);
+        assert!(st.verified_head().unwrap().is_some(), "the clean walk marked the head");
+        st.db_for_test().delete_cf(st.cf_for_test("blocks"), crate::storage::height_key_for_test(10)).unwrap();
+        assert!(startup_check(&st, &gs, VerifyMode::Replay, &StubExecutor).is_err(), "a pruned store cannot repair");
+        assert_eq!(st.verified_head().unwrap(), None, "the failed walk cleared the checkpoint");
+        assert!(
+            startup_check(&st, &gs, VerifyMode::Quick, &StubExecutor).is_err(),
+            "the next quick start walks again and fails again"
+        );
+    }
+
+    /// `rand-node verify` (without `--repair`) that finds a problem clears the checkpoint, and
+    /// leaves the store otherwise untouched (final review #2).
+    #[test]
+    fn a_verify_that_finds_a_problem_clears_the_checkpoint() {
+        let (_d, storage, gs, _) = chain_past_a_boundary();
+        storage.set_checkpoint_build_for_testing(Some(SHA_A));
+        startup(&storage, &gs, VerifyMode::Quick);
+        let clean = verify_store(&storage, &gs, VerifyMode::Quick, &StubExecutor).unwrap();
+        assert!(clean.problem.is_none());
+        assert!(storage.verified_head().unwrap().is_some(), "a clean verify leaves the row");
+        let head = storage.head().unwrap().height;
+        storage.overwrite_block_bytes_for_testing(1, b"garbage").unwrap();
+        let check = verify_store(&storage, &gs, VerifyMode::Quick, &StubExecutor).unwrap();
+        assert!(check.problem.is_some());
+        assert_eq!(storage.verified_head().unwrap(), None, "CORRUPT clears the checkpoint");
+        assert_eq!(storage.head().unwrap().height, head, "no repair without --repair");
+        assert!(matches!(startup(&storage, &gs, VerifyMode::Quick).verify, StartupVerify::Walked(WalkReason::NoCheckpoint)));
+    }
+
+    /// A tip whose body was altered but still decodes keeps its header, so its hash matches the
+    /// checkpoint; the skip must still notice (final review #5).
+    #[test]
+    fn an_altered_tip_body_under_a_valid_checkpoint_walks_and_repairs() {
+        let (_d, storage, gs, _) = chain_past_a_boundary();
+        storage.set_checkpoint_build_for_testing(Some(SHA_A));
+        startup(&storage, &gs, VerifyMode::Quick);
+        let tip = storage.head_block().unwrap();
+        assert!(!tip.transactions.is_empty());
+        let mut altered = tip.clone();
+        altered.transactions.clear();
+        storage.overwrite_block_bytes_for_testing(tip.height(), &altered.encode()).unwrap();
+        let head = storage.head().unwrap();
+        assert_eq!((head.height, head.hash), (tip.height(), tip.hash()), "the head still reads and matches the row");
+        let c = startup_check(&storage, &gs, VerifyMode::Quick, &StubExecutor).expect("the walk repairs, startup goes on");
+        match &c.verify {
+            StartupVerify::Walked(WalkReason::HeadUnreadable(why)) => assert!(why.contains("tx root"), "{why}"),
+            other => panic!("expected a walk, got {other:?}"),
+        }
+        assert!(c.resume < tip.height(), "the altered tip was truncated");
+        let row = storage.verified_head().unwrap().expect("the repaired head is marked");
+        assert_eq!(row.height, c.resume);
+    }
+
+    #[test]
+    fn a_tip_with_a_forged_signature_under_a_valid_checkpoint_walks_and_repairs() {
+        let (_d, storage, gs, _) = chain_past_a_boundary();
+        storage.set_checkpoint_build_for_testing(Some(SHA_A));
+        startup(&storage, &gs, VerifyMode::Quick);
+        let tip = storage.head_block().unwrap();
+        let forged = Block::sign(&gs.signing_domain(), tip.header.clone(), tip.transactions.clone(), &key(2));
+        assert_eq!(forged.hash(), tip.hash());
+        storage.overwrite_block_bytes_for_testing(tip.height(), &forged.encode()).unwrap();
+        let c = startup_check(&storage, &gs, VerifyMode::Quick, &StubExecutor).expect("the walk repairs, startup goes on");
+        match &c.verify {
+            StartupVerify::Walked(WalkReason::HeadUnreadable(why)) => assert!(why.contains("signature"), "{why}"),
+            other => panic!("expected a walk, got {other:?}"),
+        }
+        assert!(c.resume < tip.height(), "the forged tip was truncated");
+    }
+
+    #[test]
+    fn a_genesis_only_store_skips_on_the_second_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
+        let gs = genesis_of(7, &[&key(1)], vec![alloc_note(20, 5 * randprotocol_core::UNITS_PER_RAND)], 2);
+        storage.init_genesis(&gs).unwrap();
+        storage.set_checkpoint_build_for_testing(Some(SHA_A));
+        assert_eq!(startup(&storage, &gs, VerifyMode::Quick).verify, StartupVerify::Walked(WalkReason::NoCheckpoint));
+        assert_eq!(startup(&storage, &gs, VerifyMode::Quick).verify, StartupVerify::Skipped { height: 0 }, "the unsigned genesis tip passes");
+    }
+
+    /// The checkpoint a startup wrote moves up with a same-build commit, and the next startup
+    /// skips at the new height.
+    #[test]
+    fn a_commit_carries_the_checkpoint_and_the_next_start_skips() {
+        let (_d, storage, gs, mut ledger) = chain_past_a_boundary();
+        storage.set_checkpoint_build_for_testing(Some(SHA_A));
+        assert_eq!(startup(&storage, &gs, VerifyMode::Quick).verify, StartupVerify::Walked(WalkReason::NoCheckpoint));
+        let parent = storage.head_block().unwrap();
+        let b3 = make_block_voted(&parent, &mut ledger, Vec::new(), &key(1), &[&key(1)]);
+        storage.commit(std::slice::from_ref(&b3), &ledger, &[], &StubExecutor).unwrap();
+        let row = storage.verified_head().unwrap().expect("carried");
+        assert_eq!((row.height, row.block_hash), (b3.block.height(), b3.block.hash()));
+        assert_eq!(startup(&storage, &gs, VerifyMode::Quick).verify, StartupVerify::Skipped { height: b3.block.height() });
     }
 
     /// The next block of the epoch the chain is in, as a peer would propose it: certified parent,
@@ -5694,7 +5889,7 @@ mod tests {
         // One nullifier no block spent: every later double-spend check would read it.
         storage.plant_nullifier_for_testing(&[0xdead_beef; 8]).unwrap();
         let err = resume().err().expect("the altered snapshot is refused").to_string();
-        assert!(err.contains("ledger snapshot") && err.contains("state root") && err.contains("re-sync"), "{err}");
+        assert!(err.contains("ledger snapshot") && err.contains("state root") && err.contains("re-sync") && err.contains("--verify-chain replay"), "{err}");
     }
 
     /// The upgrade from v0.5.4 (audit v5, CON-4): a database holding the locked block under the

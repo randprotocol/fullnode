@@ -2101,6 +2101,14 @@ impl Storage {
         Ok(true)
     }
 
+    /// Delete the checkpoint row, synced (final review #2): any walk that reports a problem
+    /// calls this before it returns or bails, so the next start walks again rather than
+    /// skipping past damage a failed check found.
+    pub fn clear_verified_head(&self) -> Result<()> {
+        self.db.delete_cf_opt(self.cf(CF_META), META_VERIFIED_HEAD, &sync_opts())?;
+        Ok(())
+    }
+
     /// How many seal rows [`Storage::prune_sealed`] has visited since this store was opened.
     pub fn seal_rows_examined(&self) -> u64 {
         self.seal_rows_examined.load(std::sync::atomic::Ordering::Relaxed)

@@ -2851,7 +2851,7 @@ async fn main() -> Result<()> {
             refuse_test_fri_profile(&gs.fri_profile, test_profile_allowed)?;
             node::refuse_chains_this_build_cannot_run(&gs)?;
             let storage = Storage::open(&datadir)?;
-            let check = storage.verify_chain(&gs, mode, executor.as_ref())?;
+            let check = node::verify_store(&storage, &gs, mode, executor.as_ref())?;
             match &check.problem {
                 None if check.floor > 0 => {
                     // The snapshot half (audit v6, OPS-5): the same comparison `run` makes.
@@ -2871,7 +2871,9 @@ async fn main() -> Result<()> {
                         std::process::exit(2);
                     }
                     if repair {
-                        node::check_and_repair_chain(&storage, &gs, mode, executor.as_ref())?;
+                        // The repair ignores the checkpoint: under `quick` a same-build row
+                        // would skip the walk and "repair" nothing (`node::repair_mode`).
+                        node::check_and_repair_chain(&storage, &gs, node::repair_mode(mode), executor.as_ref())?;
                         println!("repaired: head is now {}", storage.head()?.height);
                     } else {
                         std::process::exit(2);
