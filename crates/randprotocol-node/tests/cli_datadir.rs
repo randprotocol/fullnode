@@ -161,3 +161,20 @@ fn alloc_note_prints_a_genesis_note_for_an_address_and_refuses_bad_amounts() {
     assert!(!node(&["alloc-note", "--to", "rand1nope", "--amount", "10"]).ok);
     assert!(!node(&["alloc-note", "--to", &to, "--amount", "ten"]).ok);
 }
+
+#[test]
+fn bench_apply_reports_a_verdict_and_exits_nonzero_when_over_budget() {
+    let ok = node(&["bench", "apply", "--bundles", "20", "--blocks", "4", "--report-every", "2"]);
+    assert!(ok.ok, "{}", ok.err);
+    assert!(ok.out.contains("propose_ms") && ok.out.contains("apply_ms"), "{}", ok.out);
+    assert!(ok.out.contains("verdict: apply ") && ok.out.contains("at block 4 (320 nullifiers) — within the 300 ms budget"), "{}", ok.out);
+    let rows = ok.out.lines().filter(|l| l.trim_start().starts_with(|c: char| c.is_ascii_digit())).count();
+    assert_eq!(rows, 2, "a row every 2 blocks over 4: {}", ok.out);
+
+    let incremental = node(&["bench", "apply", "--bundles", "20", "--blocks", "4", "--report-every", "2", "--incremental-nullifier-root"]);
+    assert!(incremental.ok && incremental.out.contains("within the 300 ms budget"), "{}", incremental.out);
+
+    let over = node(&["bench", "apply", "--bundles", "20", "--blocks", "4", "--report-every", "2", "--fail-over-ms", "0"]);
+    assert!(!over.ok, "over the budget is a failure for a script");
+    assert!(over.out.contains("OVER the 0 ms budget"), "{}", over.out);
+}
