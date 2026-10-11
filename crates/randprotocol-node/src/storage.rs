@@ -3565,6 +3565,10 @@ pub struct ChainCheck {
     /// (a proof above the new head may have pruned them). Empty without the section and on a
     /// pruned store, which replays nothing.
     pub perp_inputs: Vec<(u64, Vec<u32>)>,
+    /// The stored ledger this check loaded (with the genesis setters it applies), when it
+    /// loaded and nothing was wrong. `node::startup_check` hands it to
+    /// `resume_consensus_from`, so a startup loads the ledger once (spec §4.5).
+    pub stored: Option<Ledger>,
 }
 
 impl ChainCheck {
@@ -3599,6 +3603,7 @@ impl Storage {
             genesis_ok: true,
             floor: 0,
             perp_inputs: Vec::new(),
+            stored: None,
         };
         let floor = self.prune_floor()?;
         check.floor = floor;
@@ -3859,6 +3864,7 @@ impl Storage {
         // The full equality walks every commitment and nullifier (O(state), final review F2), so
         // it is evaluated once here and the arms below read `same`.
         let same = matches!(&loaded, Ok(stored) if *stored == ledger);
+        let stored_copy = if same { loaded.as_ref().ok().cloned() } else { None };
         match loaded {
             // The live gas prices (Phase 2): inside the equality, hashed under `gas.dynamic`,
             // named first so the repair knows the key.
@@ -3987,6 +3993,7 @@ impl Storage {
         }
         check.ledger = ledger;
         check.perp_inputs = perp_inputs;
+        check.stored = if check.problem.is_none() { stored_copy } else { None };
         Ok(check)
     }
 
@@ -4067,7 +4074,9 @@ impl Storage {
             }
         }
         check.last_good = head;
-        check.ledger = self.load_ledger(executor)?;
+        let stored = self.load_ledger(executor)?;
+        check.ledger = stored.clone();
+        check.stored = Some(stored);
         Ok(check)
     }
 
@@ -10455,6 +10464,33 @@ mod seal_tests {
         assert_eq!(replayed.ledger.state_root(), l2.state_root(), "the same root");
         assert_eq!(replayed.ledger.supply(), l2.supply(), "the same counters");
         assert_eq!(replayed.ledger.unsealed_fees(), l2.unsealed_fees(), "the same bucket");
+        assert_eq!(
+            replayed.stored.as_ref().map(|l| l.state_root()),
+            Some(replayed.ledger.state_root()),
+            "the stored ledger is handed over"
+        );
+    }
+
+    #[test]
+    fn verify_chain_hands_over_the_stored_ledger_it_loaded() {
+        let (_d, st, gs, _) = chain_fixture(5);
+        for mode in [VerifyMode::Quick, VerifyMode::Replay, VerifyMode::Full] {
+            let loads = st.ledger_loads();
+            let c = st.verify_chain(&gs, mode, &StubExecutor).unwrap();
+            assert!(c.is_ok(), "{:?}", c.problem);
+            assert_eq!(st.ledger_loads(), loads + 1, "{mode:?}: one load");
+            let stored = c.stored.expect("the stored ledger is handed over");
+            assert_eq!(stored.state_root(), st.load_ledger(&StubExecutor).unwrap().state_root());
+        }
+    }
+
+    #[test]
+    fn verify_chain_hands_over_nothing_when_it_found_a_problem() {
+        let (_d, st, gs, _) = chain_fixture(6);
+        st.overwrite_block_bytes_for_testing(4, b"garbage").unwrap();
+        let c = st.verify_chain(&gs, VerifyMode::Quick, &StubExecutor).unwrap();
+        assert!(!c.is_ok());
+        assert!(c.stored.is_none());
     }
 
     /// A committed block 1 carrying `n` stub-proved bundles, each with its own nullifiers and
