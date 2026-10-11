@@ -1236,8 +1236,10 @@ git commit -m "rpc: rand_status and rand_getLimits serve hc_auth_multisig (null 
   - `AuthWitness`, including the `#[cfg(test)]` emulated `Proving` paths and `tests::emulated_proof`;
   - `pub(crate)` on `Prepared`, `prepare_bundle` and `mod tests`;
   - a `dummy_sender` option on `build_bundle`.
-- Create: `crates/randprotocol-client/src/msig_private.rs`
-- Modify: `crates/randprotocol-client/src/lib.rs` (`pub mod msig_private;`), `crates/randprotocol-client/src/main.rs` and `crates/randprotocol-node/src/main.rs` (every `w.sk` → `w.spend_key()?`, as the compiler lists)
+- Create: `crates/randprotocol-msig/{Cargo.toml,src/lib.rs,tests/checks.rs}` (the pure signer-check crate; add it to the workspace `members` and `[workspace.dependencies]`)
+- Create: `crates/randprotocol-client/src/msig_private.rs` (RPC, filesystem and prover parts only)
+- Modify: `.github/workflows/ci.yml` (the wasm32 check)
+- Modify: `crates/randprotocol-client/Cargo.toml` (`randprotocol-msig = { workspace = true }`), `crates/randprotocol-client/src/lib.rs` (`pub mod msig_private; pub use randprotocol_msig as multisig_private;`), `crates/randprotocol-client/src/main.rs` and `crates/randprotocol-node/src/main.rs` (every `w.sk` → `w.spend_key()?`, as the compiler lists)
 
 **Interfaces:**
 - Consumes: Task 2 (`run_msauth`, `prove_msauth`, `ZkExecutor::hc_auth_multisig`), the vendored `msauth::*`, Task 5 (`rand_status.hc_auth_multisig`).
@@ -1277,7 +1279,99 @@ git commit -m "rpc: rand_status and rand_getLimits serve hc_auth_multisig (null 
   // wallet.rs: fn fresh_word() becomes pub(crate) (wallet.rs:1903) — Policy::new draws msk with it
   ```
 
-- [ ] **Step 1: Write the failing tests.** Create `msig_private.rs` with only `#[cfg(test)] mod tests` first. (`wallet.rs`'s `mod tests` becomes `pub(crate) mod tests` so the support module can reach its helper.)
+
+**The signer checks are a pure library crate (user decision, relayed by randprotocol-d7).** Every wallet app calls the §6.5 checks through the clients wasm/native core, so they live in a **new crate, `crates/randprotocol-msig`**, re-exported as `randprotocol_client::multisig_private` (`pub use randprotocol_msig as multisig_private;` in `lib.rs`).
+
+*Why a new crate, not a feature of `randprotocol-client`:* the client's `[dependencies]` include `reqwest`, `tokio`, `clap`, `image`, `qrcode` and `randprotocol-prover`, unconditionally, and `wallet.rs`/`main.rs` use them throughout. Making every one optional and `cfg`-gating the wallet would touch most of the crate. A crate that depends only on `randprotocol-core` and `randprotocol-zkvm` (+ `serde`, `serde_json`, `hex`, `thiserror`) has exactly the dependency cone the clients' `wallet-core` already compiles for `wasm32-unknown-unknown`.
+
+- **No RPC, no filesystem, no OS entropy, no prover/rocksdb/tokio.** For the wasm build only, the crate copies `clients/core/crates/wallet-core/Cargo.toml`'s wasm32 target block, `getrandom02 = { package = "getrandom", version = "0.2", features = ["js"] }` and `getrandom = { version = "0.4", features = ["wasm_js"] }`. These let `randprotocol-core`/`randprotocol-zkvm` link; the module itself never draws randomness. Dilithium signing is deterministic from the seed (round-3 `dilithium2`, no randomized-signing flag).
+- **Secrets.** `policy_json` carries the account's **secret `msk`** (viewing power). `proposal_json` carries the **witness words** (`nk`, the salt and the note openings). Both are secrets. The crate never logs them, and callers must store them as such.
+
+The crate's API (`crates/randprotocol-msig/src/lib.rs`):
+
+```rust
+#[derive(Serialize, Deserialize, Clone)] pub struct Policy { pub version: u32, pub threshold: u32, pub signers: Vec<String /* pk hex */>, pub msk: String }
+#[derive(Serialize, Deserialize, Clone)] pub struct Proposal { /* the spec §6.4 fields, unchanged */ }
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)] pub struct OutputSummary { pub recipient: String /* rand1… */, pub amount: u64, pub asset: u32, pub memo: String }
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)] pub struct Burns { pub burn_a: u64, pub burn_asset: u32, pub burn_r: u64 }
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ProposalSummary { pub outputs: Vec<OutputSummary>, pub fee: u64, pub burns: Burns, pub expires_at: u64,
+                             pub signing_message: [u8; 45], pub policy_fingerprint: String }
+pub fn check_proposal(proposal_json: &str, policy_json: &str) -> Result<ProposalSummary, MsigError>;
+pub fn sign(proposal_json: &str, policy_json: &str, signer_seed: &[u8; 32]) -> Result<(u8, Vec<u8>), MsigError>;
+pub fn verify_share(proposal_json: &str, policy_json: &str, share: &str /* "i:hex" */) -> Result<(), MsigError>;
+// pure helpers the client builds on:
+impl Policy { pub fn check(&self) -> Result<(), MsigError>; pub fn pks(&self) -> Result<Vec<[u8; 1312]>, MsigError>;
+              pub fn signer_root(&self) -> Word8; pub fn policy_hash(&self) -> Word8; pub fn nk(&self) -> Word8;
+              pub fn viewing_key(&self) -> ViewingKey; pub fn address(&self) -> ShieldedAddress; pub fn fingerprint(&self) -> String; }
+pub fn parse_word8(hex: &str) -> Result<Word8, MsigError>; pub fn parse_binding(hex: &str) -> Result<[u32; 8], MsigError>;
+```
+
+What `check_proposal` does, every §6.5 check in order:
+1. Parse both files; `Policy::check`.
+2. Policy fingerprint: `proposal.policy == hex(policy.policy_hash())` ("this proposal is for another policy").
+3. Decode `tx`; the recomputed binding equals `binding`, and `signing_message(binding)` equals the proposal's.
+4. `auth_commit == msauth::auth_commit(nk, salt)`.
+5. All four outputs open as sender under `policy.viewing_key().scan_key()`, each to the bundle's commitment in its slot.
+6. Value conservation: from the witness words to the transaction's nullifiers, then outputs + fee + `burn_a`/`burn_r`.
+7. Expiry, as far as a pure function can check it: `bundle.time < expires_at ≤ bundle.time + randprotocol_core::genesis::MAX_PROOF_WINDOW_BLOCKS` (4 096). Comparing with the chain head is the caller's job: the CLI reads `rand_status`, and an app reads its own node.
+
+`sign` re-runs `check_proposal`, derives the keypair with `crystals_dilithium::dilithium2::Keypair::generate(Some(signer_seed))`, refuses a public key not in `policy.signers` ("this key is not one of the policy's signers"), and returns `(index, sig)` with `sig.len() == 2420`, signed over `signing_message`. `verify_share` parses `i:hex`, range-checks `i`, and verifies the signature against `policy.signers[i]` over `signing_message`.
+
+The client's `msig_private` keeps everything that needs RPC, the filesystem or a prover: `prepare`, `prepare_sweep`, `assemble_witness`, `prove`, policy file save/load with the 0600 rule, `Policy::wallet()` through a `PolicyExt` trait, and the CLI's validator-key warning. Its `sign(proposal, policy, key: &Keypair)` is a thin wrapper: `randprotocol_msig::sign(&to_json(proposal), &to_json(policy), key.seed())`, plus the summary lines rendered from `check_proposal`'s `ProposalSummary`.
+
+- [ ] **Step 1a: Write the crate's failing tests.** Create `crates/randprotocol-msig` with a `lib.rs` that declares only the API above (bodies `todo!()`), and `tests/checks.rs`. The fixture is the client's offline proposal (`randprotocol-client`'s `tests_support::offline_proposal`, below), so `tests/checks.rs` reads JSON fixtures written by a client test, `crates/randprotocol-msig/tests/fixtures/{policy,proposal,proposal-throwaway-dummy,proposal-skim}.json`. A one-off client test regenerates them (`#[ignore]`, run: `cargo +1.98.1 test -p randprotocol-client --lib write_msig_fixtures -- --ignored`), and they are committed. The crate's own tests then need nothing but the files:
+
+```rust
+use randprotocol_msig::{check_proposal, sign, verify_share};
+const POLICY: &str = include_str!("fixtures/policy.json");          // 2 of 3, signer seeds [0x40;32], [0x41;32], [0x42;32]
+const PROPOSAL: &str = include_str!("fixtures/proposal.json");      // 10 RAND to a fresh address; change; two dummies under the account vk
+const THROWAWAY: &str = include_str!("fixtures/proposal-throwaway-dummy.json");   // slot 3 sealed under a throwaway sender
+const SKIM: &str = include_str!("fixtures/proposal-skim.json");     // witness input amount +1 over the outputs
+
+#[test]
+fn an_honest_proposal_checks_and_summarises() {
+    let s = check_proposal(PROPOSAL, POLICY).unwrap();
+    assert_eq!(s.outputs.len(), 4);
+    assert!(s.outputs.iter().any(|o| o.amount == 10 * 1_000_000_000 && o.asset == 0));
+    assert_eq!(s.fee, 1_000_000);
+    assert_eq!(&s.signing_message[..13], b"rand-msauth-1");
+}
+
+#[test]
+fn a_dummy_sealed_under_a_throwaway_key_is_refused() {
+    assert!(check_proposal(THROWAWAY, POLICY).unwrap_err().to_string().contains("does not open"));
+}
+
+#[test]
+fn a_value_mismatch_is_refused() {
+    assert!(check_proposal(SKIM, POLICY).unwrap_err().to_string().contains("value"));
+}
+
+#[test]
+fn a_member_signs_deterministically_and_a_non_member_seed_is_refused() {
+    let (i, sig) = sign(PROPOSAL, POLICY, &[0x42; 32]).unwrap();
+    assert_eq!((i, sig.len()), (2, 2420));
+    assert_eq!(sign(PROPOSAL, POLICY, &[0x42; 32]).unwrap().1, sig, "deterministic: no OS entropy");
+    assert!(sign(PROPOSAL, POLICY, &[0x99; 32]).unwrap_err().to_string().contains("not one of the policy's signers"));
+    verify_share(PROPOSAL, POLICY, &format!("{i}:{}", hex::encode(&sig))).unwrap();
+}
+
+#[test]
+fn verify_share_refuses_a_wrong_index_or_signature() {
+    let (_, sig) = sign(PROPOSAL, POLICY, &[0x42; 32]).unwrap();
+    assert!(verify_share(PROPOSAL, POLICY, &format!("1:{}", hex::encode(&sig))).is_err(), "signer 2's signature under index 1");
+    assert!(verify_share(PROPOSAL, POLICY, &format!("7:{}", hex::encode(&sig))).is_err(), "index outside the policy");
+    let mut bad = sig.clone();
+    bad[0] ^= 1;
+    assert!(verify_share(PROPOSAL, POLICY, &format!("2:{}", hex::encode(&bad))).is_err());
+    assert!(verify_share(PROPOSAL, POLICY, "2:zz").is_err());
+}
+```
+
+Run: `cargo +1.98.1 test -p randprotocol-msig` → FAIL (`todo!()`).
+
+- [ ] **Step 1: Write the client's failing tests.** Create `msig_private.rs` with only `#[cfg(test)] mod tests` first. (`wallet.rs`'s `mod tests` becomes `pub(crate) mod tests` so the support module can reach its helper.)
 
 ```rust
 #[cfg(test)]
@@ -1508,7 +1602,8 @@ Expected: compile errors (no `Policy`, `Proposal`, `sign`, `assemble_witness`, `
        - `Transaction::shielded(chain_id, prepared.bundle.clone(), Action::None)`, `binding = tx.binding(&scanned_binding_domain(…))`;
        - `expires_at = time + limits.proof_window_blocks.unwrap_or(256)`.
      - `prepare_sweep`: the same, with `amount = store.rand_balance() - fee`; refuse when the plan needs more than two RAND inputs, with "send to yourself first to merge". Doc and CLI help: "moves RAND only; token notes stay (send them with `--to … --asset`), and the old address remains spendable by the old policy for any payment that arrives later".
-     - `sign`, per spec §6.5:
+     - **`randprotocol-msig` first** (Step 1a's API): `check_proposal`, `sign` and `verify_share` implement exactly the checks listed below. The pure `Policy` and `Proposal` types live there, and the client re-exports them.
+     - The client's `sign` wraps `randprotocol_msig::sign(json(proposal), json(policy), key.seed())` and renders `check_proposal`'s summary as the lines below. The checks it runs, per spec §6.5, are:
        - decode `tx` (bincode hex); rebuild `BindingDomain::for_version(binding_domain, genesis)` (`ChainId` for version 0);
        - compare the recomputed binding with `binding` ("the transaction does not hash to the proposal's binding") and `signing_message`;
        - check `auth_commit == msauth::auth_commit(&policy.nk(), &salt)` ("the proposal's auth_commit is not this policy's account");
@@ -1529,9 +1624,14 @@ Expected: compile errors (no `Policy`, `Proposal`, `sign`, `assemble_witness`, `
        - set `bundle.proof` and `bundle.auth_proof` on the decoded `tx`; recompute `tx.binding(domain)` and require it unchanged; return `tx`.
   3. In `lib.rs`, add `pub mod msig_private;`.
 
+In `.github/workflows/ci.yml`, add a job step: `rustup +1.98.1 target add wasm32-unknown-unknown && RUSTFLAGS='--cfg getrandom_backend="wasm_js"' cargo +1.98.1 check -p randprotocol-msig --target wasm32-unknown-unknown`. The coordinator's `-p randprotocol-client --no-default-features --features multisig-private` form does not apply, because the checks are a crate, not a feature.
+
 - [ ] **Step 4: Run to see it pass.**
 
 ```bash
+cargo +1.98.1 test --release -p randprotocol-msig
+RUSTFLAGS='--cfg getrandom_backend="wasm_js"' cargo +1.98.1 check -p randprotocol-msig --target wasm32-unknown-unknown
+cargo +1.98.1 tree -p randprotocol-msig -e normal | grep -cE 'tokio|reqwest|rocksdb|randprotocol-prover'   # expect 0
 cargo +1.98.1 test --release -p randprotocol-client --lib
 cargo +1.98.1 test --release -p randprotocol-node --bin rand-node
 cargo +1.98.1 build --release -p randprotocol-client -p randprotocol-node
@@ -1542,8 +1642,8 @@ Expected: all pass, including every existing wallet test, which still uses `Wall
 - [ ] **Step 5: Commit.**
 
 ```bash
-git add crates/randprotocol-client crates/randprotocol-node/src/main.rs
-git commit -m "wallet: a spend-key-less Wallet (from_viewing_key), the multisig auth witness, and msig_private — Policy (0600, the guest's nk), Proposal, sign (recomputes the binding, opens every output as sender), assemble_witness (threshold, distinct indices, native verify, emulator run), prove (msauth local)"
+git add Cargo.toml Cargo.lock crates/randprotocol-msig crates/randprotocol-client crates/randprotocol-node/src/main.rs .github/workflows/ci.yml
+git commit -m "msig: the signer checks as a pure, wasm32-clean crate (check_proposal, sign from a seed, verify_share), re-exported as randprotocol_client::multisig_private; wallet: a spend-key-less Wallet (from_viewing_key), the multisig auth witness, and msig_private — Policy (0600, the guest's nk), Proposal, sign (recomputes the binding, opens every output as sender), assemble_witness (threshold, distinct indices, native verify, emulator run), prove (msauth local)"
 ```
 
 ---
@@ -1568,6 +1668,7 @@ git commit -m "wallet: a spend-key-less Wallet (from_viewing_key), the multisig 
                 #[arg(long)] sweep_to: Option<String>, #[arg(long, default_value = "")] memo: String, #[arg(long)] fee: Option<String>,
                 #[arg(long, default_value = "proposal.json")] out: PathBuf, #[arg(long)] store: Option<PathBuf> },
       Sign { #[arg(long)] proposal: PathBuf, #[arg(long)] policy: PathBuf, #[arg(long)] key: PathBuf },
+      Check { #[arg(long)] proposal: PathBuf, #[arg(long)] policy: PathBuf },   // multisig_private::check_proposal, prints the summary
       Prove { #[arg(long)] proposal: PathBuf, #[arg(long)] policy: PathBuf, #[arg(long = "signature", required = true, value_name = "INDEX:HEX")] signatures: Vec<String>,
               #[arg(long, default_value = "proposal.tx")] out: PathBuf, #[arg(long)] cuda: bool },
       Submit { #[arg(long)] tx: PathBuf, #[arg(long)] no_wait: bool },
@@ -1610,7 +1711,8 @@ Expected: compile error (no `MultisigPrivate`).
   - `address`: print `rand1…`, the fingerprint and `policy` hex.
   - `balance`: `scan` into the store (`--store`, default `<policy>.notes.json`) and print it.
   - `prepare`: `prepare` or `prepare_sweep`, `save_proposal` (0600), then print the summary and "gather ≥ T signatures and prove before height {expires_at}".
-  - `sign`: `load_authority_key`, then `sign`. Print the summary lines to stderr and `index:hex` to stdout. Warn on stderr ("this looks like a validator's consensus key; a multisig signer key should be its own") when the key's address is in `rand_getValidators`, checked when a node answers at `--rpc`, or when the file's path is a `rand-node` datadir key (`*/node.key.json`).
+  - `check`: read both files (mode checks as for `sign`), print `multisig_private::check_proposal`'s `ProposalSummary`, and compare `expires_at` with the head when a node answers.
+  - `sign`: `load_authority_key`, then `sign` (which wraps `multisig_private::sign` with the key's seed). Print the summary lines to stderr and `index:hex` to stdout. Warn on stderr ("this looks like a validator's consensus key; a multisig signer key should be its own") when the key's address is in `rand_getValidators`, checked when a node answers at `--rpc`, or when the file's path is a `rand-node` datadir key (`*/node.key.json`).
   - `prove`:
     - read `rand_status.height` and refuse at or past `expires_at - 16` ("prepare again");
     - use `proving_for(cli.prover, cuda, cli.cpu, …)` for the bundle;
@@ -1629,7 +1731,7 @@ cargo +1.98.1 run --release -p randprotocol-client --bin rand -- multisig-privat
 
 ```bash
 git add crates/randprotocol-client/src/main.rs docs/cli.md
-git commit -m "cli: rand multisig-private new-policy|address|balance|prepare|sign|prove|submit"
+git commit -m "cli: rand multisig-private new-policy|address|balance|prepare|check|sign|prove|submit"
 ```
 
 ---

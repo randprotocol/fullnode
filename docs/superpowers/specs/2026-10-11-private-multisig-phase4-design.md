@@ -525,6 +525,25 @@ binding.
 
 ### 6.5 What `sign` and `prove` check
 
+**Where the checks live (user decision).** Every wallet app runs these checks through the clients
+wasm/native core. So they form a pure crate, `randprotocol-msig`, re-exported as
+`randprotocol_client::multisig_private`. It has no RPC, no filesystem, no OS entropy and no
+prover/rocksdb/tokio, and it compiles for `wasm32-unknown-unknown`. Its API:
+
+- `check_proposal(proposal_json, policy_json) -> ProposalSummary` runs every check below. The
+  summary carries the outputs (recipient, amount, asset, memo), the fee, the burns, `expires_at`,
+  the 45-byte signing message and the policy fingerprint.
+- `sign(proposal_json, policy_json, signer_seed: &[u8; 32]) -> (index, 2420-byte sig)` re-runs
+  `check_proposal` and derives the Dilithium2 key deterministically from the seed.
+- `verify_share(proposal_json, policy_json, "i:hex")`.
+
+A new crate rather than a feature, because `randprotocol-client` depends unconditionally on
+reqwest, tokio, clap, image and the prover wire. The CLI's `multisig-private check` and `sign` wrap
+the crate. The CLI keeps the file-mode checks and the validator-key warning. `policy_json` carries
+the secret `msk`; `proposal_json` carries the witness words. Both are secrets. Against the chain
+head, expiry is the caller's check; the crate checks only
+`bundle.time < expires_at ≤ bundle.time + MAX_PROOF_WINDOW_BLOCKS`.
+
 `sign` never signs an opaque hash. It decodes `tx` and checks:
 
 - `tx.chain_id` and the proposal's `binding_domain` match;
@@ -685,3 +704,4 @@ startup-checkpoint and verify-cache bullets) verbatim, and makes three changes:
 | 19 | stale parent-spec copy | replaced with circuits' |
 | 20 | prover fleet and `clients/core` at the cut | §7 |
 | 21 | `sign` warns on a validator key | §6.3 |
+| — | (user decision) signer checks as the pure, wasm32-clean crate `randprotocol-msig` | §6.5, plan Task 6 |
