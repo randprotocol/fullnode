@@ -3616,3 +3616,386 @@ fn a_certificate_is_verified_once_and_the_key_covers_the_set() {
     assert!(!cache.check(n.domain(), &qc, &other), "voters outside the set: not a quorum, not cached");
     assert_eq!(cache.len(), 1);
 }
+
+// ---- the pre-applied entry point (spec 2026-10-11 off-loop apply, §3 and §5 tests 1–4) ----
+
+/// `StubExecutor`, counting every call, so a test sees whether a replica applied a block itself
+/// or took a result computed elsewhere. Every method the stub overrides is delegated, so the
+/// counted replica behaves exactly like a `StubExecutor` one.
+#[derive(Default)]
+struct Counted(std::sync::atomic::AtomicUsize);
+
+impl Counted {
+    fn calls(&self) -> usize {
+        self.0.load(std::sync::atomic::Ordering::SeqCst)
+    }
+    fn tick(&self) -> StubExecutor {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        StubExecutor
+    }
+}
+
+impl ConfidentialExecutor for Counted {
+    fn check_program(&self, base_pc: u32, words: &[u32]) -> Result<Vec<u8>, crate::confidential::ConfidentialError> {
+        self.tick().check_program(base_pc, words)
+    }
+    fn max_callable_program_words(&self, public_segment_words: usize) -> Option<usize> {
+        self.tick().max_callable_program_words(public_segment_words)
+    }
+    fn verify_call(&self, program: &crate::program::ProgramRecord, proof: &[u8]) -> Result<crate::program::CallOutcome, crate::confidential::ConfidentialError> {
+        self.tick().verify_call(program, proof)
+    }
+    fn verify_call_hardened(&self, program: &crate::program::ProgramRecord, proof: &[u8], segment: &[u32]) -> Result<crate::program::CallOutcome, crate::confidential::ConfidentialError> {
+        self.tick().verify_call_hardened(program, proof, segment)
+    }
+    fn verify_invoke(&self, program: &crate::program::ProgramRecord, proof: &[u8], segment: &[u32]) -> Result<crate::program::CallOutcome, crate::confidential::ConfidentialError> {
+        self.tick().verify_invoke(program, proof, segment)
+    }
+    fn verify_perp(&self, engine_hc: &crate::notes::Word8, max_tier: u8, segment: &[u32], proof: &[u8]) -> Result<crate::program::CallOutcome, crate::confidential::ConfidentialError> {
+        self.tick().verify_perp(engine_hc, max_tier, segment, proof)
+    }
+    fn public_digest(&self, words: &[u32]) -> crate::notes::Word8 {
+        self.tick().public_digest(words)
+    }
+    fn node_hash(&self, left: &crate::notes::Word8, right: &crate::notes::Word8) -> crate::notes::Word8 {
+        self.tick().node_hash(left, right)
+    }
+    fn hash_domain(&self, domain: u32, msg: &[u32]) -> crate::notes::Word8 {
+        self.tick().hash_domain(domain, msg)
+    }
+    fn note_commitment(&self, pk: &crate::notes::Word8, from: &crate::notes::Word8, amount: u64, asset: u32, time: u32, r: &crate::notes::Word8) -> crate::notes::Word8 {
+        self.tick().note_commitment(pk, from, amount, asset, time, r)
+    }
+    fn bundle_digest(&self, input: &crate::notes::BundleDigestInput) -> crate::notes::Word8 {
+        self.tick().bundle_digest(input)
+    }
+    fn bundle_digest_v3(&self, input: &crate::notes::BundleDigestInput) -> crate::notes::Word8 {
+        self.tick().bundle_digest_v3(input)
+    }
+    fn bundle_proof_digest(&self, hc_bundle: &crate::notes::Word8, proof: &[u8]) -> Result<crate::notes::Word8, crate::confidential::ConfidentialError> {
+        self.tick().bundle_proof_digest(hc_bundle, proof)
+    }
+    fn auth_proof_digest(&self, proof: &[u8]) -> Result<crate::notes::Word8, crate::confidential::ConfidentialError> {
+        self.tick().auth_proof_digest(proof)
+    }
+    fn verify_auth(&self, hc_auth: &crate::notes::Word8, proof: &[u8], binding: &[u32; crate::types::TX_BINDING_WORDS]) -> Result<crate::notes::Word8, crate::confidential::ConfidentialError> {
+        self.tick().verify_auth(hc_auth, proof, binding)
+    }
+    fn bundle_gas_limit(&self, proof: &[u8]) -> Result<Option<u64>, crate::confidential::ConfidentialError> {
+        self.tick().bundle_gas_limit(proof)
+    }
+    fn auth_gas_limit(&self, proof: &[u8]) -> Result<Option<u64>, crate::confidential::ConfidentialError> {
+        self.tick().auth_gas_limit(proof)
+    }
+    fn verify_bundle(&self, hc_bundle: &crate::notes::Word8, proof: &[u8], binding: &[u32; crate::types::TX_BINDING_WORDS]) -> Result<(), crate::confidential::ConfidentialError> {
+        self.tick().verify_bundle(hc_bundle, proof, binding)
+    }
+    fn aggregate_program_digest(&self, shape: &crate::types::DeclaredShape) -> Result<[u64; 4], crate::confidential::ConfidentialError> {
+        self.tick().aggregate_program_digest(shape)
+    }
+    fn verify_aggregate(&self, shape: &crate::types::DeclaredShape, covered: &[crate::types::CoveredBundle], proof: &[u8], binding: &[u32; 8]) -> Result<Vec<[u32; 8]>, crate::confidential::ConfidentialError> {
+        self.tick().verify_aggregate(shape, covered, proof, binding)
+    }
+    fn aggregate_proof_tier(&self, proof: &[u8]) -> Result<u8, crate::confidential::ConfidentialError> {
+        self.tick().aggregate_proof_tier(proof)
+    }
+    fn tree_digests(&self, tree: &crate::ledger::aggregation::TreeConfig) -> Result<crate::ledger::aggregation::TreeDigests, crate::confidential::ConfidentialError> {
+        self.tick().tree_digests(tree)
+    }
+    fn verify_tree(&self, tree: &crate::ledger::aggregation::TreeConfig, covered: &[crate::types::CoveredBundle], proof: &[u8], binding: &[u32; 8], depth: u32) -> Result<Vec<[u32; 8]>, crate::confidential::ConfidentialError> {
+        self.tick().verify_tree(tree, covered, proof, binding, depth)
+    }
+}
+
+/// Two fresh replicas identical to `sim`'s node `i` but for a counted executor each: one takes
+/// the plain path, the other the pre-applied one.
+fn counted_twins(sim: &Sim, i: usize) -> [(HotStuff, std::sync::Arc<Counted>); 2] {
+    let one = || {
+        let exec = std::sync::Arc::new(Counted::default());
+        let signer = Keypair::from_seed(*sim.keys[i].seed()).unwrap();
+        let mut hs = HotStuff::new(config_of(sim), Some(signer), sim.gs.block.clone(), sim.gs.ledger.clone(), exec.clone());
+        hs.start();
+        (hs, exec)
+    };
+    [one(), one()]
+}
+
+/// What the node's off-loop apply computes (spec §4): `apply_block_for_sync` on a clone of the
+/// parent's post-state with the replica's own sidecar — here on a separate, uncounted executor.
+fn pre_apply(hs: &HotStuff, block: &Block) -> PreApplied {
+    let parent = block.parent();
+    let mut ledger = hs.ledger_after(&parent).expect("the parent is held").clone();
+    let sidecar = hs.covered_sidecar(block).expect("no aggregate");
+    let result = ledger.apply_block_for_sync(block, &sidecar, &[], &StubExecutor, &crate::ledger::NoVerified).map(|r| (ledger, r));
+    PreApplied { parent, result }
+}
+
+/// The leader's proposal for the first view, carrying one faucet mint (so the apply calls the
+/// executor), and a follower index to receive it.
+fn mint_proposal(sim: &mut Sim) -> (Block, usize, usize) {
+    let (leader, view) = pending_leader(sim);
+    let alice = Keypair::from_seed(*sim.keys[0].seed()).unwrap();
+    sim.now += 1;
+    let block = proposal_of(&sim.nodes[leader].propose(view, vec![mint(&alice, 5)], sim.now).unwrap());
+    assert_eq!(block.transactions.len(), 1, "the mint is in the block");
+    (block, leader, (leader + 1) % sim.nodes.len())
+}
+
+/// Spec §5 test 1: a pre-applied `Ok` inserts exactly what the plain path inserts — the same
+/// actions, the same post-state and receipts — and the replica's executor is never called.
+#[test]
+fn a_pre_applied_proposal_inserts_what_the_plain_path_inserts() {
+    let mut sim = setup(4, 4);
+    let (block, _, follower) = mint_proposal(&mut sim);
+    let [(mut plain, plain_exec), (mut pre, pre_exec)] = counted_twins(&sim, follower);
+    let hash = block.hash();
+
+    let plain_acts = plain.on_proposal(block.clone(), sim.now).expect("a valid proposal");
+    assert!(plain_exec.calls() > 0, "the plain apply calls the executor");
+    assert!(votes(&plain_acts));
+
+    let applied = pre_apply(&pre, &block);
+    assert!(applied.result.is_ok());
+    let before = pre_exec.calls();
+    let pre_acts = pre.on_proposal_with(block.clone(), sim.now, Some(applied)).expect("a valid proposal");
+    assert_eq!(pre_exec.calls(), before, "the pre-applied path does not apply again");
+
+    assert_eq!(pre_acts, plain_acts);
+    assert!(pre.has_block(&hash));
+    assert!(pre.ledger_after(&hash).unwrap() == plain.ledger_after(&hash).unwrap(), "the same entry ledger");
+    assert_eq!(pre.ledger_after(&hash).unwrap().state_root(), block.header.state_root);
+    assert_eq!(pre.tip_ledger().state_root(), plain.tip_ledger().state_root());
+    assert_eq!(pre.receipts(&hash), plain.receipts(&hash));
+    assert_eq!(pre.safety_state(), plain.safety_state());
+}
+
+/// Spec §5 test 2: a result for another parent is ignored — the replica applies on its own, and
+/// a result that would be wrong for this block never reaches the tree. A result whose parent
+/// is not held (an orphan) is dropped too: the orphan re-runs on the plain path.
+#[test]
+fn a_pre_applied_result_for_another_parent_is_ignored() {
+    let mut sim = setup(4, 4);
+    let (block, _, follower) = mint_proposal(&mut sim);
+    let [(mut plain, _), (mut pre, pre_exec)] = counted_twins(&sim, follower);
+    let hash = block.hash();
+    let plain_acts = plain.on_proposal(block.clone(), sim.now).unwrap();
+
+    // The parent's own post-state, unapplied: a blind insert would hold the wrong ledger.
+    let wrong = PreApplied { parent: Hash::digest(b"some other parent"), result: Ok((sim.gs.ledger.clone(), Vec::new())) };
+    let before = pre_exec.calls();
+    let pre_acts = pre.on_proposal_with(block.clone(), sim.now, Some(wrong)).unwrap();
+    assert!(pre_exec.calls() > before, "the plain apply ran");
+    assert_eq!(pre_acts, plain_acts);
+    assert!(pre.ledger_after(&hash).unwrap() == plain.ledger_after(&hash).unwrap());
+    assert_eq!(pre.ledger_after(&hash).unwrap().state_root(), block.header.state_root);
+
+    // An orphan: the right parent's hash, but this replica does not hold it yet.
+    let mut sim = setup(4, 4);
+    let (leader, view) = pending_leader(&sim);
+    sim.pending_propose[leader] = None;
+    sim.now += 1;
+    let acts = sim.nodes[leader].propose(view, vec![], sim.now).unwrap();
+    let first = proposal_of(&acts);
+    let follower = (leader + 1) % 4;
+    let [(mut ahead, _), (mut behind, behind_exec)] = counted_twins(&sim, follower);
+    ahead.on_proposal(first.clone(), sim.now).unwrap();
+    // The simulation runs on to the next leader's proposal, on top of `first`.
+    sim.handle(leader, acts);
+    sim.deliver_all();
+    let (leader, view) = pending_leader(&sim);
+    sim.now += 1;
+    // `first` is empty and applies without the executor; `second`'s mint is what calls it.
+    let alice = Keypair::from_seed(*sim.keys[0].seed()).unwrap();
+    let second = proposal_of(&sim.nodes[leader].propose(view, vec![mint(&alice, 6)], sim.now).unwrap());
+    assert_eq!(second.parent(), first.hash());
+    assert_eq!(second.transactions.len(), 1);
+    let applied = pre_apply(&ahead, &second);
+    assert!(applied.result.is_ok());
+    assert_eq!(
+        behind.on_proposal_with(second.clone(), sim.now, Some(applied)),
+        Err(ConsensusError::UnknownParent(first.hash())),
+        "an orphan is held, its result dropped"
+    );
+    assert!(!behind.has_block(&second.hash()));
+    let before = behind_exec.calls();
+    behind.on_proposal(first.clone(), sim.now).unwrap();
+    assert!(behind.has_block(&second.hash()), "the orphan re-ran when its parent arrived");
+    assert!(behind_exec.calls() > before, "applied on the plain path");
+    ahead.on_proposal(second.clone(), sim.now).unwrap();
+    assert!(behind.ledger_after(&second.hash()).unwrap() == ahead.ledger_after(&second.hash()).unwrap());
+}
+
+/// Spec §5 test 3: a pre-applied `Err` — `apply_block_for_sync`'s own refusal on the clone — is
+/// returned exactly as the plain path returns that block's apply error, and nothing is applied
+/// or inserted on the replica.
+#[test]
+fn a_pre_applied_error_is_the_plain_error() {
+    let mut sim = setup(4, 4);
+    let (block, leader, follower) = mint_proposal(&mut sim);
+    // The leader's own block with a state root the transactions do not produce, re-signed: every
+    // pre-execute check passes, the apply refuses.
+    let mut header = block.header.clone();
+    header.state_root = Hash::digest(b"not the post-state");
+    let bad = Block::sign(&sim.domain(), header, block.transactions.clone(), &sim.keys[leader]);
+    let [(mut plain, plain_exec), (mut pre, pre_exec)] = counted_twins(&sim, follower);
+
+    let plain_err = plain.on_proposal(bad.clone(), sim.now).unwrap_err();
+    assert!(matches!(plain_err, ConsensusError::Execution(_)), "{plain_err:?}");
+    assert!(plain_exec.calls() > 0, "the plain path applied before refusing");
+
+    let applied = pre_apply(&pre, &bad);
+    assert!(applied.result.is_err());
+    let before = pre_exec.calls();
+    let pre_err = pre.on_proposal_with(bad.clone(), sim.now, Some(applied)).unwrap_err();
+    assert_eq!(pre_exec.calls(), before, "the pre-applied path does not apply");
+    assert_eq!(pre_err, plain_err);
+    assert!(!pre.has_block(&bad.hash()) && !plain.has_block(&bad.hash()));
+
+    // Neither recorded the refused block as the leader's: the valid one is still accepted.
+    let plain_acts = plain.on_proposal(block.clone(), sim.now).unwrap();
+    let applied = pre_apply(&pre, &block);
+    assert_eq!(pre.on_proposal_with(block.clone(), sim.now, Some(applied)).unwrap(), plain_acts);
+}
+
+/// Spec §5 test 4: every pre-execute refusal fires with a usable pre-applied result present —
+/// a bad signature, the wrong leader, an equivocation — with the plain path's error.
+#[test]
+fn pre_execute_refusals_still_fire_with_a_pre_applied_result() {
+    let mut sim = setup(4, 4);
+    let (block, leader, follower) = mint_proposal(&mut sim);
+    let [(mut plain, _), (mut pre, pre_exec)] = counted_twins(&sim, follower);
+
+    // The wrong leader: a well-formed block signed by a validator whose view this is not.
+    let view = block.view();
+    let wrong = (0..4).find(|&i| i != leader).unwrap();
+    let mut header = block.header.clone();
+    header.proposer = sim.keys[wrong].public_key().clone();
+    let by_wrong = Block::sign(&sim.domain(), header, block.transactions.clone(), &sim.keys[wrong]);
+    // A bad signature: the leader named, the wrong key signing.
+    let mut forged = by_wrong.clone();
+    forged.header.proposer = sim.keys[leader].public_key().clone();
+    // An equivocation: a second, different block for the same view, signed by the leader.
+    let mut header = block.header.clone();
+    header.timestamp_ms += 1;
+    let second = Block::sign(&sim.domain(), header, block.transactions.clone(), &sim.keys[leader]);
+    assert_ne!(second.hash(), block.hash());
+
+    for (bad, want) in [(by_wrong, ConsensusError::WrongLeader(view)), (forged, ConsensusError::BadSignature)] {
+        // A usable result — this parent's, `Ok` — so only the pre-execute check can refuse.
+        // (The bad block's own apply would refuse too: the proposer is in its state root.)
+        let applied = pre_apply(&pre, &block);
+        assert!(applied.result.is_ok() && applied.parent == bad.parent());
+        assert_eq!(plain.on_proposal(bad.clone(), sim.now).unwrap_err(), want);
+        let before = pre_exec.calls();
+        assert_eq!(pre.on_proposal_with(bad.clone(), sim.now, Some(applied)).unwrap_err(), want);
+        assert_eq!(pre_exec.calls(), before, "refused before the apply step: the executor is not called");
+        assert!(!pre.has_block(&bad.hash()));
+    }
+
+    plain.on_proposal(block.clone(), sim.now).unwrap();
+    let applied = pre_apply(&pre, &block);
+    pre.on_proposal_with(block.clone(), sim.now, Some(applied)).unwrap();
+    let applied = pre_apply(&pre, &second);
+    assert!(applied.result.is_ok());
+    let want = ConsensusError::Equivocation { view, first: block.hash(), second: second.hash() };
+    assert_eq!(plain.on_proposal(second.clone(), sim.now).unwrap_err(), want);
+    let before = pre_exec.calls();
+    assert_eq!(pre.on_proposal_with(second.clone(), sim.now, Some(applied)).unwrap_err(), want);
+    assert_eq!(pre_exec.calls(), before);
+    assert!(!pre.has_block(&second.hash()));
+}
+
+/// Off-loop apply fix round 1 (I1): `precheck_proposal` — the node's screen before an off-loop
+/// apply — refuses each pre-execute case with the error `on_proposal` refuses it with, and
+/// executes nothing. Two cases differ by design: an unheld parent is `UnknownParent` without
+/// being orphaned, and GOSSIP-2's repeated tail is refused on its list (the orphan pool's own
+/// refusal) where `on_proposal`, holding the parent, refuses it in the apply.
+#[test]
+fn precheck_proposal_refuses_what_on_proposal_refuses_before_the_apply() {
+    let mut sim = setup(4, 4);
+    let (leader, view) = pending_leader(&sim);
+    let alice = Keypair::from_seed(*sim.keys[0].seed()).unwrap();
+    sim.now += 1;
+    let mints = vec![mint(&alice, 5), mint(&alice, 6), mint(&alice, 7)];
+    let block = proposal_of(&sim.nodes[leader].propose(view, mints, sim.now).unwrap());
+    assert_eq!(block.transactions.len(), 3, "an odd list, for the repeated tail");
+    let follower = (leader + 1) % 4;
+    let wrong = (0..4).find(|&i| i != leader).unwrap();
+    let domain = sim.domain();
+    let signed = |header: crate::types::BlockHeader, k: usize| Block::sign(&domain, header, block.transactions.clone(), &sim.keys[k]);
+    let with = |f: &dyn Fn(&mut crate::types::BlockHeader)| {
+        let mut h = block.header.clone();
+        f(&mut h);
+        h
+    };
+
+    let [(fresh, exec), _] = counted_twins(&sim, follower);
+    assert_eq!(fresh.precheck_proposal(&block), Ok(()));
+    assert_eq!(exec.calls(), 0, "the precheck executes nothing");
+
+    let current = fresh.view();
+    let cases: Vec<(&str, Block)> = vec![
+        ("view out of range", signed(with(&|h| h.view = current + 1_000_001), leader)),
+        ("view too far ahead", signed(with(&|h| h.view = current + PROPOSAL_VIEW_WINDOW + 1), leader)),
+        ("stale", signed(with(&|h| h.height = 0), leader)),
+        ("bad signature", {
+            let mut b = block.clone();
+            b.signature = signed(block.header.clone(), wrong).signature;
+            b
+        }),
+        ("bad height", signed(with(&|h| h.height += 1), leader)),
+        ("wrong leader", signed(with(&|h| h.proposer = sim.keys[wrong].public_key().clone()), wrong)),
+        ("justify names another block", signed(with(&|h| h.justify.block_hash = Hash::digest(b"not the parent")), leader)),
+    ];
+    for (case, bad) in cases {
+        let [(mut hs, exec), _] = counted_twins(&sim, follower);
+        let pre = hs.precheck_proposal(&bad);
+        assert!(pre.is_err(), "{case}: passed the precheck");
+        let plain = hs.on_proposal(bad.clone(), sim.now);
+        assert_eq!(pre, plain.map(|_| ()), "{case}");
+        assert_eq!(exec.calls(), 0, "{case}: refused before any apply");
+    }
+
+    // An equivocation: the leader's second block for the view, after the first is held.
+    let [(mut hs, exec), _] = counted_twins(&sim, follower);
+    hs.on_proposal(block.clone(), sim.now).unwrap();
+    let second = signed(with(&|h| h.timestamp_ms += 1), leader);
+    let calls = exec.calls();
+    let pre = hs.precheck_proposal(&second);
+    assert!(matches!(pre, Err(ConsensusError::Equivocation { .. })), "{pre:?}");
+    assert_eq!(pre, hs.on_proposal(second, sim.now).map(|_| ()));
+    assert_eq!(exec.calls(), calls);
+
+    // An unheld parent: `UnknownParent`, and nothing orphaned by the precheck.
+    let [(mut hs, _), _] = counted_twins(&sim, follower);
+    let orphan = signed(with(&|h| {
+        h.parent = Hash::digest(b"unheld");
+        h.justify.block_hash = h.parent;
+    }), leader);
+    assert_eq!(hs.precheck_proposal(&orphan), Err(ConsensusError::UnknownParent(orphan.parent())));
+    assert!(!hs.holds_orphan(&orphan.hash()), "the precheck keeps nothing");
+
+    // Final review I1: an unheld parent under a proposer that leads no view is refused by the
+    // orphan checks, as `on_proposal` refuses it — not `UnknownParent`, which the node would
+    // queue behind an in-flight parent.
+    let rogue = signed(with(&|h| {
+        h.parent = Hash::digest(b"unheld");
+        h.justify.block_hash = h.parent;
+        h.proposer = sim.keys[wrong].public_key().clone();
+    }), wrong);
+    let pre = hs.precheck_proposal(&rogue);
+    assert_eq!(pre, Err(ConsensusError::WrongLeader(rogue.view())));
+    assert!(!hs.holds_orphan(&rogue.hash()), "the precheck keeps nothing");
+    assert_eq!(pre, hs.on_proposal(rogue.clone(), sim.now).map(|_| ()));
+    assert!(!hs.holds_orphan(&rogue.hash()), "nor does on_proposal");
+
+    // GOSSIP-2's repeated tail: the honest hash, refused on its list here; refused by the apply
+    // in `on_proposal`, and never inserted.
+    let mut repeated = block.clone();
+    repeated.transactions.push(block.transactions[2].clone());
+    assert_eq!(repeated.hash(), block.hash());
+    assert_eq!(hs.precheck_proposal(&repeated), Err(ConsensusError::Execution(crate::ledger::BlockError::RepeatedTransaction)));
+    assert!(matches!(hs.on_proposal(repeated, sim.now), Err(ConsensusError::Execution(_))));
+    assert!(!hs.has_block(&block.hash()));
+    assert_eq!(hs.precheck_proposal(&block), Ok(()), "the honest block still passes");
+}

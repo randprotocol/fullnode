@@ -162,7 +162,7 @@ becomes `O(block)`, and committing is applying a chain of deltas. No consensus c
 
 ### 3.3 Verification off the loop, cached by digest
 
-**Shipped**: the worker count (`rand-node run --verify-workers`, default the cores minus two, at least four, with the queue and in-flight limits sized from it), and the digest-keyed cache (`verify_cache::CachingExecutor`, every STARK verifier, keyed by a digest of all its inputs, 16 384 entries). Still open: moving an uncached apply-time verify off the consensus loop.
+**Shipped**: the worker count (`rand-node run --verify-workers`, default the cores minus two, at least four, with the queue and in-flight limits sized from it), and the digest-keyed cache (`verify_cache::CachingExecutor`, every STARK verifier, keyed by a digest of all its inputs, 16 384 entries). **Also shipped**: an incoming proposal's apply (`apply_block_for_sync` on a clone of the parent's ledger) runs on a blocking thread, so an uncached verify at apply time no longer blocks the consensus loop (spec 2026-10-11 off-loop apply). Still on the loop: `precheck_proposal` (view, stale, signature, parent, leader, equivocation, justify, transaction list), all of `on_proposal`'s checks including the QC check, and the insert. Still applied on the loop: sync batches, the leader's own block, orphan re-runs, `offer_pending` and `restore_pending`. `--apply-proposals-inline` restores the old path.
 
 The admission workers already verify proofs on `spawn_blocking` threads and the proposal path
 re-checks against a verified set. Generalise it: every proof the node will ever verify — bundle,
