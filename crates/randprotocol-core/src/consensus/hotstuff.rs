@@ -66,6 +66,20 @@ struct Entry {
     qc: Option<QuorumCertificate>,
 }
 
+/// A proposal's apply, computed off the consensus loop (spec 2026-10-11 off-loop apply, §3):
+/// `apply_block_for_sync`'s outcome on a clone of [`HotStuff::ledger_after`] the block's parent,
+/// with [`HotStuff::covered_sidecar`]'s records and the replica's own executor and verified set.
+/// [`HotStuff::on_proposal_with`] takes it in place of applying on the loop, and only when
+/// `parent` is the block's parent and that parent is still in the tree; otherwise it is dropped
+/// and the block is applied as [`HotStuff::on_proposal`] applies it. Apply is deterministic and a
+/// tree entry's post-state never changes while it is held, so the two are the same result.
+pub struct PreApplied {
+    /// The hash of the block whose `ledger_after` was cloned.
+    pub parent: Hash,
+    /// The apply's post-state and receipts, or its refusal.
+    pub result: Result<(Ledger, Vec<crate::program::CallReceipt>), BlockError>,
+}
+
 /// Chained HotStuff replica. Validators hold a `signer`; observing full nodes do not.
 /// What the covered-carrying apply path asks of the node (block aggregation, spec §3.2): the
 /// covered bundles' records for an aggregate's cover set, or `None` when any of them is
@@ -411,7 +425,7 @@ impl HotStuff {
                 tracing::info!("pending block {hash:?} (height {}) does not extend a block this replica holds; dropped", block.height());
                 continue;
             }
-            match self.execute_and_insert(&block) {
+            match self.execute_and_insert(&block, None) {
                 Ok(()) => restored += 1,
                 Err(e) => tracing::warn!("pending block {hash:?} (height {}) did not re-execute: {e}; dropped", block.height()),
             }
@@ -508,8 +522,9 @@ impl HotStuff {
     /// The covered-bundle records a block's `Aggregate` transactions need, keyed by their
     /// index in it — empty for a block that carries none, so a chain that never aggregates
     /// never consults the source. An aggregate the source cannot cover is the covered-carrying
-    /// admission's refusal, at its index.
-    fn covered_sidecar(&self, block: &Block) -> Result<BTreeMap<usize, Vec<CoveredBundle>>, ConsensusError> {
+    /// admission's refusal, at its index. Public for the node's off-loop apply ([`PreApplied`]),
+    /// which must hand `apply_block_for_sync` exactly the sidecar the on-loop apply would.
+    pub fn covered_sidecar(&self, block: &Block) -> Result<BTreeMap<usize, Vec<CoveredBundle>>, ConsensusError> {
         let mut sidecar = BTreeMap::new();
         for (index, tx) in block.transactions.iter().enumerate() {
             if let crate::types::Action::Aggregate { covers, .. } = &tx.action {
@@ -696,6 +711,17 @@ impl HotStuff {
     }
     pub fn block(&self, hash: &Hash) -> Option<&Block> {
         self.tree.get(hash).map(|e| &e.block)
+    }
+    /// The post-state of a block in the tree: what a child's off-loop apply ([`PreApplied`])
+    /// clones. `None` when the block is not held — an orphan's parent, or one pruned — and the
+    /// child is then delivered plainly.
+    pub fn ledger_after(&self, hash: &Hash) -> Option<&Ledger> {
+        self.tree.get(hash).map(|e| &e.ledger_after)
+    }
+    /// The receipts a block in the tree was applied with.
+    #[cfg(test)]
+    pub(crate) fn receipts(&self, hash: &Hash) -> Option<&[crate::program::CallReceipt]> {
+        self.tree.get(hash).map(|e| e.receipts.as_slice())
     }
     /// Ledger state on top of the block the next proposal would extend.
     pub fn tip_ledger(&self) -> &Ledger {
@@ -937,6 +963,15 @@ impl HotStuff {
     }
 
     pub fn on_proposal(&mut self, block: Block, now_ms: u64) -> Result<Vec<Action>, ConsensusError> {
+        self.on_proposal_with(block, now_ms, None)
+    }
+
+    /// [`Self::on_proposal`], with the apply step possibly done already, off the loop
+    /// ([`PreApplied`]). Every check before the apply runs here, unchanged and in the same order,
+    /// and everything after it too: only the clone, sidecar and apply of the parent's post-state
+    /// are replaced, and only when `pre` was computed on this block's parent and that parent is
+    /// still in the tree. A `pre` that is not used is dropped; the block is applied as always.
+    pub fn on_proposal_with(&mut self, block: Block, now_ms: u64, pre: Option<PreApplied>) -> Result<Vec<Action>, ConsensusError> {
         let mut out = Vec::new();
         let hash = block.hash();
         if self.tree.contains_key(&hash) {
@@ -1047,7 +1082,7 @@ impl HotStuff {
             return Err(ConsensusError::TreeFull);
         }
         // `evict_for_room` never removes the certified chain, so the parent is still there.
-        self.execute_and_insert(&block)?;
+        self.execute_and_insert(&block, pre)?;
         self.refresh_current_set();
 
         // A valid proposal for view v moves us into view v.
@@ -1096,15 +1131,27 @@ impl HotStuff {
 
     /// Execute `block` on its parent's state and put it in the tree: the one insertion path,
     /// shared by `on_proposal` and the locked block's restore. The parent must be in the tree.
-    fn execute_and_insert(&mut self, block: &Block) -> Result<(), ConsensusError> {
+    /// A `pre` computed on that same parent ([`PreApplied`]) stands in for the clone, sidecar and
+    /// apply; any other `pre` is dropped and the block is applied here.
+    fn execute_and_insert(&mut self, block: &Block, pre: Option<PreApplied>) -> Result<(), ConsensusError> {
         let hash = block.hash();
         let parent_hash = block.parent();
         let parent = self.tree.get(&parent_hash).ok_or(ConsensusError::UnknownParent(parent_hash))?;
-        let mut ledger = parent.ledger_after.clone();
-        let sidecar = self.covered_sidecar(block)?;
-        // B5: the admission cache comes along — a transaction this node verified at the pool is
-        // decoded here, not re-verified. Everything stateful is re-checked either way.
-        let receipts = ledger.apply_block_for_sync(block, &sidecar, &[], self.executor.as_ref(), self.verified.as_ref())?;
+        // `parent` was found just above, so a `pre` on the same hash is a result on this very
+        // post-state; any other is dropped.
+        let applied = match pre {
+            Some(pre) if pre.parent == parent_hash => pre.result,
+            _ => {
+                let mut ledger = parent.ledger_after.clone();
+                let sidecar = self.covered_sidecar(block)?;
+                // B5: the admission cache comes along — a transaction this node verified at the
+                // pool is decoded here, not re-verified. Everything stateful is re-checked either way.
+                ledger
+                    .apply_block_for_sync(block, &sidecar, &[], self.executor.as_ref(), self.verified.as_ref())
+                    .map(|receipts| (ledger, receipts))
+            }
+        };
+        let (ledger, receipts) = applied.map_err(Self::apply_error)?;
         self.tree.insert(hash, Entry { block: block.clone(), ledger_after: ledger, receipts, qc: None });
         self.proposed.insert((block.view(), block.proposer()), hash);
         while self.proposed.len() > MAX_PROPOSED_KEYS {
@@ -1116,6 +1163,12 @@ impl HotStuff {
         self.not_held.remove(&hash);
         self.unobtainable.remove(&hash);
         Ok(())
+    }
+
+    /// How an apply's refusal reaches `on_proposal`'s caller — the one mapping, whether the
+    /// apply ran here or off the loop ([`PreApplied`]).
+    fn apply_error(e: BlockError) -> ConsensusError {
+        ConsensusError::Execution(e)
     }
 
     pub fn on_vote(&mut self, vote: Vote) -> Result<Vec<Action>, ConsensusError> {
