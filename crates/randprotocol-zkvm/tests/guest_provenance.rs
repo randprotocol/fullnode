@@ -372,9 +372,8 @@ fn the_multisig_auth_guest_is_pinned() {
 /// `target/msauth-vk-production.bin` (where `rand-node keygen-msauth-vk --profile production`
 /// writes it for the release step).
 ///
-/// TASK-2B-RESYNC: this FAILS until the circuits re-sync brings the key export API and the
-/// keygen has run: the pins are `PIN_PENDING`, and the failure prints the digest computed from
-/// the file, which is the value to write into `executor::msauth_vk`.
+/// Until the keygen has run the pins are `PIN_PENDING`, and the failure prints the digest
+/// computed from the file, which is the value to write into `executor::msauth_vk`.
 #[test]
 fn the_msauth_verifier_key_blobs_are_pinned() {
     use randprotocol_zkvm::executor::msauth_vk::{digest, MSAUTH_VK_SHA256_PRODUCTION, MSAUTH_VK_SHA256_TEST, PIN_PENDING};

@@ -122,36 +122,27 @@ pub struct MsauthShape {
 ///
 /// The tier-18 msauth key costs 78.6 s and ~4 GB to build (Task 2's measurement), and the fleet's
 /// validators are `s-2vcpu-4gb`, so a node **loads** it instead. The key file is exactly the
-/// vendored machine's postcard-serialised `VerifierKeyBlob` (no wrapper of ours), so its pin is
-/// the SHA-256 of the file bytes. There is one location, beside the binary
+/// vendored machine's `VerifierKeyBlob::to_bytes()` (no wrapper of ours), so its pin is the
+/// SHA-256 of the file bytes — the digest `Machine::install_verifier_key_pinned` checks on the
+/// raw bytes before it decodes anything (the blob is a trust root: a crafted preprocessed
+/// commitment could make forged proofs verify). There is one location, beside the binary
 /// (`/usr/local/bin/msauth-vk-production.bin`; `--msauth-vk` / `RAND_MSAUTH_VK` override it), and
 /// a node on a chain naming `hc_auth_multisig` refuses to start without the pinned blob.
-///
-/// **TASK-2B-RESYNC.** The machine API that exports and installs a key
-/// (`Machine::export_verifier_key_with_modq`, `Machine::install_verifier_key`,
-/// `machine::VerifierKeyBlob`) is being added UPSTREAM in circuits and arrives with the next
-/// re-sync and `CIRCUITS_PIN` bump. Until then:
-/// - [`VerifierKeyBlob`] here MIRRORS the contract's layout so the node can read the header
-///   (shape, profile) before installing. At the re-sync it becomes
-///   `pub use crate::machine::VerifierKeyBlob`, and the mirror goes;
-/// - [`machine_export`] and [`machine_install`] return [`MsauthVkError::NotYetVendored`];
-/// - both pins are [`PIN_PENDING`], which no file hashes to, so every load is refused and
-///   `tests/guest_provenance.rs::the_msauth_verifier_key_blobs_are_pinned` fails, printing the
-///   digest it computed.
 pub mod msauth_vk {
     use super::{MsauthShape, ZkExecutor};
-    use crate::machine::{FriProfile, Machine};
-    use serde::{Deserialize, Serialize};
+    use crate::machine::{FriProfile, Machine, Tier};
+    pub use crate::machine::{InstallKeyError, VerifierKeyBlob, VerifierKeyShape};
+    use serde::Serialize;
 
-    /// No blob hashes to this: the value the pins hold until the real blobs exist (TASK-2B-RESYNC).
+    /// No blob hashes to this: the value a pin holds until its blob exists.
     pub const PIN_PENDING: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 
     /// SHA-256 of `msauth-vk-production.bin`, the release asset every validator installs at
     /// `/usr/local/bin/msauth-vk-production.bin`. Consensus-critical (a wrong commitment could let
     /// a forged multisig proof verify): `tests/guest_provenance.rs` and `deploy/roll-all.sh` check
-    /// it. TASK-2B-RESYNC: set from the keygen run after the re-sync.
+    /// it.
     pub const MSAUTH_VK_SHA256_PRODUCTION: &str = PIN_PENDING;
-    /// SHA-256 of `crates/randprotocol-zkvm/keys/msauth-vk-test.bin` (tests only). TASK-2B-RESYNC.
+    /// SHA-256 of `crates/randprotocol-zkvm/keys/msauth-vk-test.bin` (tests only).
     pub const MSAUTH_VK_SHA256_TEST: &str = PIN_PENDING;
 
     /// This build's pin for `profile`.
@@ -174,44 +165,37 @@ pub mod msauth_vk {
     /// the digest the vendored `Machine::install_verifier_key_pinned` checks on the raw bytes
     /// (`crate::sha256::sha256`, the same function) before it decodes anything.
     pub fn digest(bytes: &[u8]) -> String {
-        crate::sha256::sha256(bytes).iter().map(|b| format!("{b:02x}")).collect()
+        hex(&crate::sha256::sha256(bytes))
     }
 
-    /// Mirror of the vendored `FriProfile` as the contract serialises it (the vendored enum
-    /// derives no serde yet). TASK-2B-RESYNC: replaced by `machine::FriProfile`.
-    #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-    pub enum BlobProfile {
-        Test,
-        Production,
+    fn hex(d: &[u8; 32]) -> String {
+        d.iter().map(|b| format!("{b:02x}")).collect()
     }
-    impl From<FriProfile> for BlobProfile {
-        fn from(p: FriProfile) -> Self {
-            match p {
-                FriProfile::Test => BlobProfile::Test,
-                FriProfile::Production => BlobProfile::Production,
-            }
+
+    /// A 64-hex-character pin as the 32 bytes the machine compares; `None` if malformed.
+    pub fn pin_bytes(pin: &str) -> Option<[u8; 32]> {
+        if pin.len() != 64 {
+            return None;
         }
+        let mut out = [0u8; 32];
+        for (i, o) in out.iter_mut().enumerate() {
+            *o = u8::from_str_radix(pin.get(2 * i..2 * i + 2)?, 16).ok()?;
+        }
+        Some(out)
     }
 
-    /// Mirror of the contract's `VerifierKeyBlob` header. TASK-2B-RESYNC: replaced by the vendored
-    /// type. `format_version` and `constraint_set` are the machine's to check
-    /// (`Machine::install_verifier_key` refuses a wrong one); the node checks `shape` and
-    /// `profile` itself, before the install, so a mismatch is named here.
-    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-    pub struct VerifierKeyHeader {
-        pub format_version: u32,
-        pub profile: BlobProfile,
-        /// The tier and the seven log heights (the msauth header: [`ZkExecutor::msauth_heights`]).
-        pub shape: MsauthShape,
-        pub constraint_set: u32,
-    }
-
-    /// Mirror of the contract's `VerifierKeyBlob`: the header and the postcard of the key's
-    /// `CommonData`. The key file is `postcard::to_allocvec(&blob)`, whole. TASK-2B-RESYNC.
-    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-    pub struct VerifierKeyBlob {
-        pub header: VerifierKeyHeader,
-        pub common: Vec<u8>,
+    /// The machine's key-cache shape for the msauth header (the memory height is not part of a
+    /// key: every valid memory height yields the same `CommonData`).
+    pub fn key_shape(s: MsauthShape) -> VerifierKeyShape {
+        VerifierKeyShape {
+            tier: Tier(s.tier),
+            program_log_height: s.program_log_height,
+            input_log_height: s.input_log_height,
+            keccak_log_height: s.keccak_log_height,
+            sha256_log_height: s.sha256_log_height,
+            modq_log_height: s.modq_log_height,
+            public_log_height: s.public_log_height,
+        }
     }
 
     /// Where the msauth key came from: `rand_status.msauth_key`.
@@ -242,11 +226,11 @@ pub mod msauth_vk {
     pub enum MsauthVkError {
         Digest { got: String, want: String },
         Decode(String),
-        Profile { got: BlobProfile, want: BlobProfile },
-        Shape { got: MsauthShape, want: MsauthShape },
+        Profile { got: FriProfile, want: FriProfile },
+        Shape { got: VerifierKeyShape, want: VerifierKeyShape },
+        /// The machine's own install refused it (format, constraint set, structure, lookups,
+        /// a filled slot).
         Install(String),
-        /// TASK-2B-RESYNC: the vendored machine has no key export/install API yet.
-        NotYetVendored,
     }
     impl std::fmt::Display for MsauthVkError {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -256,48 +240,54 @@ pub mod msauth_vk {
                 MsauthVkError::Profile { got, want } => write!(f, "msauth key blob profile is {got:?}, this node runs {want:?}"),
                 MsauthVkError::Shape { got, want } => write!(f, "msauth key blob shape {got:?} is not the pinned msauth shape {want:?}"),
                 MsauthVkError::Install(e) => write!(f, "the machine refused the msauth key: {e}"),
-                MsauthVkError::NotYetVendored => write!(f, "the vendored machine has no verifier-key install/export API yet (TASK-2B-RESYNC: needs the circuits re-sync)"),
             }
         }
     }
     impl std::error::Error for MsauthVkError {}
 
-    /// The checks that need nothing from the machine, in order: the SHA-256 of the file bytes
-    /// equals `want_digest`; the bytes decode; the header's profile is `profile`; its shape is
-    /// exactly [`ZkExecutor::msauth_heights`]. Returns the decoded blob for the install.
+    /// The checks the node names itself, in order: the SHA-256 of the file bytes equals
+    /// `want_digest` (before anything is decoded); the bytes decode; the header's profile is
+    /// `profile`; its shape is exactly [`ZkExecutor::msauth_heights`]. The machine's install
+    /// repeats the digest check and adds format, constraint set, structure and lookups.
     pub fn check(blob: &[u8], want_digest: &str, profile: FriProfile) -> Result<VerifierKeyBlob, MsauthVkError> {
         let got = digest(blob);
         if got != want_digest {
             return Err(MsauthVkError::Digest { got, want: want_digest.to_string() });
         }
-        let b: VerifierKeyBlob = postcard::from_bytes(blob).map_err(|e| MsauthVkError::Decode(e.to_string()))?;
-        if b.header.profile != BlobProfile::from(profile) {
-            return Err(MsauthVkError::Profile { got: b.header.profile, want: profile.into() });
+        let b = VerifierKeyBlob::from_bytes(blob).map_err(|e| MsauthVkError::Decode(format!("{e:?}")))?;
+        if b.profile != profile {
+            return Err(MsauthVkError::Profile { got: b.profile, want: profile });
         }
-        let want = ZkExecutor::msauth_heights();
-        if b.header.shape != want {
-            return Err(MsauthVkError::Shape { got: b.header.shape, want });
+        let want = key_shape(ZkExecutor::msauth_heights());
+        if b.shape != want {
+            return Err(MsauthVkError::Shape { got: b.shape, want });
         }
         Ok(b)
     }
 
-    /// TASK-2B-RESYNC: `machine.export_verifier_key_with_modq(tier, plh, ilh, klh, slh, mlh, pubh)`
-    /// serialised with postcard. Builds the key (78.6 s / ~4 GB at Production).
-    /// The key file for `profile`: the full build on a fresh machine, exported (the
-    /// `rand-node keygen-msauth-vk` body; a big host only — 78.6 s / ~4 GB at Production).
+    /// The key file for `profile`: the full build on a fresh machine, exported at the pinned
+    /// msauth shape (the `rand-node keygen-msauth-vk` body; a big host only — 78.6 s / ~4 GB at
+    /// Production).
     pub fn blob(profile: FriProfile) -> Result<Vec<u8>, MsauthVkError> {
-        machine_export(&Machine::new(profile), ZkExecutor::msauth_heights())
+        Ok(machine_export(&Machine::new(profile), ZkExecutor::msauth_heights()))
     }
 
-    pub(super) fn machine_export(_machine: &Machine, _shape: MsauthShape) -> Result<Vec<u8>, MsauthVkError> {
-        Err(MsauthVkError::NotYetVendored)
+    pub(super) fn machine_export(machine: &Machine, s: MsauthShape) -> Vec<u8> {
+        machine
+            .export_verifier_key_with_modq(Tier(s.tier), s.program_log_height, s.input_log_height, s.keccak_log_height, s.sha256_log_height, s.modq_log_height, s.public_log_height)
+            .to_bytes()
     }
 
-    /// TASK-2B-RESYNC: `machine.install_verifier_key(&blob)`, its `InstallKeyError` mapped to
-    /// [`MsauthVkError::Install`]. After `Ok`, `verify`/`verify_public` at that shape use the
-    /// installed key and build nothing.
-    pub(super) fn machine_install(_machine: &Machine, _blob: &VerifierKeyBlob) -> Result<(), MsauthVkError> {
-        Err(MsauthVkError::NotYetVendored)
+    /// `machine.install_verifier_key_pinned(bytes, pin)`. After `Ok`, `verify`/`verify_public` at
+    /// that shape use the installed (non-evictable) key and build nothing.
+    pub(super) fn machine_install(machine: &Machine, bytes: &[u8], pin: &str) -> Result<(), MsauthVkError> {
+        let want = pin_bytes(pin).ok_or_else(|| MsauthVkError::Digest { got: digest(bytes), want: pin.to_string() })?;
+        machine.install_verifier_key_pinned(bytes, &want).map_err(|e| match e {
+            InstallKeyError::Pin { got } => MsauthVkError::Digest { got: hex(&got), want: pin.to_string() },
+            InstallKeyError::Decode(d) => MsauthVkError::Decode(d),
+            InstallKeyError::Profile { blob, machine } => MsauthVkError::Profile { got: blob, want: machine },
+            other => MsauthVkError::Install(format!("{other:?}")),
+        })
     }
 }
 
@@ -1432,8 +1422,8 @@ impl ZkExecutor {
     /// with a synthetic blob (no real blob hashes to a test's own digest otherwise).
     #[doc(hidden)]
     pub fn install_msauth_vk_with_pin(&self, blob: &[u8], pin: &str) -> Result<(), msauth_vk::MsauthVkError> {
-        let checked = msauth_vk::check(blob, pin, self.msauth_machine.profile)?;
-        msauth_vk::machine_install(&self.msauth_machine, &checked)?;
+        msauth_vk::check(blob, pin, self.msauth_machine.profile)?;
+        msauth_vk::machine_install(&self.msauth_machine, blob, pin)?;
         let s = Self::msauth_heights();
         // The machine holds the installed key in its slot for the 7-tuple, so this lookup returns
         // it without a build; the `OnceLock` is the readiness flag, not a second copy.
