@@ -61,6 +61,8 @@ pub enum ConfidentialError {
     Disabled,
 }
 
+/// A method added here must also be forwarded in the node's `verify_cache::CachingExecutor`, or
+/// that wrapper inherits the default.
 pub trait ConfidentialExecutor: Send + Sync {
     /// Validate program code at deploy time (must be cheap: it runs inside block application)
     /// and return the code commitment recorded on chain.
