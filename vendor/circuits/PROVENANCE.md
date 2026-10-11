@@ -10,7 +10,7 @@ lock is the one cargo reads) and `target/`; the manifests are verbatim, their `[
 included, which is why the root `Cargo.toml` lists both paths under `[workspace] exclude`. The
 copies are byte-identical to this circuits commit:
 
-circuits: 4a244b604954b13420af419170ef458156a5bbe4
+circuits: 56b70611724930a5848ac5c0fd32ca2de8e61e2e
 
 (Branch feat/tree-aggregation, not yet on zkp-circuits; 92b750e plus the tree final-review
 fixes, which touched recursion/ tests and docs and research/AGENTS.md only. The files here are

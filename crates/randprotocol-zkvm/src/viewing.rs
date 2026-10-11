@@ -54,6 +54,60 @@ impl ViewingKey {
         let (_, ek) = self.kem_keys_at(version);
         Address { pk: self.pk(), kem_ek: ek.to_bytes().to_vec() }
     }
+    /// The keys a scan opens envelopes with, under KEM version 0. Equals `scan_key_at(0)`.
+    pub fn scan_key(&self) -> ScanKey { self.scan_key_at(0) }
+    /// The keys a scan opens envelopes with, under KEM key version `version`: derived once
+    /// for the whole scan rather than once per leaf.
+    pub fn scan_key_at(&self, version: u32) -> ScanKey {
+        let (dk, _) = self.kem_keys_at(version);
+        ScanKey { dk, ovk: self.ovk() }
+    }
+}
+
+/// What a scan needs to open envelopes, derived from a [`ViewingKey`] once: the ML-KEM
+/// decapsulation key of one key version and the outgoing viewing key. Deriving the KEM keypair
+/// from its seed costs about as much as the decapsulation it serves (17 µs and 21 µs on an M4
+/// Max), so a scan that derived it per leaf spent half its time re-deriving one key.
+#[derive(Clone)]
+pub struct ScanKey { dk: Dk, ovk: [u8; 32] }
+
+/// The bytes of an [`EnvelopeHead`]: `kem_ct` (1 088) ‖ `to_receiver` (60) ‖ `to_sender` (60).
+pub const ENVELOPE_HEAD_BYTES: usize = KEM_CT_BYTES + WRAPPED_KEY_BYTES + WRAPPED_KEY_BYTES;
+const KEM_CT_BYTES: usize = 1088;
+/// A wrapped `TxKey`: 12-byte nonce ‖ 32-byte key ‖ 16-byte tag.
+const WRAPPED_KEY_BYTES: usize = 12 + 32 + 16;
+
+/// An [`Envelope`] less its body: the parts that decide whether a key opens it, and yield the
+/// transaction key if so. The same 1 208 bytes for both body layouts, so a scan can page heads
+/// alone and fetch the body only of the leaves a key opens.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EnvelopeHead {
+    pub kem_ct: Vec<u8>,
+    pub to_receiver: Vec<u8>,
+    pub to_sender: Vec<u8>,
+}
+
+impl EnvelopeHead {
+    /// `kem_ct ‖ to_receiver ‖ to_sender`.
+    pub fn to_bytes(&self) -> Vec<u8> { [&self.kem_ct[..], &self.to_receiver, &self.to_sender].concat() }
+    /// The head [`EnvelopeHead::to_bytes`] wrote; `None` unless exactly
+    /// [`ENVELOPE_HEAD_BYTES`] long.
+    pub fn from_bytes(b: &[u8]) -> Option<EnvelopeHead> {
+        if b.len() != ENVELOPE_HEAD_BYTES { return None; }
+        let (kem_ct, rest) = b.split_at(KEM_CT_BYTES);
+        let (to_receiver, to_sender) = rest.split_at(WRAPPED_KEY_BYTES);
+        Some(EnvelopeHead { kem_ct: kem_ct.to_vec(), to_receiver: to_receiver.to_vec(), to_sender: to_sender.to_vec() })
+    }
+    /// The transaction key, if `key`'s KEM version opens this head as its receiver.
+    pub fn receiver_key(&self, cm: Word8, key: &ScanKey) -> Option<TxKey> {
+        let ct = KemCt::try_from(&self.kem_ct[..]).ok()?;
+        let ss: [u8; 32] = key.dk.decapsulate(&ct).into();
+        Some(TxKey(open(&ss, &aad(AAD_RECEIVER, cm), &self.to_receiver)?.try_into().ok()?))
+    }
+    /// The transaction key, if `key`'s `ovk` opens this head as its sender.
+    pub fn sender_key(&self, cm: Word8, key: &ScanKey) -> Option<TxKey> {
+        Some(TxKey(open(&key.ovk, &aad(AAD_SENDER, cm), &self.to_sender)?.try_into().ok()?))
+    }
 }
 
 /// The per-transaction disclosure key. Handing it over discloses exactly one transaction.
@@ -192,16 +246,26 @@ impl Envelope {
     /// was actually sealed to (`ViewingKey::address_at(version)`) opens it — a wrong version,
     /// like a wrong key entirely, fails AEAD authentication and returns `None`.
     pub fn open_as_receiver_at(&self, cm: Word8, vk: &ViewingKey, version: u32) -> Option<(TxKey, Note)> {
-        let (dk, _) = vk.kem_keys_at(version);
-        let ct = KemCt::try_from(&self.kem_ct[..]).ok()?;
-        let ss: [u8; 32] = dk.decapsulate(&ct).into();
-        let key = TxKey(open(&ss, &aad(AAD_RECEIVER, cm), &self.to_receiver)?.try_into().ok()?);
-        Some((key, self.open_with_tx_key(cm, &key)?))
+        self.open_as_receiver_with(cm, &vk.scan_key_at(version))
     }
     /// Opens as the sender, through `ovk`.
     pub fn open_as_sender(&self, cm: Word8, vk: &ViewingKey) -> Option<(TxKey, Note)> {
-        let key = TxKey(open(&vk.ovk(), &aad(AAD_SENDER, cm), &self.to_sender)?.try_into().ok()?);
-        Some((key, self.open_with_tx_key(cm, &key)?))
+        self.open_as_sender_with(cm, &vk.scan_key())
+    }
+    /// [`Envelope::open_as_receiver_at`] under a [`ScanKey`] derived once — what a scan
+    /// opening leaf after leaf calls.
+    pub fn open_as_receiver_with(&self, cm: Word8, key: &ScanKey) -> Option<(TxKey, Note)> {
+        let tx_key = self.head().receiver_key(cm, key)?;
+        Some((tx_key, self.open_with_tx_key(cm, &tx_key)?))
+    }
+    /// [`Envelope::open_as_sender`] under a [`ScanKey`] derived once.
+    pub fn open_as_sender_with(&self, cm: Word8, key: &ScanKey) -> Option<(TxKey, Note)> {
+        let tx_key = self.head().sender_key(cm, key)?;
+        Some((tx_key, self.open_with_tx_key(cm, &tx_key)?))
+    }
+    /// The envelope less its body ([`EnvelopeHead`]).
+    pub fn head(&self) -> EnvelopeHead {
+        EnvelopeHead { kem_ct: self.kem_ct.clone(), to_receiver: self.to_receiver.clone(), to_sender: self.to_sender.clone() }
     }
 }
 

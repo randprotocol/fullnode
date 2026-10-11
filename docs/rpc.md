@@ -190,6 +190,24 @@ leaf `from_index`, oldest first, at most 1000 rows however large `limit` is (a m
 Every leaf and every envelope is served to everyone; only a viewing key tells one wallet's rows
 from another's.
 
+### `rand_getScanLeaves`
+Params: `[from_index]` or `[from_index, limit]`. Result: the same page as `rand_getCommitments`,
+same order and same 1000-row cap, with each envelope cut to its **head**: `scan` is
+`kem_ct ‖ to_receiver ‖ to_sender`, standard base64 with padding — 1 208 bytes for every envelope
+a wallet seals, empty for a chain-made note with an empty envelope.
+
+```json
+[ { "index": 40, "cm": "2a9f…07", "height": 37, "scan": "tBzc…" } ]
+```
+
+The head is all a scan needs to decide ownership: decapsulating `kem_ct` and opening
+`to_receiver` (or opening `to_sender` under `ovk`) succeeds only for the right key, and yields
+the transaction key. A wallet pages heads, then reads with `rand_getCommitments` only the leaves
+one of its keys opened — and any head that is not 1 208 bytes, rather than guessing at its split.
+On chain 20's first 1000 leaves a head row is 1 718 bytes of JSON against a full row's 3 876.
+A node too old to have the method answers `-32601`; `rand` then pages `rand_getCommitments` as
+before.
+
 ### `rand_getNullifiers`
 Params: `[from_height]` or `[from_height, limit]`. Result: every nullifier published from that
 block height onwards, same 1000-row cap.
@@ -1889,6 +1907,14 @@ the proof's published digest against the one it computed before it submits anyth
 ## Changelog
 
 What changed for clients, in one place. Newest first.
+
+### Unreleased — `rand_getScanLeaves` (node-only)
+
+New public read `rand_getScanLeaves(from_index, limit)`: `rand_getCommitments`' rows with
+`envelope` replaced by `scan`, the base64 of `kem_ct ‖ to_receiver ‖ to_sender` (above). Nothing
+on chain changes. `rand` scans with it and falls back to `rand_getCommitments` against a node that
+answers `-32601`. The randprotocol.org relay forwards only the methods on its own list, so a
+browser wallet behind it keeps the full pages until the relay lists this one.
 
 ### Unreleased — tree aggregation: `Aggregate.layout` (genesis-gated; no chain carries it yet)
 
