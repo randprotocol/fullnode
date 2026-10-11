@@ -1,9 +1,13 @@
 //! The RPC contract the downstream repos read, as a canary in this repo's fast CI.
 //!
-//! Four repos consume this node's JSON-RPC: randscan (its indexer), randbridge.org (the status
+//! Six repos consume this node's JSON-RPC: randscan (its indexer), randbridge.org (the status
 //! service), randprotocol.org (the sale relay and the balance viewer) and zusd.money (through
-//! randscan's REST, which is these same reads), and durian.market's perps frontend and its
-//! `perp-prover` read the RPL-3 perps methods ([`perps_reads_under_a_perps_section`]). Their own integration tests spawn a real
+//! randscan's REST, which is these same reads), durian.market's perps frontend and its
+//! `perp-prover` (the RPL-3 perps methods, [`perps_reads_under_a_perps_section`]), and the wallet
+//! clients repo, which reads the node through `clients/ui/engine/rpc.js` and checks every reply's
+//! shape in `clients/ui/engine/validate.js` ([`the_wallet_reads_the_scan_and_send_path_exactly`],
+//! the `clients` rows of the table). The wallet's own half is `web/wallet/test/node.e2e.test.mjs`,
+//! run by `scripts/e2e-node.sh` in that repo's CI job `real-node` against the release binary. Their own integration tests spawn a real
 //! `rand-node` (`scripts/dev-chain.sh`, `docs/howto.md` §7, "How do I run the downstream
 //! integration tests?"), but those run in their CI, after a release. This file fails here first: a field one of
 //! them reads that is renamed, dropped or changes JSON type is a red `check-and-test` in this repo
@@ -43,6 +47,12 @@ enum J {
     Dec,
     /// A non-empty, even-length string of lowercase hex.
     Hex,
+    /// Exactly 64 lowercase hex characters: a hash, a commitment, a Merkle root, a witness path
+    /// level (the wallet's `hexField(.., 64)`, `ui/engine/validate.js`).
+    Hex64,
+    /// Even-length lowercase hex, possibly empty (an envelope part: `to_sender` is `""` on a
+    /// faucet note, and the wallet's `hexBlob` accepts it).
+    HexOrEmpty,
     /// Any string.
     Str,
     Bool,
@@ -60,6 +70,10 @@ impl J {
             Hex => v
                 .as_str()
                 .is_some_and(|s| !s.is_empty() && s.len() % 2 == 0 && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))),
+            Hex64 => v.as_str().is_some_and(|s| s.len() == 64 && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))),
+            HexOrEmpty => v
+                .as_str()
+                .is_some_and(|s| s.len() % 2 == 0 && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))),
             Str => v.is_string(),
             Bool => v.is_boolean(),
             Arr => v.is_array(),
@@ -223,6 +237,7 @@ async fn every_field_the_downstream_repos_read_is_served_with_its_type() {
     // downstream tests fund wallets with `rand faucet`, which is this).
     let minted = call(addr, "rand_mint", json!([address()])).await;
     let tx = minted["result"].as_str().unwrap_or_else(|| panic!("rand_mint refused: {minted}")).to_string();
+    assert!(Hex64.holds(&minted["result"]), "rand_mint answers a 64-hex hash (the wallet's `checkSubmitted`): {minted}");
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     let height = loop {
         let got = call(addr, "rand_getTransaction", json!([tx])).await;
@@ -266,31 +281,38 @@ async fn every_field_the_downstream_repos_read_is_served_with_its_type() {
         // ---- chain identity ----
         // randscan crates/randscan-indexer/src/rpc.rs `chain_id`; randbridge.org status/src/rand.rs
         // (`RandBridge::read`); randprotocol.org server/sale (relay health), src/scripts/balance.js.
-        row("rand_chainId", json!([]), "randscan rpc.rs, randbridge.org status/src/rand.rs, randprotocol.org", &[("", Int)]),
+        row("rand_chainId", json!([]), "randscan rpc.rs, randbridge.org status/src/rand.rs, randprotocol.org, clients/ui/engine/wallet.js `chainIdentity`", &[("", Int)]),
         // randscan crates/randscan-indexer/src/rpc.rs `TokenInfo`.
         row("rand_tokenInfo", json!([]), "randscan crates/randscan-indexer/src/rpc.rs", &[("symbol", Str), ("decimals", Int)]),
         // randscan crates/randscan-indexer/src/rpc.rs `RpcVersion`.
         row("rand_getVersion", json!([]), "randscan crates/randscan-indexer/src/rpc.rs", &[("version", Str), ("git_sha", Str), ("fri_profile", Str)]),
         // randscan crates/randscan-indexer/src/rpc.rs `genesis_hash`.
-        row("rand_getGenesisHash", json!([]), "randscan crates/randscan-indexer/src/rpc.rs", &[("", Hex)]),
+        row("rand_getGenesisHash", json!([]), "randscan crates/randscan-indexer/src/rpc.rs, clients/ui/engine/validate.js `checkGenesisHash`", &[("", Hex64)]),
         // ---- the head and the node ----
         // randscan crates/randscan-indexer/src/rpc.rs `Head`; randbridge.org status/src/rand.rs (`height`).
-        row("rand_getHead", json!([]), "randscan rpc.rs `Head`, randbridge.org status/src/rand.rs", &[("height", Int), ("hash", Hex), ("view", Int)]),
+        row("rand_getHead", json!([]), "randscan rpc.rs `Head`, randbridge.org status/src/rand.rs, clients/ui/engine/validate.js `checkHead`", &[("height", Int), ("hash", Hex), ("view", Int)]),
         // randscan crates/randscan-indexer/src/rpc.rs `NodeStatus` (every field is `serde(default)`
         // there, so a drop would be silent downstream — which is why it is pinned here).
-        row("rand_status", json!([]), "randscan crates/randscan-indexer/src/rpc.rs `NodeStatus`", &[
+        // clients/ui/engine/wallet.js `proofParamsOf` reads `hc_bundle` (exactly 64 hex), `hc_auth`
+        // (`null` or 64 hex) and `fri_profile`; `backend-shared.js` `probe` reads `height`.
+        row("rand_status", json!([]), "randscan crates/randscan-indexer/src/rpc.rs `NodeStatus`, clients/ui/engine/wallet.js `proofParamsOf`", &[
             ("height", Int), ("head_hash", Hex), ("view", Int), ("high_qc_view", Int), ("syncing", Bool), ("sync_target", Int),
             ("peer_count", Int), ("mempool_size", Int), ("is_validator", Bool), ("active_validator", Bool), ("faucet", Bool),
             ("confidential", Bool), ("fri_profile", Str), ("programs", Int), ("notes", Int), ("nullifiers", Int),
-            ("tree_root", Hex), ("hc_bundle", Hex), ("hc_auth", Null), ("address", Str), ("peer_id", Str),
+            ("tree_root", Hex), ("hc_bundle", Hex64), ("hc_auth", Null), ("address", Str), ("peer_id", Str),
             ("gas_prices.gas_price", Dec), ("gas_prices.byte_price", Dec),
         ]),
+        // clients/ui/lib/rpc-methods.js lists `rand_syncStatus`; it is `rand_status` under another name.
+        row("rand_syncStatus", json!([]), "clients/ui/lib/rpc-methods.js", &[("height", Int), ("syncing", Bool), ("sync_target", Int), ("hc_bundle", Hex64)]),
         // randscan crates/randscan-indexer/src/rpc.rs `RpcPeer` (an empty list on one validator).
         exactly("rand_getPeers", json!([]), "randscan crates/randscan-indexer/src/rpc.rs `RpcPeer`", json!([])),
         // ---- limits and supply ----
         // randscan crates/randscan-core/src/types/stats.rs `ChainLimits`; randprotocol.org (the
         // wallet's fee path through the relay).
-        row("rand_getLimits", json!([]), "randscan crates/randscan-core/src/types/stats.rs `ChainLimits`", &[
+        // clients/ui/engine/validate.js `checkLimits` reads `envelope_bytes` (Int or null; `null` on
+        // this chain, an Int where genesis fixes it, pinned in [`the_wallet_reads_the_limits_it_derives_caps_from`]),
+        // `max_proof_bytes`, `bundle_gas_limit`, `program_state` and `proof_window_blocks`.
+        row("rand_getLimits", json!([]), "randscan crates/randscan-core/src/types/stats.rs `ChainLimits`, clients/ui/engine/validate.js `checkLimits`", &[
             ("max_program_words", Int), ("max_proof_bytes", Int), ("max_block_bytes", Int), ("max_call_envelope_bytes", Int),
             ("max_program_public_words", Int), ("envelope_bytes", Null), ("hardening_v6", Bool), ("hc_auth", Null),
             ("gas_price", Dec), ("byte_price", Dec), ("gas_metering", Str), ("bundle_gas_limit", Int),
@@ -311,12 +333,12 @@ async fn every_field_the_downstream_repos_read_is_served_with_its_type() {
         // ---- blocks and transactions ----
         // randscan crates/randscan-indexer/src/rpc.rs `RpcBlock`/`RpcTx`/`RpcAction::Mint`;
         // randbridge.org status/src/rand.rs (`transactions[].action.kind`, `transactions[].hash`).
-        Row { method: "rand_getBlockByHeight", params: json!([height]), expect: Expect::Fields(BLOCK), consumer: "randscan rpc.rs `RpcBlock`, randbridge.org status/src/rand.rs" },
+        Row { method: "rand_getBlockByHeight", params: json!([height]), expect: Expect::Fields(BLOCK), consumer: "randscan rpc.rs `RpcBlock`, randbridge.org status/src/rand.rs, clients/ui/engine/validate.js `checkBlockHeader`/`checkBlockActions`" },
         Row { method: "rand_getBlockByHash", params: json!([block_hash]), expect: Expect::Fields(BLOCK), consumer: "randscan crates/randscan-indexer/src/rpc.rs `RpcBlock`" },
         // A height past the head: `null`, which randscan's `block_by_height` reads as "not yet".
         exactly("rand_getBlockByHeight", json!([height + 1_000_000]), "randscan crates/randscan-indexer/src/rpc.rs", Value::Null),
         // randscan crates/randscan-api/tests/real_node.rs (the transaction page).
-        row("rand_getTransaction", json!([tx]), "randscan crates/randscan-api", &[
+        row("rand_getTransaction", json!([tx]), "randscan crates/randscan-api, clients/ui/engine/validate.js `checkTransaction`", &[
             ("height", Int), ("index", Int), ("block_hash", Hex), ("tx.hash", Hex), ("tx.action.kind", Str),
         ]),
         exactly("rand_getTransaction", json!([unknown]), "randscan crates/randscan-api", Value::Null),
@@ -329,14 +351,21 @@ async fn every_field_the_downstream_repos_read_is_served_with_its_type() {
         exactly("rand_getCallEnvelope", json!([tx]), "randscan crates/randscan-indexer/src/rpc.rs `call_envelope`", Value::Null),
         // ---- the shielded pool ----
         // randscan crates/randscan-indexer/src/rpc.rs `RpcCommitment` (the mint's note is leaf 0).
-        row("rand_getCommitments", json!([0, 10]), "randscan crates/randscan-indexer/src/rpc.rs `RpcCommitment`", &[
-            ("0.index", Int), ("0.cm", Hex), ("0.height", Int), ("0.envelope", Obj),
+        // clients/ui/engine/validate.js `checkCommitments`: `cm` is 64 hex, `height` an Int, and the
+        // four envelope parts are hex (`to_sender` may be empty).
+        row("rand_getCommitments", json!([0, 10]), "randscan crates/randscan-indexer/src/rpc.rs `RpcCommitment`, clients/ui/engine/validate.js `checkCommitments`", &[
+            ("0.index", Int), ("0.cm", Hex64), ("0.height", Int), ("0.envelope", Obj),
+            ("0.envelope.kem_ct", HexOrEmpty), ("0.envelope.to_receiver", HexOrEmpty), ("0.envelope.to_sender", HexOrEmpty),
+            ("0.envelope.body", HexOrEmpty),
         ]),
         // randscan crates/randscan-indexer/src/rpc.rs `RpcTreeInfo`.
-        row("rand_getTreeInfo", json!([]), "randscan crates/randscan-indexer/src/rpc.rs `RpcTreeInfo`", &[("next_index", Int), ("root", Hex), ("nullifiers", Int)]),
+        row("rand_getTreeInfo", json!([]), "randscan crates/randscan-indexer/src/rpc.rs `RpcTreeInfo`, clients/ui/engine/validate.js `checkTreeInfo`", &[("next_index", Int), ("root", Hex64), ("nullifiers", Int)]),
         // randprotocol.org src/scripts/balance.js `fetchSpent` (rows `{height, nullifier}`; no
         // spend has happened here, so the page is empty and the row shape is `rpc.rs`'s own test's).
-        exactly("rand_getNullifiers", json!([0, 1000]), "randprotocol.org src/scripts/balance.js `fetchSpent`", json!([])),
+        // The wallet pages it the same way (clients/ui/engine/validate.js `checkNullifiers`, rows
+        // `{height, nullifier}` with a 64-hex nullifier): [`the_wallet_reads_the_scan_and_send_path_exactly`]
+        // pins the empty page past the tip too.
+        exactly("rand_getNullifiers", json!([0, 1000]), "randprotocol.org src/scripts/balance.js `fetchSpent`, clients/ui/engine/validate.js `checkNullifiers`", json!([])),
         // ---- validators ----
         // randscan crates/randscan-indexer/src/rpc.rs `RpcValidator`.
         row("rand_getValidators", json!([]), "randscan crates/randscan-indexer/src/rpc.rs `RpcValidator`", &[
@@ -352,7 +381,7 @@ async fn every_field_the_downstream_repos_read_is_served_with_its_type() {
         // status/src/rand.rs (`enabled`, `emitters`, `guardians`, `assets[].{index,chain,token}`,
         // `fees`, `mint_paused`); zusd.money src/components/BalanceSheet.astro (via randscan's
         // `/bridge`).
-        row("rand_getBridgeState", json!([]), "randscan types/bridge.rs, randbridge.org status/src/rand.rs, zusd.money BalanceSheet.astro", &[
+        row("rand_getBridgeState", json!([]), "randscan types/bridge.rs, randbridge.org status/src/rand.rs, zusd.money BalanceSheet.astro, clients/ui/engine/validate.js `checkBridgeState`", &[
             ("enabled", Bool), ("emitter", Hex), ("emitters", Obj), ("emitters.2", Hex), ("guardian_set_index", Int),
             ("guardians", Arr), ("guardians.0", Hex), ("pq_guardians", Arr), ("mint_paused", Bool), ("pause_nonce", Int),
             ("list_nonce", Int), ("pause_key", Hex), ("burn_sequence", Int), ("fees", Null),
@@ -363,7 +392,7 @@ async fn every_field_the_downstream_repos_read_is_served_with_its_type() {
         // relay forwards it to the wallet); zusd.money src/components/BalanceSheet.astro `Asset`
         // `{index, chain, locked}` via randscan's `/bridge/assets`, whose `symbol` randscan joins
         // from `rand_getTokens`.
-        row("rand_getAssets", json!([]), "randscan types/bridge.rs `BridgeAsset`, zusd.money BalanceSheet.astro `Asset`", &[
+        row("rand_getAssets", json!([]), "randscan types/bridge.rs `BridgeAsset`, zusd.money BalanceSheet.astro `Asset`, clients/ui/engine/validate.js `checkAssets`", &[
             ("0.index", Int), ("0.chain", Int), ("0.token", Hex), ("0.asset_id", Hex), ("0.decimals", Int), ("0.locked", Dec),
             ("0.minted_today", Dec), ("0.mint_day", Int), ("0.mint_cap_per_day", Dec),
         ]),
@@ -371,15 +400,20 @@ async fn every_field_the_downstream_repos_read_is_served_with_its_type() {
         exactly("rand_getBridgeBurn", json!([0]), "randbridge.org status/src/rand.rs", Value::Null),
         // randscan crates/randscan-core/src/types/token.rs `TokenList`/`TokenInfo`; randprotocol.org
         // src/scripts/balance.js `fetchRegistry` (`tokens[].index`); zusd.money (via randscan).
-        row("rand_getTokens", json!([0, 1000]), "randscan types/token.rs `TokenList`, randprotocol.org balance.js `fetchRegistry`", &[
+        // clients/ui/engine/validate.js `checkTokens`: `decimals` <= 9, `total_supply` a decimal,
+        // and `authority.backings[]` `{chain, token (64 hex), decimals, locked}`.
+        row("rand_getTokens", json!([0, 1000]), "randscan types/token.rs `TokenList`, randprotocol.org balance.js `fetchRegistry`, clients/ui/engine/validate.js `checkTokens`", &[
             ("enabled", Bool), ("registration_fee", Dec), ("next_index", Int), ("tokens", Arr),
             ("tokens.0.index", Int), ("tokens.0.id", Hex), ("tokens.0.id_text", Str), ("tokens.0.name", Str),
             ("tokens.0.symbol", Str), ("tokens.0.decimals", Int), ("tokens.0.authority", Obj), ("tokens.0.mint_nonce", Int),
             ("tokens.0.total_supply", Dec), ("tokens.0.registered_at", Int),
+            ("tokens.0.id", Hex64), ("tokens.0.authority.backings", Arr), ("tokens.0.authority.backings.0.chain", Int),
+            ("tokens.0.authority.backings.0.token", Hex64), ("tokens.0.authority.backings.0.decimals", Int),
+            ("tokens.0.authority.backings.0.locked", Dec),
         ]),
         // randscan crates/randscan-core/src/types/token.rs `TokenInfo`; randprotocol.org
         // src/scripts/balance.js `getToken`.
-        row("rand_getToken", json!([1]), "randscan types/token.rs `TokenInfo`, randprotocol.org balance.js `getToken`", &[
+        row("rand_getToken", json!([1]), "randscan types/token.rs `TokenInfo`, randprotocol.org balance.js `getToken`, clients/ui/lib/rpc-methods.js", &[
             ("index", Int), ("id", Hex), ("id_text", Str), ("name", Str), ("symbol", Str), ("decimals", Int),
             ("authority", Obj), ("mint_nonce", Int), ("total_supply", Dec), ("registered_at", Int),
         ]),
@@ -392,10 +426,17 @@ async fn every_field_the_downstream_repos_read_is_served_with_its_type() {
         exactly("rand_getTokenSupply", json!([99]), "randscan crates/randscan-indexer/src/rpc.rs `token_supply`", Value::Null),
         // ---- programs (none deployed: the refusal and empty shapes the indexer branches on) ----
         // randscan crates/randscan-indexer/src/rpc.rs `program`: `null` for an unknown id.
-        exactly("rand_getProgram", json!([unknown]), "randscan crates/randscan-indexer/src/rpc.rs `program`", Value::Null),
+        exactly("rand_getProgram", json!([unknown]), "randscan crates/randscan-indexer/src/rpc.rs `program`, clients/ui/lib/rpc-methods.js", Value::Null),
+        // clients/ui/engine/validate.js `checkProgramCode` / `checkProgramPublic`: `null` is "no such program".
+        exactly("rand_getProgramCode", json!([unknown]), "clients/ui/engine/validate.js `checkProgramCode`", Value::Null),
+        exactly("rand_getProgramPublic", json!([unknown]), "clients/ui/engine/validate.js `checkProgramPublic`", Value::Null),
+        // `checkProgramCell`: without a `program_state` section `{"enabled": false}`, which the wallet reads as `null`.
+        exactly("rand_getProgramCell", json!([unknown, "00".repeat(32)]), "clients/ui/engine/validate.js `checkProgramCell`", json!({ "enabled": false })),
+        // `rand_getVesting` without a `vesting` section: `{"enabled": false}`.
+        exactly("rand_getVesting", json!([unknown]), "clients/ui/lib/rpc-methods.js `getVesting`", json!({ "enabled": false })),
         // randscan crates/randscan-indexer/src/rpc.rs `program_vault`/`program_cells`: without a
         // `program_state` section both answer `{"enabled": false}`, which the indexer reads as `None`.
-        exactly("rand_getProgramVault", json!([unknown]), "randscan crates/randscan-indexer/src/rpc.rs `program_vault`", json!({ "enabled": false })),
+        exactly("rand_getProgramVault", json!([unknown]), "randscan crates/randscan-indexer/src/rpc.rs `program_vault`, clients/ui/engine/validate.js `checkProgramVault`", json!({ "enabled": false })),
         // Multisig accounts: without a `multisig` section `{"enabled": false}`, `rand_getVesting`'s
         // and `rand_getProgramVault`'s shape (no consumer yet; the CLI's `multisig status` reads it).
         exactly("rand_getMultisig", json!([unknown]), "rand-node `multisig status`", json!({ "enabled": false })),
@@ -405,7 +446,7 @@ async fn every_field_the_downstream_repos_read_is_served_with_its_type() {
         exactly(
             "rand_getProgramCells",
             json!([unknown, { "after": null, "limit": 10 }]),
-            "randscan crates/randscan-indexer/src/rpc.rs `program_cells`",
+            "randscan crates/randscan-indexer/src/rpc.rs `program_cells`, clients/ui/engine/validate.js `checkProgramCells`",
             json!({ "enabled": false }),
         ),
         // ---- perps (RPL-3; no `perps` section here: the disabled shapes the consumers branch on) ----
@@ -420,9 +461,26 @@ async fn every_field_the_downstream_repos_read_is_served_with_its_type() {
     let mut rows = rows;
     // randprotocol.org server/sale/src/rpc.rs (the relay forwards the answer to the wallet).
     // A second, distinct mint: the first one is in the pool, and a resubmission is refused.
-    rows.push(row("rand_sendTransaction", json!([hex::encode(mint(10).encode())]), "randprotocol.org server/sale/src/rpc.rs", &[("", Hex)]));
+    // clients/ui/engine/validate.js `checkSubmitted`: the answer is a 64-hex transaction hash.
+    rows.push(row("rand_sendTransaction", json!([hex::encode(mint(10).encode())]), "randprotocol.org server/sale/src/rpc.rs, clients/ui/engine/validate.js `checkSubmitted`", &[("", Hex64)]));
+    // The wallet's own reads of the scan and send path (clients/ui/engine/{wallet,validate,backend-shared}.js).
+    rows.extend([
+        // `checkAnchor`: `height` an Int, `root` 64 hex.
+        row("rand_getAnchor", json!([]), "clients/ui/engine/validate.js `checkAnchor`", &[("height", Int), ("root", Hex64)]),
+        // `checkWitness`: `root` 64 hex, `path` exactly 32 levels of 64 hex (levels 0 and 31 here;
+        // the length is pinned in the wallet test below).
+        row("rand_getWitness", json!([0]), "clients/ui/engine/validate.js `checkWitness`", &[
+            ("index", Int), ("root", Hex64), ("path", Arr), ("path.0", Hex64), ("path.31", Hex64),
+        ]),
+        // A leaf past the tree: `null`, which `checkWitness` passes through as "no witness".
+        exactly("rand_getWitness", json!([1_000_000_000u64]), "clients/ui/engine/validate.js `checkWitness`", Value::Null),
+        // `checkBlockHeaders`: `{height, tx_count}` per header, `height === from + i`.
+        row("rand_getBlocks", json!([height, height]), "clients/ui/engine/validate.js `checkBlockHeaders`", &[("0.height", Int), ("0.tx_count", Int)]),
+        // `checkFee`: a decimal amount; `backend-shared.js` `bundleFee` falls back to a constant at 0.
+        row("rand_estimateFee", json!([{ "kind": "bundle" }]), "clients/ui/engine/validate.js `checkFee`", &[("", Dec)]),
+    ]);
     let checked = check(addr, &rows).await;
-    assert!(checked > 150, "the table shrank to {checked} checks");
+    assert!(checked > 240, "the table shrank to {checked} checks");
 
     // The exact values the fee rows above only type-check: this chain's two live rules.
     let limits = call(addr, "rand_getLimits", json!([])).await;
@@ -458,6 +516,15 @@ async fn the_refusal_shapes_the_consumers_branch_on_are_pinned() {
     assert_eq!(call(addr, "rand_getTokens", json!([0, 1000])).await["result"], json!({ "enabled": false, "tokens": [] }));
     assert_eq!(call(addr, "rand_getAssets", json!([])).await["result"], json!([]));
     assert_eq!(call(addr, "rand_getToken", json!([1])).await["result"], Value::Null);
+    // The pre-account-removal names the wallet deletes from its method table
+    // (clients/ui/test/rpc-methods.test.mjs): the node refuses them by name.
+    for gone in ["rand_getBalance", "rand_getAccount", "rand_getAssetBalance"] {
+        let r = call(addr, gone, json!([])).await;
+        assert_eq!(r["error"]["code"], json!(-32601), "{gone}: {r}");
+    }
+    // A submit with no params at all is a param error, not a panic or a method error.
+    let none = call(addr, "rand_sendTransaction", json!([])).await;
+    assert_eq!(none["error"]["code"], json!(-32602), "{none}");
     // And no `fees` section: no rules, nothing burned.
     let limits = call(addr, "rand_getLimits", json!([])).await;
     assert_eq!(limits["result"]["fee_rules"], Value::Null, "{limits}");
@@ -465,6 +532,192 @@ async fn the_refusal_shapes_the_consumers_branch_on_are_pinned() {
     assert_eq!(supply["result"]["base_fees_burned"], json!("0"), "{supply}");
 
     node.shutdown().await;
+}
+
+/// The wallet's `RPC_METHOD_RE` (clients/ui/engine/rpc.js): the only method names it will put on
+/// the wire, `^(?:rand|bridge)_[A-Za-z][A-Za-z0-9]*$`, written out by hand (no `regex` dependency).
+fn wallet_allows(method: &str) -> bool {
+    let Some(rest) = method.strip_prefix("rand_").or_else(|| method.strip_prefix("bridge_")) else { return false };
+    let mut chars = rest.chars();
+    chars.next().is_some_and(|c| c.is_ascii_alphabetic()) && chars.all(|c| c.is_ascii_alphanumeric())
+}
+
+/// Every method in the wallet's table (clients/ui/lib/rpc-methods.js `METHODS`, each as `rand_<name>`).
+const WALLET_METHODS: &[&str] = &[
+    "chainId", "tokenInfo", "status", "getHead", "getEpoch", "getValidators", "getPeers", "getSupply", "getVersion",
+    "getGenesisHash", "getHealth", "getLimits", "getMempoolInfo", "getEmission", "getVesting", "getVestingSummary",
+    "getVestingSchedule", "getTreeInfo", "getAnchor", "getWitness", "getWitnesses", "getCommitments", "getNullifiers",
+    "getCompactBlocks", "importViewingKey", "getViewingNotes", "removeViewingKey", "checkTransaction", "getProgram",
+    "getProgramPublic", "getProgramCode", "getProgramCell", "getProgramCells", "getProgramVault", "getTransaction",
+    "getTransactionStatus", "getRawTransaction", "getReceipt", "getReceipts", "getCallEnvelope", "getBlockByHeight",
+    "getBlockByHash", "getBlocks", "getFinality", "getProposer", "getAdmitted", "getAggregate", "getAggregators",
+    "getUnsealed", "getBridgeState", "getBridgeBurn", "bridgeAssetId", "getAssets", "getTokens", "getToken",
+    "getTokenSupply", "estimateFee", "sendTransaction", "mint",
+];
+
+/// The wallet's scan-and-send path, read the way `clients/ui/engine/wallet.js` reads it, with the
+/// exact values (not just the types) the wallet's checks in `validate.js` need: the three roots
+/// agree, a witness is 32 levels, the empty pages are empty, the fee is a positive decimal, a
+/// refusal carries the code and message it is shown with, and every method it can call exists.
+#[tokio::test]
+async fn the_wallet_reads_the_scan_and_send_path_exactly() {
+    let node = start().await;
+    let addr = node.rpc_addr;
+
+    // Every name the wallet may put on the wire passes its own `RPC_METHOD_RE`, and the regex
+    // refuses what it should (clients/ui/test/rpc.test.mjs pins the same on its side).
+    for m in WALLET_METHODS {
+        assert!(wallet_allows(&format!("rand_{m}")), "rand_{m} must match RPC_METHOD_RE");
+    }
+    for bad in ["eth_getBalance", "rand_", "rand_1x", "rand_get-x", "rand_get x", "getHead", "rand/getHead", "Rand_getHead"] {
+        assert!(!wallet_allows(bad), "{bad} must not match RPC_METHOD_RE");
+    }
+
+    let minted = call(addr, "rand_mint", json!([address()])).await;
+    let tx = minted["result"].as_str().unwrap_or_else(|| panic!("rand_mint refused: {minted}")).to_string();
+    assert_eq!(tx.len(), 64, "the mint answers a hash: {minted}");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let height = loop {
+        let got = call(addr, "rand_getTransaction", json!([tx])).await;
+        if let Some(h) = got["result"]["height"].as_u64() {
+            break h;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "the mint never committed: {got}");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    while call(addr, "rand_getHead", json!([])).await["result"]["height"].as_u64().unwrap_or(0) <= height {
+        assert!(tokio::time::Instant::now() < deadline, "the chain stopped after the mint");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    // Every method of the wallet's table is in the node's dispatch table: none answers -32601
+    // (a bad-params error is fine and has no effect: the empty params parse nothing).
+    for m in WALLET_METHODS {
+        let r = call(addr, &format!("rand_{m}"), json!([])).await;
+        assert_ne!(r["error"]["code"], json!(-32601), "rand_{m} is not served: {}", short(&r));
+    }
+
+    // The tree, the anchor and a witness name one root. The tree moves only when a block carries a
+    // note, so read them until one snapshot is quiet (the same root before and after).
+    let (root, next_index, anchor_height) = loop {
+        let before = call(addr, "rand_getTreeInfo", json!([])).await["result"].clone();
+        let anchor = call(addr, "rand_getAnchor", json!([])).await["result"].clone();
+        let witness = call(addr, "rand_getWitness", json!([0])).await["result"].clone();
+        let after = call(addr, "rand_getTreeInfo", json!([])).await["result"].clone();
+        if before["root"] == after["root"] && before["root"] == anchor["root"] && before["root"] == witness["root"] {
+            assert_eq!(witness["index"], json!(0), "{}", short(&witness));
+            let path = witness["path"].as_array().unwrap_or_else(|| panic!("a witness has a path: {}", short(&witness)));
+            assert_eq!(path.len(), 32, "the wallet's checkWitness wants exactly 32 levels");
+            assert!(path.iter().all(|l| Hex64.holds(l)), "every level is 64 hex: {}", short(&witness));
+            break (before["root"].clone(), before["next_index"].as_u64().unwrap(), anchor["height"].as_u64().unwrap());
+        }
+        assert!(tokio::time::Instant::now() < deadline, "the root never settled: {} {} {}", short(&before), short(&anchor), short(&witness));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    assert!(Hex64.holds(&root));
+    assert_eq!(next_index, 1, "one faucet mint is one leaf");
+    // The anchor at an explicit height is the same pair; one past the head is a refusal, not null.
+    let at = call(addr, "rand_getAnchor", json!([anchor_height])).await;
+    assert_eq!(at["result"]["root"], root, "{at}");
+    assert_eq!(at["result"]["height"], json!(anchor_height), "{at}");
+    let head = call(addr, "rand_getHead", json!([])).await["result"]["height"].as_u64().unwrap();
+    let past = call(addr, "rand_getAnchor", json!([head + 1_000])).await;
+    assert_eq!(past["error"]["code"], json!(-32001), "{past}");
+
+    // The scan: the leaf page starts at the index asked for, has no gap, and is empty past the end.
+    let leaves = call(addr, "rand_getCommitments", json!([0, 10])).await["result"].clone();
+    let leaves = leaves.as_array().unwrap_or_else(|| panic!("an array: {}", short(&leaves)));
+    assert_eq!(leaves.len() as u64, next_index);
+    assert_eq!(leaves[0]["index"], json!(0));
+    assert_eq!(call(addr, "rand_getCommitments", json!([next_index, 10])).await["result"], json!([]));
+    // The nullifier page: nothing is spent, so it is empty at the start and past the tip.
+    assert_eq!(call(addr, "rand_getNullifiers", json!([0, 1000])).await["result"], json!([]));
+    assert_eq!(call(addr, "rand_getNullifiers", json!([head + 1_000, 1000])).await["result"], json!([]));
+    // A leaf past the tree has no witness.
+    assert_eq!(call(addr, "rand_getWitness", json!([next_index])).await["result"], Value::Null);
+
+    // The block headers the wallet walks: `height === from + i`, one per block, clamped at the head.
+    let headers = call(addr, "rand_getBlocks", json!([1, head])).await["result"].clone();
+    let headers = headers.as_array().unwrap_or_else(|| panic!("an array: {}", short(&headers)));
+    assert!(!headers.is_empty() && headers.len() as u64 <= head);
+    for (i, h) in headers.iter().enumerate() {
+        assert_eq!(h["height"], json!(1 + i as u64), "{}", short(h));
+        assert!(h["tx_count"].is_u64(), "{}", short(h));
+    }
+    let minted_in = headers.iter().find(|h| h["height"] == json!(height)).expect("the mint's block is in the range");
+    assert_eq!(minted_in["tx_count"], json!(1));
+
+    // The fee: a positive decimal for a bundle; an unknown kind is a param error, not a number.
+    let fee = call(addr, "rand_estimateFee", json!([{ "kind": "bundle" }])).await["result"].clone();
+    assert!(Dec.holds(&fee), "{fee}");
+    assert!(fee.as_str().unwrap().parse::<u128>().unwrap() > 0, "the wallet falls back to a constant at 0");
+    let bad = call(addr, "rand_estimateFee", json!([{ "kind": "nonsense" }])).await;
+    assert_eq!(bad["error"]["code"], json!(-32602), "{bad}");
+
+    node.shutdown().await;
+}
+
+/// `rand_mint` on a chain whose genesis has no faucet: a refusal the wallet shows as the node's
+/// own sentence (`rand-wallet` surfaces `RpcError.message`; clients/ui/engine/wallet.js
+/// `faucet`, backend-shared.js `faucet`) — code -32000 and `faucet is disabled on this chain`.
+#[tokio::test]
+async fn the_faucet_refusal_the_wallet_shows_is_pinned() {
+    let node = common::start_one_validator_shaped(|g| g.faucet = false).await;
+    let addr = node.rpc_addr;
+    let refused = call(addr, "rand_mint", json!([address()])).await;
+    assert_eq!(refused["error"]["code"], json!(-32000), "{refused}");
+    assert_eq!(refused["error"]["message"], json!("faucet is disabled on this chain"), "{refused}");
+    assert_eq!(call(addr, "rand_status", json!([])).await["result"]["faucet"], json!(false));
+    node.shutdown().await;
+}
+
+/// The limits the wallet derives its caps from when genesis sets them (clients/ui/engine/validate.js
+/// `checkLimits`: `envelope_bytes` an Int, `program_state` `{cell_fee, max_reads, max_writes,
+/// max_payouts}`), and the program-state reads it makes on such a chain
+/// (`checkProgramCell`/`checkProgramCells`/`checkProgramVault`), served without a node behind it.
+#[tokio::test]
+async fn the_wallet_reads_the_limits_it_derives_caps_from() {
+    let (addr, _served) = common::serve_genesis(|g| {
+        g.envelope_bytes = Some(randprotocol_core::notes::MEMO_ENVELOPE_BYTES as u32);
+        // `program_state` needs `gas`, `tokens`, `hardening_v6` and an `hc_auth` beside it.
+        g.hardening_v6 = Some(true);
+        g.hc_auth = Some("11".repeat(32));
+        g.max_block_bytes = Some(20 << 20);
+        g.gas = Some(randprotocol_core::gas::GasConfig {
+            gas_price: 100,
+            byte_price: randprotocol_core::gas::BYTE_PRICE_DEFAULT,
+            bundle_gas_limit: randprotocol_core::gas::bundle_gas_limit_pin(),
+            metering: randprotocol_core::gas::GasMetering::Circuit,
+            dynamic: None,
+        });
+        g.tokens = Some(TokensConfig {
+            registration_fee: 1_000_000_000,
+            tokens: vec![],
+            mint_cap_per_day: 0,
+            max_tokens: None,
+            burn_registration_fee: None,
+            bound_note_value: None,
+            incremental_root: None,
+        });
+        g.program_state = Some(randprotocol_core::ledger::program_state::ProgramStateConfig { cell_fee: 10_000_000 });
+    })
+    .await;
+    let unknown = "ab".repeat(32);
+    let limits = call(addr, "rand_getLimits", json!([])).await["result"].clone();
+    assert_eq!(limits["envelope_bytes"], json!(randprotocol_core::notes::MEMO_ENVELOPE_BYTES), "{}", short(&limits));
+    assert_eq!(limits["program_state"]["cell_fee"], json!("10000000"), "{}", short(&limits));
+    for f in ["max_reads", "max_writes", "max_payouts"] {
+        assert!(limits["program_state"][f].as_u64().is_some_and(|n| n > 0), "program_state.{f}: {}", short(&limits));
+    }
+    // An absent cell reads as 64 zeros, under the key asked for.
+    let zeros = "00".repeat(32);
+    let cell = call(addr, "rand_getProgramCell", json!([unknown, zeros])).await["result"].clone();
+    assert_eq!(cell, json!({ "key": zeros, "value": zeros }));
+    assert_eq!(
+        call(addr, "rand_getProgramCells", json!([unknown, { "limit": 256 }])).await["result"],
+        json!({ "cells": [], "next": null })
+    );
+    assert_eq!(call(addr, "rand_getProgramVault", json!([unknown])).await["result"], json!([]));
 }
 
 /// `rand_getLimits.fee_rules` with all three flags `true`, and `rand_getSupply.base_fees_burned`

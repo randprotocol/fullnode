@@ -87,7 +87,9 @@ input. `docs/zkvm.md` §3–6.
 
 ## 7. How do I run the downstream integration tests?
 
-Four repos read this node's JSON-RPC, and each has an integration test that spawns a real
+Five repos read this node's JSON-RPC (a sixth consumer, durian.market's perps frontend and
+`perp-prover`, reads the RPL-3 methods and is pinned in `rpc_contract.rs` only), and each of these
+five has an integration test that spawns a real
 `rand-node` rather than a mock:
 
 | repo | test | what it reads |
@@ -96,6 +98,7 @@ Four repos read this node's JSON-RPC, and each has an integration test that spaw
 | randbridge.org | `status/tests/real_node.rs` (planned) | `rand_getHead`, `rand_getBlockByHeight`, `rand_getRawTransaction`, `rand_chainId`, `rand_getBridgeState`, `rand_getBridgeBurn` |
 | randprotocol.org | `server/sale/tests/real_node.rs` (planned) | the sale relay and the balance viewer: `rand_chainId`, `rand_getNullifiers`, `rand_getToken(s)`, `rand_getAssets`, `rand_getLimits`, `rand_getSupply`, `rand_sendTransaction` |
 | zusd.money | `tests/` (planned) | randscan's REST, which is `rand_getBridgeState`, `rand_getAssets`, `rand_getTokens`, `rand_getTokenSupply` |
+| clients (the wallet) | `web/wallet/test/node.e2e.test.mjs`, run by `scripts/e2e-node.sh` | the scan and send path through `ui/engine/rpc.js`, shapes checked in `ui/engine/validate.js`: `rand_chainId`, `getGenesisHash`, `status`, `getLimits`, `getHead`, `getTreeInfo`, `getCommitments`, `getNullifiers`, `getAnchor`, `getWitness`, `getBlocks`, `getBlockByHeight`, `getTransaction`, `getAssets`, `getTokens`, `getBridgeState`, `estimateFee`, `sendTransaction`, `mint` |
 
 All of them start the chain the same way, with `scripts/dev-chain.sh`: one validator on loopback,
 a test-profile genesis with the faucet on and `--binding-domain 1` (none on chain ids 14–19,
@@ -126,6 +129,12 @@ builds `rand-node` and `rand` (with `rand-prover` and `SHA256SUMS`) on `ubuntu-2
 them to the GitHub release, and the downstream jobs download those two and point `RAND_NODE_BIN`
 and `RAND_CLI` at them. They are Linux x86-64 builds; on a Mac, build them here
 (`cargo build --release -p randprotocol-node -p randprotocol-client`).
+
+The clients repo (the wallet) runs its test through its own runner, `scripts/e2e-node.sh`, which
+takes `RAND_NODE_BIN`, `RAND_CLI_BIN` and `RAND_PROVER_BIN` (the `rand-node`, `rand` and
+`rand-prover` binaries); its CI job `real-node` (`.github/workflows/node-integration.yml`) downloads
+the same release assets as the others, so what it reads must hold on the last release, and the
+rows that pin the wallet's reads in `rpc_contract.rs` (below) are what fail first.
 
 The fields those repos read are pinned here too, so a rename fails this repo's CI before a release
 reaches theirs: `crates/randprotocol-node/tests/rpc_contract.rs` runs one in-process validator
