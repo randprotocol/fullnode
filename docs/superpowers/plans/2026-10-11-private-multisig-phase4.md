@@ -1314,7 +1314,7 @@ What `check_proposal` does, every §6.5 check in order:
 4. `auth_commit == msauth::auth_commit(nk, salt)`.
 5. All four outputs open as sender under `policy.viewing_key().scan_key()`, each to the bundle's commitment in its slot.
 6. Value conservation: from the witness words to the transaction's nullifiers, then outputs + fee + `burn_a`/`burn_r`.
-7. Expiry, as far as a pure function can check it: `bundle.time < expires_at ≤ bundle.time + randprotocol_core::genesis::MAX_PROOF_WINDOW_BLOCKS` (4 096). Comparing with the chain head is the caller's job: the CLI reads `rand_status`, and an app reads its own node.
+7. Expiry, as far as a pure function can check it: `bundle.time < expires_at ≤ bundle.time + randprotocol_core::ledger::MAX_PROOF_WINDOW_BLOCKS` (4 096). Comparing with the chain head is the caller's job: the CLI reads `rand_status`, and an app reads its own node.
 
 `sign` re-runs `check_proposal`, derives the keypair with `crystals_dilithium::dilithium2::Keypair::generate(Some(signer_seed))`, refuses a public key not in `policy.signers` ("this key is not one of the policy's signers"), and returns `(index, sig)` with `sig.len() == 2420`, signed over `signing_message`. `verify_share` parses `i:hex`, range-checks `i`, and verifies the signature against `policy.signers[i]` over `signing_message`.
 
