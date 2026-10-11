@@ -30,9 +30,11 @@ Since this table was written: **chain 19** (v0.6.7, genesis `a3defc93…228a`, 2
 v0.7.1) — chain 20 is the chain that runs. **Chain 21** is prepared, not cut:
 `deploy/cut-chain21-genesis.sh` carries chain 20's shape and value plus three new sections —
 `fees` (`burn_base`, `burn_floor`), `perps` (RPL-3: BTC-PERP on zUSD) and `multisig` (the
-foundation treasury, 2 of 3) — ("The next cut: the `fees` section (chain 21)", below) and needs a
-build at 6f1cd272 or later on every node (signers read the genesis hash from the node or take
-`--genesis-hash`, so they need it only to know `fee_rules`, `perps` and `multisig`).
+foundation treasury, 2 of 3) — and private multisig's `hc_auth_multisig` field with 6 MiB proofs
+and 19 MiB blocks ("The next cut: the `fees` section (chain 21)", below), and needs a build at
+6f1cd272 or later with `feat/private-multisig` (712c6336 or later) on every node (signers read
+the genesis hash from the node or take `--genesis-hash`, so they need it only to know `fee_rules`,
+`perps`, `multisig` and `hc_auth_multisig`).
 
 ## Topology rules
 
@@ -1595,6 +1597,30 @@ signers in the file's order, threshold 2); `perps`: `rand_getLimits.perps` (coll
 64 blocks, 24 inputs, 8 payouts, min deposit `"100000000"`) and `rand_getPerps` (the market, the
 pinned `engine_hc`, `genesis_root`, and at launch `proved_height` 0 with `proved_root` ==
 `genesis_root` — run it before the first state proof).
+
+**`hc_auth_multisig`** (private multisig phase 4, `feat/private-multisig` 712c6336): the multisig
+auth guest's digest, `9705f8e2f1bc8561848b29cb8efd57c37e3e39788fa58a5f03304d8019668247`, written
+by `rand-node genesis --auth-multisig-guest` (it requires `--auth-guest`) from the build itself —
+never typed. The cut asserts it is that value (`EXPECT_HC_AUTH_MULTISIG`; any other refused), the
+file's **last** field (hashed last, a tagged append after `aggregation_tree`, so chain 20's hash
+does not move), `hc_auth` present and a different guest, and the binary's printed value equal to
+the written one; it is excused from the chain-20 comparison, probed (a seventh variant, without
+it), and read back by `check-limits` from `rand_getLimits.hc_auth_multisig` and
+`rand_status.hc_auth_multisig` (private-multisig Task 5's fields; a build without them fails the
+read-back). The cut record's `reason:` or `carries:` line must name it (`hc_auth_multisig` or
+"private multisig"). The real cut refuses a `rand-node` without `--auth-multisig-guest`; `DRY_RUN`
+skips the field, loudly (`AUTH_MULTISIG SKIPPED`). **The limits move with it:** `max_proof_bytes`
+6 MiB (6291456; chain 20's 4 MiB) — a multisig auth proof plus its bundle is estimated near 4.8 MB
+at production FRI, and the node refuses a cap below 4 MiB beside the field — and `max_block_bytes`
+19 MiB (19922944 = 3 · 6 MiB + 1 MiB, the three-proof `Call` rule; chain 20's 20 MiB), with
+`gas.dynamic.target_block_bytes` following at half, 9961472. Both are asserted at those values
+unless `LIMITS_CHANGED=1`, and `check-limits` reads them back. **6 MiB is pending the measured
+production msauth proof size** (the private-multisig session's Task 3); a measurement re-decides
+it here and in the script together. Every chain-21 node needs the msauth verifier key
+`/usr/local/bin/msauth-vk-production.bin` (23 754 B, SHA-256 `68facb06…cd30`, committed at
+`crates/randprotocol-zkvm/keys/` on `feat/private-multisig` 52f01454) or it refuses to start — see
+"The msauth verifier key" in that branch's `docs/deploy.md`; the `DRY_RUN` loopback node needs it
+too (`RAND_MSAUTH_VK=<the committed blob>`).
 
 ## The next cut: the proposer/aggregator split (`fees.proposer_share_bps`, `fees.prove_base`; unreleased)
 
