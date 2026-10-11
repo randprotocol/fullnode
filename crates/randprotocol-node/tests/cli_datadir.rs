@@ -189,7 +189,7 @@ fn verify_an_initialised_directory_in_every_mode() {
         !bad.ok
             && bad
                 .err
-                .contains("unknown verify mode paranoid (off|quick|full)"),
+                .contains("unknown verify mode paranoid (off|quick|replay|full)"),
         "{}",
         bad.err
     );
