@@ -104,8 +104,9 @@ pub const MSAUTH_REFUSAL: u32 = 0xdead_beef;
 
 /// The whole header a multisig auth proof must declare (spec §3.1): the tier and all seven log
 /// heights, each compared **exactly** — `mem_log_height` included (R-hide: it would otherwise
-/// grow with the number of signers). [`ZkExecutor::msauth_heights`] is the one value.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// grow with the number of signers). [`ZkExecutor::msauth_heights`] is the one value. Serde
+/// because it is also the header shape of the precomputed verifier key blob ([`msauth_vk`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct MsauthShape {
     pub tier: usize,
     pub program_log_height: u8,
@@ -115,6 +116,187 @@ pub struct MsauthShape {
     pub modq_log_height: u8,
     pub public_log_height: u8,
     pub mem_log_height: u8,
+}
+
+/// The precomputed msauth verifier key (plan Task 2b, spec §3.6).
+///
+/// The tier-18 msauth key costs 78.6 s and ~4 GB to build (Task 2's measurement), and the fleet's
+/// validators are `s-2vcpu-4gb`, so a node **loads** it instead. The key file is exactly the
+/// vendored machine's postcard-serialised `VerifierKeyBlob` (no wrapper of ours), so its pin is
+/// the blake3 of the file bytes. There is one location, beside the binary
+/// (`/usr/local/bin/msauth-vk-production.bin`; `--msauth-vk` / `RAND_MSAUTH_VK` override it), and
+/// a node on a chain naming `hc_auth_multisig` refuses to start without the pinned blob.
+///
+/// **TASK-2B-RESYNC.** The machine API that exports and installs a key
+/// (`Machine::export_verifier_key_with_modq`, `Machine::install_verifier_key`,
+/// `machine::VerifierKeyBlob`) is being added UPSTREAM in circuits and arrives with the next
+/// re-sync and `CIRCUITS_PIN` bump. Until then:
+/// - [`VerifierKeyBlob`] here MIRRORS the contract's layout so the node can read the header
+///   (shape, profile) before installing. At the re-sync it becomes
+///   `pub use crate::machine::VerifierKeyBlob`, and the mirror goes;
+/// - [`machine_export`] and [`machine_install`] return [`MsauthVkError::NotYetVendored`];
+/// - both pins are [`PIN_PENDING`], which no file hashes to, so every load is refused and
+///   `tests/guest_provenance.rs::the_msauth_verifier_key_blobs_are_pinned` fails, printing the
+///   digest it computed.
+pub mod msauth_vk {
+    use super::{MsauthShape, ZkExecutor};
+    use crate::machine::{FriProfile, Machine};
+    use serde::{Deserialize, Serialize};
+
+    /// No blob hashes to this: the value the pins hold until the real blobs exist (TASK-2B-RESYNC).
+    pub const PIN_PENDING: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+
+    /// blake3 of `msauth-vk-production.bin`, the release asset every validator installs at
+    /// `/usr/local/bin/msauth-vk-production.bin`. Consensus-critical (a wrong commitment could let
+    /// a forged multisig proof verify): `tests/guest_provenance.rs` and `deploy/roll-all.sh` check
+    /// it. TASK-2B-RESYNC: set from the keygen run after the re-sync.
+    pub const MSAUTH_VK_BLAKE3_PRODUCTION: &str = PIN_PENDING;
+    /// blake3 of `crates/randprotocol-zkvm/keys/msauth-vk-test.bin` (tests only). TASK-2B-RESYNC.
+    pub const MSAUTH_VK_BLAKE3_TEST: &str = PIN_PENDING;
+
+    /// This build's pin for `profile`.
+    pub fn pin(profile: FriProfile) -> &'static str {
+        match profile {
+            FriProfile::Production => MSAUTH_VK_BLAKE3_PRODUCTION,
+            FriProfile::Test => MSAUTH_VK_BLAKE3_TEST,
+        }
+    }
+
+    /// The fixed file name for `profile`, beside the running binary: `msauth-vk-<profile>.bin`.
+    pub fn file_name(profile: FriProfile) -> &'static str {
+        match profile {
+            FriProfile::Production => "msauth-vk-production.bin",
+            FriProfile::Test => "msauth-vk-test.bin",
+        }
+    }
+
+    /// The blake3 of `bytes`, lowercase hex: what every pin and every deploy check compares.
+    pub fn digest(bytes: &[u8]) -> String {
+        blake3::hash(bytes).to_hex().to_string()
+    }
+
+    /// Mirror of the vendored `FriProfile` as the contract serialises it (the vendored enum
+    /// derives no serde yet). TASK-2B-RESYNC: replaced by `machine::FriProfile`.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    pub enum BlobProfile {
+        Test,
+        Production,
+    }
+    impl From<FriProfile> for BlobProfile {
+        fn from(p: FriProfile) -> Self {
+            match p {
+                FriProfile::Test => BlobProfile::Test,
+                FriProfile::Production => BlobProfile::Production,
+            }
+        }
+    }
+
+    /// Mirror of the contract's `VerifierKeyBlob` header. TASK-2B-RESYNC: replaced by the vendored
+    /// type. `format_version` and `constraint_set` are the machine's to check
+    /// (`Machine::install_verifier_key` refuses a wrong one); the node checks `shape` and
+    /// `profile` itself, before the install, so a mismatch is named here.
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct VerifierKeyHeader {
+        pub format_version: u32,
+        pub profile: BlobProfile,
+        /// The tier and the seven log heights (the msauth header: [`ZkExecutor::msauth_heights`]).
+        pub shape: MsauthShape,
+        pub constraint_set: u32,
+    }
+
+    /// Mirror of the contract's `VerifierKeyBlob`: the header and the postcard of the key's
+    /// `CommonData`. The key file is `postcard::to_allocvec(&blob)`, whole. TASK-2B-RESYNC.
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct VerifierKeyBlob {
+        pub header: VerifierKeyHeader,
+        pub common: Vec<u8>,
+    }
+
+    /// Where the msauth key came from: `rand_status.msauth_key`.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+    #[serde(rename_all = "snake_case")]
+    pub enum MsauthKeySource {
+        /// Installed from the pinned blob.
+        Loaded,
+        /// Built on this host (`--build-msauth-key`, development only).
+        Built,
+        /// The chain has no `hc_auth_multisig`, so there is no key.
+        #[default]
+        Absent,
+    }
+    impl MsauthKeySource {
+        pub fn as_str(self) -> &'static str {
+            match self {
+                MsauthKeySource::Loaded => "loaded",
+                MsauthKeySource::Built => "built",
+                MsauthKeySource::Absent => "absent",
+            }
+        }
+    }
+
+    /// Why a blob was refused. Each refusal names its field; the node turns any of them into a
+    /// startup failure.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum MsauthVkError {
+        Digest { got: String, want: String },
+        Decode(String),
+        Profile { got: BlobProfile, want: BlobProfile },
+        Shape { got: MsauthShape, want: MsauthShape },
+        Install(String),
+        /// TASK-2B-RESYNC: the vendored machine has no key export/install API yet.
+        NotYetVendored,
+    }
+    impl std::fmt::Display for MsauthVkError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                MsauthVkError::Digest { got, want } => write!(f, "msauth key blob digest: has blake3 {got}, not the pinned {want}"),
+                MsauthVkError::Decode(e) => write!(f, "msauth key blob does not decode: {e}"),
+                MsauthVkError::Profile { got, want } => write!(f, "msauth key blob profile is {got:?}, this node runs {want:?}"),
+                MsauthVkError::Shape { got, want } => write!(f, "msauth key blob shape {got:?} is not the pinned msauth shape {want:?}"),
+                MsauthVkError::Install(e) => write!(f, "the machine refused the msauth key: {e}"),
+                MsauthVkError::NotYetVendored => write!(f, "the vendored machine has no verifier-key install/export API yet (TASK-2B-RESYNC: needs the circuits re-sync)"),
+            }
+        }
+    }
+    impl std::error::Error for MsauthVkError {}
+
+    /// The checks that need nothing from the machine, in order: the blake3 of the file bytes
+    /// equals `want_digest`; the bytes decode; the header's profile is `profile`; its shape is
+    /// exactly [`ZkExecutor::msauth_heights`]. Returns the decoded blob for the install.
+    pub fn check(blob: &[u8], want_digest: &str, profile: FriProfile) -> Result<VerifierKeyBlob, MsauthVkError> {
+        let got = digest(blob);
+        if got != want_digest {
+            return Err(MsauthVkError::Digest { got, want: want_digest.to_string() });
+        }
+        let b: VerifierKeyBlob = postcard::from_bytes(blob).map_err(|e| MsauthVkError::Decode(e.to_string()))?;
+        if b.header.profile != BlobProfile::from(profile) {
+            return Err(MsauthVkError::Profile { got: b.header.profile, want: profile.into() });
+        }
+        let want = ZkExecutor::msauth_heights();
+        if b.header.shape != want {
+            return Err(MsauthVkError::Shape { got: b.header.shape, want });
+        }
+        Ok(b)
+    }
+
+    /// TASK-2B-RESYNC: `machine.export_verifier_key_with_modq(tier, plh, ilh, klh, slh, mlh, pubh)`
+    /// serialised with postcard. Builds the key (78.6 s / ~4 GB at Production).
+    /// The key file for `profile`: the full build on a fresh machine, exported (the
+    /// `rand-node keygen-msauth-vk` body; a big host only — 78.6 s / ~4 GB at Production).
+    pub fn blob(profile: FriProfile) -> Result<Vec<u8>, MsauthVkError> {
+        machine_export(&Machine::new(profile), ZkExecutor::msauth_heights())
+    }
+
+    pub(super) fn machine_export(_machine: &Machine, _shape: MsauthShape) -> Result<Vec<u8>, MsauthVkError> {
+        Err(MsauthVkError::NotYetVendored)
+    }
+
+    /// TASK-2B-RESYNC: `machine.install_verifier_key(&blob)`, its `InstallKeyError` mapped to
+    /// [`MsauthVkError::Install`]. After `Ok`, `verify`/`verify_public` at that shape use the
+    /// installed key and build nothing.
+    pub(super) fn machine_install(_machine: &Machine, _blob: &VerifierKeyBlob) -> Result<(), MsauthVkError> {
+        Err(MsauthVkError::NotYetVendored)
+    }
 }
 
 /// The highest tier a *call* proof may declare (deep scan 2026-09-24, zkvm), enforced by
@@ -566,6 +748,9 @@ pub struct ZkExecutor {
     msauth_key: std::sync::OnceLock<std::sync::Arc<p3_batch_stark::CommonData<crate::machine::Config>>>,
     /// How many times the `msauth_key` initialiser ran — at most once ([`ZkExecutor::msauth_key_builds`]).
     msauth_key_builds: std::sync::atomic::AtomicUsize,
+    /// Where the msauth key came from (Task 2b): set once, `Loaded` by
+    /// [`ZkExecutor::install_msauth_vk`], `Built` by the build; unset reads as `Absent`.
+    msauth_key_source: std::sync::OnceLock<msauth_vk::MsauthKeySource>,
     /// Held across the whole body of `warm` and `warm_bundle` (CPUV-1): at most one warm-up
     /// builds keys at a time on this node, whoever calls it. `node::warm_new_programs` spawns a
     /// blocking task per deploy-carrying commit and the startup warm runs beside them, so before
@@ -591,6 +776,7 @@ impl ZkExecutor {
             msauth_machine: Machine::new(profile),
             msauth_key: std::sync::OnceLock::new(),
             msauth_key_builds: std::sync::atomic::AtomicUsize::new(0),
+            msauth_key_source: std::sync::OnceLock::new(),
             warm_lock: std::sync::Mutex::new(()),
             warms_in_flight: std::sync::atomic::AtomicUsize::new(0),
             peak_warms: std::sync::atomic::AtomicUsize::new(0),
@@ -1202,6 +1388,7 @@ impl ZkExecutor {
     /// The msauth key, built at most once ([`Self::msauth_key_with`] over the tier-18 build).
     fn msauth_key(&self) -> std::sync::Arc<p3_batch_stark::CommonData<crate::machine::Config>> {
         self.msauth_key_with(|| {
+            let _ = self.msauth_key_source.set(msauth_vk::MsauthKeySource::Built);
             let s = Self::msauth_heights();
             self.msauth_machine.verifier_key_with_modq(
                 Tier(s.tier),
@@ -1228,6 +1415,51 @@ impl ZkExecutor {
                 build()
             })
             .clone()
+    }
+
+    /// Install the precomputed msauth verifier key from the key file's bytes (Task 2b, spec
+    /// §3.6), instead of building it: [`msauth_vk::check`] against this build's pin for this
+    /// executor's profile (digest, decode, profile, shape), then the machine's install, then the
+    /// single-flight slot filled from the machine's cache (no build). Afterwards
+    /// [`Self::msauth_key_ready`] is true and [`Self::msauth_key_source`] is `Loaded`.
+    pub fn install_msauth_vk(&self, blob: &[u8]) -> Result<(), msauth_vk::MsauthVkError> {
+        self.install_msauth_vk_with_pin(blob, msauth_vk::pin(self.msauth_machine.profile))
+    }
+
+    /// [`Self::install_msauth_vk`] against a given pin: the tests' way to reach the header checks
+    /// with a synthetic blob (no real blob hashes to a test's own digest otherwise).
+    #[doc(hidden)]
+    pub fn install_msauth_vk_with_pin(&self, blob: &[u8], pin: &str) -> Result<(), msauth_vk::MsauthVkError> {
+        let checked = msauth_vk::check(blob, pin, self.msauth_machine.profile)?;
+        msauth_vk::machine_install(&self.msauth_machine, &checked)?;
+        let s = Self::msauth_heights();
+        // The machine holds the installed key in its slot for the 7-tuple, so this lookup returns
+        // it without a build; the `OnceLock` is the readiness flag, not a second copy.
+        self.msauth_key.get_or_init(|| {
+            self.msauth_machine.verifier_key_with_modq(
+                Tier(s.tier),
+                s.program_log_height,
+                s.input_log_height,
+                s.keccak_log_height,
+                s.sha256_log_height,
+                s.modq_log_height,
+                s.public_log_height,
+            )
+        });
+        let _ = self.msauth_key_source.set(msauth_vk::MsauthKeySource::Loaded);
+        Ok(())
+    }
+
+    /// Where this executor's msauth key came from: `Loaded`, `Built`, or `Absent` (neither yet).
+    pub fn msauth_key_source(&self) -> msauth_vk::MsauthKeySource {
+        self.msauth_key_source.get().copied().unwrap_or_default()
+    }
+
+    /// A test instrument: how many verifier keys the msauth machine itself has built — 0 after a
+    /// load, which is what "the node never builds the key" means.
+    #[doc(hidden)]
+    pub fn msauth_machine_key_builds(&self) -> usize {
+        self.msauth_machine.key_builds()
     }
 
     /// 0 before the msauth key is built, 1 after; never more (the key is one `OnceLock`).
