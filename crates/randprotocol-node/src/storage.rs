@@ -2088,6 +2088,9 @@ impl Storage {
 
     /// Record that this build verified the store through its current head (spec §3.2.1).
     /// Nothing is written without a trusted build; returns whether the row was written.
+    ///
+    /// Startup only, before consensus and sync start: it reads the head and then writes, so a
+    /// commit between the two would mark a head this build never verified.
     pub fn mark_verified_head(&self) -> Result<bool> {
         let Some(build_sha) = self.checkpoint_build() else { return Ok(false) };
         let head = self.head_block()?;

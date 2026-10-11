@@ -515,6 +515,8 @@ pub enum WalkReason {
     UntrustedBuild,
     /// The row is for another head than the stored one.
     HeadMoved { checkpoint: u64, head: u64 },
+    /// The head block did not read back (missing or undecodable): the walk finds and repairs it.
+    HeadUnreadable(String),
     /// `--verify-chain replay` or `full`.
     Forced(VerifyMode),
 }
@@ -526,6 +528,7 @@ impl std::fmt::Display for WalkReason {
             WalkReason::OtherBuild(old) => write!(f, "checkpoint from build {}", old.get(..12).unwrap_or(old)),
             WalkReason::UntrustedBuild => write!(f, "untrusted build {}", env!("RAND_GIT_SHA")),
             WalkReason::HeadMoved { checkpoint, head } => write!(f, "checkpoint at {checkpoint} but head is {head}"),
+            WalkReason::HeadUnreadable(e) => write!(f, "head block unreadable ({e})"),
             WalkReason::Forced(mode) => {
                 let mode = match mode {
                     VerifyMode::Replay => "replay",
@@ -566,24 +569,28 @@ pub fn startup_check(storage: &Storage, gs: &GenesisState, mode: VerifyMode, exe
     if mode == VerifyMode::Off {
         return Ok(StartupCheck { resume: storage.head()?.height, stored: None, verify: StartupVerify::Off });
     }
-    let head = storage.head()?;
     let reason = match (mode, storage.checkpoint_build(), storage.verified_head()?) {
         (VerifyMode::Replay | VerifyMode::Full, _, _) => WalkReason::Forced(mode),
         (_, None, _) => WalkReason::UntrustedBuild,
         (_, Some(_), None) => WalkReason::NoCheckpoint,
         (_, Some(build), Some(m)) if m.build_sha != build => WalkReason::OtherBuild(m.build_sha),
-        (_, Some(_), Some(m)) if m.height != head.height || m.block_hash != head.hash => {
-            WalkReason::HeadMoved { checkpoint: m.height, head: head.height }
-        }
-        (_, Some(build), Some(_)) => {
-            tracing::info!("chain verified: checkpoint at {} (build {}), replay skipped", head.height, &build[..12]);
-            return Ok(StartupCheck { resume: head.height, stored: None, verify: StartupVerify::Skipped { height: head.height } });
-        }
+        // The head is read only to compare it with the row: a head block that does not read is
+        // damage the walk finds and repairs, not a reason to refuse to start.
+        (_, Some(build), Some(m)) => match storage.head() {
+            Err(e) => WalkReason::HeadUnreadable(e.to_string()),
+            Ok(head) if m.height != head.height || m.block_hash != head.hash => {
+                WalkReason::HeadMoved { checkpoint: m.height, head: head.height }
+            }
+            Ok(head) => {
+                tracing::info!("chain verified: checkpoint at {} (build {}), replay skipped", head.height, &build[..12]);
+                return Ok(StartupCheck { resume: head.height, stored: None, verify: StartupVerify::Skipped { height: head.height } });
+            }
+        },
     };
     tracing::info!("startup verify ({mode:?}): {reason}");
     let t = Instant::now();
     let check = storage.verify_chain(gs, mode, executor)?;
-    // `mark_verified_head` reads the head, then writes: safe only here, before consensus and sync start.
+    // `mark_verified_head` is a startup-only write (see its doc): here, before consensus and sync start.
     if check.floor > 0 {
         return match &check.problem {
             None => {
@@ -4956,6 +4963,49 @@ mod tests {
         let before = storage.verified_head().unwrap();
         assert_eq!(startup(&storage, &gs, VerifyMode::Off).verify, StartupVerify::Off);
         assert_eq!(storage.verified_head().unwrap(), before);
+    }
+
+    #[test]
+    fn a_garbled_head_block_under_a_valid_checkpoint_walks_and_repairs() {
+        let (_d, storage, gs, _) = chain_past_a_boundary();
+        storage.set_checkpoint_build_for_testing(Some(SHA_A));
+        startup(&storage, &gs, VerifyMode::Quick);
+        let old = storage.head().unwrap().height;
+        storage.overwrite_block_bytes_for_testing(old, b"garbage").unwrap();
+        let c = startup_check(&storage, &gs, VerifyMode::Quick, &StubExecutor).expect("the walk repairs, startup goes on");
+        assert!(matches!(c.verify, StartupVerify::Walked(WalkReason::HeadUnreadable(_))), "{:?}", c.verify);
+        assert!(c.resume < old, "the damaged head was truncated");
+        let head = storage.head().unwrap();
+        assert_eq!(head.height, c.resume);
+        let row = storage.verified_head().unwrap().expect("the repaired head is marked");
+        assert_eq!((row.height, row.block_hash, row.build_sha.as_str()), (head.height, head.hash, SHA_A));
+    }
+
+    #[test]
+    fn a_repaired_walk_marks_the_truncated_head() {
+        let (_d, storage, gs, _) = chain_past_a_boundary();
+        storage.set_checkpoint_build_for_testing(Some(SHA_A));
+        startup(&storage, &gs, VerifyMode::Quick);
+        assert!(storage.verified_head().unwrap().is_some());
+        storage.overwrite_block_bytes_for_testing(1, b"garbage").unwrap();
+        let c = startup_check(&storage, &gs, VerifyMode::Replay, &StubExecutor).expect("an archive repairs");
+        assert_eq!(c.verify, StartupVerify::Walked(WalkReason::Forced(VerifyMode::Replay)));
+        let head = storage.head().unwrap();
+        assert_eq!(head.height, c.resume);
+        assert!(head.height < 1, "truncated below the damaged block");
+        let row = storage.verified_head().unwrap().expect("the truncated head is marked");
+        assert_eq!((row.height, row.block_hash, row.build_sha.as_str()), (head.height, head.hash, SHA_A));
+    }
+
+    #[test]
+    fn a_failed_walk_writes_no_checkpoint() {
+        let (_dir, st, gs, _blocks) = crate::storage::fixtures::timed_chain(12);
+        st.prune_history(u64::MAX, 10, crate::storage::PRUNE_PASS_MAX).unwrap();
+        st.db_for_test().delete_cf(st.cf_for_test("blocks"), crate::storage::height_key_for_test(10)).unwrap();
+        st.set_checkpoint_build_for_testing(Some(SHA_A));
+        assert_eq!(st.verified_head().unwrap(), None);
+        assert!(startup_check(&st, &gs, VerifyMode::Quick, &StubExecutor).is_err(), "a pruned store cannot repair");
+        assert_eq!(st.verified_head().unwrap(), None, "a failed walk writes nothing");
     }
 
     #[test]
