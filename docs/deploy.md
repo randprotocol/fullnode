@@ -28,10 +28,11 @@ Since this table was written: **chain 19** (v0.6.7, genesis `a3defc93…228a`, 2
 `deploy/cut-chain19-genesis.sh`) and **chain 20** (v0.6.8, genesis `6210cf07…5135`, live since
 2026-10-01 06:17 UTC, `deploy/cut-chain20-genesis.sh`, `deploy/cut-records/chain20.record`; now on
 v0.7.1) — chain 20 is the chain that runs. **Chain 21** is prepared, not cut:
-`deploy/cut-chain21-genesis.sh` carries chain 20's shape and value plus the `fees` section
-(`burn_base`, `burn_floor`; "The next cut: the `fees` section (chain 21)", below) and needs a
-build at d6cc16f5 or later on every node (signers read the genesis hash from the node or take
-`--genesis-hash`, so they need it only to know `fee_rules`).
+`deploy/cut-chain21-genesis.sh` carries chain 20's shape and value plus three new sections —
+`fees` (`burn_base`, `burn_floor`), `perps` (RPL-3: BTC-PERP on zUSD) and `multisig` (the
+foundation treasury, 2 of 3) — ("The next cut: the `fees` section (chain 21)", below) and needs a
+build at 6f1cd272 or later on every node (signers read the genesis hash from the node or take
+`--genesis-hash`, so they need it only to know `fee_rules`, `perps` and `multisig`).
 
 ## Topology rules
 
@@ -1295,6 +1296,12 @@ with it (`docs/rpc.md`, changelog).
 
 ## The next cut: a `multisig` section (the treasury)
 
+**Chain 21 carries it** (the user's decision, 2026-10-11): `create_fee` `"1000000000"` (1 RAND)
+and one seeded account, the foundation treasury — 2 of 3, its balance new issuance. The signers'
+keys and the amount come from the operator's `TREASURY` file; `deploy/cut-chain21-genesis.sh`
+writes the section, derives the id offline and checks it against what `genesis --multisig`
+prints ("The next cut: the `fees` section (chain 21)", the chain-21 sections, below).
+
 Multisig accounts (`docs/multisig.md`, spec `docs/superpowers/specs/2026-10-08-multisig-design.md`)
 switch on with a top-level `"multisig": { "create_fee": "<units>", "accounts": [ … ] }`. Hashed
 after every other section, folded into the state root as the wrapper `rand-state-multisig-1` and
@@ -1534,9 +1541,60 @@ and the clients repo apps, randscan and the website WASM vendor their fullnode v
 
 **After launch:** `NODE=… deploy/cut-chain21-genesis.sh check-limits <first node's RPC> <genesis
 file>` reads `rand_getLimits.fee_rules.burn_base == true` and `.burn_floor == true` (with
-`subsidy_net_of_fees == false`), `rand_getSupply.base_fees_burned == "0"` and `invariant_holds ==
-true`, beside every value carried from chain 20. Run it before the first bundle lands, or with
+`subsidy_net_of_fees == false` and the split and dollar-subsidy fields `null`),
+`rand_getSupply.base_fees_burned == "0"` and `invariant_holds == true`, beside every value carried
+from chain 20 and the two sections below. Run it before the first bundle lands, or with
 `BASE_FEES_BURNED_ANY=1` once one has.
+
+### Chain 21's other two sections: `perps` and `multisig` (the user's decision, 2026-10-11)
+
+Chain 21 switches on three genesis sections, not one. Each is a constant of the cut script (not
+overridable from the environment), asserted on the finished file, proved to be part of the
+genesis hash (the cut re-derives the hash without each section and without one optional field of
+each — `fees.burn_floor`, `perps.min_deposit`, `multisig.create_fee` — and refuses if any does
+not move), and read back by `check-limits`.
+
+**`perps`** (`docs/perps.md`): one market on zUSD.
+
+| field | value | why |
+|---|---|---|
+| `collateral_asset` | `1` | zUSD, `FIRST_TOKEN_INDEX`: chain 20's genesis lists exactly one token, and the cut asserts the finished file's `tokens.tokens[0]` is zUSD. The supply audit does **not** cover a token collateral (v0 limit M6); chosen knowing that. |
+| market 0 | `BTC-PERP`, `lot` 100000, `tick` 100000000, `max_leverage` 20, `maintenance_bps` 250, `taker_fee_bps` 5, `maker_fee_bps` 2 | `lot` is 0.0001 BTC (base atomic units, `BASE_UNIT` = 10⁹ = 1 BTC). A price is collateral units per `BASE_UNIT`, and **zUSD has eight decimals** (`BRIDGE_DECIMALS`): `tick` 10⁸ is $1 a BTC (10⁹ would be $10). perp-core's initial margin is `⌈notional / max_leverage⌉`, 500 bps at 20x; maintenance must be below it or a max-leverage position opens liquidatable — the engine does not refuse such a spec, the cut does. |
+| `max_tier`, `max_block_inputs` | 18, 24 | the documented production sizing: durian.market's gated case `block-24-14liq` (24 inputs, a close that liquidates 14) is 212 018 cycles, inside tier 18 with 15 % headroom; 25 is refused. |
+| `max_window_blocks` | 64 | the ceiling; 64 close-only blocks do not fit tier 18 (≈ 25 k cycles a close), so `perp-prover run` halves its window until one fits. |
+| `min_deposit` | 100000000 | 1 zUSD (eight decimals). |
+| `engine_hc` | `f286a611…1573` | durian.market's pinned `artifacts/perp-engine.image.bin`; the cut runs `rand perp image-hc --image $PERP_IMAGE` and refuses any other. |
+| `genesis_root` | derived | `$PERP_PROVER genesis-state` over the market list, then `rand perp genesis-root --state`; printed as `PERPS GENESIS ROOT` for the cut record. The real cut refuses without `PERP_PROVER` (durian.market's `perp-prover`, built from the commit that pinned the image). |
+
+The section is **spliced**, not passed as `rand-node genesis --perps`: the base file lists no
+token (zUSD is a bridged token and is spliced in with the bridge section), and `Genesis::validate`
+refuses `collateral_asset 1` on a file whose token list is empty. `rand-node init` on the
+finished file runs the whole of `Genesis::validate` over it (`PerpsConfig::check`, the
+`confidential`/`tokens`/`gas`/`hardening_v6`/`hc_auth` requirements, the collateral index);
+chain 20's shape already has all of them and `binding_domain 1`, which perp signatures bind to.
+**Operations perps adds:** NTP on every validator (a perps chain's block time is consensus input,
+"Block time is bounded"); a perp-view service (`perp-prover serve`) and a prover host
+(`perp-prover run`, ~22 GB of RAM a production-FRI proof; proving is open and unpaid in v0, and a
+withdrawal is paid only when the proofs reach its block).
+
+**`multisig`** (`docs/multisig.md`): `create_fee` `"1000000000"` (1 RAND, the recommended value;
+`0` is refused at this cut) and one account, the treasury: exactly 3 signers in the file's order,
+threshold 2, a fresh 32-byte salt per cut (printed), the balance **new issuance** — never carried
+from a chain-20 wallet. The operator's `TREASURY` file (default `~/.rand-chain21/treasury.txt`)
+holds public keys only: `signer <name> <Dilithium2 pk hex>` three times, `threshold 2`, `balance
+<RAND decimal>` (converted with the script's exact `units()`, no float). A signer key that is a
+validator's, a bridge guardian's or the pause key is refused, and so is a key listed twice. The cut
+derives the id offline (`rand-node multisig id`), requires `rand-node genesis --multisig` to print
+the same id and balance, prints `TREASURY ID <id>`, and refuses a cut record whose `reason:` or
+`carries:` line does not name the treasury (`require_cut_record_mentions`,
+`deploy/lib/cut-policy.sh`). The carry rule is unchanged — Σ RAND notes == Σ scanned balances —
+and the treasury is printed beside it as new issuance; notes, stakes and the treasury together
+must fit a u64. `check-limits` reads `rand_getLimits.multisig` (`create_fee` `"1000000000"`),
+`rand_getSupply.multisig_issued` (the treasury's balance) and `rand_getMultisig <id>` (the
+signers in the file's order, threshold 2); `perps`: `rand_getLimits.perps` (collateral 1, tier 18,
+64 blocks, 24 inputs, 8 payouts, min deposit `"100000000"`) and `rand_getPerps` (the market, the
+pinned `engine_hc`, `genesis_root`, and at launch `proved_height` 0 with `proved_root` ==
+`genesis_root` — run it before the first state proof).
 
 ## The next cut: the proposer/aggregator split (`fees.proposer_share_bps`, `fees.prove_base`; unreleased)
 

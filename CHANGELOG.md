@@ -42,6 +42,25 @@ Assets, when signed: `rand-node`, `rand`, `rand-prover`, `SHA256SUMS`, `SHA256SU
 
 ### Features
 
+- **The chain-21 cut carries `perps` and `multisig`** (deploy only; no node change):
+  `deploy/cut-chain21-genesis.sh` switches on two more genesis sections beside `fees`, each a
+  constant of the script, asserted on the finished file, proved to move the genesis hash and read
+  back by `check-limits`. `perps`: one market, BTC-PERP on zUSD (collateral asset 1; lot 100000,
+  tick 100000000 = $1 a BTC at zUSD's eight decimals, 20x, maintenance 250 bps, fees 5/2 bps),
+  `max_tier` 18, `max_block_inputs` 24, `max_window_blocks` 64, `min_deposit` 1 zUSD, the pinned
+  engine `f286a611…` (checked with `rand perp image-hc` on `PERP_IMAGE`), and a genesis root the
+  cut derives with durian.market's `perp-prover genesis-state` (`PERP_PROVER`, required) and
+  `rand perp genesis-root`; spliced after zUSD, since `rand-node genesis --perps` cannot name a
+  token the base file does not list yet. `multisig`: `create_fee` 1 RAND and one account, the
+  treasury, 2 of 3, its signers and balance (new issuance) read from the operator's `TREASURY`
+  file, a fresh salt per cut, the id derived offline and matched against `genesis --multisig`'s,
+  printed as `TREASURY ID`; the cut record must name the treasury
+  (`require_cut_record_mentions`, new in `deploy/lib/cut-policy.sh`). `check-limits` now expects
+  `fee_rules`' `proposer_share_bps`, `prove_base` and `usd_subsidy` as `null` (the cut build
+  serves them), and reads `rand_getLimits.perps`/`.multisig`, `rand_getPerps`,
+  `rand_getSupply.multisig_issued` and `rand_getMultisig`. Operations perps adds: NTP on every
+  validator, a perp-view service and a prover host (~22 GB a proof); a token collateral is outside
+  the supply audit (M6). `docs/deploy.md`.
 - **Tree aggregation** (genesis-gated, off by default: no existing chain carries the section; every
   aggregation genesis is still refused at startup): a genesis `aggregation_tree` section
   (`TreeConfig`: `shape`, `leaf_size`, `max_depth`, `leaf` heights, `vk_leaf`, per-level

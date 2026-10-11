@@ -15,6 +15,11 @@
 #                                        `met: no` and the genesis file does not set
 #                                        `"testnet": true` — no mainnet genesis until the keys
 #                                        are split (audit v6, OPS-6); warns past the deadline
+#   require_cut_record_mentions <file> <regex> <what> <field…>
+#                                        returns 1 unless one of the record's <field> lines matches
+#                                        <regex> (extended, case-insensitive): a cut that seeds or
+#                                        switches on <what> says so in the record published
+#                                        beforehand (chain 21: the treasury, new issuance)
 #   require_second_rebuild <file> <hash> returns 1 unless <file> carries `second-hash: <hash>` —
 #                                        the genesis hash the second operator got by rebuilding the
 #                                        genesis from the tag on another machine — equal to <hash>,
@@ -54,6 +59,21 @@ require_cut_record() {
     echo "cut-policy: every one of '$CUT_RECORD_FIELDS' needs a non-empty line (write 'nothing' for an empty list, not a blank)" >&2
     return 1
   fi
+}
+
+require_cut_record_mentions() {
+  local file=${1:-} re=${2:-} what=${3:-} field value
+  if [ -z "$file" ] || [ ! -f "$file" ] || [ -z "$re" ] || [ $# -lt 4 ]; then
+    echo "cut-policy: require_cut_record_mentions <file> <regex> <what> <field…> — no record at '${file}', or no pattern or field" >&2
+    return 1
+  fi
+  shift 3
+  for field in "$@"; do
+    value=$(_cut_record_value "$file" "$field")
+    if printf '%s\n' "$value" | grep -Eiq -- "$re"; then return 0; fi
+  done
+  echo "cut-policy: refusing the cut — $file names no $what: none of its '$*' line(s) matches /$re/; the record published before the cut must say so" >&2
+  return 1
 }
 
 refuse_reused_chain_id() {
@@ -188,6 +208,14 @@ EOF
   else
     bad "deploy/cut-record.template is missing"
   fi
+  refuses "a record that names no treasury is refused" require_cut_record_mentions "$ST/good" 'treasury|multisig' "treasury" reason carries
+  full | sed 's/^reason:.*/reason: the multisig section seeds the treasury at genesis/' > "$ST/treasury-reason"
+  accepts "a record whose reason names the treasury is accepted" require_cut_record_mentions "$ST/treasury-reason" 'treasury|multisig' "treasury" reason carries
+  full | sed 's/^carries:.*/carries: the register; the Treasury (multisig, new issuance)/' > "$ST/treasury"
+  accepts "a record whose carries names it (any case) is accepted" require_cut_record_mentions "$ST/treasury" 'treasury|multisig' "treasury" reason carries
+  refuses "a record that names it on another line only is refused" require_cut_record_mentions "$ST/treasury" 'treasury|multisig' "treasury" reason drops
+  refuses "a missing record is refused (mentions)" require_cut_record_mentions "$ST/absent" 'treasury' "treasury" reason
+  refuses "no field to search is refused" require_cut_record_mentions "$ST/treasury" 'treasury' "treasury"
   if require_cut_record "$ST/no-drops" 2>"$ST/err"; then :; fi
   if grep -q "drops" "$ST/err"; then ok "the refusal names the missing field"; else bad "the refusal does not name the missing field: $(cat "$ST/err")"; fi
 
