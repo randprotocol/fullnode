@@ -1236,7 +1236,7 @@ git commit -m "rpc: rand_status and rand_getLimits serve hc_auth_multisig (null 
   - `AuthWitness`, including the `#[cfg(test)]` emulated `Proving` paths and `tests::emulated_proof`;
   - `pub(crate)` on `Prepared`, `prepare_bundle` and `mod tests`;
   - a `dummy_sender` option on `build_bundle`.
-- Create: `crates/randprotocol-msig/{Cargo.toml,src/lib.rs,tests/checks.rs}` (the pure signer-check crate; add it to the workspace `members` and `[workspace.dependencies]`)
+- Create: `crates/randprotocol-msig/{Cargo.toml,src/lib.rs,tests/checks.rs,tests/fixtures_gen.rs,tests/gen/mod.rs}` and the committed vectors `crates/randprotocol-msig/tests/fixtures/{policy,proposal-valid,proposal-tampered-output,proposal-value-mismatch,proposal-expired,signer-seeds,expected}.json` (vendored by the clients core) (the pure signer-check crate; add it to the workspace `members` and `[workspace.dependencies]`)
 - Create: `crates/randprotocol-client/src/msig_private.rs` (RPC, filesystem and prover parts only)
 - Modify: `.github/workflows/ci.yml` (the wasm32 check)
 - Modify: `crates/randprotocol-client/Cargo.toml` (`randprotocol-msig = { workspace = true }`), `crates/randprotocol-client/src/lib.rs` (`pub mod msig_private; pub use randprotocol_msig as multisig_private;`), `crates/randprotocol-client/src/main.rs` and `crates/randprotocol-node/src/main.rs` (every `w.sk` → `w.spend_key()?`, as the compiler lists)
@@ -1320,56 +1320,134 @@ What `check_proposal` does, every §6.5 check in order:
 
 The client's `msig_private` keeps everything that needs RPC, the filesystem or a prover: `prepare`, `prepare_sweep`, `assemble_witness`, `prove`, policy file save/load with the 0600 rule, `Policy::wallet()` through a `PolicyExt` trait, and the CLI's validator-key warning. Its `sign(proposal, policy, key: &Keypair)` is a thin wrapper: `randprotocol_msig::sign(&to_json(proposal), &to_json(policy), key.seed())`, plus the summary lines rendered from `check_proposal`'s `ProposalSummary`.
 
-- [ ] **Step 1a: Write the crate's failing tests.** Create `crates/randprotocol-msig` with a `lib.rs` that declares only the API above (bodies `todo!()`), and `tests/checks.rs`. The fixture is the client's offline proposal (`randprotocol-client`'s `tests_support::offline_proposal`, below), so `tests/checks.rs` reads JSON fixtures written by a client test, `crates/randprotocol-msig/tests/fixtures/{policy,proposal,proposal-throwaway-dummy,proposal-skim}.json`. A one-off client test regenerates them (`#[ignore]`, run: `cargo +1.98.1 test -p randprotocol-client --lib write_msig_fixtures -- --ignored`), and they are committed. The crate's own tests then need nothing but the files:
+- [ ] **Step 1a: Write the crate's test vectors and failing tests.** The clients core (randprotocol-d7) vendors these vectors, so they are **JSON files** under `crates/randprotocol-msig/tests/fixtures/`. The crate's tests **load them**, with no inline duplicates:
+
+| file | contents |
+|---|---|
+| `policy.json` | a 2-of-3 `Policy` with its `msk` (the members are the first three seeds of `signer-seeds.json`) |
+| `proposal-valid.json` | 10 RAND to a fixed address, change, two dummies sealed under the account `vk` |
+| `proposal-tampered-output.json` | the valid proposal with output slot 3's envelope re-sealed under a throwaway sender (commitment unchanged) |
+| `proposal-value-mismatch.json` | the valid proposal with input slot 2's witness amount raised by 1 (spec §6.5, conservation) |
+| `proposal-expired.json` | the valid proposal with `expires_at = bundle.time + MAX_PROOF_WINDOW_BLOCKS + 1` |
+| `signer-seeds.json` | `{"members": [hex32, hex32, hex32], "non_member": hex32}` |
+| `expected.json` | the valid proposal's `ProposalSummary` (as serialised), `signing_message` hex, and the exact shares `"0:hex"` and `"2:hex"`, which are stable because signing is deterministic |
+
+**The generator lives in the crate** (`crates/randprotocol-msig/tests/fixtures_gen.rs`), so a format change is one command. It builds the v3 bundle from `randprotocol-zkvm` primitives only, as `crates/randprotocol-node/tests/split_auth.rs` does at the zkvm level: `hidden::hidden_bundle_inputs_v3`, `hidden::hidden_bundle_digest_v3`, and `address::seal_note(sender_vk, to, note, tx_key)`. It needs no client. Every random value comes from one `ChaCha20Rng::seed_from_u64(0x2026_1011)`: `msk`, the four signer seeds, the salt, the note blindings `r`, each output's `TxKey` (so ML-KEM encapsulation is seeded too), the throwaway keys and the recipient key. Nothing reads OS entropy. The binding uses `BindingDomain::ChainId` and chain id 7, the bundle `time` is 1 000, and `expires_at` is 2 024.
 
 ```rust
-use randprotocol_msig::{check_proposal, sign, verify_share};
-const POLICY: &str = include_str!("fixtures/policy.json");          // 2 of 3, signer seeds [0x40;32], [0x41;32], [0x42;32]
-const PROPOSAL: &str = include_str!("fixtures/proposal.json");      // 10 RAND to a fresh address; change; two dummies under the account vk
-const THROWAWAY: &str = include_str!("fixtures/proposal-throwaway-dummy.json");   // slot 3 sealed under a throwaway sender
-const SKIM: &str = include_str!("fixtures/proposal-skim.json");     // witness input amount +1 over the outputs
+// crates/randprotocol-msig/tests/fixtures_gen.rs
+mod gen;   // tests/gen/mod.rs: `pub fn vectors() -> std::collections::BTreeMap<&'static str, String>` — file name → pretty JSON, deterministic
+
+const DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures");
+
+/// Regenerate every fixture: `cargo +1.98.1 test -p randprotocol-msig -- --ignored regen_fixtures`.
+#[test]
+#[ignore = "writes tests/fixtures/*.json; run after a format change, then commit the files"]
+fn regen_fixtures() {
+    for (name, json) in gen::vectors() {
+        std::fs::write(format!("{DIR}/{name}"), json).unwrap();
+    }
+}
+
+/// The committed vectors are exactly what the seeded generator produces (so the clients' vendored copy is current).
+#[test]
+fn the_committed_fixtures_equal_the_regenerated_ones() {
+    let want = gen::vectors();
+    let mut on_disk: Vec<String> = std::fs::read_dir(DIR).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
+    on_disk.sort();
+    assert_eq!(on_disk, want.keys().map(|k| k.to_string()).collect::<Vec<_>>(), "the fixture set");
+    for (name, json) in want {
+        assert_eq!(std::fs::read_to_string(format!("{DIR}/{name}")).unwrap(), json, "{name} is stale: run regen_fixtures");
+    }
+}
+
+/// The generator is deterministic: two runs agree byte for byte (no OS entropy anywhere).
+#[test]
+fn the_generator_is_deterministic() {
+    assert_eq!(gen::vectors(), gen::vectors());
+}
+```
+
+```rust
+// crates/randprotocol-msig/tests/checks.rs — loads the files, nothing inline
+use randprotocol_msig::{check_proposal, sign, verify_share, ProposalSummary};
+
+fn fixture(name: &str) -> String {
+    std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/").to_owned() + name).unwrap()
+}
+fn seeds() -> (Vec<[u8; 32]>, [u8; 32]) {
+    let v: serde_json::Value = serde_json::from_str(&fixture("signer-seeds.json")).unwrap();
+    let h = |s: &serde_json::Value| -> [u8; 32] { hex::decode(s.as_str().unwrap()).unwrap().try_into().unwrap() };
+    (v["members"].as_array().unwrap().iter().map(h).collect(), h(&v["non_member"]))
+}
+fn expected() -> serde_json::Value { serde_json::from_str(&fixture("expected.json")).unwrap() }
 
 #[test]
-fn an_honest_proposal_checks_and_summarises() {
-    let s = check_proposal(PROPOSAL, POLICY).unwrap();
-    assert_eq!(s.outputs.len(), 4);
-    assert!(s.outputs.iter().any(|o| o.amount == 10 * 1_000_000_000 && o.asset == 0));
-    assert_eq!(s.fee, 1_000_000);
-    assert_eq!(&s.signing_message[..13], b"rand-msauth-1");
+fn the_valid_proposal_checks_to_the_expected_summary() {
+    let s: ProposalSummary = check_proposal(&fixture("proposal-valid.json"), &fixture("policy.json")).unwrap();
+    assert_eq!(serde_json::to_value(&s).unwrap(), expected()["summary"]);
+    assert_eq!(hex::encode(s.signing_message), expected()["signing_message"].as_str().unwrap());
 }
 
 #[test]
-fn a_dummy_sealed_under_a_throwaway_key_is_refused() {
-    assert!(check_proposal(THROWAWAY, POLICY).unwrap_err().to_string().contains("does not open"));
+fn a_tampered_output_is_refused() {
+    let e = check_proposal(&fixture("proposal-tampered-output.json"), &fixture("policy.json")).unwrap_err();
+    assert!(e.to_string().contains("does not open"), "{e}");
 }
 
 #[test]
 fn a_value_mismatch_is_refused() {
-    assert!(check_proposal(SKIM, POLICY).unwrap_err().to_string().contains("value"));
+    let e = check_proposal(&fixture("proposal-value-mismatch.json"), &fixture("policy.json")).unwrap_err();
+    assert!(e.to_string().contains("value"), "{e}");
 }
 
 #[test]
-fn a_member_signs_deterministically_and_a_non_member_seed_is_refused() {
-    let (i, sig) = sign(PROPOSAL, POLICY, &[0x42; 32]).unwrap();
-    assert_eq!((i, sig.len()), (2, 2420));
-    assert_eq!(sign(PROPOSAL, POLICY, &[0x42; 32]).unwrap().1, sig, "deterministic: no OS entropy");
-    assert!(sign(PROPOSAL, POLICY, &[0x99; 32]).unwrap_err().to_string().contains("not one of the policy's signers"));
-    verify_share(PROPOSAL, POLICY, &format!("{i}:{}", hex::encode(&sig))).unwrap();
+fn an_expired_proposal_is_refused() {
+    let e = check_proposal(&fixture("proposal-expired.json"), &fixture("policy.json")).unwrap_err();
+    assert!(e.to_string().contains("expires"), "{e}");
+}
+
+#[test]
+fn members_0_and_2_sign_the_expected_shares_and_a_non_member_is_refused() {
+    let (members, outsider) = seeds();
+    let (prop, pol) = (fixture("proposal-valid.json"), fixture("policy.json"));
+    for (i, want) in [(0usize, "share_0"), (2, "share_2")] {
+        let (idx, sig) = sign(&prop, &pol, &members[i]).unwrap();
+        assert_eq!((idx as usize, sig.len()), (i, 2420));
+        let share = format!("{idx}:{}", hex::encode(&sig));
+        assert_eq!(share, expected()[want].as_str().unwrap(), "deterministic signing reproduces the vector");
+        verify_share(&prop, &pol, &share).unwrap();
+    }
+    assert!(sign(&prop, &pol, &outsider).unwrap_err().to_string().contains("not one of the policy's signers"));
 }
 
 #[test]
 fn verify_share_refuses_a_wrong_index_or_signature() {
-    let (_, sig) = sign(PROPOSAL, POLICY, &[0x42; 32]).unwrap();
-    assert!(verify_share(PROPOSAL, POLICY, &format!("1:{}", hex::encode(&sig))).is_err(), "signer 2's signature under index 1");
-    assert!(verify_share(PROPOSAL, POLICY, &format!("7:{}", hex::encode(&sig))).is_err(), "index outside the policy");
-    let mut bad = sig.clone();
+    let (prop, pol) = (fixture("proposal-valid.json"), fixture("policy.json"));
+    let share2 = expected()["share_2"].as_str().unwrap().to_string();
+    let sig = share2.split_once(':').unwrap().1;
+    assert!(verify_share(&prop, &pol, &format!("1:{sig}")).is_err(), "signer 2's signature under index 1");
+    assert!(verify_share(&prop, &pol, &format!("7:{sig}")).is_err(), "an index outside the policy");
+    let mut bad = hex::decode(sig).unwrap();
     bad[0] ^= 1;
-    assert!(verify_share(PROPOSAL, POLICY, &format!("2:{}", hex::encode(&bad))).is_err());
-    assert!(verify_share(PROPOSAL, POLICY, "2:zz").is_err());
+    assert!(verify_share(&prop, &pol, &format!("2:{}", hex::encode(bad))).is_err());
+    assert!(verify_share(&prop, &pol, "2:zz").is_err());
 }
 ```
 
-Run: `cargo +1.98.1 test -p randprotocol-msig` → FAIL (`todo!()`).
+`tests/gen/mod.rs` builds the policy from the seeded `msk` and the three member seeds. It builds the valid proposal through the crate's own `Proposal` type and the zkvm primitives above, then derives the three bad proposals from the valid one:
+- **tampered:** re-seal slot 3 with `seal_note(throwaway_vk, …)`;
+- **mismatch:** add 1 to the word pair `hidden_input_v3::in_slot(2) + S_AMOUNT_LO/HI`;
+- **expired:** set `expires_at`.
+
+`expected.json` is written from `check_proposal` and `sign`, so the generator depends on the implementation. That is deliberate: the vectors pin its behaviour, and the clients test against them. The crate's dev-dependencies are `serde_json`, `hex` and `rand_chacha` (pinned to the workspace's `rand` line). The earlier client-side `write_msig_fixtures` test is not written.
+
+The steps, in order:
+1. Write `checks.rs` and `fixtures_gen.rs`, with `lib.rs`'s API as `todo!()` and `gen::vectors` written.
+2. Run `cargo +1.98.1 test -p randprotocol-msig` and expect it to fail: the fixtures are absent and the API is `todo!()`.
+3. Implement (Step 3).
+4. Run `cargo +1.98.1 test -p randprotocol-msig -- --ignored regen_fixtures`.
+5. Run `cargo +1.98.1 test -p randprotocol-msig`, which passes, and commit the fixture files with the crate.
 
 - [ ] **Step 1: Write the client's failing tests.** Create `msig_private.rs` with only `#[cfg(test)] mod tests` first. (`wallet.rs`'s `mod tests` becomes `pub(crate) mod tests` so the support module can reach its helper.)
 
@@ -1555,7 +1633,7 @@ pub(crate) mod tests_support {
         let b = tx.bundle.as_mut().unwrap();
         let (_, note) = b.envelopes[3].open_as_sender_with(&b.commitments[3], &account.scan_key).expect("slot 3 opens before the edit");
         let throwaway = randprotocol_zkvm::notes::SpendKey::random().viewing_key();
-        b.envelopes[3] = randprotocol_zkvm::address::seal_note(&note, &throwaway);   // the sender argument seal_note takes, as split_auth.rs calls it
+        b.envelopes[3] = randprotocol_zkvm::address::seal_note(&throwaway, &note_recipient(&note), &note, &randprotocol_zkvm::viewing::TxKey::random()).unwrap();   // seal_note(sender, to, note, tx_key); `note_recipient` reads the recipient address the opened envelope carries
         hex::encode(bincode::serialize(&tx).unwrap())
     }
 }
@@ -1629,6 +1707,7 @@ In `.github/workflows/ci.yml`, add a job step: `rustup +1.98.1 target add wasm32
 - [ ] **Step 4: Run to see it pass.**
 
 ```bash
+cargo +1.98.1 test --release -p randprotocol-msig -- --ignored regen_fixtures   # only after a format change; then commit tests/fixtures/
 cargo +1.98.1 test --release -p randprotocol-msig
 RUSTFLAGS='--cfg getrandom_backend="wasm_js"' cargo +1.98.1 check -p randprotocol-msig --target wasm32-unknown-unknown
 cargo +1.98.1 tree -p randprotocol-msig -e normal | grep -cE 'tokio|reqwest|rocksdb|randprotocol-prover'   # expect 0
