@@ -198,7 +198,8 @@ Assets, when signed: `rand-node`, `rand`, `rand-prover`, `SHA256SUMS`, `SHA256SU
   (`rand_getLimits.fee_rules`, `rand_getSupply.base_fees_burned == "0"`). It refuses
   `subsidy_net_of_fees` (aggregation stays refused until its admitted shape is re-measured,
   b053a76) and a `rand-node` without `--fees`; `SELFTEST=1` and `DRY_RUN=1` exercise it with no
-  network (`docs/deploy.md`, "The next cut: the `fees` section (chain 21)").
+  network (`docs/deploy.md`, "The next cut: the `fees` section (chain 21)"). The cut now also
+  carries `perps` and `multisig`: see "The chain-21 cut carries `perps` and `multisig`" above.
 
 ### The validator hot path (`feat/hot-path`)
 
