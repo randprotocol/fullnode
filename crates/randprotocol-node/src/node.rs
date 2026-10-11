@@ -2630,8 +2630,10 @@ pub async fn start_with(cfg: NodeConfig, rpc_options: RpcOptions, net_options: N
             // key needs nothing here; on the bare executor, since the caching wrapper's default
             // would do nothing.
             if msauth_source == crate::msauth_key::MsauthKeySource::Built {
-                msauth_builder.build_msauth_key();
-                tracing::info!("msauth verifier key built");
+                match msauth_builder.build_msauth_key() {
+                    Ok(()) => tracing::info!("msauth verifier key built; its sha256 is this build's pin"),
+                    Err(e) => tracing::error!("msauth verifier key built, but {e}"),
+                }
             }
             ex.warm_bundle();
             tracing::info!("bundle verifier key warmed");

@@ -287,7 +287,10 @@ pub trait ConfidentialExecutor: Send + Sync {
     }
     /// Build the multisig auth verifier key on this host (Task 2b's `--build-msauth-key`,
     /// development only: ~80 s and ~4 GB at production). Never called by default. May be a no-op.
-    fn build_msauth_key(&self) {}
+    /// `Err` when the built key's SHA-256 is not this build's pin (the caller logs it loudly).
+    fn build_msauth_key(&self) -> Result<(), String> {
+        Ok(())
+    }
     /// The v0.6 canonical-proof rules, for a bundle or a call proof alike: the first header or
     /// transcript field of `proof` that is not the value the honest prover writes, named, or
     /// `None`. A field the verifier does not bind to the statement lets anyone who relays a

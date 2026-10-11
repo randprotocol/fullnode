@@ -342,8 +342,12 @@ A node on a chain whose genesis names `hc_auth_multisig` verifies multisig autho
   forged proof verify), so an unpinned file is never decoded.
 - **The location.** Beside the binary: `/usr/local/bin/msauth-vk-production.bin` on the fleet
   (`msauth-vk-<profile>.bin` next to whatever `rand-node` runs). `--msauth-vk <path>`, else
-  `RAND_MSAUTH_VK`, overrides it. A binary run from a checkout with nothing beside it falls back
-  to the committed `crates/randprotocol-zkvm/keys/msauth-vk-<profile>.bin` (pin-checked the same).
+  `RAND_MSAUTH_VK`, overrides it. A developer's binary — one running from this checkout's own
+  `target/` (`cargo run`, `target/release/rand-node`) with nothing beside it — falls back to the
+  committed `crates/randprotocol-zkvm/keys/msauth-vk-<profile>.bin` only in a debug build or with
+  `RAND_MSAUTH_VK_DEV_FALLBACK=1` (pin-checked the same). A binary anywhere else, including one a
+  fleet host built in its own checkout and installed to `/usr/local/bin`, reads the fixed path
+  only, and a missing file there fails the start.
 - **The startup failure.** On a multisig chain a missing or refused file stops the start,
   naming the path, the file's SHA-256 and the expected one. There is no automatic fallback
   build; only `--build-msauth-key` (development, a ≥ 8 GB host, never set by a deploy script)
@@ -352,7 +356,11 @@ A node on a chain whose genesis names `hc_auth_multisig` verifies multisig autho
 - **The roll.** `deploy/roll-all.sh` takes the blob as its fifth argument (or `MSAUTH_VK`;
   `NO_MSAUTH_VK=1` for a chain without multisig) and, on each host, checks the copy against the
   pin of the `rand-node` being installed before installing anything, then installs it beside the
-  binary before any restart. Node A on the laptop gets the same file beside its own binary.
+  binary before any restart. Under `NO_MSAUTH_VK=1` a blob already on a host is still checked
+  against the new build's pin, and the host is skipped on a mismatch. Node A on the laptop gets
+  the same file beside its own binary, checked by that binary's own `--check`/`--print-pinned`.
+  The release workflow ships `msauth-vk-production.bin` beside the binaries, in `SHA256SUMS` and
+  the build attestation, after asserting the built `rand-node` pins it.
 - **The cutover.** `deploy/cutover-fleet-chain21.sh` (owned by the chain-21 cut session) carries
   the same copy-and-check, per host, before the first start:
 

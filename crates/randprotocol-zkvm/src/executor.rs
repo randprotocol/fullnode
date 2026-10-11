@@ -1443,6 +1443,20 @@ impl ZkExecutor {
         Ok(())
     }
 
+    /// After a `--build-msauth-key` build: the built key exported (from the machine's cache, no
+    /// second build) and its SHA-256 compared with this build's pin. A mismatch means this host
+    /// built a key the fleet's pinned blob does not match — a dependency, constraint-set or
+    /// profile drift — and is reported, never ignored.
+    pub fn check_built_msauth_key(&self) -> Result<(), String> {
+        let got = msauth_vk::digest(&msauth_vk::machine_export(&self.msauth_machine, Self::msauth_heights()));
+        let want = msauth_vk::pin(self.msauth_machine.profile);
+        if got == want {
+            Ok(())
+        } else {
+            Err(format!("the msauth key built here has sha256 {got}, not this build's pin {want}: the pinned blob and this build disagree"))
+        }
+    }
+
     /// Where this executor's msauth key came from: `Loaded`, `Built`, or `Absent` (neither yet).
     pub fn msauth_key_source(&self) -> msauth_vk::MsauthKeySource {
         self.msauth_key_source.get().copied().unwrap_or_default()
@@ -2096,6 +2110,10 @@ impl ConfidentialExecutor for ZkExecutor {
         self.verify_hidden_bundle(hc_bundle, proof, binding)
     }
 
+    fn non_canonical_proof(&self, proof: &[u8]) -> Option<String> {
+        non_canonical_proof(proof)
+    }
+
     /// The bundle guest's verifier key. Unlike `warm`, this needs no guessing: the guest is
     /// pinned, so its `(tier, program_log_height, input_log_height, keccak_log_height,
     /// sha256_log_height, public_log_height)` is a single known sextuple — tier 14, which is
@@ -2103,10 +2121,6 @@ impl ConfidentialExecutor for ZkExecutor {
     /// case), `NO_KECCAK` and `NO_SHA256` since the guest issues neither hash syscall, and the
     /// transaction binding's public height (`bundle_heights`), since every bundle proof commits
     /// to it.
-    fn non_canonical_proof(&self, proof: &[u8]) -> Option<String> {
-        non_canonical_proof(proof)
-    }
-
     fn warm_bundle(&self) {
         self.warming(|| {
             let (plh, ilh, pubh) = Self::bundle_heights();
@@ -2114,16 +2128,17 @@ impl ConfidentialExecutor for ZkExecutor {
         })
     }
 
-    /// The auth guest's one key ([`AUTH_TIER`], its pinned heights, no hash table) — the only key
-    /// `verify_auth_proof` ever asks `auth_machine` for.
     fn install_msauth_vk(&self, blob: &[u8]) -> Result<(), String> {
         ZkExecutor::install_msauth_vk(self, blob).map_err(|e| e.to_string())
     }
 
-    fn build_msauth_key(&self) {
-        self.warm_auth_multisig()
+    fn build_msauth_key(&self) -> Result<(), String> {
+        self.warm_auth_multisig();
+        self.check_built_msauth_key()
     }
 
+    /// The auth guest's one key ([`AUTH_TIER`], its pinned heights, no hash table) — the only key
+    /// `verify_auth_proof` ever asks `auth_machine` for.
     fn warm_auth(&self) {
         self.warming(|| {
             let (plh, ilh, pubh) = Self::auth_heights();

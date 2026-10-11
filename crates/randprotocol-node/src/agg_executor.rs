@@ -718,7 +718,7 @@ impl ConfidentialExecutor for AggExecutor {
         ConfidentialExecutor::install_msauth_vk(&self.inner, blob)
     }
 
-    fn build_msauth_key(&self) {
+    fn build_msauth_key(&self) -> Result<(), String> {
         ConfidentialExecutor::build_msauth_key(&self.inner)
     }
 

@@ -30,12 +30,19 @@ pub struct MsauthKeyOptions {
     pub build: bool,
 }
 
+/// The environment variable that lets a release build run from a checkout's `target/` read the
+/// committed blob (see [`resolve_path`]); debug builds there need no flag.
+pub const ENV_DEV_FALLBACK: &str = "RAND_MSAUTH_VK_DEV_FALLBACK";
+
 /// The key file this node reads: `--msauth-vk`, else `RAND_MSAUTH_VK`, else
 /// `msauth-vk-<profile>.bin` beside the running executable — the fleet's
-/// `/usr/local/bin/msauth-vk-production.bin` — and, when that file is absent, the copy a source
-/// tree carries (`crates/randprotocol-zkvm/keys/msauth-vk-<profile>.bin`, found through the
-/// build's own manifest directory: a `cargo run` / `target/release/rand-node` in a checkout). The
-/// pin is checked whichever file is read; when neither exists the error names the fleet path.
+/// `/usr/local/bin/msauth-vk-production.bin`. Only for a developer's binary is there a fallback,
+/// when that file is absent: the committed `crates/randprotocol-zkvm/keys/msauth-vk-<profile>.bin`,
+/// and only when the running executable lives under this source tree's own `target/` (a
+/// `cargo run`, a `target/release/rand-node`) **and** it is a debug build or
+/// `RAND_MSAUTH_VK_DEV_FALLBACK=1` is set. A fleet host that built in its own checkout installs
+/// the binary into `/usr/local/bin`, so it never reads a mutable git tree: a missing fixed-path
+/// file fails the start loudly there. The pin is checked whichever file is read.
 pub fn resolve_path(opts: &MsauthKeyOptions, profile: FriProfile) -> Result<PathBuf> {
     if let Some(p) = &opts.path {
         return Ok(p.clone());
@@ -44,19 +51,40 @@ pub fn resolve_path(opts: &MsauthKeyOptions, profile: FriProfile) -> Result<Path
         return Ok(PathBuf::from(p));
     }
     let exe = std::env::current_exe().context("locating the running binary for the msauth key file")?;
+    let opted_in = cfg!(debug_assertions) || std::env::var_os(ENV_DEV_FALLBACK).is_some_and(|v| v == "1");
+    Ok(default_path(&exe, profile, opted_in))
+}
+
+/// [`resolve_path`]'s default for an executable at `exe`: beside it, or — only when that file is
+/// absent, `exe` is under this source tree's `target/` and `opted_in` — the committed blob.
+pub fn default_path(exe: &Path, profile: FriProfile, opted_in: bool) -> PathBuf {
     let beside = exe.with_file_name(msauth_vk::file_name(profile));
-    if !beside.exists() {
+    if opted_in && !beside.exists() && in_source_target(exe) {
         let tree = source_tree_path(profile);
         if tree.exists() {
-            return Ok(tree);
+            return tree;
         }
     }
-    Ok(beside)
+    beside
+}
+
+/// The workspace root this binary was built from (`CARGO_MANIFEST_DIR/../..`).
+fn source_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
+}
+
+/// Whether `exe` is inside this source tree's `target/` directory (both sides canonicalised, so a
+/// symlinked or relative path does not sneak past).
+fn in_source_target(exe: &Path) -> bool {
+    let (Ok(exe), Ok(target)) = (exe.canonicalize(), source_root().join("target").canonicalize()) else {
+        return false;
+    };
+    exe.starts_with(target)
 }
 
 /// The committed blob in a source tree: `crates/randprotocol-zkvm/keys/msauth-vk-<profile>.bin`.
 pub fn source_tree_path(profile: FriProfile) -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../randprotocol-zkvm/keys").join(msauth_vk::file_name(profile))
+    source_root().join("crates/randprotocol-zkvm/keys").join(msauth_vk::file_name(profile))
 }
 
 
@@ -85,13 +113,13 @@ pub fn load_msauth_key(
             return Ok(MsauthKeySource::Built);
         }
         Err(e) => bail!(
-            "msauth verifier key: {} missing ({e}) (expected sha256 {pin}); install it from the release (a source tree carries it at crates/randprotocol-zkvm/keys/), or run with --build-msauth-key on a ≥ 8 GB host",
+            "msauth verifier key: {} missing ({e}) (expected sha256 {pin}); install it from the release, or run with --build-msauth-key on a ≥ 8 GB host",
             path.display()
         ),
     };
     install(&bytes).map_err(|e| {
         anyhow!(
-            "msauth verifier key: {} has sha256 {} and was refused: {e} (expected sha256 {pin}); install it from the release (a source tree carries it at crates/randprotocol-zkvm/keys/), or run with --build-msauth-key on a ≥ 8 GB host",
+            "msauth verifier key: {} has sha256 {} and was refused: {e} (expected sha256 {pin}); install it from the release, or run with --build-msauth-key on a ≥ 8 GB host",
             path.display(),
             msauth_vk::digest(&bytes)
         )
@@ -236,14 +264,54 @@ mod tests {
 
     /// The path order: `--msauth-vk`, then `RAND_MSAUTH_VK`, then the file beside the binary.
     #[test]
-    fn the_flag_wins_and_the_default_is_beside_the_binary() {
+    fn the_flag_wins() {
         let flag = MsauthKeyOptions { path: Some(PathBuf::from("/x/key.bin")), build: false };
         assert_eq!(resolve_path(&flag, FriProfile::Production).unwrap(), PathBuf::from("/x/key.bin"));
-        if std::env::var_os(ENV_PATH).is_none() {
-            // In a checkout with nothing beside the test binary: the committed blob.
-            let p = resolve_path(&MsauthKeyOptions::default(), FriProfile::Production).unwrap();
-            assert_eq!(p, source_tree_path(FriProfile::Production));
-            assert_eq!(msauth_vk::digest(&std::fs::read(&p).unwrap()), msauth_vk::pin(FriProfile::Production));
+    }
+
+    /// Review fix 1: an executable outside this source tree (a fleet host's `/usr/local/bin`, a
+    /// copied binary) gets the fixed path only, opted in or not — never the git tree's blob.
+    #[test]
+    fn an_exe_outside_the_tree_gets_the_fixed_path_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("rand-node");
+        std::fs::write(&exe, b"").unwrap();
+        for opted_in in [false, true] {
+            assert_eq!(default_path(&exe, FriProfile::Production, opted_in), dir.path().join("msauth-vk-production.bin"));
+        }
+        let fleet = Path::new("/usr/local/bin/rand-node");
+        assert_eq!(default_path(fleet, FriProfile::Production, true), PathBuf::from("/usr/local/bin/msauth-vk-production.bin"));
+    }
+
+    /// An executable under the tree's `target/` falls back to the committed blob only when opted
+    /// in (a debug build, or `RAND_MSAUTH_VK_DEV_FALLBACK=1`), and never past a file beside it.
+    #[test]
+    fn an_exe_in_the_tree_target_falls_back_only_when_opted_in() {
+        let exe = std::env::current_exe().unwrap(); // target/release/deps/<test binary>
+        assert!(in_source_target(&exe), "the test binary runs from this tree's target/");
+        let beside = exe.with_file_name("msauth-vk-production.bin");
+        assert!(!beside.exists());
+        assert_eq!(default_path(&exe, FriProfile::Production, false), beside);
+        let tree = default_path(&exe, FriProfile::Production, true);
+        assert_eq!(tree, source_tree_path(FriProfile::Production));
+        assert_eq!(msauth_vk::digest(&std::fs::read(&tree).unwrap()), msauth_vk::pin(FriProfile::Production));
+    }
+
+    /// Only tests may install against a pin of their choosing: the node never names the hook.
+    #[test]
+    fn the_node_never_calls_the_test_pin_hook() {
+        let hook = concat!("install_msauth_vk", "_with_pin");
+        let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut stack = vec![src];
+        while let Some(d) = stack.pop() {
+            for e in std::fs::read_dir(&d).unwrap() {
+                let p = e.unwrap().path();
+                if p.is_dir() {
+                    stack.push(p);
+                } else if p.extension().is_some_and(|x| x == "rs") {
+                    assert!(!std::fs::read_to_string(&p).unwrap().contains(hook), "{} names {hook}", p.display());
+                }
+            }
         }
     }
 

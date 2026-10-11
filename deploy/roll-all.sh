@@ -42,6 +42,10 @@ if [ -n "$MSAUTH_VK" ]; then
 elif [ "${NO_MSAUTH_VK:-}" != 1 ]; then
   echo "no msauth-vk-production.bin (fifth argument or MSAUTH_VK): a v0.8.0+ node on a chain naming hc_auth_multisig refuses to start without it; pass it, or NO_MSAUTH_VK=1 for a chain without multisig"; exit 1
 fi
+# TASK-3: once the genesis carries `hc_auth_multisig` (plan Task 3 wires `chain_has_msauth`),
+# refuse NO_MSAUTH_VK=1 when a host's genesis names it — read it on the host (e.g. a
+# `rand-node` genesis query against /root/genesis.json) before the install loop, and exit with
+# "NO_MSAUTH_VK=1 but <host>'s genesis names hc_auth_multisig". Until then no chain names it.
 . deploy/lib/verify-release.sh
 if [ -n "${RELEASE_SUMS:-}" ] || [ -n "${RELEASE_SIG:-}" ]; then
   { [ -n "${RELEASE_SUMS:-}" ] && [ -n "${RELEASE_SIG:-}" ]; } || { echo "RELEASE_SUMS and RELEASE_SIG go together: the release's SHA256SUMS and its SHA256SUMS.sig"; exit 1; }
@@ -66,28 +70,36 @@ echo "== install (no restart) $(date -u +%H:%M:%S)"
 # The msauth key blob's check and install, run on the host before the binaries' install (empty
 # when the roll carries no blob): the copy is intact (sha256) and is the blob the build being
 # installed pins (SHA-256 too, `keygen-msauth-vk --check` against `--print-pinned production`).
-VK_STEP=""
+# Under NO_MSAUTH_VK=1 a blob already installed on a host is still held to the new build's pin:
+# a stale blob beside a new binary would refuse that node's start the day its chain names
+# hc_auth_multisig, so a mismatch skips the host now, while it is visible.
+VK_STEP="if [ -f /usr/local/bin/msauth-vk-production.bin ]; then vk_got=\$(/root/rand-node.new keygen-msauth-vk --check /usr/local/bin/msauth-vk-production.bin) && vk_pin=\$(/root/rand-node.new keygen-msauth-vk --print-pinned production) && [ \"\$vk_got\" = \"\$vk_pin\" ] || { echo \"   installed msauth key blob is not this build's pin \${vk_pin:-?} (has \${vk_got:-?}), skipping\"; rm -f /root/rand-node.new /root/rand.new; exit 1; }; fi;"
 if [ -n "$MSAUTH_VK" ]; then
   VK_STEP="[ \"\$(sha256sum /root/msauth-vk-production.bin.new | cut -d' ' -f1)\" = \"$VK_SHA\" ] && vk_got=\$(/root/rand-node.new keygen-msauth-vk --check /root/msauth-vk-production.bin.new) && vk_pin=\$(/root/rand-node.new keygen-msauth-vk --print-pinned production) && [ \"\$vk_got\" = \"\$vk_pin\" ] || { echo \"   msauth key blob is not the pinned \${vk_pin:-?} (has \${vk_got:-?}), skipping\"; rm -f /root/rand-node.new /root/rand.new /root/msauth-vk-production.bin.new; exit 1; }; install -m 644 /root/msauth-vk-production.bin.new /usr/local/bin/msauth-vk-production.bin; rm -f /root/msauth-vk-production.bin.new;"
 fi
 for ip in $IPS; do
-  scp -q -o ConnectTimeout=15 -o BatchMode=yes "$NODE_BIN" root@$ip:/root/rand-node.new && scp -q -o ConnectTimeout=15 -o BatchMode=yes "$WALLET_BIN" root@$ip:/root/rand.new || { echo "   $ip: copy failed"; continue; }
+  scp -q -o ConnectTimeout=15 -o BatchMode=yes "$NODE_BIN" root@$ip:/root/rand-node.new && scp -q -o ConnectTimeout=15 -o BatchMode=yes "$WALLET_BIN" root@$ip:/root/rand.new || { echo "   $ip: copy failed"; ssh -o ConnectTimeout=15 -o BatchMode=yes root@$ip 'rm -f /root/rand-node.new /root/rand.new /root/msauth-vk-production.bin.new' 2>/dev/null; continue; }
   if [ -n "$MSAUTH_VK" ]; then
-    scp -q -o ConnectTimeout=15 -o BatchMode=yes "$MSAUTH_VK" root@$ip:/root/msauth-vk-production.bin.new || { echo "   $ip: msauth key copy failed"; continue; }
+    scp -q -o ConnectTimeout=15 -o BatchMode=yes "$MSAUTH_VK" root@$ip:/root/msauth-vk-production.bin.new || { echo "   $ip: msauth key copy failed"; ssh -o ConnectTimeout=15 -o BatchMode=yes root@$ip 'rm -f /root/rand-node.new /root/rand.new /root/msauth-vk-production.bin.new' 2>/dev/null; continue; }
   fi
   ssh -o ConnectTimeout=15 -o BatchMode=yes root@$ip "set -e; [ \"\$(sha256sum /root/rand-node.new | cut -d' ' -f1)\" = \"$WANT\" ] && [ \"\$(sha256sum /root/rand.new | cut -d' ' -f1)\" = \"$WANT_WALLET\" ] || { echo '   sha mismatch, skipping'; rm -f /root/rand-node.new /root/rand.new /root/msauth-vk-production.bin.new; exit 1; }; chmod 755 /root/rand-node.new; $VK_STEP cp -f /usr/local/bin/rand-node /root/rand-node.prev; install -m 755 /root/rand-node.new /usr/local/bin/rand-node; install -m 755 /root/rand.new /usr/local/bin/rand; rm -f /root/rand-node.new /root/rand.new; echo \"   \$(hostname): installed \$(/usr/local/bin/rand-node --version)\"" 2>&1 | tail -1
 done
 # Node A on this Mac, when its launchd job is installed (retired to the droplet rand-node-a since
 # 2026-09-27; run-a.sh refuses without RAND_NODE_A_ON_LAPTOP=1): the blob goes beside the binary
-# run-a.sh runs, $NODE_A_HOME/$BINDIR/rand-node — the same "beside the binary" rule. The Mac
-# cannot run the Linux binary's --check, so the copy is checked by SHA-256 against the local file,
-# the one each host checked against its build's pin.
+# run-a.sh runs, $NODE_A_HOME/$BINDIR/rand-node — the same "beside the binary" rule, which is also
+# the only place it reads it (a binary outside a checkout's target/ never falls back to the
+# source tree's copy). The check is that Mac binary's own: its `keygen-msauth-vk --check` must
+# equal its `--print-pinned production`, so a blob and a node A build from different commits
+# never pair; a binary without the subcommand (pre-v0.8.0) fails the check.
 if [ -n "$MSAUTH_VK" ] && [ -f ~/Library/LaunchAgents/org.randprotocol.node-a.plist ]; then
   A_BINDIR="${NODE_A_HOME:-$HOME/rand-node-a}/${BINDIR:-bin-dd2ccbe}"
-  install -m 644 "$MSAUTH_VK" "$A_BINDIR/msauth-vk-production.bin" \
-    && [ "$(shasum -a 256 "$A_BINDIR/msauth-vk-production.bin" | cut -d' ' -f1)" = "$VK_SHA" ] \
-    && echo "   A: msauth key installed beside $A_BINDIR/rand-node" \
-    || echo "   A: msauth key install FAILED at $A_BINDIR (node A will refuse to start)"
+  a_got=$("$A_BINDIR/rand-node" keygen-msauth-vk --check "$MSAUTH_VK" 2>/dev/null)
+  a_pin=$("$A_BINDIR/rand-node" keygen-msauth-vk --print-pinned production 2>/dev/null)
+  if [ -n "$a_got" ] && [ "$a_got" = "$a_pin" ] && install -m 644 "$MSAUTH_VK" "$A_BINDIR/msauth-vk-production.bin"; then
+    echo "   A: msauth key installed beside $A_BINDIR/rand-node (pin $a_pin)"
+  else
+    echo "   A: msauth key NOT installed at $A_BINDIR: its rand-node pins ${a_pin:-nothing}, the blob is ${a_got:-unreadable} (node A will refuse to start on a multisig chain)"
+  fi
 fi
 echo "== stop all $(date -u +%H:%M:%S)"
 launchctl bootout gui/$(id -u)/org.randprotocol.node-a 2>/dev/null && echo "   A stopped"

@@ -174,3 +174,14 @@ fn after_a_load_warm_auth_multisig_is_ready_and_builds_nothing() {
     assert_eq!(ex.msauth_key_builds(), 0);
     assert_eq!(ex.msauth_key_source(), MsauthKeySource::Loaded);
 }
+
+/// The keygen is deterministic: a fresh Test-profile export regenerates the committed blob byte
+/// for byte, and so its pin. Keygen-scale (the tier-18 key build: ~25 s, ~4 GB), no prove:
+/// `cargo +1.98.1 test --release -p randprotocol-zkvm --test auth_msauth_vk -- --ignored the_test_blob_regenerates`
+#[test]
+#[ignore = "builds the tier-18 Test-profile key (~25 s, ~4 GB)"]
+fn the_test_blob_regenerates_byte_for_byte_to_the_pin() {
+    let blob = msauth_vk::blob(FriProfile::Test).unwrap();
+    assert_eq!(msauth_vk::digest(&blob), msauth_vk::MSAUTH_VK_SHA256_TEST);
+    assert_eq!(blob, std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/keys/msauth-vk-test.bin")).unwrap());
+}
