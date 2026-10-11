@@ -10,6 +10,7 @@ pub mod hosted_prover;
 pub mod rlimit;
 pub mod keyfile;
 pub mod mempool;
+pub mod msauth_key;
 pub mod network;
 pub mod node;
 pub mod peer_bindings;

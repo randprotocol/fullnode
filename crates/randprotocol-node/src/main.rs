@@ -998,6 +998,21 @@ enum Cmd {
         #[arg(long, default_value = "flat", value_parser = parse_layout)]
         layout: randprotocol_core::types::AggregateLayout,
     },
+    /// The precomputed msauth verifier key (private multisig, plan Task 2b). `--profile P --out
+    /// FILE` builds the key (a big host: ~80 s, ~4 GB at production) and writes the blob, printing
+    /// `blake3 <hex>  bytes <n>`; `--check FILE` prints a file's blake3; `--print-pinned P` prints
+    /// this build's pin. A validator loads the blob from beside its binary
+    /// (`/usr/local/bin/msauth-vk-production.bin`) and never builds it.
+    KeygenMsauthVk {
+        #[arg(long, requires = "out")]
+        profile: Option<String>,
+        #[arg(long, requires = "profile")]
+        out: Option<PathBuf>,
+        #[arg(long, conflicts_with_all = ["profile", "out", "print_pinned"])]
+        check: Option<PathBuf>,
+        #[arg(long, value_name = "PROFILE", conflicts_with_all = ["profile", "out"])]
+        print_pinned: Option<String>,
+    },
     /// Benchmarks of the node's own paths; no network, no database.
     Bench {
         #[command(subcommand)]
@@ -2455,6 +2470,22 @@ async fn main() -> Result<()> {
             let v = randprotocol_node::bench::run(&randprotocol_node::bench::BenchArgs { bundles, blocks, report_every, incremental_nullifier_root, fail_over_ms })?;
             if !v.passed {
                 std::process::exit(2);
+            }
+        }
+        Cmd::KeygenMsauthVk { profile, out, check, print_pinned } => {
+            use randprotocol_node::msauth_key;
+            if let Some(p) = print_pinned {
+                println!("{}", randprotocol_zkvm::executor::msauth_vk::pin(msauth_key::parse_profile(&p)?));
+            } else if let Some(f) = check {
+                println!("{}", msauth_key::check_file(&f)?);
+            } else if let (Some(p), Some(out)) = (profile, out) {
+                let profile = msauth_key::parse_profile(&p)?;
+                let t0 = std::time::Instant::now();
+                let (digest, bytes) = msauth_key::keygen(profile, &out)?;
+                eprintln!("wrote {} in {:.1?}", out.display(), t0.elapsed());
+                println!("blake3 {digest}  bytes {bytes}");
+            } else {
+                anyhow::bail!("keygen-msauth-vk: give --profile P --out FILE, --check FILE or --print-pinned P");
             }
         }
         Cmd::Keygen { out } => {
