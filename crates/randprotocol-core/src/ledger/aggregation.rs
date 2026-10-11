@@ -184,7 +184,7 @@ pub fn check_cover_count(
 pub fn tree_depth(covers: usize, tree: &TreeConfig) -> Result<u32, AggregationError> {
     let l = tree.leaf_size as usize;
     let layout = AggregationError::TreeLayout { covers, leaf_size: tree.leaf_size };
-    if l == 0 || covers % l != 0 {
+    if l == 0 || !covers.is_multiple_of(l) {
         return Err(layout);
     }
     let leaves = covers / l;
