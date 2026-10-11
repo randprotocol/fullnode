@@ -920,6 +920,9 @@ if `node` isn't a public module path, re-export them where `NodeHandle` is re-ex
     startup chain walk (`verified_head` META row, bound to the build sha); `--verify-chain replay`
     forces it. The first start of v0.8.0 itself still runs the full check." Another session
     drafted that entry: add the bullet only, and leave the rest of the entry as it is.
+    Append one sentence to that entry's **Rollback** bullet (CHANGELOG.md:37–39): "The startup
+    checkpoint is one `meta` key (`verified_head`), not a column family: v0.7.1 ignores it and
+    needs no step, and the next start of v0.8.0 after a rollback runs the full check once."
 
 - [ ] **Step 6: Run the full suites once.**
 
