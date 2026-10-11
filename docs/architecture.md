@@ -354,17 +354,27 @@ same thing offline, without running the node.
 
 **The startup checkpoint.** A walk that succeeds writes one `meta` row, `verified_head`: the head's
 height, hash and state root, and the git sha of the build that verified it. A later start of
-the same build in `quick` mode, on a store whose head is still that block, skips the walk: it
-loads the ledger once and compares the snapshot with the head's state root (OPS-5, which runs on
-every start, checkpoint or not). Only a clean build is trusted: a sha that is not 40 hex
-characters (`-dirty`, `unknown`) neither writes nor honours the row, so such builds always walk.
-`Storage::commit` carries the row forward in the same batch as the head when it matches the
-pre-commit head and this build's sha, so blocks the node commits itself stay covered;
-`truncate_to` clears it. Every other case walks, and `NodeHandle.startup` says why (no
-checkpoint, another build, an untrusted build, a head that moved, a forced mode); an unreadable
-head block also walks and repairs, as before. On an archive's fast path the counters outside the
-state root (base fees burned, unsealed fees, perp input rows) are not re-audited;
-`--verify-chain replay` is how to audit them.
+the same build in `quick` mode, on a store whose head is still that block, skips the walk. Only a
+clean build is trusted: a sha that is not 40 hex characters (`-dirty`, `unknown`) neither writes
+nor honours the row, so such builds always walk. `Storage::commit` carries the row forward in the
+same batch as the head when it matches the pre-commit head and this build's sha, so blocks the
+node commits itself stay covered; `truncate_to` clears it, and so does any walk that reports a
+problem (at startup or in `rand-node verify`, before it repairs or bails). Every other case walks,
+and `NodeHandle.startup` says why (no checkpoint, another build, an untrusted build, a head that
+moved, a forced mode, a head block that does not read or check).
+
+The fast path trusts that the rows this build wrote have not changed on disk since. It re-checks
+only two things: the snapshot against the head's state root (OPS-5, on every start), and the tip
+block itself — it must read, its tx root must match its transactions and its proposer signature
+must verify, or the start walks and repairs. Everything else an archive's walk would catch goes
+unchecked on a skipped start: interior block bodies, QCs and `block_index`; tx records and
+receipts; the stored epoch-set rows; the supply and fee counters outside the state root
+(registration and base fees burned, unsealed fees, the faucet's epoch counters on a chain without
+a `staking` section); the perp input rows; and the equality of the stored ledger with the replayed
+one. On a pruned node the structural walk of the retained window is skipped. `--verify-chain
+replay` (or `rand-node verify`) audits all of it. One behaviour change for archives: a snapshot
+that fails OPS-5 on a skipped start is now fatal, where the walk used to truncate and repair it;
+restart with `--verify-chain replay` to rebuild the state from history.
 
 **Why a constraint-set change is a hard fork.** `--verify-chain quick`/`full` re-verify every
 historical `Call`'s proof through whatever zkVM constraints the running binary implements. A STARK

@@ -41,7 +41,8 @@ carries a node-only wire change (compact blocks) and the consensus rules a new c
   `rand-node db drop-perp-inputs --datadir <dir>` before going back to v0.7.1 (refused on a perps
   chain's database). The startup checkpoint is one `meta` key (`verified_head`), not a column
   family: v0.7.1 ignores it and needs no step, and the next start of v0.8.0 after a rollback runs
-  the full check once.
+  the full check once — but a v0.7.1 truncate does not clear the row, so after rolling back,
+  truncating and rolling forward, start v0.8.0 once with `--verify-chain replay`.
 
 Assets, when signed: `rand-node`, `rand`, `rand-prover`, `SHA256SUMS`, `SHA256SUMS.sig`.
 
