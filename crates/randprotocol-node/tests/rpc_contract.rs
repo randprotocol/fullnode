@@ -7,8 +7,8 @@
 //! clients repo, which reads the node through `clients/ui/engine/rpc.js` and checks every reply's
 //! shape in `clients/ui/engine/validate.js` ([`the_wallet_reads_the_scan_and_send_path_exactly`],
 //! the `clients` rows of the table). The wallet's own half is `web/wallet/test/node.e2e.test.mjs`,
-//! run by `scripts/e2e-node.sh` in that repo's CI job `real-node` against the release binary. Their own integration tests spawn a real
-//! `rand-node` (`scripts/dev-chain.sh`, `docs/howto.md` §7, "How do I run the downstream
+//! run by `scripts/e2e-node.sh` in that repo's CI job `real-node` against the release binary.
+//! Their own integration tests spawn a real `rand-node` (`scripts/dev-chain.sh`, `docs/howto.md` §7, "How do I run the downstream
 //! integration tests?"), but those run in their CI, after a release. This file fails here first: a field one of
 //! them reads that is renamed, dropped or changes JSON type is a red `check-and-test` in this repo
 //! before any of them sees the release.
@@ -302,8 +302,9 @@ async fn every_field_the_downstream_repos_read_is_served_with_its_type() {
             ("tree_root", Hex), ("hc_bundle", Hex64), ("hc_auth", Null), ("address", Str), ("peer_id", Str),
             ("gas_prices.gas_price", Dec), ("gas_prices.byte_price", Dec),
         ]),
-        // clients/ui/lib/rpc-methods.js lists `rand_syncStatus`; it is `rand_status` under another name.
-        row("rand_syncStatus", json!([]), "clients/ui/lib/rpc-methods.js", &[("height", Int), ("syncing", Bool), ("sync_target", Int), ("hc_bundle", Hex64)]),
+        // Node behaviour, not a wallet read: `rand_syncStatus` is `rand_status` under another name
+        // (clients/ui/lib/rpc-methods.js notes the alias; the wallet calls `rand_status`).
+        row("rand_syncStatus", json!([]), "rand-node dispatch alias of `rand_status`", &[("height", Int), ("syncing", Bool), ("sync_target", Int), ("hc_bundle", Hex64)]),
         // randscan crates/randscan-indexer/src/rpc.rs `RpcPeer` (an empty list on one validator).
         exactly("rand_getPeers", json!([]), "randscan crates/randscan-indexer/src/rpc.rs `RpcPeer`", json!([])),
         // ---- limits and supply ----
@@ -404,7 +405,7 @@ async fn every_field_the_downstream_repos_read_is_served_with_its_type() {
         // and `authority.backings[]` `{chain, token (64 hex), decimals, locked}`.
         row("rand_getTokens", json!([0, 1000]), "randscan types/token.rs `TokenList`, randprotocol.org balance.js `fetchRegistry`, clients/ui/engine/validate.js `checkTokens`", &[
             ("enabled", Bool), ("registration_fee", Dec), ("next_index", Int), ("tokens", Arr),
-            ("tokens.0.index", Int), ("tokens.0.id", Hex), ("tokens.0.id_text", Str), ("tokens.0.name", Str),
+            ("tokens.0.index", Int), ("tokens.0.id_text", Str), ("tokens.0.name", Str),
             ("tokens.0.symbol", Str), ("tokens.0.decimals", Int), ("tokens.0.authority", Obj), ("tokens.0.mint_nonce", Int),
             ("tokens.0.total_supply", Dec), ("tokens.0.registered_at", Int),
             ("tokens.0.id", Hex64), ("tokens.0.authority.backings", Arr), ("tokens.0.authority.backings.0.chain", Int),
@@ -413,7 +414,7 @@ async fn every_field_the_downstream_repos_read_is_served_with_its_type() {
         ]),
         // randscan crates/randscan-core/src/types/token.rs `TokenInfo`; randprotocol.org
         // src/scripts/balance.js `getToken`.
-        row("rand_getToken", json!([1]), "randscan types/token.rs `TokenInfo`, randprotocol.org balance.js `getToken`, clients/ui/lib/rpc-methods.js", &[
+        row("rand_getToken", json!([1]), "randscan types/token.rs `TokenInfo`, randprotocol.org balance.js `getToken` (clients/ui/lib/rpc-methods.js lists it; the engine does not read it yet)", &[
             ("index", Int), ("id", Hex), ("id_text", Str), ("name", Str), ("symbol", Str), ("decimals", Int),
             ("authority", Obj), ("mint_nonce", Int), ("total_supply", Dec), ("registered_at", Int),
         ]),
@@ -426,14 +427,14 @@ async fn every_field_the_downstream_repos_read_is_served_with_its_type() {
         exactly("rand_getTokenSupply", json!([99]), "randscan crates/randscan-indexer/src/rpc.rs `token_supply`", Value::Null),
         // ---- programs (none deployed: the refusal and empty shapes the indexer branches on) ----
         // randscan crates/randscan-indexer/src/rpc.rs `program`: `null` for an unknown id.
-        exactly("rand_getProgram", json!([unknown]), "randscan crates/randscan-indexer/src/rpc.rs `program`, clients/ui/lib/rpc-methods.js", Value::Null),
+        exactly("rand_getProgram", json!([unknown]), "randscan crates/randscan-indexer/src/rpc.rs `program` (clients/ui/lib/rpc-methods.js lists it; the engine does not read it yet)", Value::Null),
         // clients/ui/engine/validate.js `checkProgramCode` / `checkProgramPublic`: `null` is "no such program".
         exactly("rand_getProgramCode", json!([unknown]), "clients/ui/engine/validate.js `checkProgramCode`", Value::Null),
         exactly("rand_getProgramPublic", json!([unknown]), "clients/ui/engine/validate.js `checkProgramPublic`", Value::Null),
         // `checkProgramCell`: without a `program_state` section `{"enabled": false}`, which the wallet reads as `null`.
         exactly("rand_getProgramCell", json!([unknown, "00".repeat(32)]), "clients/ui/engine/validate.js `checkProgramCell`", json!({ "enabled": false })),
         // `rand_getVesting` without a `vesting` section: `{"enabled": false}`.
-        exactly("rand_getVesting", json!([unknown]), "clients/ui/lib/rpc-methods.js `getVesting`", json!({ "enabled": false })),
+        exactly("rand_getVesting", json!([unknown]), "clients/ui/lib/rpc-methods.js `getVesting` (listed in the method table, not yet read by the engine)", json!({ "enabled": false })),
         // randscan crates/randscan-indexer/src/rpc.rs `program_vault`/`program_cells`: without a
         // `program_state` section both answer `{"enabled": false}`, which the indexer reads as `None`.
         exactly("rand_getProgramVault", json!([unknown]), "randscan crates/randscan-indexer/src/rpc.rs `program_vault`, clients/ui/engine/validate.js `checkProgramVault`", json!({ "enabled": false })),
@@ -516,8 +517,8 @@ async fn the_refusal_shapes_the_consumers_branch_on_are_pinned() {
     assert_eq!(call(addr, "rand_getTokens", json!([0, 1000])).await["result"], json!({ "enabled": false, "tokens": [] }));
     assert_eq!(call(addr, "rand_getAssets", json!([])).await["result"], json!([]));
     assert_eq!(call(addr, "rand_getToken", json!([1])).await["result"], Value::Null);
-    // The pre-account-removal names the wallet deletes from its method table
-    // (clients/ui/test/rpc-methods.test.mjs): the node refuses them by name.
+    // Not a wallet read: pre-account-removal names that clients/ui/lib/rpc-methods.js documents as
+    // refused by name (-32601), which the wallet's own test removes from its table.
     for gone in ["rand_getBalance", "rand_getAccount", "rand_getAssetBalance"] {
         let r = call(addr, gone, json!([])).await;
         assert_eq!(r["error"]["code"], json!(-32601), "{gone}: {r}");
@@ -590,9 +591,12 @@ async fn the_wallet_reads_the_scan_and_send_path_exactly() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
-    // Every method of the wallet's table is in the node's dispatch table: none answers -32601
-    // (a bad-params error is fine and has no effect: the empty params parse nothing).
+    // Every method of the wallet's table is in the node's dispatch table: none answers -32601.
+    // The state-changing ones (and the viewing-key imports) are not called, only name-checked above.
     for m in WALLET_METHODS {
+        if ["mint", "sendTransaction", "importViewingKey", "removeViewingKey"].contains(m) {
+            continue;
+        }
         let r = call(addr, &format!("rand_{m}"), json!([])).await;
         assert_ne!(r["error"]["code"], json!(-32601), "rand_{m} is not served: {}", short(&r));
     }
