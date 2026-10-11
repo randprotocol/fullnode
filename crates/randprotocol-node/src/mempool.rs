@@ -663,15 +663,19 @@ impl Mempool {
     /// does wait: it never defers). Only on such a chain: elsewhere a multisig proof is the
     /// ledger's permanent `InvalidAuthProof`, and deferring it would have it retried forever. A
     /// header that does not decode is left to the ledger's verdict too.
+    ///
+    /// Readiness first: once the key is ready — always, on a node that loaded its blob — no auth
+    /// proof is decoded here at all. This runs on the node loop for every gossiped or submitted
+    /// transaction, and the ledger's `check_auth_fields` decodes the header on the verify worker
+    /// anyway; a decode here only while the key is cold costs nothing in steady state and gives
+    /// no per-message decode lever.
     fn defer_until_msauth_warm(tx: &Transaction, ledger: &Ledger, executor: &dyn ConfidentialExecutor) -> Result<(), MempoolError> {
-        if ledger.hc_auth_multisig().is_none() {
+        if ledger.hc_auth_multisig().is_none() || executor.auth_multisig_key_ready() {
             return Ok(());
         }
         let Some(b) = tx.bundle.as_ref().filter(|b| !b.auth_proof.is_empty()) else { return Ok(()) };
         match executor.auth_header(&b.auth_proof) {
-            Ok((randprotocol_core::confidential::AuthShape::Multisig, _, _)) if !executor.auth_multisig_key_ready() => {
-                Err(MempoolError::Warming(MSAUTH_WARMING))
-            }
+            Ok((randprotocol_core::confidential::AuthShape::Multisig, _, _)) => Err(MempoolError::Warming(MSAUTH_WARMING)),
             _ => Ok(()),
         }
     }
@@ -4049,14 +4053,30 @@ mod tests {
         /// The auth commitment the bundle and its proof carry.
         const C: Word8 = [0xc0; 8];
 
-        /// The stub, with its multisig auth key not yet ready.
-        struct Cold;
+        /// The stub — every trait method forwarded, defaulted ones included, so the two never
+        /// silently diverge — with its multisig auth key not ready (`ready: false`, the default),
+        /// and a count of `auth_header` calls.
+        #[derive(Default)]
+        struct Cold {
+            ready: bool,
+            headers: std::sync::atomic::AtomicUsize,
+        }
+
+        impl Cold {
+            fn warm() -> Self {
+                Cold { ready: true, ..Cold::default() }
+            }
+            fn headers(&self) -> usize {
+                self.headers.load(std::sync::atomic::Ordering::SeqCst)
+            }
+        }
 
         impl ConfidentialExecutor for Cold {
             fn auth_multisig_key_ready(&self) -> bool {
-                false
+                self.ready
             }
             fn auth_header(&self, proof: &[u8]) -> Result<(AuthShape, Word8, Option<u64>), ConfidentialError> {
+                self.headers.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 StubExecutor.auth_header(proof)
             }
             fn warm_auth_multisig(&self) {
@@ -4074,8 +4094,38 @@ mod tests {
             fn check_program(&self, base_pc: u32, words: &[u32]) -> Result<Vec<u8>, ConfidentialError> {
                 StubExecutor.check_program(base_pc, words)
             }
+            fn max_callable_program_words(&self, public_segment_words: usize) -> Option<usize> {
+                StubExecutor.max_callable_program_words(public_segment_words)
+            }
             fn verify_call(&self, program: &ProgramRecord, proof: &[u8]) -> Result<CallOutcome, ConfidentialError> {
                 StubExecutor.verify_call(program, proof)
+            }
+            fn decode_call(&self, program: &ProgramRecord, proof: &[u8]) -> Result<CallOutcome, ConfidentialError> {
+                StubExecutor.decode_call(program, proof)
+            }
+            fn verify_call_hardened(&self, program: &ProgramRecord, proof: &[u8], segment: &[u32]) -> Result<CallOutcome, ConfidentialError> {
+                StubExecutor.verify_call_hardened(program, proof, segment)
+            }
+            fn decode_call_hardened(&self, program: &ProgramRecord, proof: &[u8], segment: &[u32]) -> Result<CallOutcome, ConfidentialError> {
+                StubExecutor.decode_call_hardened(program, proof, segment)
+            }
+            fn verify_invoke(&self, program: &ProgramRecord, proof: &[u8], segment: &[u32]) -> Result<CallOutcome, ConfidentialError> {
+                StubExecutor.verify_invoke(program, proof, segment)
+            }
+            fn decode_invoke(&self, program: &ProgramRecord, proof: &[u8], segment: &[u32]) -> Result<CallOutcome, ConfidentialError> {
+                StubExecutor.decode_invoke(program, proof, segment)
+            }
+            fn verify_perp(&self, engine_hc: &Word8, max_tier: u8, segment: &[u32], proof: &[u8]) -> Result<CallOutcome, ConfidentialError> {
+                StubExecutor.verify_perp(engine_hc, max_tier, segment, proof)
+            }
+            fn decode_perp(&self, engine_hc: &Word8, max_tier: u8, segment: &[u32], proof: &[u8]) -> Result<CallOutcome, ConfidentialError> {
+                StubExecutor.decode_perp(engine_hc, max_tier, segment, proof)
+            }
+            fn warm(&self, program: &ProgramRecord) {
+                StubExecutor.warm(program)
+            }
+            fn warm_hardened(&self, program: &ProgramRecord) {
+                StubExecutor.warm_hardened(program)
             }
             fn public_digest(&self, words: &[u32]) -> Word8 {
                 StubExecutor.public_digest(words)
@@ -4113,11 +4163,26 @@ mod tests {
             fn verify_bundle(&self, hc: &Word8, proof: &[u8], binding: &[u32; TX_BINDING_WORDS]) -> Result<(), ConfidentialError> {
                 StubExecutor.verify_bundle(hc, proof, binding)
             }
+            fn warm_bundle(&self) {
+                StubExecutor.warm_bundle()
+            }
+            fn warm_auth(&self) {
+                StubExecutor.warm_auth()
+            }
+            fn non_canonical_proof(&self, proof: &[u8]) -> Option<String> {
+                StubExecutor.non_canonical_proof(proof)
+            }
             fn aggregate_program_digest(&self, shape: &DeclaredShape) -> Result<[u64; 4], ConfidentialError> {
                 StubExecutor.aggregate_program_digest(shape)
             }
+            fn check_aggregate_header(&self, proof: &[u8]) -> Result<(), ConfidentialError> {
+                StubExecutor.check_aggregate_header(proof)
+            }
             fn verify_aggregate(&self, shape: &DeclaredShape, covered: &[CoveredBundle], proof: &[u8], binding: &[u32; 8]) -> Result<Vec<[u32; 8]>, ConfidentialError> {
                 StubExecutor.verify_aggregate(shape, covered, proof, binding)
+            }
+            fn warm_aggregation(&self, shape: &DeclaredShape, max_covers: u32) {
+                StubExecutor.warm_aggregation(shape, max_covers)
             }
             fn aggregate_proof_tier(&self, proof: &[u8]) -> Result<u8, ConfidentialError> {
                 StubExecutor.aggregate_proof_tier(proof)
@@ -4127,6 +4192,9 @@ mod tests {
             }
             fn verify_tree(&self, tree: &TreeConfig, covered: &[CoveredBundle], proof: &[u8], binding: &[u32; 8], depth: u32) -> Result<Vec<[u32; 8]>, ConfidentialError> {
                 StubExecutor.verify_tree(tree, covered, proof, binding, depth)
+            }
+            fn warm_tree(&self, tree: &TreeConfig) {
+                StubExecutor.warm_tree(tree)
             }
         }
 
@@ -4152,7 +4220,7 @@ mod tests {
             l.set_hc_auth_multisig(Some(HCM));
             let tx = msig_stub_tx(&l);
             let pool = Mempool::new(16);
-            match pool.precheck(&tx, &l, &Cold) {
+            match pool.precheck(&tx, &l, &Cold::default()) {
                 Err(e @ MempoolError::Warming(_)) => assert!(e.is_retryable() && e.to_string().contains("warming"), "{e}"),
                 other => panic!("{:?}", other.map(|_| ())),
             }
@@ -4176,12 +4244,30 @@ mod tests {
         fn without_hc_auth_multisig_a_multisig_proof_is_never_deferred() {
             let l = v3_ledger_for_pool();
             let tx = msig_stub_tx(&l);
-            assert!(Mempool::new(16).precheck(&tx, &l, &Cold).is_ok(), "the pre-screen leaves it to the ledger");
-            match l.validate(&tx, &Cold) {
+            assert!(Mempool::new(16).precheck(&tx, &l, &Cold::default()).is_ok(), "the pre-screen leaves it to the ledger");
+            match l.validate(&tx, &Cold::default()) {
                 Err(TxError::InvalidAuthProof(ConfidentialError::InvalidProof(why))) => assert!(why.contains("without hc_auth_multisig"), "{why}"),
                 other => panic!("{other:?}"),
             }
-            assert!(crate::admission::is_permanent(&l.validate(&tx, &Cold).unwrap_err()));
+            assert!(crate::admission::is_permanent(&l.validate(&tx, &Cold::default()).unwrap_err()));
+        }
+
+        /// Readiness first (review IMPORTANT 1): with the key ready, the pre-screen decodes no auth
+        /// proof at all — single-key or multisig; only while it is cold does it decode, once.
+        #[test]
+        fn a_ready_key_costs_the_pre_screen_no_auth_decode() {
+            let mut l = v3_ledger_for_pool();
+            l.set_hc_auth_multisig(Some(HCM));
+            let single = fixtures::v3_tx(&l, 50, fixtures::bundle_fee(), Action::None);
+            let msig = msig_stub_tx(&l);
+            let warm = Cold::warm();
+            for tx in [&single, &msig] {
+                assert!(Mempool::new(16).precheck(tx, &l, &warm).is_ok());
+            }
+            assert_eq!(warm.headers(), 0, "no decode with the key ready");
+            let cold = Cold::default();
+            assert!(matches!(Mempool::new(16).precheck(&msig, &l, &cold), Err(MempoolError::Warming(_))));
+            assert_eq!(cold.headers(), 1, "exactly one decode while cold");
         }
 
         /// A single-key proof is never deferred, cold key or not.
@@ -4190,7 +4276,7 @@ mod tests {
             let mut l = v3_ledger_for_pool();
             l.set_hc_auth_multisig(Some(HCM));
             let tx = fixtures::v3_tx(&l, 50, fixtures::bundle_fee(), Action::None);
-            assert!(Mempool::new(16).precheck(&tx, &l, &Cold).is_ok());
+            assert!(Mempool::new(16).precheck(&tx, &l, &Cold::default()).is_ok());
         }
     }
 }

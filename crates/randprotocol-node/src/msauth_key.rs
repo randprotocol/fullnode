@@ -473,13 +473,26 @@ mod tests {
         // The same load into a bare executor, to count builds.
         let ex = ZkExecutor::new(FriProfile::Test);
         ex.enable_auth_multisig();
-        assert_eq!(verify_startup(&gs, Some(blob), &ex).unwrap(), MsauthKeySource::Loaded);
+        assert_eq!(verify_startup(&gs, Some(blob.clone()), &ex).unwrap(), MsauthKeySource::Loaded);
         assert_eq!(ex.msauth_key_source(), MsauthKeySource::Loaded);
         assert!(ex.msauth_key_ready());
         assert_eq!((ex.msauth_machine_key_builds(), ex.msauth_key_builds()), (0, 0));
         let missing = dir.path().join("no-such-msauth-vk-test.bin");
         let e = format!("{:#}", verify_startup(&gs, Some(missing.clone()), &ZkExecutor::new(FriProfile::Test)).unwrap_err());
         assert!(e.contains(&missing.display().to_string()) && e.contains(msauth_vk::pin(FriProfile::Test)), "{e}");
+        // A blob that is present but not the pinned one: the same loud refusal, nothing built.
+        let mut bytes = std::fs::read(&blob).unwrap();
+        *bytes.last_mut().unwrap() ^= 1;
+        let wrong = dir.path().join("wrong-msauth-vk-test.bin");
+        std::fs::write(&wrong, &bytes).unwrap();
+        let ex = ZkExecutor::new(FriProfile::Test);
+        ex.enable_auth_multisig();
+        let e = format!("{:#}", verify_startup(&gs, Some(wrong.clone()), &ex).unwrap_err());
+        assert!(e.contains(&wrong.display().to_string()), "{e}");
+        assert!(e.contains(&format!("expected sha256 {}", msauth_vk::pin(FriProfile::Test))), "{e}");
+        assert!(e.contains(&msauth_vk::digest(&bytes)), "names the digest it got: {e}");
+        assert!(!ex.msauth_key_ready());
+        assert_eq!((ex.msauth_machine_key_builds(), ex.msauth_key_builds()), (0, 0));
         // A chain without the field never reads the path.
         std::fs::write(dir.path().join("genesis.json"), msauth_genesis(&key, false).to_json()).unwrap();
         let (gs, node_ex) = crate::node::load_genesis(dir.path()).unwrap();
