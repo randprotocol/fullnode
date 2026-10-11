@@ -99,7 +99,7 @@ worktrees: don't touch `main` and don't push.
   - the `Storage` struct near line 437 and its constructor near line 923;
   - `load_ledger` at line 2776;
   - `VerifyMode` at lines 3433–3456.
-- Test: the `mod tests` in the same file (line ~5651).
+- Test: the `mod tests` in the same file (line ~5651); `crates/randprotocol-node/tests/cli_datadir.rs:105` (the pinned error text).
 
 **Interfaces:**
 - Produces:
@@ -301,7 +301,11 @@ In `VerifyMode`, add the variant between `Quick` and `Full`:
 ```
 
 Add `"replay" => Ok(VerifyMode::Replay),` to `FromStr`, and change the error to
-`"unknown verify mode {other} (off|quick|replay|full)"`.
+`"unknown verify mode {other} (off|quick|replay|full)"`. The binary suite
+`crates/randprotocol-node/tests/cli_datadir.rs:105` pins the old text
+(`"unknown verify mode paranoid (off|quick|full)"`). Change it to
+`"unknown verify mode paranoid (off|quick|replay|full)"` in this task, and run
+`cargo test -p randprotocol-node --test cli_datadir 2>&1 | tail -3` in Step 4 (expected: PASS).
 
 Search `verify_chain` and `verify_pruned` for `VerifyMode::Quick` and `mode ==` comparisons.
 The only Full-only branches are `mode == VerifyMode::Full` (storage.rs:3653, 3967), which
@@ -896,7 +900,7 @@ if `node` isn't a public module path, re-export them where `NodeHandle` is re-ex
   - **`docs/cli.md:399`.** Replace the row with:
     `| --verify-chain <MODE> | quick | startup integrity check: off; quick (skipped when this same clean build already verified the store through its head — the startup checkpoint, docs/architecture.md; otherwise structure plus a ledger replay, which re-checks proposer signatures and bundle proofs); replay (quick, never skipped); full (replay plus every QC's votes) |`
   - **`docs/cli.md:447`:** `quick, replay or full, as for --verify-chain (no checkpoint here: rand-node verify always walks)`.
-  - **`docs/architecture.md`:**
+  - **`docs/architecture.md`:** the heading at :341 becomes `--verify-chain off|quick|replay|full`.
     - Fix the claim at :346-347 and :657 that only `full` checks proposer signatures: `quick`
       checks them through `apply_block_for_sync`, and `full` adds only every QC's votes.
     - In the startup section, add a paragraph covering:
