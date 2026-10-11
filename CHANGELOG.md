@@ -26,6 +26,9 @@ carries a node-only wire change (compact blocks) and the consensus rules a new c
   path's node-only half (`SharedSet`, propose replay, verify workers, parallel QC verification),
   the compact-block follow-ups, the aggregate daemon's retry loop and the storage checks. Every
   gated action below is refused there by name.
+- **Startup checkpoint** (node-only): a restart of the same clean build skips the startup chain
+  walk (`verified_head` META row, bound to the build sha); `--verify-chain replay` forces it. The
+  first start of v0.8.0 itself still runs the full check.
 - **Chain 21 and later, by genesis section:** `fees` (`burn_base`, `burn_floor`,
   `subsidy_net_of_fees`, `proposer_share_bps`, `prove_base`, `usd_subsidy`), `perps` (RPL-3),
   `multisig`, `aggregation_tree`, and the `incremental_nullifier_root` flag (the hot path's
@@ -36,7 +39,10 @@ carries a node-only wire change (compact blocks) and the consensus rules a new c
   so its encoding, txid and signing domain move. No chain has carried an aggregate.
 - **Rollback:** a database opened by this build has the `perp_inputs` column family; run
   `rand-node db drop-perp-inputs --datadir <dir>` before going back to v0.7.1 (refused on a perps
-  chain's database).
+  chain's database). The startup checkpoint is one `meta` key (`verified_head`), not a column
+  family: v0.7.1 ignores it and needs no step, and the next start of v0.8.0 after a rollback runs
+  the full check once — but a v0.7.1 truncate does not clear the row, so after rolling back,
+  truncating and rolling forward, start v0.8.0 once with `--verify-chain replay`.
 
 Assets, when signed: `rand-node`, `rand`, `rand-prover`, `SHA256SUMS`, `SHA256SUMS.sig`.
 

@@ -53,7 +53,7 @@ on an aggregation chain, in aggregators.
 | disk, full blocks | about 170 GB per day if every block were full (4 MiB per block, chains ≤ 12; chain 18's block cap is 20 MiB) | `docs/block-space.md` |
 | disk, pruning validator | block tables 3.3–4.4 GB with one day kept (≤ 65.5k blocks), where they were 19 GB unpruned: chain 14, 18 validators, 2026-09-25. Not re-measured with chain 18's 26-signature certificates | `AGENTS.md`, "v0.5.7" |
 | disk, idle growth, archive | about 60 KB a block (the certificate inside the header), ≈ 3.6 GB/day at 1.4 s blocks: chain 14, 18 validators. Not re-measured on chain 18 | `AGENTS.md`, "v0.5.5" |
-| startup | about 4 minutes: the quick chain verification took 239 s at 59 183 blocks before the RPC opened (chain 12, unpruned). A pruned node's startup check is structural, not a replay | `deploy/README.md` (v0.3 update, step 2); `AGENTS.md`, "v0.5.7" |
+| startup | a restart of the same build: seconds (one ledger load and the head's state root; the startup checkpoint). The first start of a new build: the full check, which took 239 s at 59 183 blocks (chain 12, unpruned) and up to 30 min at 259 k blocks on 48 GB droplets. A pruned node's check is structural, not a replay | `deploy/README.md` (v0.3 update, step 2); `AGENTS.md`, "v0.5.7" |
 | bundle verify | 838 ms cold, about 16 ms warm | `docs/superpowers/specs/2026-09-15-block-aggregation.md` §1 |
 | call verify | about 233 ms first (uncached) verify at tier 10, production profile (constraint set 5) | `docs/confidential.md` |
 | network | TCP 30303 inbound on public nodes | `docs/deploy.md` |

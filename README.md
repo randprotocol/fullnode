@@ -296,8 +296,10 @@ rand-node verify --datadir ./data --repair        # truncate a damaged tail; pee
 RUST_LOG=debug rand-node run ...                  # verbose logs
 ```
 
-At startup a node checks its chain (`--verify-chain quick|full|off`), truncates anything
-inconsistent while keeping its vote-safety state, and refetches the missing blocks from peers.
+At startup a node checks its chain (`--verify-chain off|quick|replay|full`). When it walks, it
+truncates anything inconsistent while keeping its vote-safety state, and refetches the missing
+blocks from peers; a restart of the same build in `quick` mode skips the walk and re-checks only
+the head (see `docs/architecture.md` §7, the startup checkpoint).
 `--prune-history 24h` keeps one day of blocks and certificates (the ledger itself is never
 pruned); a node without the flag is an archive. A pruned node answers a lookup below its floor
 with `-32010`, so point wallets and explorers at an archive for old history.

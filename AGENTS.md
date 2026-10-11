@@ -2165,7 +2165,9 @@ droplets + A as a same-chain update (`deploy/README.md`, "The v0.3 same-chain up
   a pre-v0.3 binary refuses to open it. Roll back with `rand-node db drop-receipts-index --datadir
   <dir>` (v0.3 binary, node stopped) *before* re-pinning — rehearsed on A's real database.
 - **Node startup is ~4 min** (quick chain verify before the RPC opens, 239 s at 59k blocks). A
-  rolling update waits on `rand_getHealth` = `ok` per node, not a sleep.
+  rolling update waits on `rand_getHealth` = `ok` per node, not a sleep. The first
+  start of a new build still runs the full check (plan the pause for it); a restart of the same
+  build skips it (startup checkpoint, v0.8.0+).
 - **`rand_getVersion`'s sha**: `rebuild-vps.sh` passes `RAND_BUILD_SHA` because E's
   `/root/fullnode/.git` is stale (rsync `--exclude .git` protects it from `--delete`). The
   `version` field still reads the crate's `0.1.0` — the workspace version was never bumped.
