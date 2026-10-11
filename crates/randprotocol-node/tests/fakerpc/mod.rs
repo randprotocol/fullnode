@@ -35,7 +35,12 @@ pub fn fake_with(answer: Answer) -> (String, Calls) {
                     }
                 };
                 let head = String::from_utf8_lossy(&buf[..end]).to_lowercase();
-                let len: usize = head.split("content-length:").nth(1).and_then(|r| r.split("\r\n").next()).and_then(|v| v.trim().parse().ok()).unwrap_or(0);
+                let len: usize = head
+                    .split("content-length:")
+                    .nth(1)
+                    .and_then(|r| r.split("\r\n").next())
+                    .and_then(|v| v.trim().parse().ok())
+                    .unwrap_or(0);
                 while buf.len() - end < len {
                     let n = sock.read(&mut chunk).unwrap_or(0);
                     if n == 0 {
@@ -45,7 +50,9 @@ pub fn fake_with(answer: Answer) -> (String, Calls) {
                 }
                 let req: Value = serde_json::from_slice(&buf[end..]).unwrap_or(Value::Null);
                 let method = req["method"].as_str().unwrap_or_default().to_string();
-                log.lock().unwrap().push((method.clone(), req["params"].clone()));
+                log.lock()
+                    .unwrap()
+                    .push((method.clone(), req["params"].clone()));
                 let body = match answer(&method, &req["params"]) {
                     Ok(v) => json!({ "jsonrpc": "2.0", "id": 1, "result": v }),
                     Err((code, message)) => json!({ "jsonrpc": "2.0", "id": 1, "error": { "code": code, "message": message } }),
@@ -59,7 +66,9 @@ pub fn fake_with(answer: Answer) -> (String, Calls) {
 }
 
 /// The methods every chain-14 test node answers the same way, then `extra`'s.
-pub fn chain14(extra: impl Fn(&str, &Value) -> Option<Value> + Send + Sync + 'static) -> (String, Calls) {
+pub fn chain14(
+    extra: impl Fn(&str, &Value) -> Option<Value> + Send + Sync + 'static,
+) -> (String, Calls) {
     fake_with(Box::new(move |m, p| {
         if let Some(v) = extra(m, p) {
             return Ok(v);
@@ -70,7 +79,9 @@ pub fn chain14(extra: impl Fn(&str, &Value) -> Option<Value> + Send + Sync + 'st
             "rand_getHead" => Ok(json!({ "height": 40 })),
             "rand_sendTransaction" => Ok(json!("ef".repeat(32))),
             "rand_getTransactionStatus" => Ok(json!([{ "status": "committed" }])),
-            "rand_getTransaction" => Ok(json!({ "height": 41, "index": 0, "block_hash": "aa".repeat(32) })),
+            "rand_getTransaction" => {
+                Ok(json!({ "height": 41, "index": 0, "block_hash": "aa".repeat(32) }))
+            }
             _ => Err((-32601, "method not found".into())),
         }
     }))
@@ -83,8 +94,15 @@ pub struct Out {
 }
 
 pub fn node(args: &[&str]) -> Out {
-    let o = Command::new(env!("CARGO_BIN_EXE_rand-node")).args(args).output().expect("rand-node runs");
-    Out { ok: o.status.success(), out: String::from_utf8_lossy(&o.stdout).into(), err: String::from_utf8_lossy(&o.stderr).into() }
+    let o = Command::new(env!("CARGO_BIN_EXE_rand-node"))
+        .args(args)
+        .output()
+        .expect("rand-node runs");
+    Out {
+        ok: o.status.success(),
+        out: String::from_utf8_lossy(&o.stdout).into(),
+        err: String::from_utf8_lossy(&o.stderr).into(),
+    }
 }
 
 pub struct Signer {
@@ -98,9 +116,23 @@ pub fn signer(dir: &std::path::Path, name: &str) -> Signer {
     let k = node(&["keygen", "--out", key.to_str().unwrap()]);
     assert!(k.ok, "{}", k.err);
     let a = node(&["address", "--key", key.to_str().unwrap()]);
-    let public = a.out.lines().find_map(|l| l.strip_prefix("public_key: ")).unwrap().to_string();
-    let address = a.out.lines().find_map(|l| l.strip_prefix("address: ")).unwrap().to_string();
-    Signer { key, public, address }
+    let public = a
+        .out
+        .lines()
+        .find_map(|l| l.strip_prefix("public_key: "))
+        .unwrap()
+        .to_string();
+    let address = a
+        .out
+        .lines()
+        .find_map(|l| l.strip_prefix("address: "))
+        .unwrap()
+        .to_string();
+    Signer {
+        key,
+        public,
+        address,
+    }
 }
 
 pub fn sent(calls: &Calls) -> Vec<randprotocol_core::Transaction> {
@@ -109,10 +141,17 @@ pub fn sent(calls: &Calls) -> Vec<randprotocol_core::Transaction> {
         .unwrap()
         .iter()
         .filter(|(m, _)| m == "rand_sendTransaction")
-        .map(|(_, p)| randprotocol_core::Transaction::decode(&hex::decode(p[0].as_str().unwrap()).unwrap()).unwrap())
+        .map(|(_, p)| {
+            randprotocol_core::Transaction::decode(&hex::decode(p[0].as_str().unwrap()).unwrap())
+                .unwrap()
+        })
         .collect()
 }
 
 pub fn recipient() -> String {
-    randprotocol_core::notes::ShieldedAddress { pk: [5; 8], kem_ek: vec![9; 1184] }.to_string()
+    randprotocol_core::notes::ShieldedAddress {
+        pk: [5; 8],
+        kem_ek: vec![9; 1184],
+    }
+    .to_string()
 }

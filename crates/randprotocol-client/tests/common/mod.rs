@@ -54,7 +54,9 @@ pub fn fake(answer: Answer) -> Fake {
                 }
                 let req: Value = serde_json::from_slice(&buf[header_end..]).unwrap_or(Value::Null);
                 let method = req["method"].as_str().unwrap_or_default().to_string();
-                log.lock().unwrap().push((method.clone(), req["params"].clone()));
+                log.lock()
+                    .unwrap()
+                    .push((method.clone(), req["params"].clone()));
                 let body = match answer(&method, &req["params"]) {
                     Ok(v) => json!({ "jsonrpc": "2.0", "id": 1, "result": v }),
                     Err((code, message)) => json!({ "jsonrpc": "2.0", "id": 1, "error": { "code": code, "message": message } }),
@@ -70,10 +72,20 @@ pub fn fake(answer: Answer) -> Fake {
 
 impl Fake {
     pub fn methods(&self) -> Vec<String> {
-        self.calls.lock().unwrap().iter().map(|(m, _)| m.clone()).collect()
+        self.calls
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(m, _)| m.clone())
+            .collect()
     }
     pub fn params_of(&self, method: &str) -> Option<Value> {
-        self.calls.lock().unwrap().iter().find(|(m, _)| m == method).map(|(_, p)| p.clone())
+        self.calls
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(m, _)| m == method)
+            .map(|(_, p)| p.clone())
     }
 }
 
@@ -92,7 +104,11 @@ pub fn rand(rpc: &str, key: &std::path::Path, args: &[&str]) -> Run {
         .stdin(Stdio::null())
         .output()
         .expect("run rand");
-    Run { ok: o.status.success(), out: String::from_utf8_lossy(&o.stdout).into(), err: String::from_utf8_lossy(&o.stderr).into() }
+    Run {
+        ok: o.status.success(),
+        out: String::from_utf8_lossy(&o.stdout).into(),
+        err: String::from_utf8_lossy(&o.stderr).into(),
+    }
 }
 
 pub const DEAD: &str = "http://127.0.0.1:9";
@@ -107,4 +123,3 @@ pub fn keygen(dir: &tempfile::TempDir) -> std::path::PathBuf {
 pub fn address_of(key: &std::path::Path) -> String {
     rand(DEAD, key, &["address"]).out.trim().to_string()
 }
-
