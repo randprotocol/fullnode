@@ -2,7 +2,7 @@
 //! opcodes 25/27 (the 4th word is now an absolute address) without changing the verifier key: a
 //! pre-phase-4 digest or key would still verify, meaning something else. The MODQ chip, merged
 //! with it, then moved every inner-shape pin once more, so the intermediate phase-4 values are
-//! stale too. None may remain anywhere in the tree.
+//! stale too. None may remain in crates/, deploy/, scripts/, vendor/ or AGENTS.md.
 //!
 //! Not listed: `dsl-sample.digest` `8c77648e…` (phase-4-invariant — the DSL sample program has no
 //! `SPONGE`/`COMPRESS` span and circuits' suite still pins the same value at `57fb9dc`).
@@ -46,6 +46,14 @@ fn no_pre_phase4_recursion_digest_or_key_remains() {
                 }
             }
         });
+    }
+    // The agent log names pins in prose; a stale full literal there reads as current.
+    let agents = root.join("AGENTS.md");
+    let text = std::fs::read_to_string(&agents).unwrap();
+    for lit in STALE {
+        if text.contains(lit) {
+            hits.push(format!("{}: {lit}", agents.display()));
+        }
     }
     assert!(hits.is_empty(), "pre-rVM-phase-4 pins remain:\n{}", hits.join("\n"));
 }
