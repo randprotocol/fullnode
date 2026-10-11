@@ -168,14 +168,14 @@ Constraints make this a decision the user takes before the re-vendor merges (§9
 
 | header word | single-key (`auth_heights()`) | multisig (`msauth_heights()`) |
 |---|---|---|
-| `tier` | `AUTH_TIER` = 10 | `MSAUTH_TIER` *(Task 8: 18)* |
-| `program_log_height` | of `guests::auth()` | `program_log_height(msauth.bin words)` |
-| `input_log_height` | `input_log_height(16)` | `input_log_height(MSAUTH_WORDS)` |
-| `keccak_log_height` | 0 | `pinned_options().min_keccak_log_height` *(Task 8; ≈ 14 at `M_MAX` = 3)* |
+| `tier` | `AUTH_TIER` = 10 | `MSAUTH_TIER` = 18 |
+| `program_log_height` | of `guests::auth()` | 12 (`program_log_height(msauth.bin words)`) |
+| `input_log_height` | `input_log_height(16)` | 12 (`input_log_height(MSAUTH_WORDS)`) |
+| `keccak_log_height` | 0 | 14 (`pinned_options().min_keccak_log_height`) |
 | `sha256_log_height` | 0 | 0 |
-| `modq_log_height` | 0 | `pinned_options().min_modq_log_height` *(Task 8; ≈ 16: 54 calls × 1 024 rows)* |
-| `public_log_height` | `public_log_height(8)` | `public_log_height(8)` |
-| `mem_log_height` | ranged (pinned by `non_canonical`) | `pinned_options().min_mem_log_height` *(Task 8)* — **exact** |
+| `modq_log_height` | 0 | 16 (`pinned_options().min_modq_log_height`: 54 calls × 1 024 rows) |
+| `public_log_height` | `public_log_height(8)` | 7 (`public_log_height(8)`) |
+| `mem_log_height` | ranged (pinned by `non_canonical`) | 20 (`pinned_options().min_mem_log_height`) — **exact** |
 | `pv::GAS` | `gas_max(10,0,0)` = 1 279 under `gas` | `gas_max_with_modq(MSAUTH_TIER, k, 0, m)` under `gas` |
 
 Every multisig field is compared **exactly**, including `mem_log_height` (R-hide: a multisig
@@ -256,6 +256,8 @@ fn auth_header(&self, proof: &[u8]) -> Result<(AuthShape, Word8, Option<u64>), C
 /// Precompute the multisig auth guest's one verifier key. A node calls it only on a chain whose
 /// genesis names `hc_auth_multisig`.
 fn warm_auth_multisig(&self);
+/// Whether that key is built (§3.5): admission defers a multisig proof, retryably, until it is.
+fn auth_multisig_key_ready(&self) -> bool;
 ```
 
 ```rust
@@ -289,7 +291,7 @@ verify. The program digest is bound in-circuit anyway.
 `(hc, proof, binding)`. A multisig verify is cached automatically, and the `hc` in the key keeps
 it apart from a single-key verdict over the same bytes, which is the verify-cache spec §4 test 4.
 Nothing new is cached, and kind 9 is not used. If `feat/verify-cache` merges first, the plan's
-admission task adds the two forwards to `CachingExecutor`. If it merges after, its own merge fails
+admission task adds the three forwards to `CachingExecutor`. If it merges after, its own merge fails
 to compile until it adds them, and the plan says so in the verify-cache owner's ledger.
 
 ### 3.5 Keys and memory (single flight)
@@ -304,15 +306,18 @@ built once and every other caller waits for it. The verify path uses that key di
 
 - `node::warm` calls `warm_auth_multisig` **first** (before the bundle and auth keys) when the
   committed ledger has `hc_auth_multisig`.
-- The mempool: until the key is warm (`ZkExecutor::msauth_key_ready()`, forwarded through the
-  wrappers as part of `warm_auth_multisig`'s family — see below), admission **defers** a
+- The mempool: until the key is warm, admission **defers** a
   transaction whose `auth_header` is `Multisig` as a retryable refusal (never a permanent one, so
   the `RefusedCache` does not remember it), rather than building the key on a worker.
 - Block validation (`on_proposal`, apply, sync, a restarted follower) waits on the `OnceLock`: the
   first caller builds, the rest wait; a node never builds two.
 
-`msauth_key_ready` is a third required trait method, `fn auth_multisig_key_ready(&self) -> bool`,
-forwarded like the other two; the stub answers `true`.
+Naming: the **trait** method is `auth_multisig_key_ready(&self) -> bool` (required, forwarded by
+every wrapper like the other two; the stub answers `true`). `ZkExecutor` implements it by calling
+its **inherent** `msauth_key_ready()` (`self.msauth_key.get().is_some()`), the name the executor's
+own tests use. The mempool's refusal is `MempoolError::Warming(&'static str)`, a new variant: not
+`Invalid`, so never judged by `is_permanent`, never `RefusedCache`d, never a peer penalty, and
+`MempoolError::is_retryable()` is `true` for it (and for `Full`).
 
 Cost, by extrapolation from `executor.rs`'s measured call keys (tier 16 ≈ 13.7 s / 893 MB, tier 20
 ≈ 216 s / 6.5 GB at Production, plus keccak's preprocessed columns): **roughly 60 s and 1.5–2 GB
@@ -622,7 +627,10 @@ laptop):
    `msauth_gas_limit_pin()` for both the 2-signature spends. That is R-gas and R-hide checked on
    the chain's own bytes.
 
-## 8. CHANGELOG (v0.8.0, or v0.9.0)
+## 8. CHANGELOG (v0.8.0, or v0.9.0) — the release section
+
+This section is where the plan's Task 10 records the final proposed text, beside the PR
+description.
 
 The user decides the release scope and edits `CHANGELOG.md`; this text is the proposal. Under
 "Chain 21 and later, by genesis section":
@@ -668,7 +676,7 @@ The user decides the release scope and edits `CHANGELOG.md`; this text is the pr
 | 14 | one `auth_header` decode | §3.2, §3.4 |
 | 15 | rule 3 compares `Word8`s | §2.3 |
 | 16 | `--sweep-to` scope | §6.3 |
-| 17 | expiry check in the CLI; helpers | §6.3, plan Tasks 3, 6 |
+| 17 | expiry check in the CLI; helpers | §6.3, plan Tasks 3, 6, 7 |
 | 18 | `MAX_HONEST_DEGREE_BITS` asserts | §4.2 |
 | 19 | stale parent-spec copy | replaced with circuits' |
 | 20 | prover fleet and `clients/core` at the cut | §7 |
