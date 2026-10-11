@@ -5995,15 +5995,19 @@ mod tests {
         let (_dir, st, gs, _blocks) = timed_chain(12);
         assert_eq!(st.prune_history(u64::MAX, 10, PRUNE_PASS_MAX).unwrap(), 9);
         for mode in [VerifyMode::Quick, VerifyMode::Full] {
+            let loads = st.ledger_loads();
             let check = st.verify_chain(&gs, mode, &StubExecutor).unwrap();
+            assert_eq!(st.ledger_loads(), loads + 1, "{mode:?}: one load");
             assert_eq!(check.problem, None, "{mode:?}");
             assert_eq!(check.floor, 10);
             assert_eq!(check.last_good, 12);
+            assert_eq!(check.stored.as_ref().map(|l| l.state_root()), Some(check.ledger.state_root()), "{mode:?}");
             assert_eq!(check.ledger, st.load_ledger(&StubExecutor).unwrap());
         }
         // Off still needs genesis and the snapshot, nothing else.
         let check = st.verify_chain(&gs, VerifyMode::Off, &StubExecutor).unwrap();
         assert_eq!(check.problem, None);
+        assert!(check.stored.is_none());
     }
 
     #[test]
