@@ -39,7 +39,7 @@ What is different from chain 20:
     [ -e /usr/local/bin/rand.pre-c21 ] || cp -a /usr/local/bin/rand /usr/local/bin/rand.pre-c21
     [ "$(sha256sum /usr/local/bin/rand.pre-c21 | cut -d' ' -f1)" = '155dfe6667a85ea8071977512dc40c750127b9baa9b4fa4796d101c8fc1eee2d' ] || { echo 'rand.pre-c21 is NOT the 0.6.8 binary — sort it out by hand; nothing installed'; exit 1; }
     curl -fsSL -o /root/rand.c21 https://github.com/randprotocol/fullnode/releases/download/v0.8.0/rand
-    [ "$(sha256sum /root/rand.c21 | cut -d' ' -f1)" = '<v0.8.0 rand sha256>' ] || { rm -f /root/rand.c21; echo 'SHA MISMATCH'; exit 1; }
+    [ "$(sha256sum /root/rand.c21 | cut -d' ' -f1)" = 'e3a38e74ee28743a960fc1c3eb1ac6c538e18dc259411e10afff7f54e268bbf4' ] || { rm -f /root/rand.c21; echo 'SHA MISMATCH'; exit 1; }
     install -m 755 /root/rand.c21 /usr/local/bin/rand && /usr/local/bin/rand --version   # rand 0.8.0
     ```
   - **The guardian daemons** (hosts 1–6, and guardians 7/8 on the laptop): the mint PQ co-signature
@@ -137,3 +137,28 @@ What is different from chain 20:
    ```
    and the laptop guardians' tomls and cursors. Start as in step 6. No endpoint fee changes (chain
    20 and chain 21 have the same `bridge.fees`).
+
+## Source check, 2026-10-12 (no bridge session was available)
+
+A read-only source comparison of v0.6.8 against v0.8.0 (`c0878c3f`), not a live mint, found the relayer's use of
+`rand` **compatible as-is**:
+
+- **The one command it runs:** `bridge-mint @<attestation.hex> --to <rand1…> --pq @<pq.json>`
+  (`bridge/daemons/src/submit/process.rs:111-121`). Its arguments are identical in both versions:
+  `main.rs:271-288` in v0.6.8 against `main.rs:290-308` in v0.8.0.
+- **Environment and output:** `RAND_KEY` and `RAND_RPC` are unchanged. So is the one-line summary output the
+  relayer parses.
+- **The node RPCs the daemon calls** (`rand_chainId`, `rand_getBridgeState`, `rand_getBridgeBurn`) return the
+  same shapes.
+- **One behaviour change:** the default fee is now `schedule_floor` (the floor plus `prove_base`). Keep the
+  relayer wallet funded.
+
+Config changes only, already in the steps above: `chain_id` 20 → 21 in `/etc/rand-relayer.toml`, the rand
+burn cursor reset to chain 21's `burn_sequence`, and the binary swap after the fleet switch (a v0.8.0 `rand`
+cannot prove for chain 20).
+
+Open:
+- **Before relying on the bridge:** one real `bridge-mint` against chain 21.
+- **Updates for `bridge/daemons/mainnet`:** it has only `cut-chain20.sh`. That script installs `rand-v068`,
+  checks it against `RAND_SHA` and starts the relayer at its end. A chain-21 version needs `rand-v080`
+  (sha `e3a38e74…bbf4`), and must start the relayer only at step 6, after the guardians.
