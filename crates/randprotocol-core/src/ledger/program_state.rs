@@ -619,13 +619,13 @@ pub(super) fn apply(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::confidential::StubExecutor;
     use crate::crypto::Keypair;
     use crate::gas;
     use crate::ledger::tokens::TokenRegistry;
-    use crate::ledger::{BlockError, ValidatorEntry, VerifiedProofs};
+    use crate::ledger::{BlockError, ValidatorEntry};
     use crate::notes::{Bundle, KEM_EK_BYTES};
     use crate::program::program_id;
 
@@ -776,6 +776,14 @@ mod tests {
         l.validate(tx, &StubExecutor).expect_err("refused")
     }
 
+    /// For `ledger::tests::apply_never_decodes_a_proof`: a ledger under the section, an `Invoke`
+    /// (cell 1 created) that applies on it as the next block, and the key of its one validator.
+    pub(crate) fn an_invoke_that_applies() -> (Ledger, Transaction, Keypair) {
+        let l = ledger();
+        let tx = invoke(&l, 20, (0, 0, 0), Transition { reads: vec![cell(1, 0)], writes: vec![cell(1, 5)], ..empty() });
+        (l, tx, proposer())
+    }
+
     fn ps(e: ProgramStateError) -> TxError {
         TxError::ProgramState(e)
     }
@@ -906,25 +914,17 @@ mod tests {
         assert_eq!(l.program_state().unwrap().cell(&pid(), &key(1)), cell(1, 7).value);
     }
 
-    /// The verified set vouches for a transaction's proofs, never for its reads: a transaction
-    /// admitted at one state is refused at another on the comparison, with no proof looked at.
+    /// A proof's verdict — admission's, or a node's cached copy of it — vouches for the proof,
+    /// never for the transaction's reads: a transaction admitted at one state is refused at
+    /// another on the comparison (step 7), before its proof is looked at.
     #[test]
-    fn the_verified_set_does_not_vouch_for_a_read() {
-        struct All;
-        impl VerifiedProofs for All {
-            fn contains(&self, _: &Hash) -> bool {
-                true
-            }
-            fn is_empty(&self) -> bool {
-                false
-            }
-        }
+    fn an_admitted_invoke_is_refused_at_apply_on_a_stale_read() {
         let mut l = ledger();
         let admitted = invoke(&l, 20, (0, 0, 0), Transition { reads: vec![cell(1, 0)], writes: vec![cell(1, 7)], ..empty() });
         l.validate(&admitted, &StubExecutor).unwrap();
         let tx = invoke(&l, 10, (0, 0, 0), Transition { writes: vec![cell(1, 5)], ..empty() });
         apply(&mut l, &tx).unwrap();
-        let err = l.apply_tx_with(&admitted, &proposer().address(), &StubExecutor, &All).unwrap_err();
+        let err = l.apply_tx(&admitted, &proposer().address(), &StubExecutor).unwrap_err();
         assert!(matches!(err, TxError::ProgramState(ProgramStateError::StaleRead { .. })), "{err:?}");
     }
 

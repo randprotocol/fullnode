@@ -16,7 +16,7 @@ use randprotocol_core::confidential::ConfidentialExecutor;
 use randprotocol_core::consensus::{Action, CommittedBlock, ConsensusConfig, ConsensusError, ConsensusMessage, HotStuff, NotHeld, PreApplied};
 use randprotocol_core::Block;
 use randprotocol_core::genesis::{Genesis, GenesisState};
-use randprotocol_core::{Hash, Keypair, Ledger, NoVerified, ShieldedAddress, Transaction, ValidatorSet, Word8, FAUCET_MAX_UNITS};
+use randprotocol_core::{Hash, Keypair, Ledger, ShieldedAddress, Transaction, ValidatorSet, Word8, FAUCET_MAX_UNITS};
 use randprotocol_zkvm::executor::ZkExecutor;
 use randprotocol_zkvm::notes::{Note, SpendKey};
 use randprotocol_zkvm::viewing::TxKey;
@@ -744,7 +744,7 @@ fn core_profile(fri_profile: &str) -> randprotocol_core::types::FriProfile {
 /// not the ledger, so its admission pre-flights the byte checks (spec §4 step 1), assembles the
 /// covered records (§3.2's coverability), and takes the covered-carrying path; every other
 /// transaction is the ledger's own `validate`.
-fn validate_for_pool(
+pub(crate) fn validate_for_pool(
     tx: &Transaction,
     ledger: &Ledger,
     storage: &Storage,
@@ -1294,11 +1294,6 @@ struct Node {
     /// builds for them, so the same junk proof re-sent against the same proved root is refused
     /// without verifying its STARK again ([`admission::ProofRefusedCache`]).
     proof_refused: admission::ProofRefusedCache,
-    /// Transaction hashes whose proofs this node already verified (audit v3, B5), shared with
-    /// the consensus replica: the admission workers fill it, and at propose and at a proposal's
-    /// apply the ledger decodes a hit's proofs instead of re-verifying them. Behind the lock
-    /// because the workers write from blocking threads; never held across an await.
-    verified: Arc<RwLock<admission::VerifiedSet>>,
     /// Policy only — every bucket lives on its [`Peer`], so nothing here has to track the peer set.
     limiter: admission::PeerLimiter,
     /// The policy over every peer's `status_bucket` (see [`on_status_gossip`]).
@@ -1382,7 +1377,7 @@ const WAITING_PER_PROPOSER: usize = 2;
 
 /// An off-loop proposal apply's outcome (spec 2026-10-11 off-loop apply §4.1–4.2):
 /// `apply_block_for_sync` on a clone of `parent`'s post-state, with the replica's sidecar,
-/// executor and verified set. `result` is `None` when the apply panicked; the block is then
+/// executor. `result` is `None` when the apply panicked; the block is then
 /// delivered plainly and applied on the loop, which panics or refuses exactly as it always did.
 struct Applied {
     block: Block,
@@ -2551,11 +2546,6 @@ pub async fn start_with(cfg: NodeConfig, rpc_options: RpcOptions, net_options: N
             profile: core_profile(&gs.fri_profile),
         }));
     }
-    // The admission cache (audit v3, B5): one set, shared with the replica — the verification
-    // workers fill it, and propose/apply read it through the ledger. Like the covered source it
-    // is re-registered on every replica this process builds (`apply_synced` resumes).
-    let verified = Arc::new(RwLock::new(admission::VerifiedSet::new(admission::VERIFIED_SET_ENTRIES)));
-    hs.set_verified_proofs(verified.clone());
 
     // Network. The sync and gossip byte limits follow the genesis block cap (call limits
     // spec §8), computed once here and handed to the swarm and the serve path.
@@ -2817,7 +2807,6 @@ pub async fn start_with(cfg: NodeConfig, rpc_options: RpcOptions, net_options: N
         disk_free_bytes,
         refused: admission::RefusedCache::new(admission::REFUSED_CACHE_ENTRIES),
         proof_refused: admission::ProofRefusedCache::new(admission::PROOF_REFUSED_ENTRIES),
-        verified,
         limiter: admission::PeerLimiter::new(admission::PEER_TX_BURST, admission::PEER_TX_PER_SEC),
         status_limiter: admission::PeerLimiter::new(STATUS_GOSSIP_BURST, STATUS_GOSSIP_PER_SEC),
         consensus_limiter: admission::PeerLimiter::new(CONSENSUS_GOSSIP_BURST, CONSENSUS_GOSSIP_PER_SEC),
@@ -3081,21 +3070,15 @@ impl Node {
             let storage = self.storage.clone();
             let profile = core_profile(&self.gs.fri_profile);
             let executor = self.executor.clone();
-            let verified = self.verified.clone();
             let out = self.verdicts_tx.clone();
             self.verify_in_flight += 1;
             tokio::task::spawn_blocking(move || {
                 // I1: what a state proof's verdict is keyed by — this snapshot's proved root and
                 // the segment it builds — taken on the ledger the proof is verified against.
                 let proof_key = admission::state_proof_key(&tx, &ledger, executor.as_ref());
+                // This verify runs through `self.executor`, the `CachingExecutor`: it is what fills
+                // the verify cache that propose and apply then answer from.
                 let result = guard_verify(|| validate_for_pool(&tx, &ledger, &storage, profile, executor.as_ref()));
-                if result.is_ok() {
-                    // B5: remember that these exact bytes verified — the hash binds the proofs —
-                    // so the consensus path decodes them instead of verifying again. The pool's
-                    // own answer (`insert_verified`) is irrelevant here: a proof that verified is
-                    // verified, whatever the state-dependent half later says.
-                    verified.write().unwrap_or_else(|e| e.into_inner()).insert(tx.hash());
-                }
                 // The loop is the only receiver and outlives every task it spawned, so a send
                 // failure means the node is already shutting down.
                 let _ = out.blocking_send(Verdict { tx, result, source, proof_key });
@@ -4095,19 +4078,19 @@ impl Node {
 
     /// Apply `block` on a blocking worker (§4.1): a clone of its parent's post-state, taken
     /// here as the replica's own apply takes it, through this node's executor (the caching one
-    /// the replica holds) and verified set. Its [`Applied`] comes back to [`Node::on_applied`],
+    /// the replica holds). Its [`Applied`] comes back to [`Node::on_applied`],
     /// panic or not; only a closed channel — the node shutting down — loses it.
     fn spawn_apply(&mut self, block: Block, sidecar: BTreeMap<usize, Vec<randprotocol_core::types::CoveredBundle>>) {
         let parent = block.parent();
         let ledger = self.hs.ledger_after(&parent).expect("the caller found the parent in the tree").clone();
-        let (executor, verified, out) = (self.executor.clone(), self.verified.clone(), self.applied_tx.clone());
+        let (executor, out) = (self.executor.clone(), self.applied_tx.clone());
         self.in_flight.insert(block.hash());
         self.in_flight_keys.insert((block.view(), block.proposer()), block.hash());
         tokio::task::spawn_blocking(move || {
             let started = Instant::now();
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let mut ledger = ledger;
-                ledger.apply_block_for_sync(&block, &sidecar, &[], executor.as_ref(), verified.as_ref()).map(|receipts| (ledger, receipts))
+                ledger.apply_block_for_sync(&block, &sidecar, &[], executor.as_ref()).map(|receipts| (ledger, receipts))
             }))
             .map_err(|payload| {
                 let what = payload
@@ -5018,7 +5001,7 @@ impl Node {
                     sidecar.insert(index, records);
                 }
             }
-            let receipts = ledger.apply_block_for_sync(b, &sidecar, &cb.pruned, self.executor.as_ref(), &NoVerified)?;
+            let receipts = ledger.apply_block_for_sync(b, &sidecar, &cb.pruned, self.executor.as_ref())?;
             if receipts != cb.receipts {
                 anyhow::bail!("receipts for block {} do not match our execution", b.height());
             }
@@ -5126,10 +5109,6 @@ impl Node {
                 profile: core_profile(&self.gs.fri_profile),
             }));
         }
-        // The admission cache (audit v3, B5) does not ride the resume either: re-register the
-        // set this process already holds — its entries are as valid for the resumed replica as
-        // they were for the one it replaces.
-        self.hs.set_verified_proofs(self.verified.clone());
         self.timeout = None;
         self.propose_at = None;
         let acts = self.hs.start();
@@ -7387,7 +7366,6 @@ mod tests {
             disk_free_bytes: u64::MAX,
             refused: admission::RefusedCache::new(16),
             proof_refused: admission::ProofRefusedCache::new(16),
-            verified: Arc::new(RwLock::new(admission::VerifiedSet::new(16))),
             limiter: admission::PeerLimiter::new(admission::PEER_TX_BURST, admission::PEER_TX_PER_SEC),
             status_limiter: admission::PeerLimiter::new(STATUS_GOSSIP_BURST, STATUS_GOSSIP_PER_SEC),
             consensus_limiter: admission::PeerLimiter::new(CONSENSUS_GOSSIP_BURST, CONSENSUS_GOSSIP_PER_SEC),
@@ -9129,7 +9107,11 @@ mod tests {
     /// `reload_ledger`, the safety state, the pending set, the epoch sets), with the store as its
     /// covered source.
     fn resume_over(storage: &Arc<Storage>, gs: &GenesisState) -> HotStuff {
-        let executor: Arc<dyn ConfidentialExecutor> = Arc::new(StubExecutor);
+        resume_over_with(storage, gs, Arc::new(StubExecutor))
+    }
+
+    /// [`resume_over`] through `executor` — a node's `CachingExecutor`, for a test of the cache.
+    fn resume_over_with(storage: &Arc<Storage>, gs: &GenesisState, executor: Arc<dyn ConfidentialExecutor>) -> HotStuff {
         let mut hs = resume_consensus(storage, gs, Some(key(1)), Duration::from_secs(1), Duration::from_secs(8), executor).unwrap();
         hs.set_covered_source(Arc::new(StoreCovered { storage: storage.clone(), profile: randprotocol_core::types::FriProfile::Test }));
         hs.start();
@@ -9301,60 +9283,32 @@ mod tests {
         assert_eq!(restarted_peer.committed_ledger().state_root(), leader.committed_ledger().state_root());
     }
 
-    /// An admission cache that counts its hits: the node's own [`admission::VerifiedSet`] behind
-    /// the lock the node shares it through, and the number of `contains` queries it answered
-    /// `true` — the times the ledger took the decode-not-verify path.
-    struct CountingVerified {
-        set: RwLock<admission::VerifiedSet>,
-        hits: std::sync::atomic::AtomicUsize,
-    }
-
-    impl CountingVerified {
-        fn of(hashes: &[Hash]) -> CountingVerified {
-            let mut set = admission::VerifiedSet::new(admission::VERIFIED_SET_ENTRIES);
-            for h in hashes {
-                set.insert(*h);
-            }
-            CountingVerified { set: RwLock::new(set), hits: std::sync::atomic::AtomicUsize::new(0) }
-        }
-
-        fn hits(&self) -> usize {
-            self.hits.load(std::sync::atomic::Ordering::SeqCst)
-        }
-    }
-
-    impl randprotocol_core::VerifiedProofs for CountingVerified {
-        fn contains(&self, tx: &Hash) -> bool {
-            let hit = self.set.read().expect("the test's lock is never poisoned").contains(tx);
-            if hit {
-                self.hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            }
-            hit
-        }
-        fn is_empty(&self) -> bool {
-            self.set.read().expect("the test's lock is never poisoned").is_empty()
-        }
-    }
-
     /// What one live run of the fee-rule chain leaves behind: the committed root, the store's
     /// `base_fees_burned`, the aggregate's `a` record, the store's supply counters, and the
     /// cache's hit count (0 without one).
-    type LiveRun = (Hash, u64, Option<(u64, u64, u64)>, randprotocol_core::ledger::supply::Supply, usize);
+    type LiveRun = (Hash, u64, Option<(u64, u64, u64)>, randprotocol_core::ledger::supply::Supply, (u64, u64, u64));
 
     /// The #134 live run — a tip-paying bundle and an aggregate over block 1's cover, proposed by
     /// the leader and applied by a peer, driven until it commits — with the leader's replica
-    /// handed the admission cache when `cached`: the block's bundle and aggregate already marked
-    /// verified, as the mempool's verification workers mark a transaction they admitted. The
-    /// peer never gets one: it verifies every proof cold.
+    /// running through a node's verify cache (`CachingExecutor`) when `cached`, the block's bundle
+    /// and aggregate already admitted through it, as the mempool's verification workers admit a
+    /// transaction. The peer never gets one: it verifies every proof cold.
     fn fee_rules_live_run(cached: bool) -> LiveRun {
         let (_d, storage, gs, covered_tx, _b1_ledger) = fee_rules_chain();
-        let (mut leader, mut peer) = (resume_over(&storage, &gs), resume_over(&storage, &gs));
+        let cache = Arc::new(crate::verify_cache::CachingExecutor::new(Arc::new(StubExecutor)));
+        let leader_executor: Arc<dyn ConfidentialExecutor> = if cached { cache.clone() } else { Arc::new(StubExecutor) };
+        let (mut leader, mut peer) = (resume_over_with(&storage, &gs, leader_executor), resume_over(&storage, &gs));
         let bundle = tipping_bundle(leader.tip_ledger(), 31);
         let aggregate = aggregate_tx(leader.tip_ledger(), 7, &key(7), 0, 1, vec![covered_tx.hash()], b"ok".to_vec());
-        let cache = Arc::new(CountingVerified::of(&[bundle.hash(), aggregate.hash()]));
         if cached {
-            leader.set_verified_proofs(cache.clone());
+            for tx in [&bundle, &aggregate] {
+                let profile = randprotocol_core::types::FriProfile::Test;
+                assert_eq!(validate_for_pool(tx, leader.tip_ledger(), &storage, profile, cache.as_ref()), Ok(()), "admitted");
+            }
         }
+        // Every inner verifier call the cache makes is a miss (`CachingExecutor::cached` calls the
+        // inner executor exactly then), so its miss count is the inner verify count.
+        let admitted = cache.cache().misses();
         let (b2, _) = propose_to_all(&mut leader, &mut [&mut peer], &storage, vec![bundle.clone(), aggregate.clone()], 2);
         assert_eq!(
             b2.transactions.iter().map(|t| t.hash()).collect::<Vec<_>>(),
@@ -9380,28 +9334,31 @@ mod tests {
             storage.base_fees_burned().unwrap(),
             storage.aggregate_payment(&aggregate.hash()).unwrap(),
             storage.supply().unwrap(),
-            cache.hits(),
+            (admitted, cache.cache().misses(), cache.cache().hits()),
         )
     }
 
-    /// The #134 live path with the admission cache attached (the open follow-up AGENTS.md names).
-    /// On a node the leader's replica holds the `VerifiedSet` its mempool fills
-    /// (`set_verified_proofs`), so its trial apply (`apply_tx_with`) of a transaction admission
-    /// already verified skips exactly one thing: the STARK verification of the bundle (and auth
-    /// and call) proof, which it decodes instead. A peer that never saw the transaction verifies
-    /// it cold. The fee split under `burn_base` + `subsidy_net_of_fees` — the base burned, the
-    /// tip bucketed, the aggregate's netted subsidy — is computed from the fee and the ledger's
-    /// state, never from which proof path ran; were it to read anything off the verify path, the
-    /// cached leader's header root would differ from the cold peer's and the block would fork.
-    /// So: the cache is really hit, the cold peer still applies the leader's block to its root,
-    /// and every counter — the committed root, `base_fees_burned`, the `a` record, the supply —
-    /// is byte for byte the no-cache run's.
+    /// The #134 live path with the verify cache attached (the open follow-up AGENTS.md names; the
+    /// cache took over from the retired verified set, spec 2026-10-12 verified fold). On a node the
+    /// leader's replica runs through the `CachingExecutor` its mempool's admission fills, so its
+    /// trial apply (`apply_tx_checked`) of a transaction admission already verified answers the
+    /// STARK verifications from the cache instead of running them again. A peer that never saw the
+    /// transaction verifies it cold. The fee split under `burn_base` + `subsidy_net_of_fees` — the
+    /// base burned, the tip bucketed, the aggregate's netted subsidy — is computed from the fee and
+    /// the ledger's state, never from which proof path ran; were it to read anything off the verify
+    /// path, the cached leader's header root would differ from the cold peer's and the block would
+    /// fork. So: the leader's inner verifiers run at admission and never again across propose and
+    /// commit (every later verify is a cache hit), the cold peer still applies the leader's block to its
+    /// root, and every counter — the committed root, `base_fees_burned`, the `a` record, the supply
+    /// — is byte for byte the no-cache run's.
     #[test]
     fn under_both_fee_rules_the_admission_cache_on_the_leader_changes_no_root_and_no_counter() {
         let cold = fee_rules_live_run(false);
         let cached = fee_rules_live_run(true);
-        assert_eq!(cold.4, 0, "the cold run consults no cache");
-        assert!(cached.4 >= 1, "the leader's trial apply took the cache path: {} hit(s)", cached.4);
+        let (admitted, after, hits) = cached.4;
+        assert!(admitted >= 2, "admission verified the bundle and the aggregate through the cache: {admitted}");
+        assert_eq!(after, admitted, "no inner verify on the leader across propose and commit");
+        assert!(hits >= 2, "its trial apply and its own block's apply were answered from the cache: {hits}");
         assert_eq!(cached.0, cold.0, "the committed root does not depend on the leader's cache");
         assert_eq!(cached.1, cold.1, "nor does base_fees_burned");
         assert_eq!(cold.1, 3 * gas::BUNDLE_BASE, "one base per bundle in either run");
@@ -9698,7 +9655,7 @@ mod tests {
         storage.mark_sealed(raw.hash(), Hash::digest(b"the covering aggregate"), 2).unwrap();
         check_sealed_coverage(&storage, &BTreeSet::new(), &served).unwrap();
         let mut replica = gs.ledger.clone();
-        replica.apply_block_for_sync(&served.block, &BTreeMap::new(), &served.pruned, &StubExecutor, &NoVerified).unwrap();
+        replica.apply_block_for_sync(&served.block, &BTreeMap::new(), &served.pruned, &StubExecutor).unwrap();
         assert_eq!(replica.state_root(), ledger.state_root());
         assert_eq!(replica.next_index(), gs.ledger.next_index() + 4, "four leaves, dummies included");
 
@@ -9706,7 +9663,7 @@ mod tests {
         let substitute = |f: &dyn Fn(&mut randprotocol_core::Bundle)| {
             let mut bad = served.clone();
             f(bad.block.transactions[0].bundle.as_mut().unwrap());
-            gs.ledger.clone().apply_block_for_sync(&bad.block, &BTreeMap::new(), &bad.pruned, &StubExecutor, &NoVerified)
+            gs.ledger.clone().apply_block_for_sync(&bad.block, &BTreeMap::new(), &bad.pruned, &StubExecutor)
         };
         for slot in 0..4 {
             assert_eq!(substitute(&|b| b.nullifiers[slot][0] ^= 1), Err(BlockError::TxRootMismatch), "nf {slot}");
@@ -9718,7 +9675,7 @@ mod tests {
         let mut lying = served.clone();
         lying.pruned[0].public_values[pv::OUT0] ^= 1;
         assert!(matches!(
-            gs.ledger.clone().apply_block_for_sync(&lying.block, &BTreeMap::new(), &lying.pruned, &StubExecutor, &NoVerified),
+            gs.ledger.clone().apply_block_for_sync(&lying.block, &BTreeMap::new(), &lying.pruned, &StubExecutor),
             Err(BlockError::InvalidTx { index: 0, error: randprotocol_core::TxError::BadDigest })
         ));
     }
@@ -11079,7 +11036,7 @@ mod tests {
     /// what a child proposal is built on.
     fn post_state(ledger: &Ledger, block: &Block) -> Ledger {
         let mut after = ledger.clone();
-        after.apply_block_for_sync(block, &BTreeMap::new(), &[], &StubExecutor, &NoVerified).expect("the block applies");
+        after.apply_block_for_sync(block, &BTreeMap::new(), &[], &StubExecutor).expect("the block applies");
         after
     }
 

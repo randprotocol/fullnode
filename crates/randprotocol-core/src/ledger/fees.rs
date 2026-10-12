@@ -7,7 +7,7 @@
 //! `true`, the rule applies from block 1.
 //!
 //! - `burn_base`: every bundle's [`crate::gas::BUNDLE_BASE`] is destroyed instead of paid to the
-//!   proposer (`Ledger::apply_tx_with`'s fee split). The proposer keeps the rest of the fee — the
+//!   proposer (`Ledger::apply_tx`'s fee split). The proposer keeps the rest of the fee — the
 //!   tip — on a chain without aggregation, and nothing at inclusion on one with it, where the
 //!   excess is bucketed for the aggregator exactly as before. Only the base burns: it is the one
 //!   component every bundle pays and no proposer can steer, while a Call's gas and byte terms and

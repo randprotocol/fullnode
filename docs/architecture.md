@@ -484,12 +484,12 @@ A second cache sits under every verifier call rather than in front of admission.
 (`start_with`) the executor is wrapped in `verify_cache::CachingExecutor`, which remembers the `Ok`
 verdict of each of the eight STARK verifiers (bundle, auth, call, aggregate and the rest) under a
 key that is the domain `rand-verify-cache-1`, a kind tag and every argument the verifier receives,
-each length-prefixed, hashed together. It holds 16 384 entries, evicted FIFO, and stores `Ok` only,
+each length-prefixed, hashed together. It holds 32 768 entries, evicted FIFO, and stores `Ok` only,
 so a failure is always re-checked. It is sound because every input is in the key and everything else
 a verdict depends on (the FRI profile, the compiled constraints, the pinned heights) is fixed for
 the life of the process: a hit returns what the inner executor would have, and two validators with
-different cache contents reach the same verdict. `VerifiedSet` is kept: a hit there skips the
-verifier call, and a miss falls through to the cache. The effect is per node: an aggregate that
+different cache contents reach the same verdict. The admission verified set (B5) is folded into this cache: the ledger always calls the verifier and never
+decodes a proof at apply, so the cache is the only reuse. The effect is per node: an aggregate that
 admission has seen is now verified once, where the leader used to verify it three times (admission,
 trial apply, its own apply) and a follower twice (admission, apply). The startup chain walk and CLI tools such as `rand-node
 verify` use the bare executor and have no cache (a replay walk would only fill it with history no later lookup hits). 

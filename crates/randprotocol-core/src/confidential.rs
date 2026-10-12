@@ -94,12 +94,11 @@ pub trait ConfidentialExecutor: Send + Sync {
     /// computed once, at deploy.
     fn verify_call(&self, program: &ProgramRecord, proof: &[u8]) -> Result<CallOutcome, ConfidentialError>;
     /// Decode `proof` against `program` and return exactly what [`Self::verify_call`] would
-    /// return, but without the STARK verification. Called only for a transaction whose hash a
-    /// [`crate::ledger::VerifiedProofs`] set vouches for — one this node already ran `verify_call`
-    /// on, against this same record (a program's record is immutable once deployed) and this same
-    /// proof (bound by the transaction hash) — so the answer is the one admission computed, and
-    /// every check a validator that re-verifies would apply to the outcome (the tier's fee floor,
-    /// the receipt's words) still runs here.
+    /// return, but without the STARK verification. Admission pricing only — the ledger never
+    /// calls this: a node's `call_pricing` reads a call's header to price it before paying for a
+    /// verify. Consensus always verifies (spec
+    /// `docs/superpowers/specs/2026-10-12-verified-fold-design.md`), so a decoder that drifts from
+    /// its verifier can mis-price a pool entry but never make a block valid.
     ///
     /// The default is `verify_call` itself: an executor that cannot decode without verifying
     /// simply pays the full cost again, which is always correct.
@@ -128,7 +127,8 @@ pub trait ConfidentialExecutor: Send + Sync {
         Err(ConfidentialError::InvalidProof("this executor does not implement the hardening_v6 call rules".into()))
     }
     /// [`Self::decode_call`]'s twin for [`Self::verify_call_hardened`]: everything but the STARK
-    /// verification, for a transaction the verified set vouches for. Defaults to the full verify.
+    /// verification. Admission pricing only — the ledger never calls this. Defaults to the full
+    /// verify.
     fn decode_call_hardened(
         &self,
         program: &ProgramRecord,
@@ -154,7 +154,8 @@ pub trait ConfidentialExecutor: Send + Sync {
     ) -> Result<CallOutcome, ConfidentialError> {
         Err(ConfidentialError::InvalidProof("this executor does not implement the RPL-2 invoke rules".into()))
     }
-    /// [`Self::decode_call_hardened`]'s twin for [`Self::verify_invoke`]. Defaults to the full verify.
+    /// [`Self::decode_call_hardened`]'s twin for [`Self::verify_invoke`]. Admission pricing only —
+    /// the ledger never calls this. Defaults to the full verify.
     fn decode_invoke(
         &self,
         program: &ProgramRecord,
@@ -180,8 +181,8 @@ pub trait ConfidentialExecutor: Send + Sync {
         Err(ConfidentialError::InvalidProof("this executor does not implement the RPL-3 state-proof rules".into()))
     }
     /// [`Self::decode_invoke`]'s twin for [`Self::verify_perp`]: everything but the STARK
-    /// verification — the segment's digest is still compared, so the verified set's verdict
-    /// stands only for the segment this ledger builds now. Defaults to the full verify.
+    /// verification, the segment's digest still compared. The ledger never calls this; kept as
+    /// `verify_perp`'s header twin (no production caller). Defaults to the full verify.
     fn decode_perp(
         &self,
         engine_hc: &Word8,

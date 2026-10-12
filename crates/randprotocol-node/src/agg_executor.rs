@@ -517,13 +517,14 @@ impl ConfidentialExecutor for AggExecutor {
         self.inner.verify_call(program, proof)
     }
 
-    /// Audit v3, B5: a call proof admission already verified is decoded, not verified again.
-    /// Mirrors `ZkExecutor::verify_call`'s pre-`Machine::verify` half exactly, out of the
-    /// vendored crate's public API (the executor's own `decode_and_check` is private): the
-    /// canonical decode, the declared-height ranges, the public-table height against the
-    /// record, the public-value count and `u32` ranges, and the `PUB0..7` compare. Absent are
-    /// the degree-bits check and the STARK verification itself — both ran at admission over
-    /// these same bytes. Re-mirror against `verify_call` at every re-vendor.
+    /// Admission pricing only (`call_pricing`, which reads a call's header before paying for a
+    /// verify) — the ledger never decodes a proof (spec 2026-10-12 verified fold). Mirrors
+    /// `ZkExecutor::verify_call`'s pre-`Machine::verify` half exactly, out of the vendored
+    /// crate's public API (the executor's own `decode_and_check` is private): the canonical
+    /// decode, the declared-height ranges, the public-table height against the record, the
+    /// public-value count and `u32` ranges, and the `PUB0..7` compare. Absent are the
+    /// degree-bits check and the STARK verification itself — admission's verify that follows
+    /// runs both. Re-mirror against `verify_call` at every re-vendor.
     fn decode_call(&self, record: &ProgramRecord, proof: &[u8]) -> Result<CallOutcome, ConfidentialError> {
         use randprotocol_zkvm::tables::cpu::pv;
         let proof = randprotocol_zkvm::executor::decode_canonical(proof)?;

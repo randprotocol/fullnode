@@ -87,7 +87,7 @@ does not.
 
 **The proof is state-independent.** The ledger builds the segment from the transaction, never
 from its own cells, so a proof verifies or fails on the transaction's bytes alone; the read check
-is a separate comparison that always runs. This is what keeps the node's verified-proofs cache
+is a separate comparison that always runs. This is what keeps the node's verify cache
 sound.
 
 ## Writing a program for it

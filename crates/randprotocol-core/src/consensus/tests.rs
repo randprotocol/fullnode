@@ -1673,7 +1673,7 @@ fn a_failing_candidate_is_dropped_and_the_block_still_verifies() {
     let block = actions.iter().find_map(|a| match a { Action::Broadcast(ConsensusMessage::Proposal(b)) => Some(b.clone()), _ => None }).unwrap();
     assert_eq!(block.transactions, vec![ok1, ok3], "the double spend is dropped, the third candidate kept");
     let mut replica = tip.clone();
-    replica.apply_block_for_sync(&block, &Default::default(), &[], &StubExecutor, &crate::ledger::NoVerified).expect("the header's root is what a replica computes");
+    replica.apply_block_for_sync(&block, &Default::default(), &[], &StubExecutor).expect("the header's root is what a replica computes");
 }
 
 /// The replay is what undoes a half-applied candidate. A `Deploy` passes `validate_inner`, its
@@ -1700,7 +1700,7 @@ fn a_half_applied_candidate_is_undone_by_the_replay() {
     let block = actions.iter().find_map(|a| match a { Action::Broadcast(ConsensusMessage::Proposal(b)) => Some(b.clone()), _ => None }).unwrap();
     assert_eq!(block.transactions, vec![ok1, ok3], "the half-applied deploy is dropped, its neighbours kept");
     let mut replica = tip.clone();
-    replica.apply_block_for_sync(&block, &Default::default(), &[], &StubExecutor, &crate::ledger::NoVerified).expect("the header's root is what a replica computes");
+    replica.apply_block_for_sync(&block, &Default::default(), &[], &StubExecutor).expect("the header's root is what a replica computes");
     assert!(!n.node.tip_ledger().is_spent(&bad_nf), "the dropped candidate's nullifiers are not in the tip");
 }
 
@@ -1728,7 +1728,7 @@ fn refused_candidates_are_skipped_without_counting_a_replay() {
     let block = actions.iter().find_map(|a| match a { Action::Broadcast(ConsensusMessage::Proposal(b)) => Some(b.clone()), _ => None }).unwrap();
     assert_eq!(block.transactions, vec![ok, trailing], "every refusal skipped, none counted; the trailing candidate is carried");
     let mut replica = tip.clone();
-    replica.apply_block_for_sync(&block, &Default::default(), &[], &StubExecutor, &crate::ledger::NoVerified).expect("the header's root is what a replica computes");
+    replica.apply_block_for_sync(&block, &Default::default(), &[], &StubExecutor).expect("the header's root is what a replica computes");
 }
 
 /// A proposal tolerates `MAX_PROPOSE_REPLAYS` half-applied candidates (each replays the accepted
@@ -1755,7 +1755,7 @@ fn a_proposal_closes_after_max_replays() {
     let block = actions.iter().find_map(|a| match a { Action::Broadcast(ConsensusMessage::Proposal(b)) => Some(b.clone()), _ => None }).unwrap();
     assert_eq!(block.transactions, vec![ok], "closed after the bound; the trailing good candidate waits for the next block");
     let mut replica = tip.clone();
-    replica.apply_block_for_sync(&block, &Default::default(), &[], &StubExecutor, &crate::ledger::NoVerified).expect("the header's root is what a replica computes");
+    replica.apply_block_for_sync(&block, &Default::default(), &[], &StubExecutor).expect("the header's root is what a replica computes");
 }
 
 #[test]
@@ -3745,7 +3745,7 @@ fn pre_apply(hs: &HotStuff, block: &Block) -> PreApplied {
     let parent = block.parent();
     let mut ledger = hs.ledger_after(&parent).expect("the parent is held").clone();
     let sidecar = hs.covered_sidecar(block).expect("no aggregate");
-    let result = ledger.apply_block_for_sync(block, &sidecar, &[], &StubExecutor, &crate::ledger::NoVerified).map(|r| (ledger, r));
+    let result = ledger.apply_block_for_sync(block, &sidecar, &[], &StubExecutor).map(|r| (ledger, r));
     PreApplied { parent, result }
 }
 

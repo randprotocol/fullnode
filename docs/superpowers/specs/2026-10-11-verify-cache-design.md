@@ -43,7 +43,7 @@ A repeat costs one hash of the inputs and a map lookup.
 - Negative caching. `RefusedCache` and `ProofRefusedCache` already exist, and errors can be
   transient (a key build that failed, a panic).
 - Removing `VerifiedSet`. It stays as is: a hit there skips the verifier call entirely, and a
-  miss there now falls through to this cache. Folding the two together is a later cleanup.
+  miss there now falls through to this cache. Folded later: see `2026-10-12-verified-fold-design.md`.
 
 ## 3. Design
 
