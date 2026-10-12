@@ -13,7 +13,7 @@
 #     chain 21's decided limits for it, 6 MiB proofs and 19 MiB blocks.
 #
 #   deploy/cut-chain21-genesis.sh snapshot <dir>     # chain 20 still up, bridge daemons stopped
-#   WALLET=<chain 20's rand, v0.7.1> deploy/cut-chain21-genesis.sh balances <dir>
+#   WALLET=<chain 20's rand, v0.7.0> deploy/cut-chain21-genesis.sh balances <dir>
 #                                                    # read-only toward the chain: the RAND carry list
 #   CUT_RECORD=<record> CHAIN20_SNAPSHOT=<dir> NODE=<the cut build's rand-node> WALLET=<its rand> \
 #     EXPECT_NODE_VERSION=<that release> PERP_PROVER=<durian's perp-prover> \
@@ -63,7 +63,8 @@
 #     `rand_getSupply`'s identity. The user chose zUSD knowing this (2026-10-11).
 #
 # DERIVED from deploy/cut-chain20-genesis.sh (chain 20 — v0.6.8, live since 2026-10-01 06:17 UTC,
-# genesis 6210cf07…5135, now running v0.7.1 — is chain 21's predecessor): the same snapshot /
+# genesis 6210cf07…5135, running v0.7.0 (806ed349) since 2026-10-02; v0.7.1 was tagged, never
+# rolled — is chain 21's predecessor): the same snapshot /
 # balances / carry-over rule / splice, with chain 20 as the source. Read it first. What this script
 # does that chain 20's did not:
 #
@@ -178,10 +179,10 @@
 #   * The SSH tunnel to obs1 is checked (`rand_getGenesisHash` answers, and is chain 20's) right
 #     before `snapshot` and right before `balances`, not only described.
 #   * NODE must report rand-node $EXPECT_NODE_VERSION for the cut, and EXPECT_NODE_VERSION has no
-#     default: the release that carries the fees section is not tagged yet (d6cc16f5 still reports
-#     0.7.1, chain 20's running version, which lacks `--fees`). Set it to that release, or cut with
-#     NODE_VERSION_OK=1 knowingly; `--fees` itself is checked either way. `balances` runs with chain
-#     20's own build, v0.7.1 (WALLET).
+#     default: the release that carries the fees section is v0.8.0 (d6cc16f5 reported 0.7.1, a
+#     version chain 20 never ran; chain 20 runs 0.7.0, which lacks `--fees`). Set it to 0.8.0, or
+#     cut with NODE_VERSION_OK=1 knowingly; `--fees` itself is checked either way. `balances` runs
+#     with chain 20's own build, v0.7.0 (WALLET, built from tag v0.7.0 = 806ed349).
 #
 # Traps carried from the chain-17 to 20 cuts (AGENTS.md):
 #   - `balances` scans CURATED directories of wallet key files, `$WALLETS_DIRS` =
@@ -2219,7 +2220,7 @@ if [ "${1:-}" = balances ]; then
   SNAP=${2:?balances <snapshot dir>}
   [ ! -e "$SNAP/balances.json" ] || { echo "cut-chain21: $SNAP/balances.json exists — move it aside to re-scan" >&2; exit 1; }
   [ ! -e "$ALLOC_ADDRESSES" ] || { echo "cut-chain21: $ALLOC_ADDRESSES exists — move it aside; \`balances\` writes it" >&2; exit 1; }
-  [ -x "$WALLET" ] || { echo "cut-chain21: $WALLET is not executable — a rand that decodes chain 20: v0.7.1 (the build chain 20 runs)" >&2; exit 1; }
+  [ -x "$WALLET" ] || { echo "cut-chain21: $WALLET is not executable — a rand that decodes chain 20: v0.7.0 (the build chain 20 runs, tag 806ed349)" >&2; exit 1; }
   for w in $REQUIRED_WALLETS; do
     found=; for d in $WALLETS_DIRS; do [ -e "$d/$w.key.json" ] && found=$d/$w.key.json; done
     [ -n "$found" ] || { echo "cut-chain21: $w.key.json is in none of WALLETS_DIRS ($WALLETS_DIRS) — link it there before the scan (the relayer's: ~/.rand-chain17/alloc-wallets/relayer.key.json → ~/.rand-chain14/wallets/relayer.key.json)" >&2; exit 1; }

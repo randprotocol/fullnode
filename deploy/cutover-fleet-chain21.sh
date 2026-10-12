@@ -5,9 +5,10 @@
 # hosts of deploy/nodes.env (A–F, the twelve regional validators, obs1, rand-archive-2) and the six
 # guardian hosts (their own ssh key; their unit takes its ExecStart from a drop-in).
 #
-# DERIVED from deploy/cutover-fleet-chain20.sh (chain 20 = v0.6.8 then v0.7.1, chain 21's
-# predecessor; read it first). The phases, the stop order (C and D started first, every phase run
-# alone), the datadir handling (nodes.env units: suffix -<chain-20 prefix> → -<chain-21 prefix>,
+# DERIVED from deploy/cutover-fleet-chain20.sh (chain 20 = v0.6.8, then v0.7.0 from 2026-10-02;
+# v0.7.1 was tagged but never rolled — a read-only `status` on 2026-10-12 showed all 26 hosts on
+# 0.7.0, git_sha 806ed349; chain 21's predecessor; read it first). The phases, the stop order
+# (C and D started first, every phase run alone), the datadir handling (nodes.env units: suffix -<chain-20 prefix> → -<chain-21 prefix>,
 # volumes behind symlinks kept; guardian hosts: chain20.conf/data-20 → chain21.conf/data-21, a
 # stale data-21 moved aside, never reused), the sha-checked binary backups, the marker that
 # licenses `start`, and the rollback are chain 20's. Against chain 20's script:
@@ -36,7 +37,7 @@
 #         any node, refuses the whole start if one host fails, and checks each host once more in the
 #         same ssh call as its `systemctl start`: a node whose key is not verified is never started;
 #       - `wait` counts a host only when `rand_status.msauth_key` is `loaded`.
-#     A start after `rollback` (chain 20, v0.7.1, which has no msauth key) skips the key check.
+#     A start after `rollback` (chain 20, v0.7.0, which has no msauth key) skips the key check.
 #   * THE GENESIS MUST BE CHAIN 21'S: chain_id 21, hc_auth_multisig = 9705f8e2…8247 (the decided
 #     private-multisig guest), max_proof_bytes 6291456 and max_block_bytes 19922944 (the cut
 #     script's decided limits). `push` and `switch` refuse any other file.
@@ -46,10 +47,13 @@
 #     without it"). SECOND_REBUILD_WAIVED=1 is kept from chain 20 (it printed what the waiver leaves
 #     unchecked and appended `second-rebuild-waived: …` to the record); the policy says not to, and
 #     the chain-21 record is drafted for a real second operator.
-#   * THE OLD BUILD IS v0.7.1 (what chain 20 runs since 2026-10-07): OLD_SHA / OLD_SHA_WALLET have
-#     NO default here (this tree holds no v0.7.1 SHA256SUMS). Give them, or OLD_RELEASE_SUMS (+
-#     OLD_RELEASE_SUMS_SIG) — v0.7.1's signed SHA256SUMS, verified, read for rand-node and rand.
-#     preflight, switch and rollback need them. OLD (chain 20's datadir suffix) is 6210cf07.
+#   * THE OLD BUILD IS OLD_VERSION (default 0.7.0, tag 806ed349 = OLD_GIT_SHA: what chain 20 runs
+#     since 2026-10-02), one variable for every old-side check. OLD_SHA / OLD_SHA_WALLET have NO
+#     default here (this tree holds no v0.7.0 SHA256SUMS). Give them, or OLD_RELEASE_SUMS (+
+#     OLD_RELEASE_SUMS_SIG) — v0.7.0's signed SHA256SUMS, verified with its .sig by
+#     verify_release_sums, read for rand-node and rand. preflight (which also reads each node's
+#     rand_getVersion: version OLD_VERSION, git_sha OLD_GIT_SHA), the stop gate, switch's *.pre-c21
+#     backups and rollback need them. OLD (chain 20's datadir suffix) is 6210cf07.
 #   * DRY_RUN=1: every phase prints every remote command (per host list) and every local write,
 #     runs no ssh/scp/curl, writes no marker and no record line — touches nothing. Missing inputs
 #     (the signed sums, LOCAL_NODE, the genesis) become placeholders, loudly.
@@ -74,7 +78,7 @@
 #                                                      # chain 20 running: v0.8.0 + the msauth blob to /root/*.c21, checked
 #   (bridge: deploy/chain21-bridge-steps.md "stop" — relayer + guardians down, BEFORE the snapshot)
 #   deploy/cut-chain21-genesis.sh snapshot <dir>       # chain 20 still up
-#   WALLET=<v0.7.1 rand> deploy/cut-chain21-genesis.sh balances <dir>
+#   WALLET=<v0.7.0 rand> deploy/cut-chain21-genesis.sh balances <dir>
 #   (cut: CUT_RECORD=… CHAIN20_SNAPSHOT=<dir> NODE=<v0.8.0 rand-node> WALLET=<v0.8.0 rand> …
 #         deploy/cut-chain21-genesis.sh — reads only the snapshot; chain 20 still up)
 #   (the second operator re-derives the hash and writes second-hash into the record)
@@ -94,7 +98,7 @@
 # Rollback (bridge stopped first — deploy/chain21-bridge-steps.md):
 #   deploy/cutover-fleet-chain21.sh quiet <genesis>    # read-only: nothing burned or minted on chain 21?
 #   deploy/cutover-fleet-chain21.sh halt               # stop a fleet that does not run chain 20 (refuses one that does)
-#   OLD_RELEASE_SUMS=… deploy/cutover-fleet-chain21.sh rollback     # chain 20's units / drop-ins and v0.7.1 binaries
+#   OLD_RELEASE_SUMS=… deploy/cutover-fleet-chain21.sh rollback     # chain 20's units / drop-ins and v0.7.0 binaries
 #   deploy/cutover-fleet-chain21.sh start              # the rollback marker licenses it (no key check)
 #   deploy/cutover-fleet-chain21.sh wait20             # until all 26 serve chain 20 and C's height moves
 # A re-cut after a switch: halt, rollback, start, wait20, then push / stop / switch the new genesis.
@@ -116,7 +120,7 @@
 # 20's: a path holds rand-node, rand and msauth-vk-production.bin), RELEASE_SUMS / RELEASE_SUMS_SIG
 # (required: stage, push, switch), WANT_SHA / WANT_SHA_WALLET / WANT_SHA_VK (optional, must agree
 # with the signed file), WANT_VERSION (0.8.0), NEED_FLAGS, OLD_SHA / OLD_SHA_WALLET or
-# OLD_RELEASE_SUMS / OLD_RELEASE_SUMS_SIG (v0.7.1), OLD (6210cf07), CUT_RECORD (push),
+# OLD_RELEASE_SUMS / OLD_RELEASE_SUMS_SIG (v0.7.0), OLD (6210cf07), CUT_RECORD (push),
 # GUARDIAN_HOSTS (`<index> <ip>` per line; the bridge session's file), LOCAL_NODE, DRY_RUN, SELFTEST.
 #
 # Nothing here touches keys (/root/keys, /var/lib/randnode/node.key.json) or the guardian daemons
@@ -127,7 +131,7 @@
 # /root/rand-node.service.$OLD.bak over the unit and /root/rand-node.pre-c21, /root/rand.pre-c21 over
 # /usr/local/bin; on a guardian host move /root/chain20.conf.c20 back into
 # /etc/systemd/system/rand-node.service.d/, delete chain21.conf, restore the same two binaries;
-# daemon-reload; start. /usr/local/bin/msauth-vk-production.bin may stay: v0.7.1 never reads it.
+# daemon-reload; start. /usr/local/bin/msauth-vk-production.bin may stay: v0.7.0 never reads it.
 # Chain 20 resumes from the height it stopped at: its data dirs are never touched here — retire
 # them with deploy/retire-chain-dirs.sh only once chain 21 has run a day (it deletes the rollback
 # target too).
@@ -162,12 +166,14 @@ HC_AUTH_MULTISIG=9705f8e2f1bc8561848b29cb8efd57c37e3e39788fa58a5f03304d801966824
 MAX_PROOF_BYTES=6291456
 MAX_BLOCK_BYTES=19922944
 VK=msauth-vk-production.bin
-# v0.7.1, which chain 20 runs: no default (see the header).
+# The build chain 20 runs (one variable; see the header). Its binary pins have no default.
 OLD_SHA=${OLD_SHA:-}
 OLD_SHA_WALLET=${OLD_SHA_WALLET:-}
 OLD_RELEASE_SUMS=${OLD_RELEASE_SUMS:-}
 OLD_RELEASE_SUMS_SIG=${OLD_RELEASE_SUMS_SIG:-${OLD_RELEASE_SUMS:+$OLD_RELEASE_SUMS.sig}}
-OLD_VERSION=${OLD_VERSION:-0.7.1}
+OLD_VERSION=${OLD_VERSION:-0.7.0}
+OLD_GIT_SHA=${OLD_GIT_SHA:-806ed349e52a25045455f3e4a84bdb941daddc60}   # tag v0.7.0, what rand_getVersion reports
+[[ "$OLD_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ && "$OLD_GIT_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "OLD_VERSION / OLD_GIT_SHA are not a version and a 40-hex commit" >&2; exit 1; }
 # Chain 20's datadir suffix on the nodes.env hosts: its genesis hash prefix (6210cf07…5135).
 OLD=${OLD:-6210cf07}
 CUT_RECORD=${CUT_RECORD:-deploy/cut-records/chain21.record}
@@ -388,6 +394,9 @@ preflight)
     G=\$(curl -s -m5 -X POST 127.0.0.1:8545 -H 'content-type: application/json' -d '{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"rand_getGenesisHash\",\"params\":[]}' | grep -oE '\"result\":\"[0-9a-f]+\"' | cut -d'\"' -f4)
     case \"\$G\" in $OLD*) ;; *) echo \"serves genesis \${G:-nothing}, not chain 20 ($OLD…)\"; exit 1;; esac
     curl -s -m5 -X POST 127.0.0.1:8545 -H 'content-type: application/json' -d '{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"rand_getHealth\",\"params\":[]}' | grep -q '\"status\":\"ok\"' || { echo 'rand_getHealth is not ok'; exit 1; }
+    VER=\$(curl -s -m5 -X POST 127.0.0.1:8545 -H 'content-type: application/json' -d '{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"rand_getVersion\",\"params\":[]}')
+    printf '%s' \"\$VER\" | grep -q '\"version\":\"$OLD_VERSION\"' && printf '%s' \"\$VER\" | grep -q '\"git_sha\":\"$OLD_GIT_SHA\"' \\
+      || { echo \"rand_getVersion answers \$(printf '%s' \"\$VER\" | grep -oE '\"(version|git_sha)\":\"[^\"]*\"' | tr '\\n' ' '), not $OLD_VERSION / ${OLD_GIT_SHA:0:8}\"; exit 1; }
     S=\$( [ -e /root/rand-node.c21 ] && echo ', a staged rand-node.c21 present' || echo ', nothing staged yet')
     K=\$( [ -e /usr/local/bin/$VK ] && echo \", an msauth blob already installed (sha256 \$(sha256sum /usr/local/bin/$VK | cut -c1-12)…; switch replaces it)\" || echo '')
     echo \"\$(hostname) \$KIND ready: \$(/usr/local/bin/rand-node --version), on chain 20, healthy, \$(df -h / | tail -1 | awk '{print \$4}') free\$S\$K\"" \
@@ -553,7 +562,7 @@ switch)
   # One script for both kinds of host; the guardian branch is chosen by the drop-in's presence.
   # Order on each host: refuse while running; genesis and staged files at their pins; the msauth
   # key verified by the STAGED binary (docs/deploy.md's snippet) — all before any change; then the
-  # v0.7.1 backups, the install (binaries + key), the installed key re-verified by the installed
+  # v$OLD_VERSION backups, the install (binaries + key), the installed key re-verified by the installed
   # binary, the datadir init and the unit / drop-in rewrite.
   each "set -e
     systemctl is-active --quiet rand-node && { echo 'STILL RUNNING — refusing'; exit 1; }
@@ -624,9 +633,9 @@ switch)
   echo "SWITCHED — marker $MARKER_GLOB$P written; next: start (alone; check \$?)"
   ;;
 rollback)
-  # Back to chain 20's unit / drop-in and v0.7.1 binaries on every host. Only after `stop`.
+  # Back to chain 20's unit / drop-in and v$OLD_VERSION binaries on every host. Only after `stop`.
   # Idempotent per host (a host never switched, or already rolled back, answers "on chain 20").
-  # The msauth blob stays in /usr/local/bin: v0.7.1 never reads it.
+  # The msauth blob stays in /usr/local/bin: v$OLD_VERSION never reads it.
   clear_markers
   need_old_shas
   echo "== rollback to chain 20 (datadir suffix -$OLD / data-20, v$OLD_VERSION binaries) $(date -u +%T)"

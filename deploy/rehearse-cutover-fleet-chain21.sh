@@ -10,8 +10,9 @@
 #   NODE=<rand-node built from this tree> WALLET=<rand> deploy/rehearse-cutover-fleet-chain21.sh
 #   SELFTEST=1 NODE=… WALLET=… deploy/cutover-fleet-chain21.sh        # the same
 #
-# DERIVED from deploy/rehearse-cutover-fleet-chain20.sh. The fleet starts on chain 20 on "v0.7.1"
-# (a wrapper that has no `keygen-msauth-vk`, as v0.7.1 has none) and is staged and switched to
+# DERIVED from deploy/rehearse-cutover-fleet-chain20.sh. The fleet starts on chain 20 on "v0.7.0"
+# (what it really runs: 0.7.0, git_sha 806ed349 over rand_getVersion)
+# (a wrapper that has no `keygen-msauth-vk`, as v0.7.0 has none) and is staged and switched to
 # "v0.8.0" (a wrapper around $NODE: every call but --version goes to the real binary, so `init`
 # really derives each chain-21 genesis hash on every fake host and `keygen-msauth-vk` really checks
 # the committed blob crates/randprotocol-zkvm/keys/msauth-vk-production.bin against the pin
@@ -24,7 +25,7 @@
 # binary pins another key; the genesis must name hc_auth_multisig at the decided guest and limits;
 # switch installs the blob after the staged binary verified it; start refuses the whole fleet when
 # one host's installed blob is not verified; wait counts msauth_key "loaded"; a start after a
-# rollback (v0.7.1) skips the key check. DRY_RUN prints and changes nothing.
+# rollback (v0.7.0) skips the key check. DRY_RUN prints and changes nothing.
 #
 # What it does NOT prove: the remote commands run under this machine's tools behind small shims
 # (`systemctl`, `runuser`, `sha256sum`, `install -o`, GNU `sed -i`, the node's RPC, a download), not
@@ -45,10 +46,10 @@ RN=$(cd "$(dirname "$NODE")" && pwd)/$(basename "$NODE"); RW=$(cd "$(dirname "$W
 mkdir -p "$BIN/old" "$BIN/new" "$BIN/badrel" "$BIN/badvk" "$BIN/oldrel" "$T/repo/deploy/lib" "$T/shim" "$T/rshim" "$T/hosts" "$T/markers" "$T/key"
 cat > "$BIN/old/rand-node" <<EOF
 #!/usr/bin/env bash
-# rehearsal wrapper: chain 20's build, "v0.7.1" (no keygen-msauth-vk, as v0.7.1 has none)
+# rehearsal wrapper: chain 20's build, "v0.7.0" (no keygen-msauth-vk, as v0.7.0 has none)
 case "\${1:-}" in
-  --version) echo "rand-node 0.7.1 (rehearsal wrapper: chain 20's build)"; exit 0;;
-  keygen-msauth-vk) echo "error: unrecognized subcommand 'keygen-msauth-vk' (rehearsal wrapper: v0.7.1)" >&2; exit 2;;
+  --version) echo "rand-node 0.7.0 (rehearsal wrapper: chain 20's build)"; exit 0;;
+  keygen-msauth-vk) echo "error: unrecognized subcommand 'keygen-msauth-vk' (rehearsal wrapper: v0.7.0)" >&2; exit 2;;
 esac
 exec "$RN" "\$@"
 EOF
@@ -85,7 +86,7 @@ sums "$BIN/new" "$T/SUMS"; sign "$T/SUMS"
 sed "s/^$(sha "$BLOB") /$(sha "$TESTBLOB") /" "$T/SUMS" > "$T/SUMS-otherblob"; sign "$T/SUMS-otherblob"
 cp "$T/SUMS" "$T/SUMS-tampered"; cp "$T/SUMS.sig" "$T/SUMS-tampered.sig"; echo "0000000000000000000000000000000000000000000000000000000000000000 extra" >> "$T/SUMS-tampered"
 cp "$T/SUMS" "$T/SUMS-unsigned"
-# v0.7.1's signed SHA256SUMS (rand-node, rand) — OLD_RELEASE_SUMS
+# v0.7.0's signed SHA256SUMS (rand-node, rand) — OLD_RELEASE_SUMS
 (cd "$BIN/old" && shasum -a 256 rand-node rand | sed 's/  / /') > "$T/OLD-SUMS"; sign "$T/OLD-SUMS"
 
 # ── the fake ssh / scp (the laptop side) ───────────────────────────────────────────────────────
@@ -181,10 +182,18 @@ PY
     k=absent; g=$($B/rand-node keygen-msauth-vk --check $B/msauth-vk-production.bin 2>/dev/null); p=$($B/rand-node keygen-msauth-vk --print-pinned production 2>/dev/null)
     [ -n "$g" ] && [ "$g" = "$p" ] && k=loaded
     echo "{\"id\":1,\"jsonrpc\":\"2.0\",\"result\":{\"height\":$n,\"view\":6,\"msauth_key\":\"$k\"}}";;
-  *rand_getVersion*) echo '{"id":1,"jsonrpc":"2.0","result":{"chain_id":0,"git_sha":"fake","version":"fake"}}';;
+  *rand_getVersion*)
+    # what the INSTALLED build reports: v0.7.0 = tag 806ed349 (REHEARSE_V071_HOST: that host answers as
+    # the never-rolled v0.7.1, a build whose binary sha the rehearsal does not model)
+    case "$($B/rand-node --version 2>/dev/null)" in
+      "rand-node 0.7.0"*) v=0.7.0; gs=806ed349e52a25045455f3e4a84bdb941daddc60;;
+      *) v=0.8.0; gs=fake;;
+    esac
+    [ "${REHEARSE_V071_HOST:-}" = "$FAKE_HOST" ] && { v=0.7.1; gs=0000000000000000000000000000000000000071; }
+    echo "{\"id\":1,\"jsonrpc\":\"2.0\",\"result\":{\"chain_id\":20,\"git_sha\":\"$gs\",\"version\":\"$v\"}}";;
 esac
 FAKE_CURL
-# ── the 26 fake hosts, on chain 20, on the "v0.7.1" wrapper ────────────────────────────────────
+# ── the 26 fake hosts, on chain 20, on the "v0.7.0" wrapper ────────────────────────────────────
 cat > "$T/mkfleet.sh" <<'MKFLEET'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -272,13 +281,15 @@ t "a STAGE_URL with a space is refused" 1 "shell metacharacter" env "STAGE_URL=h
 t "NEED_FLAGS with a non-flag word is refused" 1 "is not a --flag" env "NEED_FLAGS=--fees ;id" $F status
 
 # ── preflight ──
-t "preflight without v0.7.1's pins" 1 "OLD_SHA / OLD_SHA_WALLET" $F preflight
-t "preflight on a healthy chain-20 fleet" 0 "PREFLIGHT OK" env "${OLDENV[@]}" $F preflight
+t "preflight without v0.7.0's pins" 1 "OLD_SHA / OLD_SHA_WALLET" $F preflight
+t "preflight on a healthy chain-20 fleet (v0.7.0, git_sha 806ed349 over RPC)" 0 "PREFLIGHT OK" env "${OLDENV[@]}" $F preflight
 chk "preflight changed nothing" '[ "$(units)" = "$U0" ] && [ "$(active)" = 26 ] && [ "$(nmark)" = 0 ]'
 cp "$BIN/new/rand-node" "$T/hosts/192.0.2.7/usr/local/bin/rand-node"
 t "preflight with one host on another rand-node" 1 "not every host is ready" env "${OLDENV[@]}" $F preflight
-has "…and names the host's binary" "not chain 20's v0.7.1"
+has "…and names the host's binary" "not chain 20's v0.7.0"
 cp "$BIN/old/rand-node" "$T/hosts/192.0.2.7/usr/local/bin/rand-node"
+t "preflight with one node answering rand_getVersion as another build" 1 "not every host is ready" env "${OLDENV[@]}" REHEARSE_V071_HOST=192.0.2.8 $F preflight
+has "…and names what it answers" "not 0.7.0 / 806ed349"
 mkdir -p "$T/hosts/192.0.2.103/var/lib/randnode/data-21"
 t "preflight with a stale data-21 on a guardian host" 1 "not every host is ready" env "${OLDENV[@]}" $F preflight
 rmdir "$T/hosts/192.0.2.103/var/lib/randnode/data-21"
@@ -306,13 +317,13 @@ t "stage from url without STAGE_URL" 1 "needs STAGE_URL" env "${NEWENV[@]}" STAG
 t "stage from a plain-http url" 1 "is not https://" env "${NEWENV[@]}" STAGE_FROM=url STAGE_URL=http://rehearsal.invalid/x $F stage
 t "stage from the release" 0 "STAGED" env "${NEWENV[@]}" $F stage
 has "…each host verified the staged key with the staged binary" "msauth key ${VK_SHA:0:12}… verified"
-chk "26 hosts hold rand-node.c21 / rand.c21 / the blob at the pins; installed still v0.7.1; 26 still active" '[ "$(staged)" = 26 ] && [ "$(installed rand-node)" = "26:$OLD_SHA " ] && [ "$(active)" = 26 ] && [ "$(for h in $T/hosts/*; do sha $h/root/rand-node.c21; sha $h/root/rand.c21; sha $h/root/msauth-vk-production.bin.c21; done | sort -u | tr "\n" " ")" = "$(printf "%s\n%s\n%s\n" $NEW_SHA $NEW_SHA_WALLET $VK_SHA | sort | tr "\n" " ")" ]'
+chk "26 hosts hold rand-node.c21 / rand.c21 / the blob at the pins; installed still v0.7.0; 26 still active" '[ "$(staged)" = 26 ] && [ "$(installed rand-node)" = "26:$OLD_SHA " ] && [ "$(active)" = 26 ] && [ "$(for h in $T/hosts/*; do sha $h/root/rand-node.c21; sha $h/root/rand.c21; sha $h/root/msauth-vk-production.bin.c21; done | sort -u | tr "\n" " ")" = "$(printf "%s\n%s\n%s\n" $NEW_SHA $NEW_SHA_WALLET $VK_SHA | sort | tr "\n" " ")" ]'
 t "stage again from a private url (token kept out of the log)" 0 "STAGED" env "${NEWENV[@]}" STAGE_FROM=url "STAGE_URL=https://rehearsal.invalid/private/v080?token=SECRET123" $F stage
 ! grep -q SECRET123 "$T/out.log" && { echo "ok   — …the url's token is not in the output"; pass=$((pass+1)); } || { echo "FAIL — the token was printed"; fail=$((fail+1)); }
 t "stage again from a local path (STAGE_ALLOW_NON_ELF=1: the rehearsal's wrappers are scripts)" 0 "STAGED" env "${NEWENV[@]}" STAGE_FROM=path STAGE_DIR=$BIN/new STAGE_ALLOW_NON_ELF=1 $F stage
 # ── push, with chain 20 still running ──
 t "push without LOCAL_NODE" 1 "LOCAL_NODE is unset" env "${NEWENV[@]}" $F push $G21
-t "push with chain 20's v0.7.1 as LOCAL_NODE" 1 "nothing done" env "${NEWENV[@]}" LOCAL_NODE=$BIN/old/rand-node $F push $G21
+t "push with chain 20's v0.7.0 as LOCAL_NODE" 1 "nothing done" env "${NEWENV[@]}" LOCAL_NODE=$BIN/old/rand-node $F push $G21
 t "push without RELEASE_SUMS" 1 "RELEASE_SUMS is unset" env "${LN[@]}" $F push $G21
 t "push of chain 20's genesis" 1 "has chain_id 20, not 21" env "${NEWENV[@]}" "${LN[@]}" $F push $G20
 t "push of a chain-21 genesis without hc_auth_multisig" 1 "has hc_auth_multisig None" env "${NEWENV[@]}" "${LN[@]}" $F push $G21X
@@ -345,7 +356,7 @@ record "$H21B"
 t "stop when the record's second-hash is another genesis's" 1 "differ" env "${NEWENV[@]}" "${OLDENV[@]}" "${LN[@]}" $F stop $G21
 chk "…all 26 still active" '[ "$(active)" = 26 ]'
 record "$H21"
-t "stop without v0.7.1's pins" 1 "OLD_SHA / OLD_SHA_WALLET" env "${NEWENV[@]}" "${LN[@]}" $F stop $G21
+t "stop without v0.7.0's pins" 1 "OLD_SHA / OLD_SHA_WALLET" env "${NEWENV[@]}" "${LN[@]}" $F stop $G21
 chk "…all 26 still active" '[ "$(active)" = 26 ]'
 echo active > "$T/hosts/192.0.2.104/state/rand-guardian"
 t "stop while one guardian host's rand-guardian still runs" 1 "NOTHING STOPPED" env "${NEWENV[@]}" "${OLDENV[@]}" "${LN[@]}" $F stop $G21
@@ -353,7 +364,7 @@ has "…that host names its rand-guardian" "rand-guardian still active"
 chk "…all 26 still active" '[ "$(active)" = 26 ]'
 echo inactive > "$T/hosts/192.0.2.104/state/rand-guardian"
 cp "$BIN/badrel/rand-node" "$T/hosts/192.0.2.13/usr/local/bin/rand-node"
-t "stop while one host's installed rand-node is not v0.7.1" 1 "NOTHING STOPPED" env "${NEWENV[@]}" "${OLDENV[@]}" "${LN[@]}" $F stop $G21
+t "stop while one host's installed rand-node is not v0.7.0" 1 "NOTHING STOPPED" env "${NEWENV[@]}" "${OLDENV[@]}" "${LN[@]}" $F stop $G21
 has "…that host names its binary" "switch would refuse it"
 cp "$BIN/old/rand-node" "$T/hosts/192.0.2.13/usr/local/bin/rand-node"
 t "stop (gated: all 26 ready)" 0 "STOPPED" env "${NEWENV[@]}" "${OLDENV[@]}" "${LN[@]}" $F stop $G21
@@ -362,14 +373,14 @@ chk "all 26 inactive" '[ "$(active)" = 0 ]'
 record ""
 t "switch with the record's second-hash blanked after push (M3)" 1 "no 'second-hash:' line" env "${NEWENV[@]}" "${OLDENV[@]}" "${LN[@]}" $F switch $G21
 record "$H21"
-t "switch without v0.7.1's pins" 1 "OLD_SHA / OLD_SHA_WALLET" env "${NEWENV[@]}" "${LN[@]}" $F switch $G21
+t "switch without v0.7.0's pins" 1 "OLD_SHA / OLD_SHA_WALLET" env "${NEWENV[@]}" "${LN[@]}" $F switch $G21
 # the first switch attempt: every other host switches in it — a failed switch is re-run, never undone
 cp "$TESTBLOB" "$T/hosts/192.0.2.5/root/msauth-vk-production.bin.c21"
 cp "$BIN/badrel/rand-node" "$T/hosts/192.0.2.12/usr/local/bin/rand-node"
-t "switch with host 5's staged blob replaced and host 12 not on v0.7.1" 1 "rollback → start → wait20, then restart the bridge on chain 20" env "${NEWENV[@]}" "${OLDENV[@]}" "${LN[@]}" $F switch $G21
+t "switch with host 5's staged blob replaced and host 12 not on v0.7.0" 1 "rollback → start → wait20, then restart the bridge on chain 20" env "${NEWENV[@]}" "${OLDENV[@]}" "${LN[@]}" $F switch $G21
 has "…host 5 says its staged blob is not the pinned one (sha256, before the key check)" "files are not staged"
 has "…host 12 made no backup" "no backup made"
-chk "…host 5 installed nothing: still v0.7.1, no key, unit on chain 20; no marker" '[ "$(sha $T/hosts/192.0.2.5/usr/local/bin/rand-node)" = "$OLD_SHA" ] && [ ! -e $T/hosts/192.0.2.5/usr/local/bin/msauth-vk-production.bin ] && grep -q -- "-6210cf07 " $T/hosts/192.0.2.5/etc/systemd/system/rand-node.service && [ "$(nmark)" = 0 ]'
+chk "…host 5 installed nothing: still v0.7.0, no key, unit on chain 20; no marker" '[ "$(sha $T/hosts/192.0.2.5/usr/local/bin/rand-node)" = "$OLD_SHA" ] && [ ! -e $T/hosts/192.0.2.5/usr/local/bin/msauth-vk-production.bin ] && grep -q -- "-6210cf07 " $T/hosts/192.0.2.5/etc/systemd/system/rand-node.service && [ "$(nmark)" = 0 ]'
 chk "…host 12's unit still names chain 20, no .pre-c21 there" '[ ! -e $T/hosts/192.0.2.12/root/rand-node.pre-c21 ] && grep -q -- "-6210cf07 " $T/hosts/192.0.2.12/etc/systemd/system/rand-node.service'
 cp "$BLOB" "$T/hosts/192.0.2.5/root/msauth-vk-production.bin.c21"
 cp "$BIN/old/rand-node" "$T/hosts/192.0.2.12/usr/local/bin/rand-node"
@@ -385,7 +396,7 @@ echo inactive > "$T/hosts/192.0.2.102/state/rand-guardian"
 t "switch (re-run over the hosts already switched)" 0 "SWITCHED" env "${NEWENV[@]}" "${OLDENV[@]}" "${LN[@]}" $F switch $G21
 NEW=$(cut -d' ' -f1 "$T"/markers/*); P=${NEW:0:8}
 chk "one marker, named after the genesis prefix $P (= the hash the real binary derives)" '[ "$(nmark)" = 1 ] && [ -f $T/markers/chain21-switched-$P ] && [ "$NEW" = "$H21" ]'
-chk "every host runs the v0.8.0 binaries + the decided key, and kept the v0.7.1 ones as *.pre-c21" '[ "$(installed rand-node)" = "26:$NEW_SHA " ] && [ "$(installed rand)" = "26:$NEW_SHA_WALLET " ] && [ "$(installed msauth-vk-production.bin)" = "26:$VK_SHA " ] && [ "$(for h in $T/hosts/*; do sha $h/root/rand-node.pre-c21; done | sort -u)" = "$OLD_SHA" ] && [ "$(for h in $T/hosts/*; do sha $h/root/rand.pre-c21; done | sort -u)" = "$OLD_SHA_WALLET" ]'
+chk "every host runs the v0.8.0 binaries + the decided key, and kept the v0.7.0 ones as *.pre-c21" '[ "$(installed rand-node)" = "26:$NEW_SHA " ] && [ "$(installed rand)" = "26:$NEW_SHA_WALLET " ] && [ "$(installed msauth-vk-production.bin)" = "26:$VK_SHA " ] && [ "$(for h in $T/hosts/*; do sha $h/root/rand-node.pre-c21; done | sort -u)" = "$OLD_SHA" ] && [ "$(for h in $T/hosts/*; do sha $h/root/rand.pre-c21; done | sort -u)" = "$OLD_SHA_WALLET" ]'
 chk "20 node units name -$P, none -6210cf07; each new datadir initialised" '[ "$(grep -l -- "-$P " $T/hosts/192.0.2.{1..20}/etc/systemd/system/rand-node.service | wc -l | tr -d " ")" = 20 ] && ! grep -q -- "-6210cf07 " $T/hosts/192.0.2.{1..20}/etc/systemd/system/rand-node.service && [ "$(ls -d $T/hosts/192.0.2.{1..20}/root/data-n*-$P/db | wc -l | tr -d " ")" = 20 ]'
 chk "the two symlinked (archive) hosts got their chain-21 datadir on the volume" '[ -L $T/hosts/192.0.2.19/root/data-n19-$P ] && [ -d $T/hosts/192.0.2.19/mnt/volume/data-n19-$P/db ] && [ -d $T/hosts/192.0.2.20/mnt/volume/data-n20-$P/db ]'
 chk "every node host kept a chain-20 unit backup; chain-20 datadirs untouched" '[ "$(ls $T/hosts/192.0.2.{1..20}/root/rand-node.service.6210cf07.bak | wc -l | tr -d " ")" = 20 ] && [ "$(ls -d $T/hosts/192.0.2.{1..18}/root/data-n*-6210cf07/db | wc -l | tr -d " ")" = 18 ]'
@@ -432,8 +443,8 @@ t "switch to a re-cut over the switched fleet (no rollback)" 1 "needs rollback f
 chk "…no host changed its unit, no marker" '[ "$(units)" = "$UB" ] && [ "$(nmark)" = 0 ]'
 # ── rollback (bridge stopped first, in the runbook) ──
 t "rollback" 0 "ROLLED BACK" env "${OLDENV[@]}" $F rollback
-chk "every unit / drop-in is byte-for-byte chain 20's again, and every binary is v0.7.1" '[ "$(units)" = "$U0" ] && [ "$(installed rand-node)" = "26:$OLD_SHA " ] && [ "$(installed rand)" = "26:$OLD_SHA_WALLET " ]'
-t "start after rollback (v0.7.1: no msauth key check)" 0 "START-DONE" $F start
+chk "every unit / drop-in is byte-for-byte chain 20's again, and every binary is v0.7.0" '[ "$(units)" = "$U0" ] && [ "$(installed rand-node)" = "26:$OLD_SHA " ] && [ "$(installed rand)" = "26:$OLD_SHA_WALLET " ]'
+t "start after rollback (v0.7.0: no msauth key check)" 0 "START-DONE" $F start
 ! grep -q "msauth key on every host" "$T/out.log" && { echo "ok   — …the key gate was skipped for the rollback"; pass=$((pass+1)); } || { echo "FAIL — the key gate ran on a rollback start"; fail=$((fail+1)); }
 t "wait20: chain 20 serves on all 26 and C's height moves" 0 "CHAIN 20 COMMITTING AGAIN" $F wait20
 t "rollback while running" 1 "not back on chain 20" env "${OLDENV[@]}" $F rollback
@@ -448,7 +459,7 @@ t "stop for the re-cut (gated)" 0 "STOPPED" env "${NEWENV[@]}" "${OLDENV[@]}" "$
 t "switch to the re-cut genesis (guardian hosts still hold the first cut's data-21)" 0 "SWITCHED" env "${NEWENV[@]}" "${OLDENV[@]}" "${LN[@]}" $F switch $G21B
 NEWB=$(cut -d' ' -f1 "$T"/markers/*)
 chk "each guardian host moved the first cut's data-21 aside (kept) and initialised a fresh one" '[ "$(ls -d $T/hosts/192.0.2.10{1..6}/var/lib/randnode/data-21.stale-$P/db | wc -l | tr -d " ")" = 6 ] && [ "$(ls -d $T/hosts/192.0.2.10{1..6}/var/lib/randnode/data-21/db | wc -l | tr -d " ")" = 6 ] && [ "$(cat $T/hosts/192.0.2.10{1..6}/var/lib/randnode/data-21.genesis | sort -u)" = "$NEWB" ] && [ "$NEWB" != "$NEW" ]'
-chk "…and the re-cut installed v0.8.0 again over the restored v0.7.1, keeping the one backup" '[ "$(installed rand-node)" = "26:$NEW_SHA " ] && [ "$(for h in $T/hosts/*; do sha $h/root/rand-node.pre-c21; done | sort -u)" = "$OLD_SHA" ]'
+chk "…and the re-cut installed v0.8.0 again over the restored v0.7.0, keeping the one backup" '[ "$(installed rand-node)" = "26:$NEW_SHA " ] && [ "$(for h in $T/hosts/*; do sha $h/root/rand-node.pre-c21; done | sort -u)" = "$OLD_SHA" ]'
 t "start on the re-cut" 0 "START-DONE" $F start
 t "wait on the re-cut" 0 "CUTOVER DONE" env "${LN[@]}" $F wait $G21B
 # ── the waiver (kept from chain 20) ──

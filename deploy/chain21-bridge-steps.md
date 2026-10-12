@@ -12,17 +12,21 @@ side is `deploy/cutover-fleet-chain21.sh` and `docs/chain21-cut-runbook.md`.
 What is different from chain 20:
 
 - **A new build: v0.8.0, and every prover-side `rand` needs it.** v0.8.0 carries constraint set 9:
-  every verifier key and the proof encoding change, so a proof made by a v0.7.1 `rand` does not
+  every verifier key and the proof encoding change, so a proof made by a chain-20 `rand` does not
   decode on chain 21, and a v0.8.0 `rand` does not prove for chain 20. So:
   - **The relayer** (droplet `rand-relayer-1`, unit `rand-relayer`, CLI `/usr/local/bin/rand`,
     wallet `/var/lib/rand-relayer/wallet/`) needs the **Linux v0.8.0 `rand`** from the signed
-    release (the fleet's `rand`, sha256 as listed in v0.8.0's signed `SHA256SUMS`). **Keep the
-    v0.7.1 one as `/usr/local/bin/rand.pre-c21`** (sha-checked against v0.7.1's signed
+    release (the fleet's `rand`, sha256 as listed in v0.8.0's signed `SHA256SUMS`). **Which `rand`
+    the relayer runs today is not recorded**: the chain-20 cut installed v0.6.8 there, and the
+    v0.7.0 fleet roll (2026-10-02) covered the 26 nodes, not `rand-relayer-1`. Read it first
+    (`/usr/local/bin/rand --version` and its sha256 on `rand-relayer-1`, and the guardian daemons'
+    own `rand` if they shell out to one) and use that release's signed sums below. **Keep the
+    installed one as `/usr/local/bin/rand.pre-c21`** (sha-checked against its release's signed
     `SHA256SUMS`) and install the new one while the relayer is stopped, after the fleet's `switch`,
     never before (a v0.8.0 `rand` cannot serve chain 20 in the meantime):
     ```
     systemctl is-active --quiet rand-relayer && { echo 'stop the relayer first'; exit 1; }
-    [ "$(sha256sum /usr/local/bin/rand | cut -d' ' -f1)" = '<v0.7.1 rand sha256>' ] || { echo 'installed rand is not v0.7.1'; exit 1; }
+    [ "$(sha256sum /usr/local/bin/rand | cut -d' ' -f1)" = '<installed release rand sha256>' ] || { echo 'installed rand is not the release it reports'; exit 1; }
     [ -e /usr/local/bin/rand.pre-c21 ] || cp -a /usr/local/bin/rand /usr/local/bin/rand.pre-c21
     curl -fsSL -o /root/rand.c21 https://github.com/randprotocol/fullnode/releases/download/v0.8.0/rand
     [ "$(sha256sum /root/rand.c21 | cut -d' ' -f1)" = '<v0.8.0 rand sha256>' ] || { rm -f /root/rand.c21; echo 'SHA MISMATCH'; exit 1; }
@@ -78,7 +82,7 @@ What is different from chain 20:
    `cursors/rand.json` `next_sequence`. If a lock is in flight, let it mint on chain 20 first.
 2. Fleet: snapshot → balances → the cut → the second operator's hash → `push` (chain 20 still
    running) → the user's go → `stop <genesis>` → `switch` → `start` → `wait` → `check-limits`.
-3. **Relayer `rand`** — on `rand-relayer-1`, the v0.7.1 → v0.8.0 swap above (backup
+3. **Relayer `rand`** — on `rand-relayer-1`, the chain-20 `rand` → v0.8.0 swap above (backup
    `rand.pre-c21` first).
 4. **`droplet <1..6>`** — on each guardian host, once its node answers chain 21's genesis hash and
    `rand_getHealth` ok:
@@ -112,11 +116,11 @@ What is different from chain 20:
    20; a chain-21 mint is re-mintable on chain 20 only below its floor): the user decides.
 3. Fleet: `halt` → `rollback` → `start` → `wait20` (all 26 on chain 20 and C's height moving).
 4. Restore on each guardian host `rand-guardian.toml.chain20` and `cursors.chain20`; on
-   `rand-relayer-1` the toml, the cursors **and the v0.7.1 `rand`**:
+   `rand-relayer-1` the toml, the cursors **and its chain-20 `rand`**:
    ```
-   [ "$(sha256sum /usr/local/bin/rand.pre-c21 | cut -d' ' -f1)" = '<v0.7.1 rand sha256>' ] || { echo 'rand.pre-c21 is NOT the v0.7.1 rand — nothing installed; stop here'; exit 1; }
+   [ "$(sha256sum /usr/local/bin/rand.pre-c21 | cut -d' ' -f1)" = '<installed release rand sha256>' ] || { echo 'rand.pre-c21 is NOT the chain-20 rand recorded at the swap — nothing installed; stop here'; exit 1; }
    install -m 755 /usr/local/bin/rand.pre-c21 /usr/local/bin/rand
-   /usr/local/bin/rand --version                                       # 0.7.1
+   /usr/local/bin/rand --version                                       # the version read before the swap
    ```
    and the laptop guardians' tomls and cursors. Start as in step 6. No endpoint fee changes (chain
    20 and chain 21 have the same `bridge.fees`).

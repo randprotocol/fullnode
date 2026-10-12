@@ -103,18 +103,28 @@ only if that run ends green; otherwise a new run's id replaces it in the annotat
    wc -c < "$REL/msauth-vk-production.bin"           # 23754
    ```
 
-5. **v0.7.1's signed sums** (what chain 20 runs; the cutover's `OLD_RELEASE_SUMS`, read for the
-   `*.pre-c21` backups and the rollback):
+5. **v0.7.0's signed sums** — what chain 20 runs. Chain 20 ran v0.6.8, then v0.7.0 from 2026-10-02;
+   v0.7.0 was tagged but **never rolled** (a read-only `status` on 2026-10-12: all 26 hosts
+   "0.7.0", git_sha 806ed349, healthy). They are the cutover's `OLD_RELEASE_SUMS` (default
+   `OLD_VERSION` 0.7.0, `OLD_GIT_SHA` 806ed349…), read for preflight, the stop gate, the
+   `*.pre-c21` backups and the rollback. **Confirm before the cut** with
+   `deploy/cutover-fleet-chain21.sh status` (every host: version 0.7.0, git_sha 806ed349…) — and
+   read the relayer's own `rand --version` on `rand-relayer-1` (its build is not recorded; see
+   `deploy/chain21-bridge-steps.md`); if anything else answers, set `OLD_VERSION`/`OLD_GIT_SHA` and
+   that release's sums instead:
 
    ```bash
-   OLDREL=~/.rand-chain21/release-v0.7.1; mkdir -p "$OLDREL"
-   gh release download v0.7.1 -R randprotocol/fullnode -D "$OLDREL" -p SHA256SUMS -p SHA256SUMS.sig
+   # already done 2026-10-12: ~/.rand-chain21/release-v0.7.0/SHA256SUMS (+ .sig) verified; it pins
+   # rand-node fd7fa517…, rand 406e0108…, rand-prover 524c6e9b…. To redo it:
+   OLDREL=~/.rand-chain21/release-v0.7.0; mkdir -p "$OLDREL"
+   gh release download v0.7.0 -R randprotocol/fullnode -D "$OLDREL" -p SHA256SUMS -p SHA256SUMS.sig
    bash -c ". deploy/lib/verify-release.sh; verify_release_sums $OLDREL/SHA256SUMS $OLDREL/SHA256SUMS.sig"
    ```
 
 6. **macOS builds on the laptop** (the release assets are Linux): the cut's `NODE`/`WALLET` and the
    cutover's `LOCAL_NODE` must be **v0.8.0 from the tag**; the `balances` scan needs chain 20's
-   **v0.7.1** `rand` (none is on the laptop: the chain-20 lesson — build it from the tag). Check
+   own `rand`, **v0.7.0** — a local input, macOS, built from tag v0.7.0 (806ed349), matching chain 20
+   exactly (none is on the laptop: the chain-20 lesson — build it from the tag). Check
    free disk first (≥ 40 GiB; see the memory note on Time Machine snapshots).
 
    ```bash
@@ -123,9 +133,9 @@ only if that run ends green; otherwise a new run's id replaces it in the annotat
    (cd ~/rand-worktrees/fullnode-v080 && RAND_BUILD_SHA=$(git rev-parse HEAD) cargo build --release --locked -p randprotocol-node -p randprotocol-client)
    ~/rand-worktrees/fullnode-v080/target/release/rand-node --version        # rand-node 0.8.0
    ~/rand-worktrees/fullnode-v080/target/release/rand-node keygen-msauth-vk --print-pinned production   # 68facb06…cd30
-   git worktree add ~/rand-worktrees/fullnode-v071 v0.7.1
-   (cd ~/rand-worktrees/fullnode-v071 && cargo build --release --locked -p randprotocol-client)
-   ~/rand-worktrees/fullnode-v071/target/release/rand --version             # rand 0.7.1
+   git worktree add ~/rand-worktrees/fullnode-v070 v0.7.0
+   (cd ~/rand-worktrees/fullnode-v070 && RAND_BUILD_SHA=$(git rev-parse HEAD) cargo build --release --locked -p randprotocol-client)
+   ~/rand-worktrees/fullnode-v070/target/release/rand --version             # rand 0.7.0
    ```
 
 7. **Dry runs on the release inputs** (local, no network):
@@ -176,11 +186,11 @@ the snapshot and the balances scan, with chain 20 still committing.
    It writes `~/.rand-chain21/snapshot/chain20-state.json` (refuses if one is already there — a
    snapshot is taken once). Take it with the default `EMITTER_*` (chain 20's endpoints).
 
-4. **Balances** (chain 20's own `rand`, v0.7.1; rescans every wallet from leaf 0):
+4. **Balances** (chain 20's own `rand`, v0.7.0 built from tag 806ed349; rescans every wallet from leaf 0):
 
    ```bash
    ls -l ~/.rand-chain17/alloc-wallets/relayer.key.json     # the link must resolve (it went missing once)
-   CHAIN20_RPC=http://127.0.0.1:8545 WALLET=~/rand-worktrees/fullnode-v071/target/release/rand \
+   CHAIN20_RPC=http://127.0.0.1:8545 WALLET=~/rand-worktrees/fullnode-v070/target/release/rand \
      deploy/cut-chain21-genesis.sh balances ~/.rand-chain21/snapshot
    ```
 
@@ -286,7 +296,8 @@ quorum 18):
 
 `deploy/nodes.env` in this tree matches `configuration/fleet/nodes.env`, and the guardian list
 matches `configuration/fleet/guardian-hosts.txt`. Re-check against the live fleet in `preflight`
-(the snapshot is from 2026-10-06; the fleet has run v0.7.1 since 2026-10-07).
+(the snapshot is from 2026-10-06; the fleet runs v0.7.0, git_sha 806ed349 — read with `status` on
+2026-10-12; v0.7.0 was never rolled).
 
 **Order.** The genesis goes to every host while chain 20 runs (`push`); then a cut is all-stop,
 all-start: every host stops (only once all 26 pass the gate), every host switches, then C and D
@@ -302,13 +313,13 @@ handled by the cutover script: see section f.
 
 ```bash
 cd ~/rand-worktrees/fullnode-chain21-cutover
-REL=~/.rand-chain21/release-v0.8.0; OLDREL=~/.rand-chain21/release-v0.7.1
+REL=~/.rand-chain21/release-v0.8.0; OLDREL=~/.rand-chain21/release-v0.7.0
 LN=~/rand-worktrees/fullnode-v080/target/release/rand-node
 G=deploy/genesis-chain21.json
 
 # 0. a dry run of every phase (prints every remote command; contacts nothing)
 DRY_RUN=1 RELEASE_SUMS=$REL/SHA256SUMS OLD_RELEASE_SUMS=$OLDREL/SHA256SUMS LOCAL_NODE=$LN deploy/cutover-fleet-chain21.sh switch $G
-# 1. read-only, chain 20 running: v0.7.1 installed, chain 20 served, healthy, disk
+# 1. read-only, chain 20 running: v0.7.0 installed (sha256 and rand_getVersion 0.7.0/806ed349), chain 20 served, healthy, disk
 OLD_RELEASE_SUMS=$OLDREL/SHA256SUMS deploy/cutover-fleet-chain21.sh preflight
 # 2. chain 20 running: each host fetches rand-node, rand, msauth-vk-production.bin from the release,
 #    checks all three against the SIGNED sums, and its staged rand-node verifies the staged key
@@ -397,7 +408,7 @@ unit or drop-in that already names another chain-21 genesis.
 
 Possible only **before** anything is minted, released or paid out on chain 21 — after that, going
 back loses it. v0.8.0 cannot run chain 20 and a chain-21 database cannot be rolled back across
-constraint set 9, so rollback is "chain 20 again from where it stopped", never "chain 21 on v0.7.1".
+constraint set 9, so rollback is "chain 20 again from where it stopped", never "chain 21 on v0.7.0".
 In this order (each line alone, `echo $?`):
 
 1. **The bridge stops FIRST** (`deploy/chain21-bridge-steps.md`, rollback step 1): the relayer on
@@ -424,7 +435,7 @@ In this order (each line alone, `echo $?`):
 
    ```bash
    deploy/cutover-fleet-chain21.sh halt                                       # stops chain 21 (refuses a host running chain 20)
-   OLD_RELEASE_SUMS=$OLDREL/SHA256SUMS deploy/cutover-fleet-chain21.sh rollback    # units/drop-ins + v0.7.1 binaries, sha-checked
+   OLD_RELEASE_SUMS=$OLDREL/SHA256SUMS deploy/cutover-fleet-chain21.sh rollback    # units/drop-ins + v0.7.0 binaries, sha-checked
    deploy/cutover-fleet-chain21.sh start                                      # the rollback marker licenses it; no key check
    deploy/cutover-fleet-chain21.sh wait20                                     # all 26 serve chain 20, healthy, C's height MOVING
    ```
@@ -432,19 +443,21 @@ In this order (each line alone, `echo $?`):
    `wait20` ends with "CHAIN 20 COMMITTING AGAIN" only when every host serves chain 20's genesis
    `6210cf07…` and C's height rises between two polls; `status` alone does not show that.
 4. **The bridge back on chain 20** (`deploy/chain21-bridge-steps.md`, rollback step 4): the
-   guardians' and the relayer's chain-20 config and cursors, the relayer's v0.7.1 `rand` from
+   guardians' and the relayer's chain-20 config and cursors, the relayer's v0.7.0 `rand` from
    `rand.pre-c21` (sha-checked), then the daemons started; the cut record gets a line saying why.
 
 Chain 20 resumes at the height it stopped at; its data dirs were never touched. The msauth blob
-stays in `/usr/local/bin` (v0.7.1 ignores it). By hand, if `rollback` itself cannot run: the
+stays in `/usr/local/bin` (v0.7.0 ignores it). By hand, if `rollback` itself cannot run: the
 script's header lists the files per host shape.
 
 ## What did not carry over cleanly from the chain-20 tooling
 
 - The chain-20 cutover took the signed `SHA256SUMS` optionally (and staged on the operator's sha256
   word otherwise); chain 21's **requires** it and reads every pin from it, the blob's included.
-- The v0.7.1 binary pins (`OLD_SHA`/`OLD_SHA_WALLET`) have no default: this tree has no v0.7.1
-  `SHA256SUMS`; they come from v0.7.1's signed file (a.5).
+- The old-side binary pins (`OLD_SHA`/`OLD_SHA_WALLET`) have no default: this tree has no v0.7.0
+  `SHA256SUMS`; they come from v0.7.0's signed file (a.5). The old version is one variable,
+  `OLD_VERSION` (0.7.0) with `OLD_GIT_SHA` (806ed349…). An earlier draft of this tooling assumed
+  v0.7.1 (tagged, never rolled); the fleet's `status` corrected it.
 - Chain 20's cutover had no SELFTEST and no DRY_RUN; its rehearsal was a separate script. Chain 21's
   has `DRY_RUN=1` built in and `SELFTEST=1` runs `deploy/rehearse-cutover-fleet-chain21.sh`.
 - **The phase order changed.** Chain 20 stopped the fleet, then cut, then waited for the second
