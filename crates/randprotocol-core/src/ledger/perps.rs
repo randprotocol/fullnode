@@ -1088,8 +1088,9 @@ pub fn state_proof_segment_on(
 /// engine commitment and the tier cap of the genesis section, over `segment` ([`validate`]'s);
 /// always verified, never decoded — at apply a node's verify cache (`randprotocol-node`'s
 /// `CachingExecutor`, keyed on the segment too) answers what admission verified on the same tip
-/// (spec `docs/superpowers/specs/2026-10-12-verified-fold-design.md`). Then the engine's own two words: the version it ran and the
-/// number of blocks it ran over. A tier refusal keeps its name; any other is `ProofRefused`.
+/// (spec `docs/superpowers/specs/2026-10-12-verified-fold-design.md`). Then the engine's own two
+/// words: the version it ran and the number of blocks it ran over. A tier refusal keeps its name;
+/// any other is `ProofRefused`.
 pub(super) fn verify_state_proof(
     ledger: &Ledger,
     action: &Action,
@@ -1467,7 +1468,7 @@ pub enum PerpError {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::confidential::StubExecutor;
 
@@ -2480,6 +2481,14 @@ mod tests {
         close(&mut l, 1);
         close(&mut l, 2);
         (l, word8_from_bytes(tx.hash().as_bytes()).unwrap())
+    }
+
+    /// For `ledger::tests::apply_never_decodes_a_proof`: [`withdrawn`]'s ledger (tip 2), a state
+    /// proof of `0..=2` paying its request that applies as block 3, and a validator's key.
+    pub(crate) fn a_state_proof_that_applies() -> (Ledger, Transaction, Keypair) {
+        let (l, request) = withdrawn(5);
+        let tx = state_proof(&l, 0, 2, [7; 8], vec![PerpPayout { request, amount: 5 }], 0);
+        (l, tx, kp(1))
     }
 
     #[test]

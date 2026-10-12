@@ -619,7 +619,7 @@ pub(super) fn apply(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::confidential::StubExecutor;
     use crate::crypto::Keypair;
@@ -774,6 +774,14 @@ mod tests {
 
     fn refusal(l: &Ledger, tx: &Transaction) -> TxError {
         l.validate(tx, &StubExecutor).expect_err("refused")
+    }
+
+    /// For `ledger::tests::apply_never_decodes_a_proof`: a ledger under the section, an `Invoke`
+    /// (cell 1 created) that applies on it as the next block, and the key of its one validator.
+    pub(crate) fn an_invoke_that_applies() -> (Ledger, Transaction, Keypair) {
+        let l = ledger();
+        let tx = invoke(&l, 20, (0, 0, 0), Transition { reads: vec![cell(1, 0)], writes: vec![cell(1, 5)], ..empty() });
+        (l, tx, proposer())
     }
 
     fn ps(e: ProgramStateError) -> TxError {

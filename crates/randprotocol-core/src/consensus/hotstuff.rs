@@ -1507,17 +1507,17 @@ impl HotStuff {
         // Phase 2 (spec §7.1): the calls' gas, for the controller at the block's end — summed
         // exactly as `apply_block_for_sync` sums its receipts.
         let mut call_gas = 0u64;
-        // Candidates apply to the running ledger directly (spec 2026-10-05, plan correction 2):
-        // a clone per candidate was 2 000 clones a block. `apply_tx_checked` says how a candidate
+        // Candidates apply to the running ledger directly (spec 2026-10-05, plan correction 2): a
+        // clone per candidate was 2 000 clones a block. `apply_tx_checked` says how a candidate
         // failed (final review F1). A refusal by validation wrote nothing, so the candidate is
         // skipped for free — the mempool offers contending RPL-2 invokes together and lets this
-        // trial apply decide, so refusals are routine. A half-apply (the action step failed
-        // after the bundle was written) is undone by rebuilding from the pre-loop ledger and
-        // replaying the accepted ones in order. Deterministic, so the replay cannot fail; if it
-        // ever did, the block closes with no ordinary transactions rather than a wrong root.
-        // On a node the executor is its verify cache, so a candidate's proofs, verified at the
-        // pool, are answered from it here rather than verified a second time. Only half-applies count against MAX_PROPOSE_REPLAYS; past it the block
-        // closes with what it has.
+        // trial apply decide, so refusals are routine. A half-apply (the action step failed after
+        // the bundle was written) is undone by rebuilding from the pre-loop ledger and replaying
+        // the accepted ones in order. Deterministic, so the replay cannot fail; if it ever did, the
+        // block closes with no ordinary transactions rather than a wrong root. On a node the
+        // executor is its verify cache, so a candidate's proofs, verified at the pool, are answered
+        // from it here rather than verified a second time. Only half-applies count against
+        // MAX_PROPOSE_REPLAYS; past it the block closes with what it has.
         let base = ledger.clone();
         let mut replays = 0usize;
         for tx in ordinary {

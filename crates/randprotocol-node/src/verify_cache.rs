@@ -1232,8 +1232,9 @@ mod tests {
         (l, tx)
     }
 
-    /// Admission (`validate`) then apply (`apply_tx`, which verifies the proof again) through one cache: the bundle verifier runs once. The control, the same
-    /// two calls on the bare executor, shows apply does verify: there it runs twice.
+    /// Admission (`validate`) then apply (`apply_tx`, which verifies the proof again) through one
+    /// cache: the bundle verifier runs once. The control, the same two calls on the bare executor,
+    /// shows apply does verify: there it runs twice.
     #[test]
     fn a_ledger_apply_after_validate_reuses_the_bundle_verdict() {
         let (l, tx) = bundle_ledger();
@@ -1291,8 +1292,13 @@ mod tests {
         assert_eq!(receipts.len(), 1, "the call's receipt");
         let applied = (inner.count(Kind::Bundle), inner.count(Kind::Auth), inner.count(Kind::CallHardened));
         assert_eq!(applied, (2, 2, 1), "apply verified nothing again");
+        // The sync / off-loop path (`apply_block_for_sync`) on another clone: the same.
+        let synced = ledger.clone().apply_block_for_sync(&block.block, &std::collections::BTreeMap::new(), &[], &cx).expect("the block applies");
+        assert_eq!(synced, receipts);
+        let synced = (inner.count(Kind::Bundle), inner.count(Kind::Auth), inner.count(Kind::CallHardened));
+        assert_eq!(synced, (2, 2, 1), "nor did the sync apply");
         assert_eq!(inner.count(Kind::Call) + inner.count(Kind::Invoke) + inner.count(Kind::Perp), 0);
-        assert_eq!((cx.cache().hits(), cx.cache().misses()), (5, 5));
+        assert_eq!((cx.cache().hits(), cx.cache().misses()), (10, 5));
     }
 
     /// A ledger under an aggregation section that admits the stub bundle's shape, with `kp`

@@ -2856,8 +2856,9 @@ impl Ledger {
         // 7b. under genesis `hardening_v6`, the canonical-proof rules (INT-5, VERIFIER-1/-2): a
         // header or transcript field the honest prover would not write — one the verifier accepts
         // at any value, so a relayer can re-encode the proof into a second transaction id — is
-        // refused before either proof is looked at. A decode and a few compares. Without the flag it is the node's pool policy only
-        // (`admission::non_canonical_proofs`) and a block carrying such a proof applies.
+        // refused before either proof is looked at. A decode and a few compares. Without the flag
+        // it is the node's pool policy only (`admission::non_canonical_proofs`) and a block
+        // carrying such a proof applies.
         if self.hardening_v6 {
             if let Some(e) = non_canonical_proofs(tx, &|p| executor.non_canonical_proof(p)) {
                 return Err(e);
@@ -4579,7 +4580,8 @@ pub(crate) mod tests {
     /// is what spares the re-verification of a proof admission already verified. Through an
     /// executor whose `decode_*` panic: a block of a bundle transaction and a call applies through
     /// `apply_block` and through `apply_block_for_sync`, and a call — plain and under
-    /// `hardening_v6` — validates.
+    /// `hardening_v6` — validates. So does an RPL-2 `Invoke` and an RPL-3 `PerpStateProof`, each
+    /// applied as a block through both paths.
     #[test]
     fn apply_never_decodes_a_proof() {
         let (a, _) = keys();
@@ -4610,6 +4612,40 @@ pub(crate) mod tests {
         let bound = StubExecutor::bound(bound);
         assert_eq!(gated.validate(&bound, &NoDecode), Ok(()));
         assert!(gated.clone().apply_tx(&bound, &a.address(), &NoDecode).is_ok());
+
+        // RPL-2 (`verify_invoke`) and RPL-3 (`verify_perp`), each as the next block on its own
+        // fixture ledger, through `apply_block` and `apply_block_for_sync`.
+        for (l, tx, key) in [program_state::tests::an_invoke_that_applies(), perps::tests::a_state_proof_that_applies()] {
+            assert_eq!(l.validate(&tx, &NoDecode), Ok(()), "{:?}", tx.action);
+            let block = block_with_its_root(&l, vec![tx], &key);
+            l.clone().apply_block(&block, &NoDecode).unwrap();
+            l.clone().apply_block_for_sync(&block, &BTreeMap::new(), &[], &NoDecode).unwrap();
+        }
+    }
+
+    /// `txs` as the block after `l`'s tip, signed by `key`, at the parent's timestamp, carrying
+    /// the state root `apply_block` computes for it (read off the `StateRootMismatch` a trial
+    /// apply under a zero root answers, so the block-end steps — a perps close included — are
+    /// the ledger's own).
+    fn block_with_its_root(l: &Ledger, txs: Vec<Transaction>, key: &Keypair) -> Block {
+        let height = l.height() + 1;
+        let build = |state_root: Hash| {
+            let header = BlockHeader {
+                height,
+                view: height,
+                parent: Hash::ZERO,
+                proposer: key.public_key().clone(),
+                timestamp_ms: l.timestamp_ms(),
+                tx_root: Block::tx_root(&txs),
+                state_root,
+                justify: QuorumCertificate::genesis(Hash::ZERO),
+            };
+            Block::sign(&crate::types::SigningDomain::v0(Hash::ZERO), header, txs.clone(), key)
+        };
+        match l.clone().apply_block(&build(Hash::ZERO), &StubExecutor) {
+            Err(BlockError::StateRootMismatch { computed, .. }) => build(computed),
+            other => panic!("the trial apply: {other:?}"),
+        }
     }
 
     #[test]

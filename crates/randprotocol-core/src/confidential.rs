@@ -181,8 +181,8 @@ pub trait ConfidentialExecutor: Send + Sync {
         Err(ConfidentialError::InvalidProof("this executor does not implement the RPL-3 state-proof rules".into()))
     }
     /// [`Self::decode_invoke`]'s twin for [`Self::verify_perp`]: everything but the STARK
-    /// verification, the segment's digest still compared. Admission pricing only — the ledger
-    /// never calls this. Defaults to the full verify.
+    /// verification, the segment's digest still compared. The ledger never calls this; kept as
+    /// `verify_perp`'s header twin (no production caller). Defaults to the full verify.
     fn decode_perp(
         &self,
         engine_hc: &Word8,
