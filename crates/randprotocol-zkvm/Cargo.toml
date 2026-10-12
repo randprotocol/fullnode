@@ -80,6 +80,13 @@ sbpf-core = { path = "../../vendor/circuits/sbpf-core" }
 # Private multisig phase 4 (the MODQ re-vendor): the no_std Dilithium2 verifier core the `msauth`
 # guest is compiled from, run natively by the vendored `src/dilithium_host.rs` (host-side Keccak).
 # Like evm-core/sbpf-core it has no dependencies of its own; vendored by `deploy/sync-zkvm.sh`.
+# Not on wasm32 (below).
+
+# `dilithium-core`'s packing barrier is an empty `asm!`, which is unstable on wasm32, and only the
+# host-side `dilithium_host` (tests and witnesses, never a wallet path) reads the crate: so the
+# browser build of this crate — the clients' core, `randprotocol-msig`'s wasm32 check — leaves both
+# out (`lib.rs` gates the module the same way).
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 dilithium-core = { path = "../../vendor/circuits/dilithium-core" }
 
 [dev-dependencies]

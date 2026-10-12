@@ -1,0 +1,38 @@
+[package]
+name = "randprotocol-msig"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Private multisig signer checks (spec 2026-10-11 phase 4 §6.5): pure, no I/O, wasm32-clean"
+
+# Every wallet app runs a signer's checks through the clients' wasm/native core, which vendors this
+# crate and its `tests/fixtures/*.json`. So the dependency cone is exactly the one that core
+# already compiles for `wasm32-unknown-unknown`: no RPC, no filesystem, no tokio, no prover, no
+# rocksdb (`cargo tree -p randprotocol-msig -e normal` shows none of them).
+[dependencies]
+randprotocol-core = { workspace = true }
+randprotocol-zkvm = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+hex = { workspace = true }
+thiserror = { workspace = true }
+
+# Copied from the clients' `core/crates/wallet-core/Cargo.toml`: they only let the two chain crates
+# link for the browser. Nothing in this crate draws randomness.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+# randprotocol-core draws its randomness through rand 0.8 (getrandom 0.2, needs the `js` feature);
+# randprotocol-zkvm through rand 0.10 (getrandom 0.4, selected by `--cfg getrandom_backend="wasm_js"`).
+getrandom02 = { package = "getrandom", version = "0.2", features = ["js"] }
+getrandom = { version = "0.4", features = ["wasm_js"] }
+
+[dev-dependencies]
+# The fixture generator (`tests/gen`): every random value from one seeded ChaCha20 stream, on the
+# workspace's `rand` 0.8 line.
+rand_chacha = "0.3"
+# The generator seals envelopes exactly as the vendored `viewing::Envelope::seal`, but with its
+# ML-KEM message and AEAD nonces drawn from that stream (the vendored function draws them from
+# `rand::rng()`, so its output is never reproducible). Pinned to the versions `randprotocol-zkvm`
+# pins, so an envelope sealed here is one the vendored opener reads.
+ml-kem = "=0.3.2"
+chacha20poly1305 = "=0.11.0"

@@ -18,6 +18,8 @@ pub mod modq;
 /// Vendored (private multisig phase 4): the `msauth` guest's host model — layout, tags 65-69, witness.
 pub mod msauth;
 /// Vendored (private multisig phase 4): host-side Keccak for `dilithium-core` (tests and witnesses).
+/// Not on wasm32, where `dilithium-core`'s `asm!` barrier does not compile (`Cargo.toml`).
+#[cfg(not(target_arch = "wasm32"))]
 pub mod dilithium_host;
 pub mod sbpf;
 pub mod notes;

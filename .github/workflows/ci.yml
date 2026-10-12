@@ -92,6 +92,14 @@ jobs:
       - name: Check every target
         working-directory: fullnode
         run: cargo check --workspace --tests
+      # Private multisig phase 4 (spec §6.5): the signer checks are the pure crate
+      # `randprotocol-msig`, which the clients' wasm and native cores vendor, so it must keep
+      # compiling for the browser — no RPC, filesystem, tokio or prover crept into its cone.
+      - name: The signer checks build for wasm32
+        working-directory: fullnode
+        run: |
+          rustup toolchain install 1.98.1 --profile minimal --target wasm32-unknown-unknown
+          RUSTFLAGS='--cfg getrandom_backend="wasm_js"' cargo +1.98.1 check -p randprotocol-msig --target wasm32-unknown-unknown
       # The node's aggregation tests read the pinned recursion fixtures committed at
       # crates/randprotocol-node/fixtures/recursion (#131). A missing, truncated or edited file
       # fails here, by name, rather than as a panic or a wrong digest in the middle of the suite.
@@ -262,7 +270,7 @@ jobs:
         run: |
           cargo clippy --no-deps \
             -p randprotocol-core -p randprotocol-node -p randprotocol-client \
-            -p randprotocol-prover -p bridge-codec \
+            -p randprotocol-prover -p bridge-codec -p randprotocol-msig \
             --all-targets -- -D warnings
 
   # Audit v6, PROC-6: a dependency and supply-chain gate. `cargo audit` fails on a RUSTSEC
