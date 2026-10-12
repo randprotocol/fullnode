@@ -84,10 +84,11 @@ apply. On a follower that runs off the loop (off-loop apply). On the leader it i
 more than once: each proof is hashed at least twice — the trial apply (`apply_tx_checked` in
 `HotStuff::propose`) and then `on_proposal` re-applying the leader's own block — so ≈ 16 ms at a
 maximal block (≈ 10 % of the 150 ms budget), well under 1 % at today's sizes. Each half-apply
-replay (at most `MAX_PROPOSE_REPLAYS` = 8) re-hashes the accepted set again, so the worst case is
-about 9× that. A call or invoke key also bincode-serializes the whole `ProgramRecord` (its words:
-up to ≈ 256 KB at `MAX_PROGRAM_WORDS_LIMIT` = 65 535) on every lookup. Against it, a call / invoke / perp hit no longer decodes its proof at all (the cached
-outcome is returned), and decoding a proof costs at least as much as hashing it.
+replay (at most `MAX_PROPOSE_REPLAYS` = 8) re-hashes the accepted set again (and a half-applied candidate hashes its own proofs), so the
+worst case is about ten block-hashes, ≈ 80 ms at a maximal block. A call or invoke key also
+bincode-serializes the whole `ProgramRecord` (its words: up to ≈ 256 KB at
+`MAX_PROGRAM_WORDS_LIMIT` = 65 535) on every lookup. Against it, a call / invoke / perp hit no
+longer decodes its proof at all (the cached outcome is returned), and decoding a proof costs at least as much as hashing it.
 
 ## 4. Not in scope
 
