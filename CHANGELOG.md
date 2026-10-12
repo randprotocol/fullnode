@@ -99,6 +99,11 @@ Assets, when signed: `rand-node`, `rand`, `rand-prover`, `SHA256SUMS`, `SHA256SU
   `rand_getSupply.multisig_issued` and `rand_getMultisig`. Operations perps adds: NTP on every
   validator, a perp-view service and a prover host (~22 GB a proof); a token collateral is outside
   the supply audit (M6). `docs/deploy.md`.
+- **The chain-21 cut carries `hc_auth_multisig`** (deploy only): `deploy/cut-chain21-genesis.sh`
+  passes `rand-node genesis --auth-multisig-guest` (refusing a build without it; `DRY_RUN` skips
+  loudly), asserts the msauth guest `9705f8e2…` as the last field beside a different `hc_auth`,
+  probes it (7 variants) and reads it back from `rand_getLimits`/`rand_status`; chain 21's limits
+  become 6 MiB proofs (pending the measured msauth proof) and 19 MiB blocks (byte target 9961472).
 - **Tree aggregation** (genesis-gated, off by default: no existing chain carries the section; every
   aggregation genesis is still refused at startup): a genesis `aggregation_tree` section
   (`TreeConfig`: `shape`, `leaf_size`, `max_depth`, `leaf` heights, `vk_leaf`, per-level
