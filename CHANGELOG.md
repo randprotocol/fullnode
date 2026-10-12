@@ -69,7 +69,7 @@ each chain:
 - **Rollback:** going back to v0.7.1 is possible only on a chain v0.7.1 runs (18–20); a chain-21
   database cannot be rolled back across constraint set 9.
 
-Assets, when signed: `rand-node`, `rand`, `rand-prover`, `SHA256SUMS`, `SHA256SUMS.sig`.
+Assets, when signed: `rand-node`, `rand`, `rand-prover`, `msauth-vk-production.bin` (the pinned msauth verifier key, listed in `SHA256SUMS`), `SHA256SUMS`, `SHA256SUMS.sig`.
 
 ### Features
 
