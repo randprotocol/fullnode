@@ -164,8 +164,9 @@ becomes `O(block)`, and committing is applying a chain of deltas. No consensus c
 
 **Shipped**: the worker count (`rand-node run --verify-workers`, default the cores minus two, at least four, with the queue and in-flight limits sized from it), and the digest-keyed cache (`verify_cache::CachingExecutor`, every STARK verifier, keyed by a digest of all its inputs, 32 768 entries). The admission verified set (B5, `VerifiedSet`) is retired: the ledger always calls the verifier, and this cache is the only reuse. **Also shipped**: an incoming proposal's apply (`apply_block_for_sync` on a clone of the parent's ledger) runs on a blocking thread, so an uncached verify at apply time no longer blocks the consensus loop (spec 2026-10-11 off-loop apply). Still on the loop: `precheck_proposal` (view, stale, signature, parent, leader, equivocation, justify, transaction list), all of `on_proposal`'s checks including the QC check, and the insert. Still applied on the loop: sync batches, the leader's own block, orphan re-runs, `offer_pending` and `restore_pending`. `--apply-proposals-inline` restores the old path.
 
-The admission workers already verify proofs on `spawn_blocking` threads and the proposal path
-re-checked against a verified set. Generalise it: every proof the node will ever verify — bundle,
+The admission workers already verify proofs on `spawn_blocking` threads, and the proposal path
+re-verifies through the same digest-keyed verify cache, which answers what admission verified.
+Generalise it: every proof the node will ever verify — bundle,
 auth, call, aggregate — goes through one `VerifyCache` keyed by proof digest (the shipped key is a digest of every verifier input, kind tag, program or hc, proof and public inputs, not of the proof alone), filled by a worker
 pool sized to the cores (default `cores − 2`, minimum 4), and the consensus loop only ever
 looks up. A proposal whose aggregates are all cached applies in the time it takes to append

@@ -9286,7 +9286,7 @@ mod tests {
     /// What one live run of the fee-rule chain leaves behind: the committed root, the store's
     /// `base_fees_burned`, the aggregate's `a` record, the store's supply counters, and the
     /// cache's hit count (0 without one).
-    type LiveRun = (Hash, u64, Option<(u64, u64, u64)>, randprotocol_core::ledger::supply::Supply, usize);
+    type LiveRun = (Hash, u64, Option<(u64, u64, u64)>, randprotocol_core::ledger::supply::Supply, (u64, u64, u64));
 
     /// The #134 live run — a tip-paying bundle and an aggregate over block 1's cover, proposed by
     /// the leader and applied by a peer, driven until it commits — with the leader's replica
@@ -9306,6 +9306,9 @@ mod tests {
                 assert_eq!(validate_for_pool(tx, leader.tip_ledger(), &storage, profile, cache.as_ref()), Ok(()), "admitted");
             }
         }
+        // Every inner verifier call the cache makes is a miss (`CachingExecutor::cached` calls the
+        // inner executor exactly then), so its miss count is the inner verify count.
+        let admitted = cache.cache().misses();
         let (b2, _) = propose_to_all(&mut leader, &mut [&mut peer], &storage, vec![bundle.clone(), aggregate.clone()], 2);
         assert_eq!(
             b2.transactions.iter().map(|t| t.hash()).collect::<Vec<_>>(),
@@ -9331,7 +9334,7 @@ mod tests {
             storage.base_fees_burned().unwrap(),
             storage.aggregate_payment(&aggregate.hash()).unwrap(),
             storage.supply().unwrap(),
-            cache.cache().hits() as usize,
+            (admitted, cache.cache().misses(), cache.cache().hits()),
         )
     }
 
@@ -9344,14 +9347,18 @@ mod tests {
     /// base burned, the tip bucketed, the aggregate's netted subsidy — is computed from the fee and
     /// the ledger's state, never from which proof path ran; were it to read anything off the verify
     /// path, the cached leader's header root would differ from the cold peer's and the block would
-    /// fork. So: the cache is really hit, the cold peer still applies the leader's block to its
+    /// fork. So: the leader's inner verifiers run at admission and never again across propose and
+    /// commit (every later verify is a cache hit), the cold peer still applies the leader's block to its
     /// root, and every counter — the committed root, `base_fees_burned`, the `a` record, the supply
     /// — is byte for byte the no-cache run's.
     #[test]
     fn under_both_fee_rules_the_admission_cache_on_the_leader_changes_no_root_and_no_counter() {
         let cold = fee_rules_live_run(false);
         let cached = fee_rules_live_run(true);
-        assert!(cached.4 >= 1, "the leader's trial apply was answered from the cache: {} hit(s)", cached.4);
+        let (admitted, after, hits) = cached.4;
+        assert!(admitted >= 2, "admission verified the bundle and the aggregate through the cache: {admitted}");
+        assert_eq!(after, admitted, "no inner verify on the leader across propose and commit");
+        assert!(hits >= 2, "its trial apply and its own block's apply were answered from the cache: {hits}");
         assert_eq!(cached.0, cold.0, "the committed root does not depend on the leader's cache");
         assert_eq!(cached.1, cold.1, "nor does base_fees_burned");
         assert_eq!(cold.1, 3 * gas::BUNDLE_BASE, "one base per bundle in either run");

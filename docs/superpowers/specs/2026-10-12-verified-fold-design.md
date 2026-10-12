@@ -65,6 +65,11 @@ A hit needs apply's verifier arguments to equal admission's byte for byte.
   they run on; if the state moved, the old path's `decode_perp` refused too (it compares
   `H_PUB`), so a miss there is a refusal either way, not a lost hit.
 
+The leader's propose ledger is not the tip admission ran on: it is the parent plus the earlier
+transactions of the same block. That is harmless, because no bundle, auth, call or invoke argument
+above reads ledger state (and a perp proof's does only through the proved root, which only another
+state proof moves).
+
 The acceptance test (Task 1) proves it on the real admission path: through a `CachingExecutor`
 over a counting executor, admitting one transaction of each kind and then applying a block of
 them runs each inner verifier exactly once.
@@ -75,9 +80,13 @@ The one cost is that a hit now hashes the proof for the cache key, where the set
 transaction hash apply computed anyway. blake3 on this machine (M-series, single thread,
 `blake3 1.8.7`, release): 100 KiB 87 µs, 400 KiB 232 µs, 1.3 MiB 556 µs, 3.4 MiB 1.44 ms,
 6 MiB 2.6 ms — about 2.4 GB/s. A full 19 MiB chain-21 block is ≈ 8 ms of hashing on a hit-only
-apply. On a follower that runs off the loop (off-loop apply); on the leader's propose replay it
-is on the loop, ≈ 5 % of the 150 ms budget at a maximal block and well under 1 % at today's
-sizes. Against it, a call / invoke / perp hit no longer decodes its proof at all (the cached
+apply. On a follower that runs off the loop (off-loop apply). On the leader it is on the loop, and
+more than once: each proof is hashed at least twice — the trial apply (`apply_tx_checked` in
+`HotStuff::propose`) and then `on_proposal` re-applying the leader's own block — so ≈ 16 ms at a
+maximal block (≈ 10 % of the 150 ms budget), well under 1 % at today's sizes. Each half-apply
+replay (at most `MAX_PROPOSE_REPLAYS` = 8) re-hashes the accepted set again, so the worst case is
+about 9× that. A call or invoke key also bincode-serializes the whole `ProgramRecord` (its words:
+up to ≈ 256 KB at `MAX_PROGRAM_WORDS_LIMIT` = 65 535) on every lookup. Against it, a call / invoke / perp hit no longer decodes its proof at all (the cached
 outcome is returned), and decoding a proof costs at least as much as hashing it.
 
 ## 4. Not in scope
@@ -92,3 +101,13 @@ outcome is returned), and decoding a proof costs at least as much as hashing it.
 - A miss where the set used to hit costs one full verify at apply (never a wrong verdict). §2's
   test is the guard; a cluster run is the end-to-end check.
 - Signature churn across ~90 call sites; mechanical.
+
+## 6. Follow-ups
+
+- (a) Feed the leader's trial post-state into `on_proposal_with` as a `PreApplied`, so the
+  leader's own block is not applied (and its proofs not re-hashed) a second time on the loop.
+- (b) Key a call / invoke entry by the record's `id`, `code_hash`, `public_digest` and
+  `public_len` instead of the serialized record, with a `KEY_DOMAIN` bump.
+- (c) The vendored zkvm crate's `decode_*` wording (`randprotocol-zkvm/src/executor.rs`,
+  `tests/executor.rs`) still describes the verified-set path; fix it at the next circuits
+  re-vendor.

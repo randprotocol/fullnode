@@ -1301,6 +1301,163 @@ mod tests {
         assert_eq!((cx.cache().hits(), cx.cache().misses()), (10, 5));
     }
 
+    /// The two inner verifier counts the bundle-carrying tests below read.
+    fn bundle_auth_counts(inner: &Counting) -> (usize, usize) {
+        (inner.count(Kind::Bundle), inner.count(Kind::Auth))
+    }
+
+    /// An empty store for `validate_for_pool`, which reads it only for an `Aggregate`.
+    fn scratch_store(gs: &randprotocol_core::genesis::GenesisState) -> (tempfile::TempDir, crate::storage::Storage) {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = crate::storage::Storage::open(dir.path()).unwrap();
+        storage.init_genesis(gs).unwrap();
+        (dir, storage)
+    }
+
+    /// The fold's review focus 1 and 3 for the two proof kinds that read more than the
+    /// transaction: an RPL-2 `Invoke` (its segment carries the transition's context words) and an
+    /// RPL-3 `PerpStateProof` admitted and applied on the same tip (its segment carries the
+    /// ledger's proved root). Admitted through `validate_for_pool`, then applied as the next block
+    /// through `apply_block` and `apply_block_for_sync`: `verify_invoke` and `verify_perp` each
+    /// run exactly once.
+    #[test]
+    fn admission_then_apply_verifies_an_invoke_and_a_state_proof_once() {
+        use crate::storage::fixtures::{make_block, make_perps_block, perp_state_proof_tx, perps_genesis, rpl2_chain, rpl2_invoke_tx};
+        use randprotocol_core::ledger::program_state::{Cell, Inflow, Transition};
+        use std::collections::BTreeMap;
+        const FEE: u64 = randprotocol_core::UNITS_PER_RAND;
+
+        // RPL-2: an invoke creating one cell.
+        let (_dir, storage, _gs, ledger, b1) = rpl2_chain(7);
+        let cell = Cell { key: [1, 0, 0, 0, 0, 0, 0, 0], value: [5, 0, 0, 0, 0, 0, 0, 1] };
+        let transition = Transition { reads: vec![], writes: vec![cell], inflow: Inflow::None, pays: vec![], mints: vec![] };
+        let invoke = rpl2_invoke_tx(&ledger, 60, FEE, (0, 0, 0), transition);
+        let inner = Arc::new(Counting::plain());
+        let cx = CachingExecutor::new(inner.clone());
+        assert_eq!(crate::node::validate_for_pool(&invoke, &ledger, &storage, FriProfile::Test, &cx), Ok(()));
+        assert_eq!(inner.count(Kind::Invoke), 1, "admission verified the invoke");
+        let block = make_block(&b1, &mut ledger.clone(), vec![invoke], &key(1));
+        let receipts = ledger.clone().apply_block(&block.block, &cx).expect("the block applies");
+        assert_eq!(receipts.len(), 1, "the invoke's receipt");
+        ledger.clone().apply_block_for_sync(&block.block, &BTreeMap::new(), &[], &cx).expect("the block applies");
+        assert_eq!(inner.count(Kind::Invoke), 1, "apply verified the invoke again");
+        assert_eq!(bundle_auth_counts(&inner), (1, 1));
+        assert_eq!(inner.count(Kind::Call) + inner.count(Kind::CallHardened), 0, "an invoke is not a call");
+
+        // RPL-3: a state proof of 0..=2, admitted at tip 2 and applied as block 3.
+        let gs = perps_genesis(7);
+        let (_dir, storage) = scratch_store(&gs);
+        let mut ledger = gs.ledger.clone();
+        let b1 = make_perps_block(&gs.block, &mut ledger, vec![], &key(1));
+        let b2 = make_perps_block(&b1, &mut ledger, vec![], &key(1));
+        let proof = perp_state_proof_tx(&ledger, 2, [7; 8], vec![], 0);
+        let inner = Arc::new(Counting::plain());
+        let cx = CachingExecutor::new(inner.clone());
+        assert_eq!(crate::node::validate_for_pool(&proof, &ledger, &storage, FriProfile::Test, &cx), Ok(()));
+        assert_eq!(inner.count(Kind::Perp), 1, "admission verified the state proof");
+        let block = make_perps_block(&b2, &mut ledger.clone(), vec![proof], &key(1));
+        ledger.clone().apply_block(&block.block, &cx).expect("the block applies");
+        ledger.clone().apply_block_for_sync(&block.block, &BTreeMap::new(), &[], &cx).expect("the block applies");
+        assert_eq!(inner.count(Kind::Perp), 1, "apply on the same tip verified the state proof again");
+        assert_eq!((cx.cache().hits(), cx.cache().misses()), (2, 1));
+    }
+
+    /// Private multisig through the fold: a transfer whose auth proof is multisig-shaped
+    /// (`auth_header` dispatches it to genesis `hc_auth_multisig`) is admitted and applied with
+    /// one inner `verify_auth` — the cache key carries the multisig hc, and the stub's verify
+    /// refuses any other guest (`WrongProgram`), so the applies' success shows the dispatch.
+    #[test]
+    fn admission_then_apply_verifies_a_multisig_auth_proof_once() {
+        use crate::storage::fixtures::{make_block, rpl2_chain, v3_bundle};
+        const HCM: Word8 = [23; 8];
+        const C: Word8 = [0x0c; 8];
+        let (_dir, storage, _gs, mut ledger, b1) = rpl2_chain(7);
+        ledger.set_hc_auth_multisig(Some(HCM));
+        let mut b = v3_bundle(&ledger, 70, randprotocol_core::UNITS_PER_RAND, (0, 0, 0));
+        b.auth_commit = C;
+        b.proof = StubExecutor::make_bundle_proof(&ledger.hc_bundle(), &StubExecutor.bundle_digest_v3(&b.digest_input()), &[0; 8]);
+        b.auth_proof = StubExecutor::make_msauth_proof(&HCM, &C, &[0; 8]);
+        let tx = StubExecutor::bound(Transaction::shielded(ledger.chain_id(), b, Action::None));
+        assert_eq!(StubExecutor.auth_header(&tx.bundle.as_ref().unwrap().auth_proof).unwrap().0, AuthShape::Multisig);
+
+        let inner = Arc::new(Counting::plain());
+        let cx = CachingExecutor::new(inner.clone());
+        assert_eq!(crate::node::validate_for_pool(&tx, &ledger, &storage, FriProfile::Test, &cx), Ok(()));
+        assert_eq!(bundle_auth_counts(&inner), (1, 1), "admission verified both proofs");
+        let block = make_block(&b1, &mut ledger.clone(), vec![tx], &key(1));
+        ledger.clone().apply_block(&block.block, &cx).expect("the block applies");
+        ledger.clone().apply_block_for_sync(&block.block, &std::collections::BTreeMap::new(), &[], &cx).expect("the block applies");
+        assert_eq!(bundle_auth_counts(&inner), (1, 1), "apply verified neither again");
+    }
+
+    /// Review focus 5: eviction. Two one-proof transfers (a chain without split authorisation)
+    /// admitted through a one-entry cache leave only the second's verdict; a block applying the
+    /// second, then the first, costs exactly one inner verify more than the same run through an
+    /// unbounded cache — the evicted verdict — and still applies.
+    #[test]
+    fn an_evicted_verdict_costs_one_verify_at_apply_and_the_block_still_applies() {
+        use crate::storage::fixtures::make_block;
+        let gs = genesis_of(7, &[&key(1)], vec![], 2);
+        let (_dir, storage) = scratch_store(&gs);
+        let ledger = gs.ledger.clone();
+        let first = bundle_tx(&ledger, [[1; 8], [2; 8]], [[3; 8], [4; 8]], bundle_fee());
+        let second = bundle_tx(&ledger, [[5; 8], [6; 8]], [[7; 8], [8; 8]], bundle_fee());
+        let block = make_block(&gs.block, &mut ledger.clone(), vec![second.clone(), first.clone()], &key(1));
+        let run = |cap: usize| {
+            let inner = Arc::new(Counting::plain());
+            let cx = CachingExecutor::with_capacity(inner.clone(), cap);
+            for tx in [&first, &second] {
+                assert_eq!(crate::node::validate_for_pool(tx, &ledger, &storage, FriProfile::Test, &cx), Ok(()));
+            }
+            ledger.clone().apply_block(&block.block, &cx).expect("the block applies, evicted or not");
+            (inner.count(Kind::Bundle), cx.cache().len())
+        };
+        assert_eq!(run(VERIFY_CACHE_ENTRIES), (2, 2), "unbounded: admission's two verifies, apply answered");
+        assert_eq!(run(1), (3, 1), "one entry: the first's verdict was evicted and verified again");
+    }
+
+    /// Review focus 2: a pruned (aggregate-covered) bundle at apply. A split-auth transfer is
+    /// admitted raw; its block then applies in the sealed form a pruning peer serves — the
+    /// bundle proof replaced by the marker, the side table attesting it — through
+    /// `apply_block_for_sync`. The auth proof is verified there and answered from the cache (one
+    /// inner `verify_auth` in total); the bundle verifier is not called again.
+    #[test]
+    fn a_pruned_bundles_auth_proof_is_answered_from_the_cache_and_its_bundle_proof_is_untouched() {
+        use crate::storage::{fixtures::{make_block, rpl2_chain, v3_tx}, PRUNED_PROOF_MARKER};
+        let (_dir, storage, _gs, ledger, b1) = rpl2_chain(7);
+        let raw = v3_tx(&ledger, 40, randprotocol_core::UNITS_PER_RAND, Action::None);
+        let inner = Arc::new(Counting::plain());
+        let cx = CachingExecutor::new(inner.clone());
+        assert_eq!(crate::node::validate_for_pool(&raw, &ledger, &storage, FriProfile::Test, &cx), Ok(()));
+        assert_eq!(bundle_auth_counts(&inner), (1, 1), "admission verified both proofs");
+
+        // The sealed form (as `storage`'s sealed-sync test builds it, over the v3 digest).
+        let raw_cb = make_block(&b1, &mut ledger.clone(), vec![raw.clone()], &key(1));
+        let bundle = raw.bundle.as_ref().unwrap();
+        let digest = StubExecutor.bundle_digest_v3(&bundle.digest_input());
+        let hpub = StubExecutor.public_digest(&raw.binding(ledger.binding_domain()));
+        let mut public_values = vec![0u64; pv::NUM];
+        public_values[pv::TIER] = 14;
+        for k in 0..8 {
+            public_values[pv::OUT0 + k] = digest[k] as u64;
+            public_values[pv::PUB0 + k] = hpub[k] as u64;
+        }
+        let proof_hash = Hash::digest(&bundle.proof);
+        let mut served = raw_cb.block.clone();
+        served.transactions[0].bundle.as_mut().unwrap().proof = [PRUNED_PROOF_MARKER, proof_hash.as_bytes().as_slice()].concat();
+        let side = randprotocol_core::consensus::PrunedBundle {
+            tx_hash: raw.hash(),
+            proof_hash,
+            public_values,
+            shape: stub_pruned_facts(&raw).shape,
+        };
+        let mut synced = ledger.clone();
+        synced.apply_block_for_sync(&served, &std::collections::BTreeMap::new(), &[side], &cx).expect("the sealed form applies");
+        assert_eq!(synced.state_root(), raw_cb.block.header.state_root);
+        assert_eq!(bundle_auth_counts(&inner), (1, 1), "the auth proof from the cache, the bundle proof untouched");
+        assert_eq!((cx.cache().hits(), cx.cache().misses()), (1, 2), "one hit: the auth verdict");
+    }
+
     /// A ledger under an aggregation section that admits the stub bundle's shape, with `kp`
     /// registered as an aggregator and one applied bundle in the coverable set: the ledger, that
     /// bundle's hash and its covered record.
