@@ -12,9 +12,9 @@ stopped at v0.4 until 2026-09-30, when the entries v0.5 to v0.6.7 were written f
 
 ## Unreleased
 
-## v0.8.0 — TAG_DATE (chain 21 onward)
+## v0.8.0 — 2026-10-12 (chain 21 onward)
 
-Tag `TAG_SHA` (fullnode `main`, vendoring circuits `d217252`: constraint set 9 — rVM phase 4's
+Tagged from fullnode `main` (vendoring circuits `d217252`: constraint set 9 — rVM phase 4's
 Merkle spans and the MODQ chip — with tree aggregation and the scan heads' `viewing.rs`; the
 branch pins `d217252`). A minor bump, not a patch: the release carries a new constraint set, a
 node-only wire change (compact blocks) and the consensus rules a new chain needs. What reaches
@@ -55,7 +55,7 @@ each chain:
   cut script on `feat/chain21-msauth` (`a7379a6c`), which merges after this branch). Wallet:
   `rand multisig-private new-policy|address|balance|prepare|check|sign|prove|submit`
   (`docs/cli.md`), where `check`/`sign --expect-to <address>` (optionally `:AMOUNT`) refuse a proposal paying anyone but
-  the named payee; the auth proof is proved locally (tier 18, ≥ 48 GB), the bundle proof may go
+  the named payee; the auth proof is proved locally (tier 18; a ≈ 76 GB peak footprint at the Test profile, so ≥ 96 GB), the bundle proof may go
   to a paired prover. The signer checks are the pure crate `randprotocol-msig`
   (`randprotocol_client::multisig_private`, vendored by the clients' core). RPC: `rand_status`
   and `rand_getLimits` serve `hc_auth_multisig` (hex, `null` without it), `rand_status.msauth_key`

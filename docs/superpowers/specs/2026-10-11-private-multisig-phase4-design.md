@@ -624,7 +624,7 @@ and `prove_auth_locally` proves `prove_auth` or `prove_msauth` by variant.
 | `balance --policy P` | P, node | scans as the account; prints balance and notes |
 | `prepare --policy P --to ADDR --amount X [--memo M] [--fee F] --out prop.json`, or `--sweep-to ADDR` | P, node | checks the chain (`rand_status.hc_bundle` is v3, `hc_auth_multisig` is this build's), scans, selects notes, builds the v3 bundle with `nk` from P and a **fresh `salt`**, `auth_commit = msauth::auth_commit(nk, salt)`, places it in `Transaction::shielded(chain_id, bundle, Action::None)`, computes `binding = tx.binding(domain)` and `signing_message(binding)`, and writes the proposal (§6.4) with mode 0600. Every output envelope, **dummies included**, is sealed with the account's `vk` as sender (a single-key wallet seals dummies under a throwaway key; here that would make them unopenable by the signers). `prepare` does **not** mark the selected notes pending: nothing is spent until a transaction commits, and an abandoned proposal must not hide notes from the next one. `--sweep-to` spends every **RAND** note to ADDR minus the fee, refusing more than two ("send to yourself first to merge"); it is how a rotation is done. Token notes are not swept (use `--to … --asset`), and the old address stays spendable by the old policy for any payment that arrives later |
 | `sign --proposal prop.json --policy P --key K [--index i]` | P, a signer key file; offline | re-derives everything it signs over (§6.5), prints the summary to stderr, then prints `i:<sig hex>`. Warns if K is a validator consensus key (the key's address is in `rand_getValidators` when `--rpc` answers, or the file is a `rand-node` node key by path) |
-| `prove --proposal prop.json --policy P --signature i:hex… [--prover]` | P, ≥ T signatures, ≥ 48 GB | checks the shares (§6.5), assembles `msauth_inputs(msk, salt, T, slots)` with slots in ascending index order, each with `pk`, `sig` and the path from `signer_tree`; runs the guest in the emulator (`run_msauth`, refusing the sentinel or a `c ≠ auth_commit`); proves msauth locally (tier 18, minutes); proves the bundle locally or on the paired prover (the witness carries `nk`, as today); writes `prop.tx` (the transaction, bincode hex) |
+| `prove --proposal prop.json --policy P --signature i:hex… [--prover]` | P, ≥ T signatures, ≥ 96 GB (≈ 76 GB Test-profile footprint) | checks the shares (§6.5), assembles `msauth_inputs(msk, salt, T, slots)` with slots in ascending index order, each with `pk`, `sig` and the path from `signer_tree`; runs the guest in the emulator (`run_msauth`, refusing the sentinel or a `c ≠ auth_commit`); proves msauth locally (tier 18, minutes); proves the bundle locally or on the paired prover (the witness carries `nk`, as today); writes `prop.tx` (the transaction, bincode hex) |
 | `submit --tx prop.tx [--no-wait]` | node | `rand_sendTransaction`, then the usual settle and rescan |
 
 Both proofs are made against the binding computed at `prepare`. The **CLI** `prove` reads the head
@@ -741,7 +741,7 @@ light wallet fails on chain 21's keys.
 `crates/randprotocol-client/tests/wallet_flow.rs`,
 `a_private_multisig_receives_spends_rotates_and_refuses_one_signature_end_to_end`, is `#[ignore]`d
 because it runs about 4 bundle proofs and 3 tier-18 msauth proofs and needs a machine with
-≥ 48 GB. On a one-validator Test-profile chain with v3, `hc_auth`, `hc_auth_multisig`, a `gas`
+≥ 96 GB (a Test-profile msauth prove has a ≈ 76 GB peak footprint, RSS 22.5 GB). On a one-validator Test-profile chain with v3, `hc_auth`, `hc_auth_multisig`, a `gas`
 section, `proof_window_blocks: 1024` (3 s test blocks would otherwise give 12.8 minutes for two
 signatures, a tier-18 Test prove and a bundle prove) and a `multisig` section seeding one 2-of-3
 public account. Before it runs, the Test-profile msauth prove time and peak RSS from the plan's
@@ -814,7 +814,7 @@ they differ on the cut's numbers the cut script's asserted values win.
      and chain 21 is cut at 6 MiB with 19 MiB blocks: the decided chain-21 values, asserted by the
      cut script on `feat/chain21-msauth` (`a7379a6c`), which merges after this branch). Wallet: `rand multisig-private
      new-policy|address|balance|prepare|check|sign|prove|submit` (`docs/cli.md`); the auth proof is
-     proved locally (tier 18, ≥ 48 GB), the bundle proof may go to a paired prover. The signer
+     proved locally (tier 18; minutes; a ≈ 76 GB peak footprint measured at the Test profile, so ≥ 96 GB), the bundle proof may go to a paired prover. The signer
      checks are the pure crate `randprotocol-msig` (`randprotocol_client::multisig_private`,
      vendored by the clients' core). RPC: `rand_status` and `rand_getLimits` serve
      `hc_auth_multisig` (hex, `null` without it), `rand_status.msauth_key` where the key came from.

@@ -270,7 +270,7 @@ of M signatures and learns nothing about the policy. It needs a chain whose gene
 | a payment's amounts and recipients | the payouts' amounts (recipients shielded) | hidden |
 | what the chain does see | everything above | that the auth proof has the multisig shape, the bundle's public fields, the transaction size |
 | what a signer signs | a 32-byte blake3 digest, checked natively by the node | `b"rand-msauth-1" ‖ binding`, checked inside the proof |
-| cost | a few KB of keys and signatures | a ≥ 3.4 MB auth proof (estimated; the Production size is not yet measured), proved on a ≥ 48 GB machine |
+| cost | a few KB of keys and signatures | a ≥ 3.4 MB auth proof (estimated; the Production size is not yet measured), proved on a machine with ≥ 96 GB (a ≈ 76 GB peak footprint measured at the Test profile) |
 
 A treasury that must be auditable stays public; M-of-N control with the pool's privacy is the
 private account.

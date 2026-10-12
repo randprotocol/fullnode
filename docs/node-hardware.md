@@ -566,10 +566,10 @@ does no LDE and no Merkle commit, which is the build's 4 GB.
 **To measure on an `s-2vcpu-4gb` droplet (Task 8 / cut rehearsal): RSS after load, and after the
 first tier-18 verify.** glibc may return freed memory where macOS did not.
 
-**The proof itself: not yet measured.** The guest runs 85 830 / 169 068 / 251 946 cycles at
+**The proof itself: not yet measured.** One Test-profile measurement exists (M = 2 shares, tier 18, 52 GB M-series Mac, `/usr/bin/time -l`): max RSS 22.5 GB but a peak memory footprint of 76.4 GB (compressed pages included; RSS understates it), killed by macOS after 273 s. Plan for a machine with at least 96 GB; the Production profile is larger and unmeasured. The guest runs 85 830 / 169 068 / 251 946 cycles at
 M = 1 / 2 / 3 signatures, inside tier 18's 262 143 (a Dilithium2 verify is 80 572 cycles with the
 MODQ chip, 880 102 in software). The Production msauth prove (time and peak RSS on the wallet's
-machine, at least 48 GB), the proof's size and a warm tier-18 verify on a validator are the plan's
+machine, at least 96 GB), the proof's size and a warm tier-18 verify on a validator are the plan's
 Task 2 `MSAUTH-PROD:`/`MSAUTH-TEST:` lines, which have not been taken (a user-terminal run). Until
 they are: the auth proof is estimated at ≥ 3.4 MB (≈ 4.8 MB with the bundle proof), the node's floor
 beside `hc_auth_multisig` is a 4 MiB `max_proof_bytes`, and chain 21 is cut at 6 MiB (6 291 456) with
