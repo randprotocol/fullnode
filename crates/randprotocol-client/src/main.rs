@@ -1388,6 +1388,9 @@ fn confirm(question: &str, verb: &str, declined: &str) -> Result<()> {
     Ok(())
 }
 
+/// Blocks a proposal needs before its window closes: to be proved, submitted and committed.
+const EXPIRY_MARGIN: u64 = 16;
+
 /// The default note store of a private multisig policy: `<policy>.notes.json`.
 fn policy_store_path(policy: &Path) -> PathBuf {
     let mut name = policy.as_os_str().to_owned();
@@ -1446,6 +1449,7 @@ async fn multisig_private_cmd(prover: bool, cpu: bool, key: &Path, max_prover_fe
         MultisigPrivateCmd::Prepare { policy, to, amount, sweep_to, memo, fee, out, store } => {
             let store_path = store.unwrap_or_else(|| policy_store_path(&policy));
             let policy = Policy::load(&policy)?;
+            anyhow::ensure!(matches!((&to, &amount, &sweep_to), (Some(_), Some(_), None) | (None, None, Some(_))), "give --to with --amount, or --sweep-to");
             let fee = match fee {
                 Some(f) => parse_amount(&f)?,
                 None => wallet::schedule_floor(rpc, &Action::None).await?,
@@ -1467,7 +1471,7 @@ async fn multisig_private_cmd(prover: bool, cpu: bool, key: &Path, max_prover_fe
             let (proposal, policy) = (mp::load_proposal(&proposal)?, Policy::load(&policy)?);
             print_proposal_summary(&mp::check(&proposal, &policy)?);
             match rpc.head().await.ok().and_then(|h| h["height"].as_u64()) {
-                Some(head) if head + 16 >= proposal.expires_at => println!("expired or about to: the head is {head}, the proposal expires at {} — prepare again", proposal.expires_at),
+                Some(head) if head + EXPIRY_MARGIN >= proposal.expires_at => println!("expired or about to: the head is {head}, the proposal expires at {} — prepare again", proposal.expires_at),
                 Some(head) => println!("ok: the head is {head}, {} blocks left", proposal.expires_at - head),
                 None => println!("ok (no node answered: expiry not compared with the head)"),
             }
@@ -1482,7 +1486,10 @@ async fn multisig_private_cmd(prover: bool, cpu: bool, key: &Path, max_prover_fe
             let in_datadir = key.file_name().is_some_and(|n| n == "node.key.json");
             let validates = match rpc.validators().await {
                 Ok(rows) => rows.as_array().is_some_and(|rows| rows.iter().any(|r| r["address"].as_str() == Some(&keypair.public_key().address().to_string()))),
-                Err(_) => false,
+                Err(e) => {
+                    eprintln!("note: could not check the key against rand_getValidators ({e})");
+                    false
+                }
             };
             if in_datadir || validates {
                 eprintln!("warning: this looks like a validator's consensus key; a multisig signer key should be its own");
@@ -1490,10 +1497,12 @@ async fn multisig_private_cmd(prover: bool, cpu: bool, key: &Path, max_prover_fe
             println!("{share}");
         }
         MultisigPrivateCmd::Prove { proposal, policy, signatures, out, cuda } => {
+            // `save_tx` never overwrites, and it runs after minutes of proving: refuse first.
+            anyhow::ensure!(!out.exists(), "{} exists; choose another --out", out.display());
             let (proposal, policy) = (mp::load_proposal(&proposal)?, Policy::load(&policy)?);
             let shares = signatures.iter().map(|s| s.parse::<Share>().map_err(|e| anyhow!("--signature {s}: {e}"))).collect::<Result<Vec<_>>>()?;
             let head = rpc.head().await?["height"].as_u64().context("head height")?;
-            anyhow::ensure!(head + 16 < proposal.expires_at, "the proposal expires at height {} and the head is {head}: prepare again", proposal.expires_at);
+            anyhow::ensure!(head + EXPIRY_MARGIN < proposal.expires_at, "the proposal expires at height {} and the head is {head}: prepare again", proposal.expires_at);
             let profile = profile_of(rpc).await?;
             let proving = proving_for(prover, cuda, cpu, key, max_prover_fee)?;
             eprintln!("proving the auth proof on this machine (tier 18: minutes, at least 48 GB), then the bundle");
@@ -3942,6 +3951,14 @@ mod tests {
         multisig_private_cmd(false, false, Path::new("k"), "1", &rpc, new(path.clone())).await.unwrap();
         assert!(multisig_private_cmd(false, false, Path::new("k"), "1", &rpc, new(path.clone())).await.is_err(), "never over an existing policy");
         multisig_private_cmd(false, false, Path::new("k"), "1", &rpc, MultisigPrivateCmd::Address { policy: path.clone() }).await.unwrap();
+        let tx = dir.path().join("proposal.tx");
+        std::fs::write(&tx, "x").unwrap();
+        let prove = MultisigPrivateCmd::Prove { proposal: dir.path().join("none"), policy: path.clone(), signatures: vec!["0:aa".into()], out: tx, cuda: false };
+        let e = multisig_private_cmd(false, false, Path::new("k"), "1", &rpc, prove).await.unwrap_err().to_string();
+        assert!(e.contains("exists; choose another --out"), "refused before any proving: {e}");
+        let prep = MultisigPrivateCmd::Prepare { policy: path.clone(), to: Some("rand1x".into()), amount: None, sweep_to: None, memo: String::new(), fee: None, out: dir.path().join("p.json"), store: None };
+        let e = multisig_private_cmd(false, false, Path::new("k"), "1", &rpc, prep).await.unwrap_err().to_string();
+        assert!(e.contains("--sweep-to"), "shape refused with the node down: {e}");
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
