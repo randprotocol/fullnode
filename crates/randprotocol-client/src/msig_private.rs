@@ -371,6 +371,24 @@ pub fn load_proposal(path: &Path) -> Result<Proposal> {
     serde_json::from_str(&text).with_context(|| format!("{} is not a private multisig proposal", path.display()))
 }
 
+/// What a signer reads before signing ([`randprotocol_msig::check_proposal`] over the two typed
+/// files): every §6.5 check, and the summary, which `lines()` renders.
+pub fn check(proposal: &Proposal, policy: &Policy) -> Result<pure::ProposalSummary> {
+    Ok(pure::check_proposal(&json(proposal), &zeroize::Zeroizing::new(json(&policy.pure())))?)
+}
+
+/// Writes a proved transaction as bincode hex, owner-only and never over an existing file.
+pub fn save_tx(tx: &Transaction, path: &Path) -> Result<()> {
+    wallet::write_new_secret(path, &(hex::encode(tx.encode()) + "\n"))
+}
+
+/// Reads a transaction [`save_tx`] wrote.
+pub fn load_tx(path: &Path) -> Result<Transaction> {
+    let text = std::fs::read_to_string(path).with_context(|| format!("reading transaction {}", path.display()))?;
+    let bytes = hex::decode(text.trim()).with_context(|| format!("{} is not hex", path.display()))?;
+    Transaction::decode(&bytes).with_context(|| format!("{} is not a transaction", path.display()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

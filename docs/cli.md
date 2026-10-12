@@ -748,6 +748,46 @@ new account). Each waits for the commit unless `--no-wait`.
 | `perp account [ID]` | `--trading-key <FILE>` (instead of `ID`) | `rand_getPerpAccount`: key, `nonce_high`, `used`, pending withdrawals |
 | `perp inputs <HEIGHT>` | | `rand_getPerpInputs`: the block's perp input words and digest |
 
+### `rand multisig-private`
+
+Private multisig accounts: a T-of-N policy of Dilithium2 signer keys whose address and spends look
+like any wallet's. The account has a viewing key and no spend key; a spend is a **proposal** that
+T signers check and sign offline, and the signatures are hidden in a proof. Needs a chain whose
+`rand_status` names `hc_auth_multisig`. The **policy file** holds the account's secret `msk` (its
+viewing power over every note) and a **proposal** holds the witness: both are written mode 0600,
+never over an existing file, refused when group or other can read them, and never printed. Signers
+need the policy file (give it to them out of band) and a `rand-node keygen` key of their own. The
+global `--rpc` applies; `--key` matters only to `--prover` (which prover is paired); the account's notes live beside the policy.
+
+| command | flags | does |
+|---|---|---|
+| `multisig-private new-policy` | `--signer <pubkey hex>` (repeat, in order: the order is part of the address), `--threshold <T>`, `--out` (`policy.json`), `--public-account <ID>` (repeat) | make a policy with a fresh `msk`; prints the address and its fingerprint. Refused where the prover could never spend it (T above 3, more than 16 signers, a repeated key). Each `--public-account` is read from the node (`rand_getMultisig`) and a warning is printed for every signer that also signs it: anyone who knows both policies can link the two |
+| `multisig-private address` | `--policy` | the address, the fingerprint (every signer compares it out of band) and the policy hash |
+| `multisig-private balance` | `--policy`, `--store` (`<policy>.notes.json`) | scan the chain for the account's notes; prints the balance |
+| `multisig-private prepare` | `--policy`, `--to <rand1…>` with `--amount <RAND>`, or `--sweep-to <rand1…>`; `--memo`, `--fee <RAND>`, `--out` (`proposal.json`), `--store` | write the proposal every signer checks: a payment, or every RAND note of the account (at most two) moved to a new address, less the fee, which is how a policy is rotated. Prints the summary and the height before which it must be proved |
+| `multisig-private check` | `--proposal`, `--policy` | every check a signer makes, offline, and the summary; compares the expiry with the head when a node answers |
+| `multisig-private sign` | `--proposal`, `--policy`, `--key` | one signer, offline: the checks, the summary on stderr, and `<index>:<hex>` on stdout. Each output line says the owner key is verified and the delivery key is not verifiable from the proposal: compare the recipient out of band. Warns when the key looks like a validator's (its address is in `rand_getValidators`, or the file is a datadir `node.key.json`) |
+| `multisig-private prove` | `--proposal`, `--policy`, `--signature <index:hex>` (repeat, at least T), `--out` (`proposal.tx`), `--cuda` | verify the shares and prove: the **auth proof is proved on this machine (tier 18: minutes, at least 48 GB)**, the bundle here or on the paired prover (`--prover`). Refused at or past 16 blocks before the expiry. Prints both proofs' sizes |
+| `multisig-private submit` | `--tx`, `--no-wait` | send the proved transaction and wait for the commit; prints its hash |
+
+A 2-of-3 walk-through:
+
+```sh
+rand multisig-private new-policy --signer $PK0 --signer $PK1 --signer $PK2 --threshold 2 --out policy.json
+rand multisig-private address --policy policy.json            # signers compare the fingerprint
+#   pay the printed address from any wallet, then:
+rand multisig-private balance --policy policy.json
+rand multisig-private prepare --policy policy.json --to rand1… --amount 1.5 --out proposal.json
+rand multisig-private sign --proposal proposal.json --policy policy.json --key signer0.key.json   # 0:…
+rand multisig-private sign --proposal proposal.json --policy policy.json --key signer2.key.json   # 2:…
+rand multisig-private prove --proposal proposal.json --policy policy.json --signature 0:… --signature 2:…
+rand multisig-private submit --tx proposal.tx
+```
+
+A proposal expires `proof_window_blocks` after it is prepared (256 unless the genesis sets it): the
+shares must be gathered and the transaction proved before then, or `prepare` again. Preparing
+reserves nothing; a note named by two live proposals is spent by whichever commits first.
+
 ### Key file formats
 
 Node key (both binaries' `keygen` used to share this; only `rand-node` writes it now):

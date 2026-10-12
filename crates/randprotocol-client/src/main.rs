@@ -219,6 +219,13 @@ enum Cmd {
     /// and rotating its signers are signed, bundle-less actions — `rand-node multisig pay|rotate`.
     #[command(subcommand)]
     Multisig(MultisigCmd),
+    /// Private multisig accounts: a T-of-N policy whose address looks like any other and whose
+    /// spends are proposals that signers sign offline and a proof hides. `new-policy` makes the
+    /// policy file (it holds the account's secret `msk`: keep it, share it with the signers
+    /// out of band), `prepare` writes a proposal, `sign` is each signer's side, `prove` makes
+    /// the transaction on this machine (tier 18: minutes, at least 48 GB) and `submit` sends it.
+    #[command(subcommand, name = "multisig-private")]
+    MultisigPrivate(MultisigPrivateCmd),
     /// Run a confidential call: prove locally, pay from a bundle, wait for the receipt.
     ///
     /// By default the call also publishes a sealed transcript of its private inputs (spec §6.1),
@@ -875,6 +882,104 @@ enum MultisigCmd {
 }
 
 #[derive(Subcommand)]
+enum MultisigPrivateCmd {
+    /// Make a policy: T of the given signer keys and a fresh secret. Writes the policy file
+    /// (mode 0600, never over an existing file) and prints the address and its fingerprint.
+    NewPolicy {
+        /// A signer's public key (hex, as `rand-node keygen` prints it). Repeat for each, in
+        /// order: the order is part of the address.
+        #[arg(long = "signer", required = true)]
+        signers: Vec<String>,
+        /// How many signatures a spend needs.
+        #[arg(long)]
+        threshold: u32,
+        #[arg(long, default_value = "policy.json")]
+        out: PathBuf,
+        /// A public multisig account (id, 64 hex) to check these signers against: a key that
+        /// signs both lets anyone who knows both policies link them. Repeatable; a warning only.
+        #[arg(long = "public-account", value_name = "ID")]
+        public_accounts: Vec<String>,
+    },
+    /// Print the account's address, its fingerprint and the policy hash.
+    Address {
+        #[arg(long)]
+        policy: PathBuf,
+    },
+    /// Scan the chain for the account's notes and print its balance.
+    Balance {
+        #[arg(long)]
+        policy: PathBuf,
+        /// The account's note store; default `<policy>.notes.json`.
+        #[arg(long)]
+        store: Option<PathBuf>,
+    },
+    /// Write a proposal that every signer checks and signs: pay `--to` an `--amount`, or move the
+    /// whole RAND balance with `--sweep-to` (how a policy is rotated).
+    Prepare {
+        #[arg(long)]
+        policy: PathBuf,
+        #[arg(long, conflicts_with = "sweep_to")]
+        to: Option<String>,
+        /// RAND, display units.
+        #[arg(long, requires = "to")]
+        amount: Option<String>,
+        #[arg(long)]
+        sweep_to: Option<String>,
+        #[arg(long, default_value = "")]
+        memo: String,
+        /// Fee in RAND; default: the schedule's floor.
+        #[arg(long)]
+        fee: Option<String>,
+        #[arg(long, default_value = "proposal.json")]
+        out: PathBuf,
+        /// The account's note store; default `<policy>.notes.json`.
+        #[arg(long)]
+        store: Option<PathBuf>,
+    },
+    /// A signer's side, offline: check the proposal, print what it pays on stderr and this key's
+    /// `index:hex` share on stdout.
+    Sign {
+        #[arg(long)]
+        proposal: PathBuf,
+        #[arg(long)]
+        policy: PathBuf,
+        /// A `rand-node keygen` key file.
+        #[arg(long)]
+        key: PathBuf,
+    },
+    /// Check a proposal against the policy and print what it pays; signs nothing.
+    Check {
+        #[arg(long)]
+        proposal: PathBuf,
+        #[arg(long)]
+        policy: PathBuf,
+    },
+    /// Prove the proposal with at least T signatures: the auth proof on this machine (tier 18),
+    /// then the bundle. Writes the transaction.
+    Prove {
+        #[arg(long)]
+        proposal: PathBuf,
+        #[arg(long)]
+        policy: PathBuf,
+        #[arg(long = "signature", required = true, value_name = "INDEX:HEX")]
+        signatures: Vec<String>,
+        #[arg(long, default_value = "proposal.tx")]
+        out: PathBuf,
+        /// Prove the bundle on an attached NVIDIA GPU (requires a build with `--features cuda`).
+        #[arg(long)]
+        cuda: bool,
+    },
+    /// Send a proved transaction.
+    Submit {
+        #[arg(long)]
+        tx: PathBuf,
+        /// Return once the node accepts it instead of waiting for it to commit.
+        #[arg(long)]
+        no_wait: bool,
+    },
+}
+
+#[derive(Subcommand)]
 enum ProgramCmd {
     /// Assemble a built-in guest program to a JSON file.
     Build {
@@ -1279,6 +1384,133 @@ fn confirm(question: &str, verb: &str, declined: &str) -> Result<()> {
     std::io::stdin().read_line(&mut line)?;
     if !line.trim().eq_ignore_ascii_case("y") {
         anyhow::bail!("{declined}");
+    }
+    Ok(())
+}
+
+/// The default note store of a private multisig policy: `<policy>.notes.json`.
+fn policy_store_path(policy: &Path) -> PathBuf {
+    let mut name = policy.as_os_str().to_owned();
+    name.push(".notes.json");
+    PathBuf::from(name)
+}
+
+/// What a signer sees of a proposal, on stderr (the lines say the delivery key is not verifiable).
+fn print_proposal_summary(s: &randprotocol_client::multisig_private::ProposalSummary) {
+    for line in s.lines() {
+        eprintln!("{line}");
+    }
+    eprintln!("policy {}\nexpires at height {}", s.policy_fingerprint, s.expires_at);
+}
+
+/// `rand multisig-private …`. Secrets (the policy's `msk`, a proposal's witness) are never printed.
+async fn multisig_private_cmd(prover: bool, cpu: bool, key: &Path, max_prover_fee: &str, rpc: &RpcClient, cmd: MultisigPrivateCmd) -> Result<()> {
+    use randprotocol_client::msig_private::{self as mp, Policy, Share};
+    match cmd {
+        MultisigPrivateCmd::NewPolicy { signers, threshold, out, public_accounts } => {
+            let keys = signers
+                .iter()
+                .map(|k| PublicKey::from_hex(k.trim()).map_err(|e| anyhow!("--signer {k} is not a public key: {e}")))
+                .collect::<Result<Vec<_>>>()?;
+            let policy = Policy::new(keys, threshold)?;
+            let mut accounts = Vec::new();
+            for id in &public_accounts {
+                let raw = randprotocol_client::hex32(id).with_context(|| format!("--public-account {id} must be 32 bytes of hex"))?;
+                accounts.push(rpc.multisig(&raw).await?.with_context(|| format!("no public multisig account {id}"))?);
+            }
+            let ledger: Vec<_> = accounts
+                .iter()
+                .map(|a| randprotocol_core::ledger::multisig::Account { signers: a.signers.clone(), threshold: a.threshold, nonce: a.nonce, vault: a.vault.iter().copied().collect() })
+                .collect();
+            for i in policy.reused_in(&ledger) {
+                let which: Vec<String> = accounts.iter().zip(&public_accounts).filter(|(a, _)| a.signers.contains(&policy.signers[i])).map(|(_, id)| id.clone()).collect();
+                eprintln!("warning: signer {i} also signs public account {}: anyone who knows both policies can link them", which.join(", "));
+            }
+            policy.save(&out)?;
+            println!("wrote {} (holds the account's secret: keep it private, give it to the signers out of band)", out.display());
+            println!("address: {}\nfingerprint: {}", policy.wallet().address, policy.fingerprint());
+        }
+        MultisigPrivateCmd::Address { policy } => {
+            let policy = Policy::load(&policy)?;
+            println!("address: {}\nfingerprint: {}\npolicy: {}", policy.wallet().address, policy.fingerprint(), word8_to_hex(&policy.policy_hash()));
+        }
+        MultisigPrivateCmd::Balance { policy, store } => {
+            let store_path = store.unwrap_or_else(|| policy_store_path(&policy));
+            let w = Policy::load(&policy)?.wallet();
+            let mut store = NoteStore::load(&store_path);
+            let scanned = wallet::scan(rpc, &w, &mut store).await;
+            store.save(&store_path)?;
+            scanned?;
+            println!("balance: {} RAND\nnotes: {} unspent", format_amount(store.balance()), store.spendable().len());
+        }
+        MultisigPrivateCmd::Prepare { policy, to, amount, sweep_to, memo, fee, out, store } => {
+            let store_path = store.unwrap_or_else(|| policy_store_path(&policy));
+            let policy = Policy::load(&policy)?;
+            let fee = match fee {
+                Some(f) => parse_amount(&f)?,
+                None => wallet::schedule_floor(rpc, &Action::None).await?,
+            };
+            let chain_id = rpc.chain_id().await?;
+            let mut store = NoteStore::load(&store_path);
+            let made = match (&to, &amount, &sweep_to) {
+                (Some(to), Some(amount), None) => mp::prepare(rpc, &policy, &mut store, &parse_address(to)?, parse_amount(amount)?, &memo, fee, chain_id).await,
+                (None, None, Some(to)) => mp::prepare_sweep(rpc, &policy, &mut store, &parse_address(to)?, fee, chain_id).await,
+                _ => Err(anyhow!("give --to with --amount, or --sweep-to")),
+            };
+            store.save(&store_path)?;
+            let proposal = made?;
+            mp::save_proposal(&proposal, &out)?;
+            print_proposal_summary(&mp::check(&proposal, &policy)?);
+            println!("wrote {}: gather {} or more signatures and prove before height {}", out.display(), policy.threshold, proposal.expires_at);
+        }
+        MultisigPrivateCmd::Check { proposal, policy } => {
+            let (proposal, policy) = (mp::load_proposal(&proposal)?, Policy::load(&policy)?);
+            print_proposal_summary(&mp::check(&proposal, &policy)?);
+            match rpc.head().await.ok().and_then(|h| h["height"].as_u64()) {
+                Some(head) if head + 16 >= proposal.expires_at => println!("expired or about to: the head is {head}, the proposal expires at {} — prepare again", proposal.expires_at),
+                Some(head) => println!("ok: the head is {head}, {} blocks left", proposal.expires_at - head),
+                None => println!("ok (no node answered: expiry not compared with the head)"),
+            }
+        }
+        MultisigPrivateCmd::Sign { proposal, policy, key } => {
+            let (proposal, policy) = (mp::load_proposal(&proposal)?, Policy::load(&policy)?);
+            let keypair = wallet::load_authority_key(&key)?;
+            let (share, lines) = mp::sign(&proposal, &policy, &keypair)?;
+            for line in lines {
+                eprintln!("{line}");
+            }
+            let in_datadir = key.file_name().is_some_and(|n| n == "node.key.json");
+            let validates = match rpc.validators().await {
+                Ok(rows) => rows.as_array().is_some_and(|rows| rows.iter().any(|r| r["address"].as_str() == Some(&keypair.public_key().address().to_string()))),
+                Err(_) => false,
+            };
+            if in_datadir || validates {
+                eprintln!("warning: this looks like a validator's consensus key; a multisig signer key should be its own");
+            }
+            println!("{share}");
+        }
+        MultisigPrivateCmd::Prove { proposal, policy, signatures, out, cuda } => {
+            let (proposal, policy) = (mp::load_proposal(&proposal)?, Policy::load(&policy)?);
+            let shares = signatures.iter().map(|s| s.parse::<Share>().map_err(|e| anyhow!("--signature {s}: {e}"))).collect::<Result<Vec<_>>>()?;
+            let head = rpc.head().await?["height"].as_u64().context("head height")?;
+            anyhow::ensure!(head + 16 < proposal.expires_at, "the proposal expires at height {} and the head is {head}: prepare again", proposal.expires_at);
+            let profile = profile_of(rpc).await?;
+            let proving = proving_for(prover, cuda, cpu, key, max_prover_fee)?;
+            eprintln!("proving the auth proof on this machine (tier 18: minutes, at least 48 GB), then the bundle");
+            let tx = mp::prove(&proposal, &policy, &shares, &proving, profile).await?;
+            mp::save_tx(&tx, &out)?;
+            let bundle = tx.bundle.as_ref().context("the proved transaction carries no bundle")?;
+            println!("wrote {}: bundle proof {} bytes, auth proof {} bytes", out.display(), bundle.proof.len(), bundle.auth_proof.len());
+        }
+        MultisigPrivateCmd::Submit { tx, no_wait } => {
+            let tx = mp::load_tx(&tx)?;
+            let hash = rpc.send_transaction(&tx).await.map_err(randprotocol_client::submit_refused)?;
+            if !no_wait {
+                let r = rpc.wait_for_transaction(&hash, Duration::from_secs(120)).await?;
+                println!("committed in block {} (index {})", r.height, r.index);
+            }
+            println!("{hash}");
+        }
     }
     Ok(())
 }
@@ -2252,6 +2484,7 @@ async fn main() -> Result<()> {
             store.save(&path)?;
             report(&s?, "multisig deposit");
         }
+        Cmd::MultisigPrivate(cmd) => multisig_private_cmd(cli.prover, cli.cpu, &cli.key, &cli.max_prover_fee, &rpc, cmd).await?,
         Cmd::Faucet { address, amount } => {
             let to = match address {
                 Some(a) => parse_address(&a)?,
@@ -3672,6 +3905,50 @@ mod tests {
         };
         assert_eq!((account.as_str(), amount.as_str(), asset.as_deref(), fee.as_deref(), no_wait), (id.as_str(), "12.5", Some("2"), Some("0.01"), true));
         assert!(matches!(parse(&["multisig", "deposit", &id, "1"]), Ok(Cmd::Multisig(MultisigCmd::Deposit { asset: None, .. }))));
+    }
+
+    /// Private multisig: the eight `rand multisig-private` commands parse with their documented flags.
+    #[test]
+    fn the_multisig_private_commands_parse_with_their_documented_flags() {
+        let parse = |args: &[&str]| Cli::try_parse_from(std::iter::once("rand").chain(args.iter().copied())).map(|c| c.cmd);
+        let k = "ab".repeat(1312);
+        let Ok(Cmd::MultisigPrivate(MultisigPrivateCmd::NewPolicy { signers, threshold, out, .. })) =
+            parse(&["multisig-private", "new-policy", "--signer", &k, "--signer", &k, "--threshold", "2"]) else { panic!() };
+        assert_eq!((signers.len(), threshold, out), (2, 2, PathBuf::from("policy.json")));
+        assert!(matches!(parse(&["multisig-private", "address", "--policy", "p.json"]), Ok(Cmd::MultisigPrivate(MultisigPrivateCmd::Address { .. }))));
+        let Ok(Cmd::MultisigPrivate(MultisigPrivateCmd::Prepare { to, amount, sweep_to, out, .. })) =
+            parse(&["multisig-private", "prepare", "--policy", "p.json", "--to", "rand1x", "--amount", "1.5"]) else { panic!() };
+        assert_eq!((to.as_deref(), amount.as_deref(), sweep_to, out), (Some("rand1x"), Some("1.5"), None, PathBuf::from("proposal.json")));
+        assert!(parse(&["multisig-private", "prepare", "--policy", "p.json", "--to", "rand1x", "--sweep-to", "rand1y"]).is_err(), "one or the other");
+        assert!(parse(&["multisig-private", "sign", "--proposal", "x", "--policy", "p", "--key", "k"]).is_ok());
+        assert!(parse(&["multisig-private", "check", "--proposal", "x", "--policy", "p"]).is_ok());
+        assert!(parse(&["multisig-private", "balance", "--policy", "p"]).is_ok());
+        let Ok(Cmd::MultisigPrivate(MultisigPrivateCmd::Prove { signatures, .. })) =
+            parse(&["multisig-private", "prove", "--proposal", "x", "--policy", "p", "--signature", "0:aa", "--signature", "2:bb"]) else { panic!() };
+        assert_eq!(signatures, ["0:aa", "2:bb"]);
+        assert!(parse(&["multisig-private", "prove", "--proposal", "x", "--policy", "p"]).is_err(), "at least one --signature");
+        assert!(parse(&["multisig-private", "submit", "--tx", "t"]).is_ok());
+    }
+
+    /// `new-policy` and `address` need no node: the policy file is written owner-only, an existing
+    /// one is never overwritten, and a loose-mode one is refused by `address`.
+    #[tokio::test]
+    async fn the_multisig_private_policy_commands_work_offline_and_guard_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("policy.json");
+        let signers: Vec<String> = (0..3u8).map(|i| Keypair::from_seed([0x40 + i; 32]).unwrap().public_key().to_hex()).collect();
+        let rpc = RpcClient::new("http://127.0.0.1:1".to_string());
+        let new = |out: PathBuf| MultisigPrivateCmd::NewPolicy { signers: signers.clone(), threshold: 2, out, public_accounts: vec![] };
+        multisig_private_cmd(false, false, Path::new("k"), "1", &rpc, new(path.clone())).await.unwrap();
+        assert!(multisig_private_cmd(false, false, Path::new("k"), "1", &rpc, new(path.clone())).await.is_err(), "never over an existing policy");
+        multisig_private_cmd(false, false, Path::new("k"), "1", &rpc, MultisigPrivateCmd::Address { policy: path.clone() }).await.unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+            assert!(multisig_private_cmd(false, false, Path::new("k"), "1", &rpc, MultisigPrivateCmd::Address { policy: path }).await.is_err(), "a readable policy is refused");
+        }
     }
 
     /// `rand sync` scans from where the store left off; `--rescan` starts the store over first
