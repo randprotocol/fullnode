@@ -66,3 +66,39 @@ fn verify_share_refuses_a_wrong_index_or_signature() {
     assert!(verify_share(&prop, &pol, &format!("2:{}", hex::encode(bad))).is_err());
     assert!(verify_share(&prop, &pol, "2:zz").is_err());
 }
+
+#[test]
+fn a_wrong_expected_digest_is_refused() {
+    let e = check_proposal(&fixture("proposal-wrong-expected.json"), &fixture("policy.json")).unwrap_err();
+    assert!(e.to_string().contains("expected digest is not its bundle's"), "{e}");
+}
+
+/// The fee raised in the bundle and the witness, digest and binding re-made: only the per-asset
+/// balance can refuse it (the nullifiers still re-derive).
+#[test]
+fn a_raised_fee_is_refused_by_the_balance() {
+    let e = check_proposal(&fixture("proposal-fee-raised.json"), &fixture("policy.json")).unwrap_err();
+    assert!(e.to_string().contains("the witness's value does not match the outputs: asset 0"), "{e}");
+}
+
+/// An envelope edited without re-making the binding.
+#[test]
+fn an_unbound_edit_is_refused_at_the_binding() {
+    let e = check_proposal(&fixture("proposal-unbound.json"), &fixture("policy.json")).unwrap_err();
+    assert!(e.to_string().contains("does not hash to the proposal's binding"), "{e}");
+}
+
+/// The informational summary is untrusted and shown nowhere: naming another address there
+/// changes nothing a signer sees, and every output line claims only the owner key.
+#[test]
+fn the_summary_names_nothing_a_signer_is_shown() {
+    let (prop, pol) = (fixture("proposal-valid.json"), fixture("policy.json"));
+    let want = check_proposal(&prop, &pol).unwrap().lines();
+    let other = randprotocol_core::notes::ShieldedAddress { pk: [1; 8], kem_ek: vec![2; randprotocol_core::notes::KEM_EK_BYTES] };
+    let mut v: serde_json::Value = serde_json::from_str(&prop).unwrap();
+    v["summary"] = serde_json::json!([format!("pay 10 RAND to {}", other.to_string()), "fee 0.001 RAND"]);
+    let lines = check_proposal(&v.to_string(), &pol).unwrap().lines();
+    assert_eq!(lines, want);
+    assert!(lines[..4].iter().all(|l| l.contains("(owner key verified; delivery key NOT verifiable from this proposal)")), "{lines:?}");
+    assert!(lines.iter().all(|l| !l.contains("rand1")), "no address is shown: {lines:?}");
+}

@@ -6012,6 +6012,11 @@ pub(crate) mod tests {
     /// `proof_window_blocks: 1024`, and whose tree holds one note of `amount` RAND owned by `w` —
     /// with a client for it and a store that has scanned it.
     pub(crate) async fn fake_multisig_chain(w: &Wallet, amount: u64) -> (RpcClient, NoteStore) {
+        fake_multisig_chain_with(w, &[amount]).await
+    }
+
+    /// [`fake_multisig_chain`] with one RAND note per amount, each in a block of its own.
+    pub(crate) async fn fake_multisig_chain_with(w: &Wallet, amounts: &[u64]) -> (RpcClient, NoteStore) {
         let chain = Arc::new(Mutex::new(ChainState::new()));
         {
             let mut c = chain.lock().unwrap();
@@ -6019,7 +6024,9 @@ pub(crate) mod tests {
             c.hc_auth = Some(ZkExecutor::hc_auth());
             c.hc_auth_multisig = Some(ZkExecutor::hc_auth_multisig());
             c.proof_window_blocks = Some(1024);
-            c.fund(w, amount, 0);
+            for &amount in amounts {
+                c.fund(w, amount, 0);
+            }
         }
         let rpc = serve(&chain).await;
         let mut store = NoteStore::default();

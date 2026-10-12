@@ -11,6 +11,19 @@
 //! transaction, recomputes its binding, opens every output as the account, and re-derives the
 //! spent notes' nullifiers from the witness. [`sign`] signs only what checked.
 //!
+//! **What a signer can and cannot verify about delivery.** Each output is opened as sender with
+//! the account's own outgoing key, so its owner key (`pk`), amount, asset and memo are checked
+//! against the bundle's commitment. Who can *find* the note is not: the envelope's ML-KEM half is
+//! sealed to some encapsulation key, and that key cannot be recovered or re-derived from the
+//! envelope (encapsulation is randomised, and the vendored sealer draws its randomness from the
+//! OS, so it cannot be re-run). A proposer could therefore pay the right `pk` while sealing to a
+//! KEM key of its own choosing: nothing is stolen, but the payee never detects the note. So an
+//! output is shown by a fingerprint of its owner key alone ([`owner_fingerprint`]), never by an
+//! address, and every line says the delivery key is not verified; nothing from the proposal's
+//! informational `summary` is shown or relied on. The follow-up is a deterministic seal API
+//! upstream (the encapsulation message derived from the transaction key), which would let a
+//! signer re-seal and compare.
+//!
 //! **Secrets.** A policy's JSON carries the account's `msk` (viewing power over every note of the
 //! account) and a proposal's JSON carries the witness words (`nk`, the salt, the spent notes'
 //! openings). This crate never logs either; callers must store both as secrets.
@@ -19,7 +32,7 @@ use randprotocol_core::ledger::MAX_PROOF_WINDOW_BLOCKS;
 use randprotocol_core::notes::{word8_from_hex, word8_to_hex, ShieldedAddress, Word8};
 use randprotocol_core::{format_amount, Action, BindingDomain, Hash, Keypair, PublicKey, Signature, Transaction};
 use randprotocol_zkvm::address::{address_of, envelope_from_core};
-use randprotocol_zkvm::hidden::hidden_input_v3 as hi;
+use randprotocol_zkvm::hidden::{hidden_bundle_digest_v3, hidden_input_v3 as hi, HiddenDigestInput, HiddenDigestInputV3};
 use randprotocol_zkvm::msauth::{self, M_MAX, N_MAX};
 use randprotocol_zkvm::notes::{Note, ViewingKey};
 use serde::{Deserialize, Serialize, Serializer};
@@ -88,13 +101,13 @@ pub struct Proposal {
     pub summary: Vec<String>,
 }
 
-/// One output as the account opened it. `recipient` is a `rand1…` address — this account's own
-/// for change, otherwise the address the proposal's informational summary names for this owner
-/// key — or `pk:<hex>` (the note's owner key) when neither applies, as for a dummy. Only the owner
-/// key is checked: an address's KEM half cannot be recovered from an envelope.
+/// One output as the account opened it: its owner key's [`owner_fingerprint`] (verified; the
+/// delivery key is not — see the module doc), whether that owner is this account (change), and
+/// the amount, asset and memo the note carries.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct OutputSummary {
-    pub recipient: String,
+    pub owner_fingerprint: String,
+    pub to_account: bool,
     pub amount: u64,
     pub asset: u32,
     pub memo: String,
@@ -132,7 +145,15 @@ impl ProposalSummary {
             .outputs
             .iter()
             .enumerate()
-            .map(|(n, o)| format!("{n}: {} to {} memo {:?}", amount_text(o.amount, o.asset), who(&o.recipient), o.memo))
+            .map(|(n, o)| {
+                format!(
+                    "{n}: → {} to {}{} memo {:?} (owner key verified; delivery key NOT verifiable from this proposal)",
+                    amount_text(o.amount, o.asset),
+                    if o.to_account { "this account " } else { "" },
+                    o.owner_fingerprint,
+                    o.memo
+                )
+            })
             .collect();
         lines.push(format!("fee {} RAND", format_amount(self.fee)));
         lines.push(format!(
@@ -153,13 +174,16 @@ fn amount_text(amount: u64, asset: u32) -> String {
     }
 }
 
-/// An address's fingerprint, or the `pk:` label as it is.
-fn who(recipient: &str) -> String {
-    ShieldedAddress::parse(recipient).map_or_else(|_| recipient.to_string(), |a| a.fingerprint().to_string())
+/// The fingerprint of an owner key alone: the first 16 hex digits (as many symbols as an address
+/// fingerprint has) of `blake3("rand-msig-owner-1" ‖ pk)`. Unlike an address's fingerprint it
+/// covers no KEM key, so it claims exactly what a signer verified.
+pub fn owner_fingerprint(pk: &Word8) -> String {
+    let bytes: Vec<u8> = pk.iter().flat_map(|w| w.to_le_bytes()).collect();
+    Hash::digest_domain(b"rand-msig-owner-1", &bytes).to_hex()[..16].to_string()
 }
 
 /// The informational `summary` lines a proposal carries (§6.4): the payment, the fee, the memo.
-/// [`check_proposal`] shows nothing from them but the address it names for an output's owner key.
+/// [`check_proposal`] neither shows nor relies on them.
 pub fn informational_summary(to: Option<(&ShieldedAddress, u64)>, asset: u32, fee: u64, memo: &str) -> Vec<String> {
     let mut lines = Vec::new();
     if let Some((addr, amount)) = to {
@@ -286,7 +310,8 @@ impl Proposal {
 
 /// 64 hex characters → 8 words (`word8_to_hex`'s inverse).
 pub fn parse_word8(hex: &str) -> Result<Word8, MsigError> {
-    word8_from_hex(hex).ok_or_else(|| invalid(format!("{hex:?} is not 64 hex characters")))
+    // Never echo the value: a salt or an `msk` is parsed here.
+    word8_from_hex(hex).ok_or_else(|| invalid(format!("a word is 64 hex characters; this one is {} characters or not hex", hex.len())))
 }
 
 /// The proposal's `binding`: 32 bytes, little-endian words, as hex.
@@ -324,7 +349,8 @@ fn parse_inputs(proposal_json: &str, policy_json: &str) -> Result<(Proposal, Pol
 /// 2. The proposal names this policy (`policy == hex(policy_hash)`).
 /// 3. `tx` decodes, carries a bundle and no action, on the proposal's chain; its binding under the
 ///    proposal's domain is `binding`, and `signing_message` is that binding's.
-/// 4. `auth_commit == msauth::auth_commit(nk, salt)`: the bundle spends from this account.
+/// 4. `auth_commit == msauth::auth_commit(nk, salt)`: the bundle spends from this account; and
+///    `expected` is the bundle's v3 digest, recomputed.
 /// 5. All four outputs open as sender under the account's scan key, each to the bundle's
 ///    commitment in its slot — an output that does not open is refused, never skipped.
 /// 6. Value: the witness's input notes nullify (under the account's `nk`) to exactly the bundle's
@@ -373,12 +399,28 @@ fn check(p: &Proposal, policy: &Policy) -> Result<ProposalSummary, MsigError> {
     if bundle.auth_commit != c || parse_word8(&p.auth_commit)? != c {
         return Err(refused("the proposal's auth_commit is not this policy's account"));
     }
+    // The digest the bundle proof must publish, recomputed from the bundle, never trusted.
+    let digest = hidden_bundle_digest_v3(&HiddenDigestInputV3 {
+        base: HiddenDigestInput {
+            anchor: bundle.anchor,
+            nullifiers: bundle.nullifiers,
+            commitments: bundle.commitments,
+            fee: bundle.fee,
+            burn_a: bundle.burn_a,
+            burn_r: bundle.burn_r,
+            burn_asset: bundle.burn_asset,
+            time: bundle.time,
+        },
+        auth_commit: c,
+    });
+    if parse_word8(&p.expected)? != digest {
+        return Err(refused("the proposal's expected digest is not its bundle's"));
+    }
 
     // 5. Every output, as the account.
     let vk = ViewingKey { nk };
     let scan_key = vk.scan_key();
     let account = policy.address();
-    let named: Vec<ShieldedAddress> = p.summary.iter().flat_map(|l| l.split_whitespace()).filter_map(|t| ShieldedAddress::parse(t).ok()).collect();
     let mut opened: Vec<(Note, String)> = Vec::with_capacity(bundle.envelopes.len());
     for (slot, (env, cm)) in bundle.envelopes.iter().zip(&bundle.commitments).enumerate() {
         let env = envelope_from_core(env);
@@ -437,14 +479,17 @@ fn check(p: &Proposal, policy: &Policy) -> Result<ProposalSummary, MsigError> {
         )));
     }
 
-    let recipient = |pk: &Word8| -> String {
-        if *pk == account.pk {
-            return account.to_string();
-        }
-        named.iter().find(|a| a.pk == *pk).map_or_else(|| format!("pk:{}", word8_to_hex(pk)), |a| a.to_string())
-    };
     Ok(ProposalSummary {
-        outputs: opened.iter().map(|(n, memo)| OutputSummary { recipient: recipient(&n.pk), amount: n.amount, asset: n.asset, memo: memo.clone() }).collect(),
+        outputs: opened
+            .iter()
+            .map(|(n, memo)| OutputSummary {
+                owner_fingerprint: owner_fingerprint(&n.pk),
+                to_account: n.pk == account.pk,
+                amount: n.amount,
+                asset: n.asset,
+                memo: memo.clone(),
+            })
+            .collect(),
         fee: bundle.fee,
         burns: Burns { burn_a: bundle.burn_a, burn_asset: bundle.burn_asset, burn_r: bundle.burn_r },
         expires_at: p.expires_at,

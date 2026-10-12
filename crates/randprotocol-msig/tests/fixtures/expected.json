@@ -15,25 +15,29 @@
         "amount": 0,
         "asset": 0,
         "memo": "",
-        "recipient": "pk:b2b749a9f3838472389920d8d8b917ac9a824f3f13f32a0589e6102c67aabe41"
+        "owner_fingerprint": "cb5c9747f9a2ef35",
+        "to_account": false
       },
       {
         "amount": 0,
         "asset": 0,
         "memo": "",
-        "recipient": "pk:863d15e8cce5a58d9f838dc0758c03d2fb6b4ba924fd0d6f3595af6ea037c0ce"
+        "owner_fingerprint": "2c94b28813d4ce65",
+        "to_account": false
       },
       {
         "amount": 10000000000,
         "asset": 0,
         "memo": "",
-        "recipient": "rand17gXwSDLFKubgL1XyThxChyBmpPiSqbaWjqeKVn5K8MfyUMe6fCCtZ52Q2ekUuAfoED4i5JGJ2nTtnpgM9kcGNMyjX42RzZvuqoSyJQXgf9oiB6MMb8AZVizwiGdAuWutF1VvKjQMD8StkUuPznta5xDrJ5xK9F2AM6p31VuLXb6ocHLXp2E6RXD3ThcYcemr7YWTBRENEDNoqBoSpskUkEeuc63ChrwTJ7NYFRSzZnRoyckuHmRvbxrSFT2ezsrDnwo7x3LaSggY7cQFMQZgvUkrK6FkXTK9eVLTEQG6a1trLBNYwza5w1W2UW4yBnQWgdqWcEsGHWaEkXPsX3bYxgUZuuNxCnCXRBX8HduDNBELv54karp6QYgQN9DPbJAok3mZKJpesmY2MuJRkcRF65rcZDKrrz446gKzJNSwigGagDxQ89N5QKFS2bWhukdm8ehCrHEWBcy7jATeY79aQRM5dxz4ckxPCuX8ogrBJeGvKMxtXSFcrgdQ4Wb8U2gwXmthaLgKrfkMM4rjduYBKQ5GXRXKJMfxLqDXcAqMmDecGDKRYk29FjyUPV3PeXtQ8Dzp8sUp2o9brJz7prpzs3UEBHXB7Ha6GZb4HQ2zkDc4Hkg5K3pgdM3z7JbuXUxX5fduk1jvLbh2JBtyLtW7KJw6scBmYwumo8KwGExpvAVMTqVe8rPiwtSs3nvERGzoGs3cAZUGdXPW8NBdadNdW42QiccH9VLCkRNVq3x67jz951Kg63rMk1oVEQKVvLqJPgraGmyWY2DEAweCwTanM5hWGy2e86Z1PQmDnADgWY1nMowkNSHFDm2UYxkwmdr5oXAJeTwn6h6EqMPPADrVXk5zrhSG8HkVXLeBNuXyXC2C1U2JPVwHL145AfkGWT5z7ug8bU4G3Zn1G81cP3VQ1tQgGXppA3ew2o1NBa6tBUka8HtsLKjMJ293JyywDfzKNULEgdJgArwy61LZeWG3UVrt2ZbbS3FbCRnywvdd2AFHUjcqPND4qfw2SKXAZpvba1kDHAY7ZfFmSHx9722NSg7RyYCnb1ALCmFeudfD39iQcqoKTeWTUwMiQz1XfALZYSNFGrwwkurCjB95p372baMxfuPK3sEzyKYNWtWSvvRXSbp5zgQpV6eFGuUjEnUMYPzr9PY3KyMD4ojgMKAi7VtvuWpLvFFTbWJXnNoBbox5V2gb3PfuHTkmF7VHxfFVaAx2Mbhg16LjTakxTKfpMErFrxq9qoRUb5ArUrgsh25H8eifUzjgALpRMakLcAhtPaVCdtZpreQuvFi74Z9o8Ya35qBafAL4dirheTwX8Xv2nppk2zgUeV9KkbytKHd1NSR53654rkmXbiqEBG5d2zv3kZUtjUYQc71DFee615aR9oTrkfcbcdBsDiM7LSHfYdqx4ythkFKMSFT7jfwqF2wUJ2G5WscqXTKsgPAvehHanS4zAzkytkaiF2wmxj378sJkniMfRsxSdovTkfHZYHob4etYZkQtUNswtSCganEBnaYsbrZXeSqzEdmXcWPL2cegBYB5cnS816Kfw8TqaadikmzNGq3LGLHLEgG7QVt4nHHD9ruKrsTg2tkZaF3jXRpyJbwkuq1DG3JwdAT1kysoQjbz7BGV7BTSNd4edsX2nyFFZjeTSuuPP8AtT"
+        "owner_fingerprint": "35bad5bd21a6f0f7",
+        "to_account": false
       },
       {
         "amount": 14999000000,
         "asset": 0,
         "memo": "",
-        "recipient": "rand17tkTyKDC3bhMMvEh9f1bZrpQsB5kfJY6oURkEuFTYf5TYAfjxaS8VKUz8T4sKSv77LVZFQHkAb8i1FcmnpjX6jN5bxGTaDMGzmwQH5RsVs8DnCfFv1qWrwpbmcqy82q7EtasRmFeHeRDfW4Rx9xEbXfyCq1KjZRFLWA5DW75vyNhNLU9StrKX4L8twpw4b9eXrE92QpYdCiK5eh1KH612DJf1XSkCEYADaCQTLYZSfSi73jCRE1L3nvQ1oPExWNTZFau6F5g7FALdbD6Fi2U4n7bj6bLYJ685sNgh9cGvSvaUjt1GMaivzx1MqjqhLqG9jVrFuGLHQrgrsUjPgnNYiWUfzKnPvGp9yyCNdR7hpey5djX5pyAKooSVnUMcrPumAt8yXCpsLJe3hsJQLLWFXTB8ufp9JEsEkjoRgtrvARUgBSHcz6sHc2CvTLXwDNpDreGj8wPYDLS8YrkGooNm7Ltb6du3WmcY7nm6TLQKtxYQvhBe92L5mHd6zF4WHuLdFvCzpGdC9gKiVMcMxEhPvRTymwwYwJbPpjDfpikNsxMDE9TXjfj7rDL3S5id3sYU6syzPCC2R1LEzhGzZrm83rvvypDLjqVqfcjK6DKkjR4ZjvDRp3tN1vZH4pGmjmTEhnRXTRADAvTTLHZs4a1LFS8pB2NRqhvbnJs2wosoRQxn46aET41whdudsZjbXH1HVTpMFCZVt4Z4XyAcAkgQdtpjUmek9qUJfZ8TKqqCDTw51V7whVanzpq3WbqhVuJeBHRoqNLoA7QmGTzsgFn6WCbGN92SRHPZaMr7jbtFWC15rdWz6uAfELP3sk3rMF9rGnDN3yUiYFTVrp5UxXzBqmFmPszHJYDyGJWtaFXsQAem4F1B7nR4KjYDoV6E1BBCkwWRZQMRKjPDVBLWHd5DAzZ5ToB5BJYSxoVpbfKhYbCjCqHc4TufF34S9aCgMgygsDLDkA4APq15YRWjQhVPjvULp5CYSbZbsS3or1suSqhCQ5tQvY6BRLdBqrW9Nhkz74axkRc68qooKkENwXNb46HBi7mWK3598nVQ4gTAVgxq6u7gUcmg8utjHu9bmh4ULn2ALRxLcEGUcapKwimPJp1BkKJPmwC8crJeXEZfprShZmB6m1SQBQyJdX1vxoU2pQEvfPKNSxrsrAE8js4kemeWrQih5b8FTTEgryDxqgPRZrTyE81rHciqSaJBTyWFJL8LHRmJyVWvuxgf7D7BhxUvH7UNRUQAfpjebwJPvNtbznnftyUdxdvDjojLNohLq41fXQfuZQ8bZeQdg5Ei8rTzEGKWnRynbEEsiSQ4TB9QCnYr2WHVBYMhhTXF8cnMaTaiL5Q1u2z7RavTLqjKtFUBzZ15o7eoas3Sng3XmDn7jBr9xHw2BtjddTPnxYaPVo9bcWA1gNs1HjQqiBsDjyKDSobS6tgZvZTPQ9B4moXwDMbp9huH5kdchsJfaFg1cSnBCD5bfm8gHVuE6ryAVWK7pRBVBCUtMk8iHBd7CY1Pwqe8Z93dj8rLDocDWxDZD2VRqpriSMoA9wFCe4xPoriXnqTKibB9kKSgweeTK1QhgsC8MWtvZsrMiGcAafJVmQeYcmZuNKUNy6SP5SNmmc17FiyNcLoKEhSTrLJd1pWr7NtDv7VtRQP6aiVq"
+        "owner_fingerprint": "4333dd507bcc4286",
+        "to_account": true
       }
     ],
     "policy_fingerprint": "NFYW-K8E9-E5K9-AAK3",

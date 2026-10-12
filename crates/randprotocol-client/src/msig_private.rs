@@ -272,7 +272,8 @@ fn json<T: serde::Serialize>(v: &T) -> String {
 /// value conserved against the witness) — and the summary lines it checked, for the signer to
 /// read. Refused for a key outside the policy.
 pub fn sign(proposal: &Proposal, policy: &Policy, key: &Keypair) -> Result<(Share, Vec<String>)> {
-    let (proposal, policy) = (json(proposal), json(&policy.pure()));
+    // The policy's JSON carries `msk`: wiped when dropped.
+    let (proposal, policy) = (json(proposal), zeroize::Zeroizing::new(json(&policy.pure())));
     let shown = pure::check_proposal(&proposal, &policy)?.lines();
     let (index, sig) = pure::sign(&proposal, &policy, key.seed())?;
     Ok((Share { index, signature: Signature::from_bytes(&sig)? }, shown))
@@ -343,7 +344,7 @@ fn prepared_of(proposal: &Proposal, tx: &Transaction) -> Result<Prepared> {
 /// No expiry check: this takes no node. The CLI reads the head and refuses at or past
 /// `expires_at - 16` before calling it.
 pub async fn prove(proposal: &Proposal, policy: &Policy, shares: &[Share], proving: &Proving, profile: FriProfile) -> Result<Transaction> {
-    pure::check_proposal(&json(proposal), &json(&policy.pure()))?;
+    pure::check_proposal(&json(proposal), &zeroize::Zeroizing::new(json(&policy.pure())))?;
     let words = zeroize::Zeroizing::new(assemble_witness(proposal, policy, shares)?);
     let mut tx = Transaction::decode(&hex::decode(&proposal.tx)?)?;
     let binding = parse_binding(&proposal.binding)?;
@@ -497,6 +498,39 @@ mod tests {
         // A second proposal over the same notes is still possible.
         assert!(prepare(&rpc, &p, &mut store, &to, randprotocol_core::UNITS_PER_RAND, "", randprotocol_core::gas::BUNDLE_BASE, 7).await.is_ok());
         drop(prop);
+    }
+
+    /// `prepare_sweep`: every RAND note less the fee, to one output; more than two notes refused.
+    #[tokio::test]
+    async fn prepare_sweep_moves_the_whole_rand_balance_and_refuses_more_than_two_notes() {
+        let (p, _) = two_of_three();
+        let unit = randprotocol_core::UNITS_PER_RAND;
+        let fee = randprotocol_core::gas::BUNDLE_BASE;
+        let to = crate::wallet::Wallet::from_spend_key(randprotocol_zkvm::notes::SpendKey([6; 8])).address;
+        let (rpc, mut store) = crate::wallet::tests::fake_multisig_chain_with(&p.wallet(), &[3 * unit, 4 * unit]).await;
+        let sweep = prepare_sweep(&rpc, &p, &mut store, &to, fee, 7).await.unwrap();
+        let s = crate::multisig_private::check_proposal(&json(&sweep), &json(&p.pure())).unwrap();
+        let moved: Vec<u64> = s.outputs.iter().filter(|o| o.amount > 0).map(|o| o.amount).collect();
+        assert_eq!(moved, vec![7 * unit - fee], "one output, the whole balance less the fee, no change");
+        let (rpc, mut store) = crate::wallet::tests::fake_multisig_chain_with(&p.wallet(), &[unit, unit, unit]).await;
+        let e = prepare_sweep(&rpc, &p, &mut store, &to, fee, 7).await.err().expect("three notes are refused").to_string();
+        assert!(e.contains("send to yourself first to merge"), "{e}");
+    }
+
+    /// More shares than the threshold: all are verified, the lowest `M_MAX` indices are kept, and
+    /// the guest still publishes `auth_commit`.
+    #[test]
+    fn assemble_witness_keeps_the_lowest_m_max_of_more_than_t_shares() {
+        use randprotocol_zkvm::msauth::{M_MAX, SLOT_WORDS};
+        let k = keys(4);
+        let p = Policy::new(k.iter().map(|k| k.public_key().clone()).collect(), 2).unwrap();
+        let prop = proposal(&p);
+        let shares: Vec<Share> = [3usize, 1, 0, 2].iter().map(|&i| sign(&prop, &p, &k[i]).unwrap().0).collect();
+        let w = assemble_witness(&prop, &p, &shares).unwrap();
+        let active: Vec<(u32, u32)> = (0..M_MAX).map(|s| (w[17 + s * SLOT_WORDS], w[17 + s * SLOT_WORDS + 1])).collect();
+        assert_eq!(active, vec![(1, 0), (1, 1), (1, 2)], "the lowest M_MAX = 3 indices, in order");
+        let binding = parse_binding(&prop.binding).unwrap();
+        assert_eq!(randprotocol_zkvm::executor::run_msauth(&w, &binding).unwrap(), parse_word8(&prop.auth_commit).unwrap());
     }
 
     #[test]

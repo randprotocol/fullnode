@@ -1,5 +1,5 @@
 //! The seeded generator of `tests/fixtures/*.json`: a 2-of-3 policy and one proposal over a real v3
-//! bundle (no proof), built from `randprotocol-zkvm` primitives only — no client — and three bad
+//! bundle (no proof), built from `randprotocol-zkvm` primitives only — no client — and six bad
 //! proposals derived from it.
 //!
 //! Every random value comes from one `ChaCha20Rng::seed_from_u64(0x2026_1011)`, drawn in the
@@ -159,7 +159,7 @@ pub fn vectors() -> BTreeMap<&'static str, String> {
         informational_summary(Some((&recipient, PAYMENT)), 0, fee, ""),
     );
 
-    // ---- the three bad proposals ----
+    // ---- the six bad proposals ----
     // Output slot 3 (the change) sealed again under a throwaway sender: the commitment stays, the
     // envelope moves, so the binding and signing message are re-made over it (a proposer hiding an
     // output would hand out a self-consistent file) and only "opens as sender" can refuse it.
@@ -180,6 +180,26 @@ pub fn vectors() -> BTreeMap<&'static str, String> {
     let v = (w[lo] as u64 | (w[hi_] as u64) << 32) + 1;
     (w[lo], w[hi_]) = (v as u32, (v >> 32) as u32);
     mismatch.bundle_words = words_hex(&w);
+    // The envelope edit above with the binding left as it was: refused at the binding.
+    let mut unbound = valid.clone();
+    unbound.tx = tampered.tx.clone();
+    // An `expected` digest that is not the bundle's.
+    let mut wrong_expected = valid.clone();
+    let mut digest = randprotocol_msig::parse_word8(&valid.expected).unwrap();
+    digest[0] ^= 1;
+    wrong_expected.expected = word8_to_hex(&digest);
+    // The fee raised by 1 in the bundle and the witness, the digest and binding re-made: every
+    // check up to the balance passes, and the balance cannot (the outputs did not shrink).
+    let mut fee_tx = tx.clone();
+    fee_tx.bundle.as_mut().unwrap().fee += 1;
+    let mut fee_words = words.clone();
+    let f = (fee_words[hi::FEE_LO] as u64 | (fee_words[hi::FEE_HI] as u64) << 32) + 1;
+    (fee_words[hi::FEE_LO], fee_words[hi::FEE_HI]) = (f as u32, (f >> 32) as u32);
+    let fee_expected = hidden::hidden_bundle_digest_v3(&HiddenDigestInputV3 {
+        base: HiddenDigestInput { anchor, nullifiers, commitments, fee: fee + 1, burn_a: 0, burn_r: 0, burn_asset: 0, time: TIME },
+        auth_commit,
+    });
+    let fee_raised = Proposal::new(&policy, &fee_tx, &Hash::ZERO, 0, &fee_words, &fee_expected, &salt, EXPIRES_AT, valid.summary.clone());
     // One block past the longest window a chain may set.
     let mut expired = valid.clone();
     expired.expires_at = TIME as u64 + randprotocol_core::ledger::MAX_PROOF_WINDOW_BLOCKS + 1;
@@ -206,6 +226,9 @@ pub fn vectors() -> BTreeMap<&'static str, String> {
         ("expected.json", pretty(&expected_json)),
         ("policy.json", policy_json),
         ("proposal-expired.json", pretty(&expired)),
+        ("proposal-fee-raised.json", pretty(&fee_raised)),
+        ("proposal-unbound.json", pretty(&unbound)),
+        ("proposal-wrong-expected.json", pretty(&wrong_expected)),
         ("proposal-tampered-output.json", pretty(&tampered)),
         ("proposal-valid.json", valid_json),
         ("proposal-value-mismatch.json", pretty(&mismatch)),
