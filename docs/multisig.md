@@ -1,6 +1,6 @@
 # Multisig accounts: M-of-N controlled public balances
 
-> **Status: implemented on `feat/multisig`, not yet on any chain.** The section is genesis-gated: a
+> **Status: on `main` (fullnode 3119a29a), not yet on any chain.** The section is genesis-gated: a
 > chain without it refuses all four actions (`UnsupportedAction("multisig")`) and runs byte for
 > byte as before, so the build changes no live chain. It reaches one with the genesis cut that
 > carries the treasury. Design: `docs/superpowers/specs/2026-10-08-multisig-design.md`.
@@ -216,6 +216,145 @@ rand-node multisig rotate submit --proposal rotate.json --signature 0:<hex> --si
 A payment reveals "account X paid N of asset A" at that block, exactly as a program invoke does; the
 receiving note is shielded, and from then on the RAND is indistinguishable from any other.
 Creating and depositing burn from a shielded wallet, so they reveal the amount, not the funder.
+
+### So is a multisig account private?
+
+**No — not the account itself.** A multisig account is a *public register*, like the validator and
+vesting registers: its balance, its signer keys, its threshold and every payment out of it are on
+chain for anyone to read. Only the edges are shielded: the wallet that created or funded it (a
+burn from a shielded note) and where a payout goes once it is a note. It is the right shape for a
+foundation treasury, whose balance is meant to be auditable; it is the wrong shape for anyone who
+wants M-of-N control *and* RandProtocol's normal privacy.
+
+The reason is where the threshold check runs. A shielded note is spent by a proof that its owner
+knows one key (`sk`, or on split-authorisation chains the auth proof over `sk`, `docs/shielded.md`
+§2); there is no threshold inside that proof. So the four multisig actions check their Dilithium2
+signatures **natively, in the node, outside any proof** — and whatever the node checks, it must
+see: the keys, the threshold, the indices that signed, the amounts.
+
+Explicit multisig is also the post-quantum norm, not a RandProtocol shortcut. The compact
+constructions classical chains use — MuSig2 and FROST (one Schnorr signature for M of N), BLS
+aggregation — all rest on discrete logs or pairings that a quantum computer breaks, and lattice
+threshold signatures are not yet standardised or deployed. What is left is N public keys and M
+independent Dilithium2 signatures: 1 312 bytes per key and 2 420 per signature on the wire, with
+the signer set visible.
+
+## Private accounts (private multisig, v0.8.0)
+
+A private account moves the M-of-N check **into a proof**, so the node verifies one proof instead
+of M signatures and learns nothing about the policy. It needs a chain whose genesis names
+`hc_auth_multisig` (`rand_status` and `rand_getLimits` serve it; chain 21 onward). The commands are
+[`rand multisig-private`](cli.md#rand-multisig-private); the chain-side rules are
+`docs/shielded.md` §2, "Private multisig: the second auth guest"; the designs are
+`docs/superpowers/specs/2026-10-11-private-multisig-design.md` and
+`docs/superpowers/specs/2026-10-11-private-multisig-phase4-design.md`.
+
+- A **policy** is up to 16 Dilithium2 signer keys (the same `rand-node keygen` files a public
+  account uses), a threshold `T` from 1 to 3 (`M_MAX`), and `msk`, 8 random words every signer
+  holds. Its `nk` is `H(69, msk ‖ policy)`, so its address is an ordinary `rand1…` address, its
+  notes sit in the one shielded pool, and nobody can tell it from a single-key wallet.
+- **Spending** uses the existing bundle guest unchanged. What changes is the *auth* proof: a second
+  auth guest (tier 18) verifies `T` signatures over the transaction's binding inside the zkVM and
+  publishes the same `auth_commit` the single-key auth guest does.
+- `msk` and the policy are a **viewing** key: every signer can scan the account and read its whole
+  history. Neither can spend without `T` signatures.
+
+### Public register or private policy: what each shows
+
+| | public account (`MultisigPay`, this page above) | private account (`hc_auth_multisig`) |
+|---|---|---|
+| the account | an id on the register | an ordinary `rand1…` address, indistinguishable from any other |
+| balance | every asset's balance, on chain | hidden (shielded notes) |
+| signers, N, threshold | the keys and the threshold, on chain | hidden |
+| which signers signed | the indices, on chain | hidden |
+| a payment's amounts and recipients | the payouts' amounts (recipients shielded) | hidden |
+| what the chain does see | everything above | that the auth proof has the multisig shape, the bundle's public fields, the transaction size |
+| what a signer signs | a 32-byte blake3 digest, checked natively by the node | `b"rand-msauth-1" ‖ binding`, checked inside the proof |
+| cost | a few KB of keys and signatures | a ≥ 3.4 MB auth proof (estimated; the Production size is not yet measured), proved on a ≥ 48 GB machine |
+
+A treasury that must be auditable stays public; M-of-N control with the pool's privacy is the
+private account.
+
+### Funding, from anywhere
+
+A private address receives like any other: a shielded transfer, a mint, a bridge deposit — and a
+**public account's `MultisigPay`**, whose payout is a note like any other. So a public treasury
+moves into a private account with an ordinary `MultisigPay` to the private address (the end-to-end
+test does exactly this); the payment is visible on the public side and nothing after it is.
+
+### Rotation is a sweep
+
+There is no register and no nonce. To change the signers, the threshold or `msk`, make a new policy
+and spend every note of the old account to its address: `rand multisig-private prepare --sweep-to
+<new address>`, signed by `T` of the **old** signers. Replay protection is the nullifier, so a
+proposal prepared before the rotation dies when its notes are spent. The old policy still reads
+the old account's history; give the new `msk` only to the new signers.
+
+### The signing domain
+
+A private-account signature is over `b"rand-msauth-1" ‖ binding (32 LE bytes)`; a public account's
+`MultisigPay`/`MultisigRotate` signatures are over a bare 32-byte blake3 digest. The prefix keeps a
+signature made for one from ever being valid for the other, so the same key can sign both without
+one signature moving funds of the other kind.
+
+### What a signer sees, and what it cannot check
+
+`rand multisig-private sign` (and `check`) recomputes the binding from the proposal's bundle, opens
+every output as the sender, and shows each output by its **owner-key fingerprint** — the first 16 hex
+digits of `blake3("rand-msig-owner-1" ‖ pk)` (`randprotocol_msig::owner_fingerprint`) — never by an
+address taken from the proposal's summary. The summary's first line names the chain id and the
+genesis hash, so a testnet proposal is not mistaken for a mainnet one.
+
+**Who is paid is checked only if the signer names the payee.** The coordinator holds the policy,
+so it can build a proposal that passes every other check while paying a key of its own: the checks
+prove each output is *some* owner key and the value balances, not that the payee is the one the
+signer meant. So the signer flow is:
+
+1. Ask the payee, out of band, for their `rand1…` address (`rand address` prints it, and also its
+   `owner fingerprint`).
+2. Sign with `--expect-to <address>[:AMOUNT]` (repeat it for several payees). Three rules, or
+   nothing is signed:
+   - every output that moves value and is not the account's own change pays one of those
+     addresses' owner keys (`output N pays <owner fingerprint>, not an expected recipient`);
+   - every named address is paid by at least one such output
+     (`expected recipient <fp> is not paid`);
+   - with `:AMOUNT` (RAND, written as `--amount` is), the outputs paying that address sum to
+     exactly it (`expected recipient <fp> is paid <sum>, not <AMOUNT>`; a non-RAND output to it
+     is refused).
+
+   The paying line then says `matches <address fingerprint> (<amount>)`. (Zero-amount outputs, a
+   bundle's dummies, move nothing and are not held to it.)
+3. If you only have the payee's owner fingerprint, compare it by eye with the output line.
+
+Without `--expect-to` the share is still produced — the coordinator-trusting mode stays possible —
+but the summary says, once, `WARNING: no expected recipient given: the payee was NOT checked`.
+
+What is verified: the owner key, amount, asset and memo of every output; the change returns to this
+account; value balances; the chain, genesis and binding; with `--expect-to`, the payee's owner key.
+What is **not** verified: the delivery key. Every output line carries the caveat **"owner key
+verified; delivery key NOT verifiable from this proposal"**. ML-KEM encapsulation is randomised, so a
+proposal cannot prove which KEM key an output's envelope was sealed to: a dishonest coordinator could
+pay the right owner key with an envelope its recipient cannot open (nothing is stolen, but the payee
+does not find the note until the envelope is re-sent). Confirm receipt with the payee; a
+deterministic seal API, which would let a signer re-seal and compare, is a follow-up. The checks are the pure, wasm32-clean crate
+`randprotocol-msig` (re-exported as `randprotocol_client::multisig_private`, vendored by the clients'
+core), so a browser signer runs the same code.
+
+### Key reuse
+
+- A signer key on **both** a public account and a private policy links them for anyone who knows
+  the policy: the public register lists the key. `new-policy --public-account <ID>` warns for every
+  such signer; use fresh keys for a private policy.
+- Never sign with a validator key: `sign` warns when the key looks like one (its address is in
+  `rand_getValidators`, or the file is a datadir `node.key.json`).
+- The custody rules below apply unchanged: never two signer keys in one place.
+
+### Not yet
+
+- The auth proof is proved **locally only**; delegating it to a prover is specified (phase-4 spec
+  §6.6) and not built. The bundle proof can go to a paired prover.
+- A bundle spends at most two RAND notes, so `prepare --sweep-to` refuses an account holding more:
+  merge them first (pay the account to itself), then sweep.
 
 ## Reading it
 

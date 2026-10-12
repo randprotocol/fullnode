@@ -265,7 +265,7 @@ pub mod col {
     pub const JALR_B0: usize = SYS_HASH_LEN + 1;
     /// Constraint set 8 (fullnode spec 2026-09-28 §4.2): the gas accumulated *through* this row —
     /// `1` on row 0 (always a digest row, weight 1), then on every real row the previous row's
-    /// `GAS` plus this row's weight `1 + 2·IS_HASH + 191·SYS_KECCAK + 63·SYS_SHA256`
+    /// `GAS` plus this row's weight `1 + 2·IS_HASH + 191·SYS_KECCAK + 63·SYS_SHA256 + 167·SYS_MODQ`
     /// (`gas::row_gas`'s constants). Read once, on the `HALT` row, against `pv::GAS`; unconstrained
     /// on padding rows (the fill copies the halt row's value forward). Appended at the end of the
     /// column list.
@@ -274,9 +274,17 @@ pub mod col {
     /// other row) of `pv::GAS − GAS` on the `HALT` row — they prove `GAS ≤ GAS_LIMIT` without
     /// publishing the run's gas. `GD0 + k` is limb `k`, little-endian.
     pub const GD0: usize = GAS + 1;
-    pub const WIDTH: usize = GD0 + 4;
+    /// Private multisig phase 3 (spec §3.2): the `MODQ` ecall row — `SYS_SHA256`'s twin. One row;
+    /// `a0` (in `B`) is the arena's word address `BASE`, bounded through the shared
+    /// `HASH_PTR`/`HP0..3`/`HP3_HI` columns exactly as a sha256 row's pointer is, and `a1` (in
+    /// `MEM_VAL`, the register read every ecall row makes) is the op word. The whole call — its
+    /// 1 024-row block and its memory traffic — belongs to the modq chip, which this row claims
+    /// once on `bus::MODQ` as `(CLK, HASH_PTR, MEM_VAL)` with a 0/1 count, so `CLK` is unique per
+    /// real block. Appended at the end of the column list, like every column since M4.2.
+    pub const SYS_MODQ: usize = GD0 + 4;
+    pub const WIDTH: usize = SYS_MODQ + 1;
     /// Columns that must be zero on padding rows.
-    pub const SELECTORS: [usize; 31] = [
+    pub const SELECTORS: [usize; 32] = [
         IS_ALU, IS_IMM, IS_BRANCH, IS_LB, IS_LH, IS_LW, IS_SB, IS_SH, IS_SW, SIGNED,
         IS_JAL, IS_JALR, IS_LUI, IS_AUIPC, IS_ECALL, WRITES_RD, SYS_HALT, SYS_WRITE, SYS_READ, BR_NEG,
         SYS_HASH, IS_HASH, IS_HASH_OUT, HASH_FIN, IS_DIGEST, IS_INDIGEST, SYS_KECCAK, SYS_SHA256,
@@ -285,6 +293,8 @@ pub mod col {
         SYS_READ_PUB, IS_PUBDIGEST,
         // The next constraint set (HCS-4).
         SYS_HASH_LEN,
+        // Private multisig phase 3: boolean, and zero on padding rows, like `SYS_SHA256`.
+        SYS_MODQ,
     ];
 }
 pub mod pv {
@@ -379,7 +389,9 @@ where
             let w_next = one.clone()
                 + AB::Expr::from_u64(crate::gas::POSEIDON2_ABSORB_GAS - 1) * n(IS_HASH)
                 + AB::Expr::from_u64(crate::gas::KECCAK_GAS - 1) * n(SYS_KECCAK)
-                + AB::Expr::from_u64(crate::gas::SHA256_GAS - 1) * n(SYS_SHA256);
+                + AB::Expr::from_u64(crate::gas::SHA256_GAS - 1) * n(SYS_SHA256)
+                // Private multisig phase 3: `SYS_SHA256`'s twin, at `MODQ_GAS − 1`.
+                + AB::Expr::from_u64(crate::gas::MODQ_GAS - 1) * n(SYS_MODQ);
             t.assert_zero(n(IS_REAL) * (n(GAS) - v(GAS) - w_next));
         }
 
@@ -526,6 +538,8 @@ where
         b.assert_zero(off_cpu.clone() * v(SYS_READ));
         b.assert_zero(off_cpu.clone() * v(SYS_KECCAK));
         b.assert_zero(off_cpu.clone() * v(SYS_SHA256));
+        // Private multisig phase 3: `SYS_SHA256`'s twin.
+        b.assert_zero(off_cpu.clone() * v(SYS_MODQ));
         b.assert_zero(off_cpu.clone() * v(SYS_READ_PUB));
         b.assert_zero(off_cpu.clone() * v(A));
         b.assert_zero(off_cpu.clone() * v(B));
@@ -751,7 +765,8 @@ where
         bus::MEMORY.send(b, [slot_w_space, slot_w_addr, ts(SLOT_W), slot_w_val, slot_w_is_write], Count::bounded(count3, 1));
 
         // syscalls: a = number, b = arg0, mem_val = arg1
-        let sys_sum = v(SYS_HALT) + v(SYS_WRITE) + v(SYS_READ) + v(SYS_HASH) + v(SYS_KECCAK) + v(SYS_SHA256) + v(SYS_READ_PUB) + v(SYS_HASH_LEN);
+        // Private multisig phase 3: `SYS_MODQ` joins the one-hot, beside `SYS_SHA256`.
+        let sys_sum = v(SYS_HALT) + v(SYS_WRITE) + v(SYS_READ) + v(SYS_HASH) + v(SYS_KECCAK) + v(SYS_SHA256) + v(SYS_READ_PUB) + v(SYS_HASH_LEN) + v(SYS_MODQ);
         b.assert_zero(v(IS_ECALL) * (sys_sum.clone() - one.clone()));
         b.assert_zero((one.clone() - v(IS_ECALL)) * sys_sum);
         b.assert_zero(v(SYS_HALT) * (v(A) - AB::Expr::from_u32(SYS_NUM_HALT)));
@@ -825,7 +840,11 @@ where
         // and the shared limb columns still carry one well-defined pointer per row.
         //
         // HCS-4: and `SYS_HASH_LEN`, whose group addresses memory exactly as a `SYS_HASH` group does.
-        let hp_gate = v(SYS_HASH) + v(SYS_KECCAK) + v(SYS_SHA256) + v(SYS_HASH_LEN);
+        //
+        // Private multisig phase 3: and `SYS_MODQ`, `SYS_SHA256`'s twin — the modq chip addresses
+        // `BASE .. BASE + 8 959` by plain field addition and bounds nothing itself. Still one-hot
+        // with the others, so the count stays ≤ 1.
+        let hp_gate = v(SYS_HASH) + v(SYS_KECCAK) + v(SYS_SHA256) + v(SYS_HASH_LEN) + v(SYS_MODQ);
         {
             let mut hp = AB::Expr::ZERO;
             for i in 0..4 { hp += v(HP0 + i) * AB::Expr::from_u32(1 << (8 * i)); }
@@ -907,6 +926,31 @@ where
             // table's own (digest-prefix-shifted) clock, which is also what the chip's memory
             // timestamps `4·CLK`/`4·CLK + 1` are built from.
             bus::SHA256.lookup_key(b, [v(CLK), v(HASH_PTR)], Count::bounded(v(SYS_SHA256), 1));
+        }
+
+        // Private multisig phase 3 (spec §3.2): the `MODQ` ecall row, `SYS_SHA256`'s twin rule for
+        // rule. `a0` (in `B`) is the arena base, copied into the bounded `HASH_PTR`; `a1` is
+        // `MEM_VAL`, deliberately not pinned for the reason the sha256 block gives (it is the `a1`
+        // register read, bound over `MEMORY` on every ecall row) — and here it is load-bearing:
+        // it is the op word the chip decomposes.
+        {
+            b.assert_zero(v(SYS_MODQ) * (v(A) - AB::Expr::from_u32(crate::isa::SYS_MODQ)));
+            b.assert_zero(v(SYS_MODQ) * (v(HASH_PTR) - v(B)));
+            // The rest of the hash group's shared columns stay zero, as on a sha256 row.
+            b.assert_zero(v(SYS_MODQ) * v(HASH_N));
+            b.assert_zero(v(SYS_MODQ) * v(HASH_LEFT));
+            b.assert_zero(v(SYS_MODQ) * v(HASH_IDX));
+            for i in 0..8 { b.assert_zero(v(SYS_MODQ) * v(HS0 + i)); }
+            // The cubic pointer rule: `HP3_HI ∈ {0, 1, 2}`, so `BASE < 0x3000_0000` and every chip
+            // address `BASE + 8 959` stays below `2^30` (the CRITICAL-1 key-aliasing argument;
+            // the emulator's `MODQ_PTR_LIMIT` is the tighter honest bound).
+            let hi = v(HP3_HI);
+            b.assert_zero(
+                v(SYS_MODQ) * hi.clone() * (hi.clone() - one.clone()) * (hi - AB::Expr::TWO),
+            );
+            // The chip's side: one `IS_REAL·IS_FIRST` entry per real 1 024-row block, keyed by
+            // `(clk, base, a1)`. A 0/1 count on a boolean selector, so one claim per ecall row.
+            bus::MODQ.lookup_key(b, [v(CLK), v(HASH_PTR), v(MEM_VAL)], Count::bounded(v(SYS_MODQ), 1));
         }
         {
             let mut t = b.when_transition();
@@ -1853,6 +1897,20 @@ pub fn cpu_trace(program: &Program, inputs: &[u32], public: &[u32], salt: [u32; 
                 let hpl = limbs(ptr);
                 for k in 0..4 { r[HP0 + k] = hpl[k]; range.range8((ptr >> (8 * k)) & 0xff); }
                 let hp3 = (ptr >> 24) & 0xff;
+                let (hp3_lo, hp3_hi) = (hp3 & 0xf, hp3 >> 4);
+                r[HP3_HI] = F::from_u32(hp3_hi);
+                nibble.and4(hp3_lo, 0);
+                nibble.and4(hp3_hi, 0xC);
+            }
+            // Private multisig phase 3: the `Sha256` arm below, for `SYS_MODQ` — the arena base
+            // in `HASH_PTR` with its bounded byte decomposition. `a1` needs nothing here: it is
+            // already `MEM_VAL`, the register read every ecall row fills.
+            Some(Syscall::Modq { base, .. }) => {
+                r[SYS_MODQ] = F::ONE;
+                r[HASH_PTR] = F::from_u32(base);
+                let hpl = limbs(base);
+                for k in 0..4 { r[HP0 + k] = hpl[k]; range.range8((base >> (8 * k)) & 0xff); }
+                let hp3 = (base >> 24) & 0xff;
                 let (hp3_lo, hp3_hi) = (hp3 & 0xf, hp3 >> 4);
                 r[HP3_HI] = F::from_u32(hp3_hi);
                 nibble.and4(hp3_lo, 0);

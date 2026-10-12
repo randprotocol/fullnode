@@ -16,6 +16,10 @@ authoritative reference and are cited by name below.
 > eight-mandatory-tables, no-sha256, no-public-segment set; proofs made under it do not verify
 > under set 6, so the move was a hard fork — see `docs/confidential.md`'s "Constraint set 6"
 > section.
+>
+> **Constraint set 9 (v0.8.0, chain 21 onward):** the MODQ chip — syscall 8 and an optional `modq`
+> table, carried only by the multisig auth guest's proofs. Every verifier key and the proof encoding
+> moved with it; see §8a.
 
 ## 1. What a proof states
 
@@ -114,15 +118,16 @@ comes from `a1` through the row's memory slot; a value-returning syscall writes 
 | 5 | `SHA256 ptr` **(M4.4)** | one SHA-256 compression of the 24 words at word address `ptr` (16-word block, 8-word chaining state), the new state written back in place; the sha256 table reads and writes the words itself | 1 | **64** |
 | 6 | `READ_PUBLIC idx` **(constraint set 6)** | returns public-segment word `idx`, looked up in the public table; two reads of one index agree; `idx ≥ n_pub` is unsatisfiable | 1 | 1 |
 | 7 | `POSEIDON2_LEN ptr n` **(constraint set 7)** | `POSEIDON2` with the length seeded into capacity lane 4, at least one permutation | 1 + max(⌈n/4⌉, 1) + 2 | `3 + 3·max(⌈n/4⌉, 1)` (the bare formula is exact for every `n ≥ 1`; at `n = 0` it still absorbs one length-seeded empty block, so its true minimum is 6, not 3) |
+| 8 | `MODQ base args` **(constraint set 9)** | one mod-q (`q = 8 380 417`, Dilithium's prime) operation on 256-coefficient polynomials in the arena at word address `base`: `NTT`, `INTT`, `DOT4` or `MSUB4` (`a1 = op ‖ OUT ‖ A ‖ B`, `modq::Args`); the modq table reads and writes the words itself | 1 | **168** (`MODQ_GAS`: one 1 024-row block of 59 + 16 columns) |
 
 Every ordinary RV32I/RV32M cpu row (no syscall) costs 1 gas the same way `WRITE_OUTPUT`/etc. do;
 the syscalls above are the only non-uniform costs (`docs/fees.md` §5's constants,
 `randprotocol-zkvm/src/gas.rs`, constraint set 8, not yet cut).
 
-Rows 0–7 are the whole syscall surface. A guest that issues `ECALL` with `a7 = 4` or `a7 = 5`
-makes its proof declare the matching hash table (`keccak_log_height` / `sha256_log_height !=
-0`); a `SYS_KECCAK` or `SYS_SHA256` row in a proof that declares none cannot balance that bus
-and is rejected. `READ_PUBLIC` needs no such declaration: the public table is in every batch.
+Rows 0–8 are the whole syscall surface. A guest that issues `ECALL` with `a7 = 4`, `a7 = 5` or
+`a7 = 8` makes its proof declare the matching table (`keccak_log_height` / `sha256_log_height` /
+`modq_log_height != 0`); a `SYS_KECCAK`, `SYS_SHA256` or `SYS_MODQ` row in a proof that declares
+none cannot balance that bus and is rejected. `READ_PUBLIC` needs no such declaration: the public table is in every batch.
 
 Note commitments, nullifiers and Merkle verification are **not** syscalls: they are assembler
 library routines that stage a domain-tagged message in RAM and call `POSEIDON2`
@@ -269,6 +274,34 @@ keccak-bearing proof is admissible on this chain today; `docs/block-space.md` ha
 consequences. *(Note 2026-09-28: 2 MiB is `gas::MAX_PROOF_BYTES`, the default for a genesis that does not set `max_proof_bytes`. The live chain does: chain 15's genesis — like chains 13 and 14 — sets `max_proof_bytes` to 8 388 608 (8 MiB), so a keccak-carrying proof fits there.)*
 
 Proving is a wallet-side cost paid once; verification is the consensus cost paid by every node.
+
+## 8a. Constraint set 9: the MODQ chip
+
+Vendored from circuits `d217252` (`CIRCUITS_PIN`; the chip itself landed at `57fb9dc`, spec
+`circuits/docs/superpowers/specs/2026-10-11-rvm-modq-chip-design.md`) for private multisig
+(`docs/shielded.md` §2). A Dilithium2 verify is mostly polynomial arithmetic mod `q`; done in RV32
+instructions it costs 880 102 cycles, with the `MODQ` syscall (§4, row 8) 80 572. That is what
+lets the multisig auth guest verify up to three signatures inside tier 18 (85 830 / 169 068 /
+251 946 cycles at M = 1 / 2 / 3, against tier 18's 262 143).
+
+- **A new optional table.** `modq`, like `keccak` and `sha256`, is present only in a proof whose
+  guest called the syscall: each call is one 1 024-row block (59 main + 16 preprocessed columns),
+  so its height is a power of two from 2^10 to 2^20. A proof declares it in the new header field
+  **`Proof.modq_log_height`** (`0` = no table).
+- **Every key moved, and the encoding.** The cpu AIR gained the syscall's columns, so every verifier
+  key changed (bundle, auth, call, the recursion's inner key: `inner_vk_digest` `1b0c4b00…ddc7`,
+  `docs/aggregation.md`), and `Proof` gained `modq_log_height`. That is why a constraint-set-9 build
+  runs chain 21 onward and refuses chains 18–20 at startup (`node::CHAINS_THIS_BUILD_CANNOT_RUN`).
+- **Only the multisig auth guest carries it.** `ZkExecutor::msauth_heights()` is the only shape that
+  declares a non-zero `modq_log_height` (16, pinned exactly). A bundle and a single-key auth proof
+  are refused one by their exact pins; every call, hardened call, invoke and state proof refuses a
+  modq table by its own check before any key is built; and no aggregate or tree path hands a
+  modq-bearing proof to the chip-free recursion verifier (`agg_executor`). The memory-height
+  ceiling and the preprocessed-matrix count both see the table (`executor.rs`, `NO_MODQ`).
+- **Proof size.** A chip-free proof grows by ≈ 1–4 KB over constraint set 8 (the wider cpu table);
+  one modq block adds ≈ 35 KB at the Test profile and ≈ 153 KB at Production (measured at tier 10).
+  The Production msauth proof's own size is not yet measured (estimate ≥ 3.4 MB, dominated by the
+  keccak table's width, §8).
 
 ## 9. Soundness notes worth knowing
 

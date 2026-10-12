@@ -1,21 +1,23 @@
 # Provenance of the vendored circuits crates
 
-`evm-core/` and `sbpf-core/` are copies, made by `deploy/sync-zkvm.sh`, of the crates at
-`guests-compiled/evm-core` and `guests-compiled/sbpf-core` in the public circuits repository
-(<https://github.com/randprotocol/zkp-circuits>): the `no_std` EVM and sBPF interpreter cores
-that `crates/randprotocol-zkvm`'s `src/evm.rs` and `src/sbpf.rs` run natively and the `evm` and
-`sbpf` guests (`crates/randprotocol-zkvm/guests-compiled/`) are compiled from. Nothing here is
+`evm-core/`, `sbpf-core/` and `dilithium-core/` are copies, made by `deploy/sync-zkvm.sh`, of
+the crates at `guests-compiled/{evm-core,sbpf-core,dilithium-core}` in the public circuits
+repository (<https://github.com/randprotocol/zkp-circuits>): the `no_std` EVM and sBPF
+interpreter cores that `crates/randprotocol-zkvm`'s `src/evm.rs` and `src/sbpf.rs` run natively
+and the `evm` and `sbpf` guests are compiled from, and the `no_std` Dilithium2 verifier core that
+`src/dilithium_host.rs` runs natively and the `dilithium-verify` and `msauth` guests
+(`crates/randprotocol-zkvm/guests-compiled/`) are compiled from. Nothing here is
 edited in this repository. Each crate is copied whole except its `Cargo.lock` (the workspace's
 lock is the one cargo reads) and `target/`; the manifests are verbatim, their `[workspace]` table
-included, which is why the root `Cargo.toml` lists both paths under `[workspace] exclude`. The
+included, which is why the root `Cargo.toml` lists all three paths under `[workspace] exclude`. The
 copies are byte-identical to this circuits commit:
 
-circuits: 56b70611724930a5848ac5c0fd32ca2de8e61e2e
+circuits: d217252afde318b2ff51976351f449a685b5832f
 
-(Branch feat/tree-aggregation, not yet on zkp-circuits; 92b750e plus the tree final-review
-fixes, which touched recursion/ tests and docs and research/AGENTS.md only. The files here are
-byte-identical at 71e1a04, the pushed commit both rand-zkvm-cuda revs name: the tree re-vendor
-moved only recursion/.)
+(Branch feat/private-multisig, not yet on zkp-circuits: rVM phase 4 (Merkle spans) and the MODQ
+chip (constraint set 9), with the `dilithium-verify` and `msauth` guests and the
+`dilithium-core` crate. `rand-zkvm-cuda/` and `research/src/poseidon2_constants.rs` are
+byte-identical at 71e1a04, the pushed commit both rand-zkvm-cuda revs name.)
 
 That is the commit `.github/workflows/ci.yml` checks out as `CIRCUITS_PIN`, and the commit
 `crates/randprotocol-zkvm/guests-compiled/PROVENANCE.md` names;
@@ -24,7 +26,7 @@ either.
 
 Why vendored (audit v6, PROC-2, issue #109): until 2026-10-01 both were path dependencies on a
 sibling `circuits/` checkout, and cargo loads every path dependency's manifest, so a clone of
-this repository alone failed at `cargo metadata`. Neither crate has a dependency of its own
+this repository alone failed at `cargo metadata`. No crate here has a dependency of its own
 (`deploy/sync-zkvm.sh` refuses to vendor one that grew any), so the copies add nothing to the
 dependency tree beyond themselves. The third sibling path, the CUDA backend `rand-zkvm-cuda`, is
 not vendored: it is an optional git dependency on the same repository at a pinned revision

@@ -88,6 +88,9 @@ pub struct NodeConfig {
     pub prune_history: Option<Duration>,
     /// Spec 2026-09-28 §4.1: price calls by their proof header; None = no policy.
     pub gas_policy: Option<randprotocol_core::gas::GasPolicy>,
+    /// Where the precomputed msauth verifier key is read from, and whether a missing one may be
+    /// built here (plan Task 2b; consulted only on a chain naming `hc_auth_multisig`).
+    pub msauth: crate::msauth_key::MsauthKeyOptions,
 }
 
 /// Handles returned by `Node::start` so tests and the CLI can observe the node.
@@ -152,6 +155,13 @@ pub fn load_genesis(datadir: &std::path::Path) -> Result<(GenesisState, Arc<dyn 
     let genesis = Genesis::from_json(&text)?;
     let executor = executor_for_profile(&genesis.fri_profile)?;
     let gs = genesis.build(executor.as_ref())?;
+    // Private multisig (plan Task 3): the executor's msauth path opens only for a genesis naming
+    // `hc_auth_multisig`. On every other chain a multisig-`hc` verify is refused before any
+    // decode, so no auth proof can make this node build the ~4 GB msauth key. Here, on the bare
+    // executor, before any caching wrapper sees it.
+    if gs.ledger.hc_auth_multisig().is_some() {
+        executor.enable_auth_multisig();
+    }
     Ok((gs, executor))
 }
 
@@ -221,6 +231,9 @@ pub fn reload_ledger_from(
     // would recompute the v1 digest and refuse every v3 bundle its peers apply — a fork at the
     // first transaction after its restart.
     ledger.set_hc_auth(gs.ledger.hc_auth());
+    // And private multisig's auth guest (genesis `hc_auth_multisig`): a node that came back
+    // without it would refuse every multisig spend its peers apply — a fork at its first restart.
+    ledger.set_hc_auth_multisig(gs.ledger.hc_auth_multisig());
     // And the gas section (design 2026-09-28 §4.2, §4.3, §7.1): `load_ledger` comes back at
     // `None`, and a node that kept it would run without the prices and the bundle gas limit its
     // peers enforce.
@@ -853,6 +866,16 @@ fn assemble_covered(
 /// refuses a cover with no entry), so a block that re-covers a sealed bundle is invalid on
 /// every replica whatever this source answers. `assemble_covered` keeps the three named
 /// verdicts for admission's error reporting.
+/// The covered record the sync path keeps for a raw bundle it has just applied, for later
+/// aggregates in the same batch: [`crate::agg_executor::covered_bundle_of`], the builder the store's
+/// `covered_record` uses — so `HotStuff::covered_sidecar` (through [`StoreCovered`], the off-loop
+/// apply's source) and this path hand the ledger the same record, the modq refusal included.
+/// `None` for bytes that do not decode or a proof it refuses.
+fn sync_raw_cover(proof: &[u8], profile: randprotocol_core::types::FriProfile) -> Option<randprotocol_core::types::CoveredBundle> {
+    let proof = postcard::from_bytes::<randprotocol_zkvm::machine::Proof>(proof).ok()?;
+    crate::agg_executor::covered_bundle_of(&proof, profile).ok()
+}
+
 struct StoreCovered {
     storage: Arc<Storage>,
     profile: randprotocol_core::types::FriProfile,
@@ -2270,33 +2293,44 @@ fn close_batch_coverage(storage: &Storage, batch: &mut Vec<CommittedBlock>, limi
 ///   and pins bundle guest v3 and `hc_auth`, both of which this build still carries — so only its
 ///   hash refuses it: this binary installed on a chain-17 host would otherwise start, refuse the
 ///   chain's own history at its startup replay, and a `verify --repair` would truncate it.
-pub const CHAINS_THIS_BUILD_CANNOT_RUN: [(u64, &str, &str); 4] = [
+/// - **Chains 18, 19 and 20** (v0.6.5–v0.7.x) commit proofs under constraint set 8. Constraint set
+///   9 (the MODQ chip, private multisig phase 4) moved every verifier key and the proof encoding
+///   (`Proof::modq_log_height`), so this build verifies none of their proofs.
+pub const CHAINS_THIS_BUILD_CANNOT_RUN: [(u64, &str, &str); 7] = [
     (14, "1cff3b7da248d93ab547aef5c05bb7d0d22da510b592dab9cf7374807de7c7ff", CONSTRAINT_SET_6_REASON),
     (15, "cc30e0854fb25b3abcee96bb7bc206dcd6e37862f6dfe80a05b3e474c2d1b6b8", CONSTRAINT_SET_6_REASON),
     (16, "20925ae63cfa6e6c96f3ff369486ead8ea04821fec026a55df9e2893f3d53005", SPLIT_AUTH_REASON),
     (17, "d1afefc3dd68f73e3799aa0803b692d0e6a5c7c27d228bdeb3d06cdf4027e7ff", CONSTRAINT_SET_7_REASON),
+    (18, "a7cb020cc99a33c83fc38cfa0ec1db357f67fbf8b6dab13ab1d9812280b4da76", CONSTRAINT_SET_8_REASON),
+    (19, "a3defc937d561d4beb1df9a08c9cb87a3dc32dadbfc2d1814ab6f627b0a2228a", CONSTRAINT_SET_8_REASON),
+    (20, "6210cf071a390d7ac61d8cbea5dd9d139d1a493a862b54a45a498f36af2d5135", CONSTRAINT_SET_8_REASON),
 ];
 
-/// The constraint set this build proves and verifies under: 8, the gas meter (`pv::GAS`, chain 18).
-pub const BUILD_CONSTRAINT_SET: u8 = 8;
+/// The constraint set this build proves and verifies under: 9, the MODQ chip (private multisig
+/// phase 4; set 8, the gas meter, ran chains 18-20).
+pub const BUILD_CONSTRAINT_SET: u8 = 9;
 
 const CONSTRAINT_SET_6_REASON: &str = "its proofs were made under constraint set 6; this build is constraint \
-     set 8 (v0.6.5 and later) and verifies none of them, so its startup replay would refuse the chain's own \
+     set 9 (v0.8.0 and later) and verifies none of them, so its startup replay would refuse the chain's own \
      history and a `verify --repair` would truncate it — on an archive node, the only full copy. Run the \
      chain's own release (v0.6 or earlier), never this one";
 
-const SPLIT_AUTH_REASON: &str = "its proofs were made under constraint set 7 and this build is constraint set 8, \
+const SPLIT_AUTH_REASON: &str = "its proofs were made under constraint set 7 and this build is constraint set 9, \
      and this build changes the bundle wire and every transaction id (rand-txid-3, split authorisation): a \
      `verify --repair` would truncate the chain's history — on an archive node, the only full copy. Use the \
      v0.6.1/v0.6.2 release for chain 16";
 
 const CONSTRAINT_SET_7_REASON: &str = "its proofs were made under constraint set 7; this build is constraint \
-     set 8 (v0.6.5 and later) and verifies none of them, so its startup replay would refuse the chain's own \
+     set 9 (v0.8.0 and later) and verifies none of them, so its startup replay would refuse the chain's own \
      history and a `verify --repair` would truncate it. Use the v0.6.3 release for chain 17";
+
+const CONSTRAINT_SET_8_REASON: &str = "its proofs were made under constraint set 8; this build is constraint \
+     set 9 (the MODQ chip, v0.8.0 and later) and verifies none of them, so its startup replay would refuse the \
+     chain's own history and a `verify --repair` would truncate it. Use the v0.7.x release for chains 18-20";
 
 /// Refuse a genesis in [`CHAINS_THIS_BUILD_CANNOT_RUN`]: `run` (through
 /// [`check_build_runs_genesis`]) and `verify` both call it before touching the datadir's blocks,
-/// so this binary installed on a chain-14, -15, -16 or -17 host neither starts nor `verify --repair`s
+/// so this binary installed on a host of any of chains 14-20 neither starts nor `verify --repair`s
 /// that chain's history away — on an archive (obs1, rand-archive-2) that history is the only full
 /// copy there is.
 pub fn refuse_chains_this_build_cannot_run(gs: &GenesisState) -> Result<()> {
@@ -2368,6 +2402,19 @@ pub fn check_build_runs_genesis(gs: &GenesisState, built_hc_bundles: &[randproto
         ),
         _ => {}
     }
+    // Private multisig (spec §2.3): `hc_auth_multisig` must be this build's multisig auth guest —
+    // another is a guest no wallet built from it can prove, and the executor dispatches the
+    // msauth path on exactly this digest. Core checks the rest (it needs `hc_auth`, it differs
+    // from it); `hc_auth` being this build's auth guest and bundle guest v3 is checked above.
+    if let Some(h) = gs.ledger.hc_auth_multisig() {
+        if h != ZkExecutor::hc_auth_multisig() {
+            anyhow::bail!(
+                "the genesis hc_auth_multisig ({}) is not this build's multisig auth guest ({}); rebuild from the chain's pinned commit",
+                randprotocol_core::notes::word8_to_hex(&h),
+                randprotocol_core::notes::word8_to_hex(&ZkExecutor::hc_auth_multisig())
+            );
+        }
+    }
     if gs.ledger.aggregation().is_some() {
         anyhow::bail!(
             "this genesis enables block aggregation, which is not supported on the hidden-asset \
@@ -2430,6 +2477,21 @@ pub async fn start_with(cfg: NodeConfig, rpc_options: RpcOptions, net_options: N
     let bare_executor = executor.clone();
     let executor: Arc<dyn ConfidentialExecutor> = Arc::new(crate::verify_cache::CachingExecutor::new(executor));
     check_build_runs_genesis(&gs, &ZkExecutor::known_hc_bundles())?;
+    // The precomputed msauth verifier key (plan Task 2b, spec §3.6), before any other key: on a
+    // chain naming `hc_auth_multisig` a missing or unpinned blob refuses the start here, loudly;
+    // the build happens only under `--build-msauth-key`, first in the warm thread below.
+    let msauth_source = crate::msauth_key::startup(&gs, &cfg.msauth, bare_executor.as_ref())
+        .map_err(|e| anyhow!("{e:#}; refusing to start"))?;
+    let msauth_builder = bare_executor.clone();
+    // `--build-msauth-key` on a validator: built here, before anything starts, and a key whose
+    // digest is not the pin refuses the start (`msauth_key::built_key_verdict`). A development
+    // (non-validator) node builds it in the warm thread below and logs a mismatch.
+    let build_in_warm_thread = msauth_source == crate::msauth_key::MsauthKeySource::Built && !cfg.validator;
+    if msauth_source == crate::msauth_key::MsauthKeySource::Built && cfg.validator {
+        let b = bare_executor.clone();
+        let built = tokio::task::spawn_blocking(move || b.build_msauth_key()).await.context("the msauth key build panicked")?;
+        crate::msauth_key::built_key_verdict(built, true)?;
+    }
     // Before RocksDB opens its ~1000 table files (issue #41): a node started under the default
     // soft limit of 1024 ran out of descriptors and its RPC refused every connection.
     match crate::rlimit::raise_nofile_limit() {
@@ -2564,6 +2626,7 @@ pub async fn start_with(cfg: NodeConfig, rpc_options: RpcOptions, net_options: N
         prune_floor: 0,
         prune_history_secs: cfg.prune_history.map(|d| d.as_secs()),
         reserved_peers: peer_bindings.reserved_count(),
+        msauth_key: msauth_source,
         ..Default::default()
     }));
     let (cmd_tx, cmd_rx) = mpsc::channel(256);
@@ -2652,8 +2715,21 @@ pub async fn start_with(cfg: NodeConfig, rpc_options: RpcOptions, net_options: N
         // Split authorisation (genesis `hc_auth`): every bundle on such a chain carries an auth
         // proof too, so its key is warmed beside the bundle's; a chain without it never needs one.
         let split_auth = hs.committed_ledger().hc_auth().is_some();
+        // Private multisig (genesis `hc_auth_multisig`): its key first, since admission defers
+        // every multisig auth proof until it is ready.
+        let multisig = hs.committed_ledger().hc_auth_multisig().is_some();
         let ex = executor.clone();
         tokio::task::spawn_blocking(move || {
+            // `--build-msauth-key` with no key file on a non-validator (development only): the
+            // build, first (a validator built it before starting). A loaded key needs nothing
+            // here; on the bare executor, since the caching wrapper's default would do nothing.
+            if build_in_warm_thread {
+                let _ = crate::msauth_key::built_key_verdict(msauth_builder.build_msauth_key(), false);
+            }
+            if multisig {
+                ex.warm_auth_multisig();
+                tracing::info!("multisig auth verifier key warmed");
+            }
             ex.warm_bundle();
             tracing::info!("bundle verifier key warmed");
             if split_auth {
@@ -2955,6 +3031,7 @@ impl Node {
         s.tree_root = randprotocol_core::notes::word8_to_hex(&ledger.root());
         s.hc_bundle = randprotocol_core::notes::word8_to_hex(&ledger.hc_bundle());
         s.hc_auth = ledger.hc_auth().map(|h| randprotocol_core::notes::word8_to_hex(&h));
+        s.hc_auth_multisig = ledger.hc_auth_multisig().map(|h| randprotocol_core::notes::word8_to_hex(&h));
         s.binding_domain = ledger.binding_domain().version();
         let target = self.peers.values().filter_map(|p| p.status.as_ref()).map(|p| p.height).max().unwrap_or(0);
         s.sync_target = target.max(s.height);
@@ -4959,26 +5036,10 @@ impl Node {
                         recent.insert(p.tx_hash, randprotocol_core::types::CoveredBundle { public_values: pv, shape: p.shape });
                     }
                     None => {
-                        if let Some(bd) = &tx.bundle {
-                            if let Ok(proof) = postcard::from_bytes::<randprotocol_zkvm::machine::Proof>(&bd.proof) {
-                                let pv: [u64; randprotocol_core::types::pv::NUM] = proof.public_values.clone().try_into().expect("cs8 proofs carry pv::NUM public values");
-                                recent.insert(
-                                    tx.hash(),
-                                    randprotocol_core::types::CoveredBundle {
-                                        public_values: pv,
-                                        shape: randprotocol_core::types::DeclaredShape {
-                                            profile,
-                                            tier: proof.tier.0 as u8,
-                                            program_log_height: proof.program_log_height,
-                                            input_log_height: proof.input_log_height,
-                                            keccak_log_height: proof.keccak_log_height,
-                                            sha256_log_height: proof.sha256_log_height,
-                                            public_log_height: proof.public_log_height,
-                                            mem_log_height: proof.mem_log_height,
-                                        },
-                                    },
-                                );
-                            }
+                        // A record it refuses (a modq table, a short public-value run) is left
+                        // out: a later cover of it then reads the store, which refuses it too.
+                        if let Some(record) = tx.bundle.as_ref().and_then(|bd| sync_raw_cover(&bd.proof, profile)) {
+                            recent.insert(tx.hash(), record);
                         }
                     }
                 }
@@ -5148,6 +5209,23 @@ fn faucet_mint_tx(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Constraint set 9 (the MODQ chip): every verifier key and the proof encoding moved, so this
+    /// build verifies none of chain 18's, 19's or 20's proofs and must refuse their genesis before
+    /// touching a datadir.
+    #[test]
+    fn this_build_refuses_chains_18_to_20() {
+        assert_eq!(BUILD_CONSTRAINT_SET, 9);
+        for (chain, hash) in [
+            (18, "a7cb020cc99a33c83fc38cfa0ec1db357f67fbf8b6dab13ab1d9812280b4da76"),
+            (19, "a3defc937d561d4beb1df9a08c9cb87a3dc32dadbfc2d1814ab6f627b0a2228a"),
+            (20, "6210cf071a390d7ac61d8cbea5dd9d139d1a493a862b54a45a498f36af2d5135"),
+        ] {
+            let row = CHAINS_THIS_BUILD_CANNOT_RUN.iter().find(|(c, _, _)| *c == chain).unwrap_or_else(|| panic!("chain {chain} not listed"));
+            assert_eq!(row.1, hash, "chain {chain}");
+            assert!(row.2.contains("constraint set 8") && row.2.contains("v0.7"), "chain {chain}: {}", row.2);
+        }
+    }
     use crate::storage::fixtures::{alloc_note, bundle_fee, bundle_tx, genesis_of, key, make_block_voted};
     use randprotocol_core::confidential::StubExecutor;
     use randprotocol_core::consensus::{EpochSets, HotStuff};
@@ -6887,6 +6965,35 @@ mod tests {
         assert_eq!(reloaded.hc_auth(), Some([21; 8]), "restored from the genesis state");
     }
 
+    /// Private multisig phase 4: `hc_auth_multisig` must be this build's msauth guest.
+    #[test]
+    fn startup_refuses_an_hc_auth_multisig_this_build_does_not_carry() {
+        let mut gs = genesis_of(7, &[&key(1)], vec![], 2);
+        let known = ZkExecutor::known_hc_bundles();
+        gs.hc_bundle = ZkExecutor::hc_hidden_bundle_v3();
+        gs.ledger.set_hc_auth(Some(ZkExecutor::hc_auth()));
+        gs.ledger.set_hc_auth_multisig(Some(ZkExecutor::hc_auth_multisig()));
+        assert!(check_build_runs_genesis(&gs, &known).is_ok());
+        gs.ledger.set_hc_auth_multisig(Some([0xdead; 8]));
+        let e = check_build_runs_genesis(&gs, &known).unwrap_err().to_string();
+        assert!(e.contains("not this build's multisig auth guest"), "{e}");
+        assert!(e.contains(&randprotocol_core::notes::word8_to_hex(&ZkExecutor::hc_auth_multisig())), "names this build's: {e}");
+    }
+
+    /// `hc_auth_multisig` survives a restart like `hc_auth`: a node that came back without it
+    /// would refuse every multisig spend its peers apply — a fork at its first restart.
+    #[test]
+    fn a_restart_restores_hc_auth_multisig() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
+        let mut gs = genesis_of(7, &[&key(1)], vec![], 2);
+        gs.ledger.set_hc_auth(Some([21; 8]));
+        gs.ledger.set_hc_auth_multisig(Some([23; 8]));
+        storage.init_genesis(&gs).unwrap();
+        assert_eq!(storage.load_ledger(&StubExecutor).unwrap().hc_auth_multisig(), None);
+        assert_eq!(reload_ledger(&storage, &gs, &StubExecutor).unwrap().hc_auth_multisig(), Some([23; 8]));
+    }
+
     /// v0.6.8: core's `kem_ek_is_valid` (genesis `bridge.fees.recipient`) agrees with the KEM the
     /// node seals with (`address::to_research`, `ml_kem`'s own check) on a real wallet's key, on
     /// the zero key, and on keys with one coefficient at and past the modulus.
@@ -7233,6 +7340,7 @@ mod tests {
             apply_inline: false,
             prune_history: None,
             gas_policy: None,
+            msauth: Default::default(),
         };
         let wire = network::WireLimits::for_ledger(&gs.ledger);
         let max_block_bytes = gs.ledger.max_block_bytes();
@@ -8788,6 +8896,23 @@ mod tests {
         let b1 = make_block_unchecked(&gs.block, &ledger_after, vec![covered_tx.clone(), mint_tx.clone()], &key(1));
         storage.commit(std::slice::from_ref(&b1), &ledger_after, &[], &StubExecutor).unwrap();
         (dir, storage, gs, covered_tx, mint_tx)
+    }
+
+    /// The sync path's inline record and the off-loop apply's (`HotStuff::covered_sidecar` through
+    /// `StoreCovered`, i.e. `Storage::covered_record`) are one builder: equal for a raw proof, and
+    /// both refuse a proof declaring a modq table.
+    #[test]
+    fn the_sync_paths_cover_record_is_the_covered_sidecars() {
+        use randprotocol_core::consensus::CoveredSource;
+        let (_d, storage, _gs, covered_tx, _mint) = chain_with_a_real_proof();
+        let profile = randprotocol_core::types::FriProfile::Test;
+        let inline = sync_raw_cover(&covered_tx.bundle.as_ref().unwrap().proof, profile).expect("a raw proof's record");
+        assert_eq!(Some(inline.clone()), storage.covered_record(&covered_tx.hash(), profile).unwrap());
+        let source = StoreCovered { storage: Arc::new(storage), profile };
+        assert_eq!(source.covered(&[covered_tx.hash()]), Some(vec![inline]));
+        let modq = crate::agg_executor::modq_fixture_proof_bytes();
+        assert_eq!(sync_raw_cover(modq, profile), None, "a modq-declaring proof is refused inline");
+        assert!(crate::agg_executor::covered_bundle_of(&postcard::from_bytes(modq).unwrap(), profile).is_err(), "and by the store's builder");
     }
 
     /// Assembly reads the store (spec §3.2): the covered bundle's `pv::NUM` public values and its
@@ -10843,6 +10968,22 @@ mod tests {
     }
 
     impl ConfidentialExecutor for Hooked {
+        fn auth_header(&self, proof: &[u8]) -> Result<(randprotocol_core::confidential::AuthShape, randprotocol_core::notes::Word8, Option<u64>), randprotocol_core::confidential::ConfidentialError> {
+            StubExecutor.auth_header(proof)
+        }
+        fn warm_auth_multisig(&self) {}
+        fn auth_multisig_key_ready(&self) -> bool {
+            true
+        }
+        fn install_msauth_vk(&self, blob: &[u8]) -> Result<(), String> {
+            StubExecutor.install_msauth_vk(blob)
+        }
+        fn enable_auth_multisig(&self) {
+            StubExecutor.enable_auth_multisig()
+        }
+        fn build_msauth_key(&self) -> Result<(), String> {
+            StubExecutor.build_msauth_key()
+        }
         fn check_program(&self, base_pc: u32, words: &[u32]) -> Result<Vec<u8>, ConfidentialError> {
             StubExecutor.check_program(base_pc, words)
         }

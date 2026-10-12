@@ -293,9 +293,9 @@ fn hint_array_via_hintn_matches_the_compiled_pairs() {
 
 /// Cut C: the walk with injections under `Precompiles::On` (one COMPRESS per level) computes the
 /// compiled walk's digest, for random leaves, siblings and index bits, 1..=12 levels, with and
-/// without an injection — and dispatches one `COMPRESS` per level and per injection. (A level's cpu
-/// cost is two rows, not one: `compress_step` also emits the `FADDI` that folds the sibling
-/// `Ptr`'s offset into a register; `merkle_walk`'s doc has the measured `2·levels + 15`.)
+/// without an injection — and dispatches one `COMPRESS` per level and per injection. (Since phase
+/// 4 B the sibling is `COMPRESS`'s absolute immediate, so `compress_step` no longer emits the
+/// `FADDI` that folded the sibling `Ptr`'s offset into a register.)
 #[test]
 fn merkle_walk_via_compress_matches_the_compiled_walk() {
     use randprotocol_rvm::dsl::{hash, Builder, Checkpoints, Digest, Liveness};
@@ -320,8 +320,7 @@ fn merkle_walk_via_compress_matches_the_compiled_walk() {
                 let injections = if with_injection && levels >= 2 {
                     vec![hash::Injection { after_level: levels / 2, rows: inj_p, n_cells: 9 }]
                 } else { vec![] };
-                let out = Digest(b.alloc(4));
-                hash::merkle_walk_with_injections(&mut b, Digest(leaf_p), &bit_f, sib_p, levels, &injections, out);
+                let out = hash::merkle_walk_with_injections(&mut b, Digest(leaf_p), &bit_f, sib_p, levels, &injections);
                 for k in 0..4 { let v = b.load(out.0, k); b.public(v); }
                 let exec = execute(&b.finish(), &[], 1_000_000).unwrap();
                 let compress_rows = exec.histogram()[Op::Compress as usize];
@@ -505,4 +504,34 @@ fn a_pow_immediate_leaving_the_buffer_is_refused_at_registration() {
     }
     let p = common::pow_program(&[0; 64], 44, 20, F::TWO, F::ONE);
     assert_eq!(Machine::check_program(&p), Ok(()));
+}
+
+/// D2: the walk overwrites the leaf with the digest it reaches, so a leaf that aliases the siblings
+/// would be read back corrupted — refused at build time.
+#[test]
+#[should_panic(expected = "the walk consumes its leaf")]
+fn a_walk_whose_leaf_aliases_its_siblings_is_refused_at_build() {
+    use randprotocol_rvm::dsl::{hash, Builder, Checkpoints, Digest, Liveness};
+    use randprotocol_rvm::programs::Precompiles;
+    let mut b = Builder::with_opts(Checkpoints::Off, Liveness::On, Precompiles::On);
+    let sibs = b.alloc(16);
+    let bits: Vec<_> = (0..4).map(|_| b.zero()).collect();
+    let leaf = Digest(b.offset(sibs, 4));
+    let _ = hash::merkle_walk(&mut b, leaf, &bits, sibs, 4);
+}
+
+/// D2: the same refusal for an injection's rows. (The hash scratch is `pub(super)`, so a test cannot
+/// name its address; that third clause of the assertion is covered by review only.)
+#[test]
+#[should_panic(expected = "the walk consumes its leaf")]
+fn a_walk_whose_leaf_aliases_an_injection_is_refused_at_build() {
+    use randprotocol_rvm::dsl::{hash, Builder, Checkpoints, Digest, Liveness};
+    use randprotocol_rvm::programs::Precompiles;
+    let mut b = Builder::with_opts(Checkpoints::Off, Liveness::On, Precompiles::On);
+    let sibs = b.alloc(16);
+    let rows = b.alloc(9);
+    let bits: Vec<_> = (0..4).map(|_| b.zero()).collect();
+    let inj = [hash::Injection { after_level: 1, rows, n_cells: 9 }];
+    let leaf = Digest(b.offset(rows, 3));
+    let _ = hash::merkle_walk_with_injections(&mut b, leaf, &bits, sibs, 4, &inj);
 }

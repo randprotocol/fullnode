@@ -591,6 +591,17 @@ and 16 set. A v3 transaction carries three proofs at most (bundle, auth, call), 
 cap must hold `3·max_proof_bytes + 1 MiB` (`Genesis::validate` refuses a `hc_auth` genesis below it,
 the 4 MiB default included): a 4 MiB block admits transfers but no `Call` at Production FRI. The implementation plan is `docs/superpowers/plans/2026-09-28-delegated-proving-phase2.md`.
 
+**The second auth guest, `hc_auth_multisig` (private multisig, v0.8.0): local only.** On a chain
+whose genesis names `hc_auth_multisig` (`9705f8e2…8247`, `docs/shielded.md` §2), a private multisig
+account's auth proof is the multisig auth guest's, at **tier 18** with the MODQ chip, and it is
+made **on the wallet's own machine only** (`rand multisig-private prove`, `docs/cli.md`): at least
+48 GB and minutes per proof (the Production prove time and size are not yet measured; the estimate
+is ≥ 3.4 MB). Its witness holds `msk`, the policy and the signatures — the account's viewing power —
+and no prover advertises the shape. The bundle proof of a multisig spend is an ordinary v3 bundle
+proof over the account's `nk` and may still go to a paired prover (`--prover`), exactly as above. A
+`MultisigAuth` witness kind is specified in the phase-4 spec §6.6
+(`docs/superpowers/specs/2026-10-11-private-multisig-phase4-design.md`) and is not built.
+
 ## 9. The validators' prover pool: `prover.randprotocol.org`
 
 A wallet that cannot make a bundle proof and whose owner runs no prover can use the pool the

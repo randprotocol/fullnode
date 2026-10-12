@@ -76,6 +76,7 @@ fn genesis_v3(validator: &Keypair) -> Genesis {
         fees: None,
         incremental_nullifier_root: None,
         perps: None,
+        hc_auth_multisig: None,
     }
 }
 
@@ -116,6 +117,7 @@ async fn a_v3_chain_admits_a_real_auth_proof_and_refuses_a_swapped_one() {
         apply_inline: false,
         prune_history: None,
         gas_policy: None,
+        msauth: Default::default(),
     })
     .await
     .expect("a v3 + hc_auth genesis starts on this build");
@@ -198,15 +200,15 @@ async fn a_v3_chain_admits_a_real_auth_proof_and_refuses_a_swapped_one() {
     });
     assert_eq!(digest, expected, "the v3 guest published the digest the ledger recomputes (no taint)");
     let t = Instant::now();
-    let (auth_proof, published, auth_tier) = prove_auth(FriProfile::Test, &w.sk, &salt, &binding, Backend::Cpu).unwrap();
+    let (auth_proof, published, auth_tier) = prove_auth(FriProfile::Test, w.spend_key().unwrap(), &salt, &binding, Backend::Cpu).unwrap();
     eprintln!("auth proof: tier {auth_tier}, {:.1?}, {} bytes", t.elapsed(), auth_proof.len());
     assert_eq!(published, c, "the auth proof publishes c = H(AUTH, nk, salt)");
     // Two swaps: an auth proof over another transaction's binding (same salt, same c), and one
     // over this binding under another salt (another c).
     let mut other_binding = binding;
     other_binding[0] ^= 1;
-    let (foreign, _, _) = prove_auth(FriProfile::Test, &w.sk, &salt, &other_binding, Backend::Cpu).unwrap();
-    let (resalted, other_c, _) = prove_auth(FriProfile::Test, &w.sk, &fresh(), &binding, Backend::Cpu).unwrap();
+    let (foreign, _, _) = prove_auth(FriProfile::Test, w.spend_key().unwrap(), &salt, &other_binding, Backend::Cpu).unwrap();
+    let (resalted, other_c, _) = prove_auth(FriProfile::Test, w.spend_key().unwrap(), &fresh(), &binding, Backend::Cpu).unwrap();
     assert_ne!(other_c, c);
     tx.bundle.as_mut().unwrap().proof = bundle_proof;
     assert_eq!(tx.binding(&domain), binding, "the binding blanks both proofs");

@@ -299,7 +299,7 @@ async fn every_field_the_downstream_repos_read_is_served_with_its_type() {
             ("height", Int), ("head_hash", Hex), ("view", Int), ("high_qc_view", Int), ("syncing", Bool), ("sync_target", Int),
             ("peer_count", Int), ("mempool_size", Int), ("is_validator", Bool), ("active_validator", Bool), ("faucet", Bool),
             ("confidential", Bool), ("fri_profile", Str), ("programs", Int), ("notes", Int), ("nullifiers", Int),
-            ("tree_root", Hex), ("hc_bundle", Hex64), ("hc_auth", Null), ("address", Str), ("peer_id", Str),
+            ("tree_root", Hex), ("hc_bundle", Hex64), ("hc_auth", Null), ("hc_auth_multisig", Null), ("address", Str), ("peer_id", Str),
             ("gas_prices.gas_price", Dec), ("gas_prices.byte_price", Dec),
         ]),
         // Node behaviour, not a wallet read: `rand_syncStatus` is `rand_status` under another name
@@ -315,7 +315,7 @@ async fn every_field_the_downstream_repos_read_is_served_with_its_type() {
         // `max_proof_bytes`, `bundle_gas_limit`, `program_state` and `proof_window_blocks`.
         row("rand_getLimits", json!([]), "randscan crates/randscan-core/src/types/stats.rs `ChainLimits`, clients/ui/engine/validate.js `checkLimits`", &[
             ("max_program_words", Int), ("max_proof_bytes", Int), ("max_block_bytes", Int), ("max_call_envelope_bytes", Int),
-            ("max_program_public_words", Int), ("envelope_bytes", Null), ("hardening_v6", Bool), ("hc_auth", Null),
+            ("max_program_public_words", Int), ("envelope_bytes", Null), ("hardening_v6", Bool), ("hc_auth", Null), ("hc_auth_multisig", Null),
             ("gas_price", Dec), ("byte_price", Dec), ("gas_metering", Str), ("bundle_gas_limit", Int),
             ("admission_by_vote", Bool), ("testnet", Bool), ("binding_domain", Int), ("proof_window_blocks", Null),
             ("program_state", Null), ("multisig", Null),

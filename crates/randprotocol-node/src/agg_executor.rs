@@ -291,6 +291,52 @@ impl AggExecutor {
     }
 }
 
+/// The refusal every aggregate/tree path gives an inner proof that declares a modq table
+/// (constraint set 9, circuits Task 9b): the vendored recursion verifier (`recursion/src`, the
+/// aggregate program) does not know the MODQ chip, so it can verify only chip-free inner proofs.
+pub const INNER_MODQ_REFUSAL: &str = "an inner proof declares a modq table; the aggregation verifier is chip-free";
+
+/// Whether a zkVM proof may be an aggregate's or a tree's inner proof: `modq_log_height == 0`
+/// (`NO_MODQ`), else [`INNER_MODQ_REFUSAL`] as `InvalidAggregateProof`, before anything reaches
+/// the rVM. Every place an inner proof's header is decoded runs it — [`covered_bundle_of`] (the
+/// covered records `verify_aggregate` and `verify_tree`, its bottom-up recompute included, are
+/// handed: `Storage::covered_record`, the pruning pass) and the aggregator's own cover assembly
+/// (`rand-node aggregate`'s `decode_inner_proofs`). `DeclaredShape` has no modq field, so a
+/// covered record cannot carry the declaration past this point. Auth proofs (msauth included)
+/// are never aggregated, so a multisig spend never meets it; and a bundle declaring a modq table
+/// is refused at admission by the zkVM's exact pin, so on an honest chain no stored bundle can.
+pub fn check_inner_chip_free(proof: &randprotocol_zkvm::machine::Proof) -> Result<(), ConfidentialError> {
+    if proof.modq_log_height != 0 {
+        return Err(ConfidentialError::InvalidAggregateProof(INNER_MODQ_REFUSAL.into()));
+    }
+    Ok(())
+}
+
+/// The covered-bundle record of an inner proof (spec §6.2): its `pv::NUM` public values and its
+/// declared shape, read off the header — after [`check_inner_chip_free`]. `MalformedProof` for a
+/// public-value vector of another length.
+pub fn covered_bundle_of(
+    proof: &randprotocol_zkvm::machine::Proof,
+    profile: randprotocol_core::types::FriProfile,
+) -> Result<CoveredBundle, ConfidentialError> {
+    check_inner_chip_free(proof)?;
+    let public_values: [u64; randprotocol_core::types::pv::NUM] =
+        proof.public_values.clone().try_into().map_err(|_| ConfidentialError::MalformedProof)?;
+    Ok(CoveredBundle {
+        public_values,
+        shape: DeclaredShape {
+            profile,
+            tier: proof.tier.0 as u8,
+            program_log_height: proof.program_log_height,
+            input_log_height: proof.input_log_height,
+            keccak_log_height: proof.keccak_log_height,
+            sha256_log_height: proof.sha256_log_height,
+            public_log_height: proof.public_log_height,
+            mem_log_height: proof.mem_log_height,
+        },
+    })
+}
+
 /// The rVM's `InnerShape` for a declared shape, through the fallible `try_of`.
 fn inner_shape(shape: &DeclaredShape) -> Result<InnerShape, ConfidentialError> {
     InnerShape::try_of(
@@ -332,21 +378,28 @@ fn zkvm_profile(profile: randprotocol_core::types::FriProfile) -> FriProfile {
 /// 18/19/20. Phase 3 (circuits `recursion/docs/06-phase3-fold-reduce.md`, docs/02 "The
 /// N-economics at the phase-3 tiers") keeps the sets: production N=1 at 20 (585 960 rows), N=2–3
 /// at 21, N=4–5 at 22 — and stops there, at the reduce chip's N ceiling (production N ≤ 5,
-/// `check_n_ceiling`; tier 22 would hold N ≤ 7 by cpu rows); test N=1 at 18, N=2–3 at 19, N=4–6 at
-/// 20 (by the row model; not measured). The rate-¼ profile (docs/07) moves no tier. The sets below are those rungs — three a
-/// profile, as the spec sized them.
+/// `check_n_ceiling`; (at phase 3) tier 22 would have held N ≤ 7 by cpu rows); test N=1 at 18, N=2–3 at 19, N=4–6 at
+/// 20 (by the row model; not measured). The rate-¼ profile (docs/07) moves no tier.
+///
+/// rVM phase 4 (Merkle spans, circuits `recursion/docs/09-phase4-spans.md` §5, re-pinned with the
+/// MODQ chip at circuits `57fb9dc`) moved production one tier down again: one inner verification
+/// is 315 391 rows, so N=1 lands at **tier 19**, N=2–3 at 20 (632 175 / 948 071 rows emulated
+/// before the MODQ re-pin) and N=4–5 at 21; the reduce chip's N ≤ 5 ceiling did not move, so tier
+/// 22 admits nothing a valid production aggregate can be and is refused. Production is therefore
+/// {19, 20, 21} (docs/09 §5's recommendation). Test: N=1 and N=2 at 18, N=3 at 19, so {18, 19, 20}
+/// still covers it. The sets below are those rungs — three a profile, as the spec sized them.
 ///
 /// Nothing enforced this before (audit v3, AGG-3). `Machine::verify` accepts any tier on the
 /// ladder and builds the verifier key for whatever the proof declares *before* verifying it — so
 /// a proposer could put an invalid aggregate at an unwarmed tier in a block and every replica
 /// would pay a 30–70 s key build, on the consensus loop at block apply, before refusing it.
 ///
-/// Production is the spec's three, one tier down; test is the one the fixtures and the warm path
+/// Production is the spec's three, two tiers down (phase 2, then phase 4); test is the one the fixtures and the warm path
 /// use, plus its two neighbours for the same N=2/N=3 reason.
 pub fn admitted_tiers(profile: FriProfile) -> &'static [u8] {
     match profile {
         FriProfile::Test => &[18, 19, 20],
-        FriProfile::Production => &[20, 21, 22],
+        FriProfile::Production => &[19, 20, 21],
     }
 }
 
@@ -474,6 +527,11 @@ impl ConfidentialExecutor for AggExecutor {
     fn decode_call(&self, record: &ProgramRecord, proof: &[u8]) -> Result<CallOutcome, ConfidentialError> {
         use randprotocol_zkvm::tables::cpu::pv;
         let proof = randprotocol_zkvm::executor::decode_canonical(proof)?;
+        // Constraint set 9: `check_decoded`'s call refusal, mirrored — a modq table is the
+        // multisig auth guest's alone, and no deployed program issues `SYS_MODQ`.
+        if proof.modq_log_height != 0 {
+            return Err(ConfidentialError::InvalidProof("a call proof declares no modq table".into()));
+        }
         randprotocol_zkvm::machine::check_declared_heights(
             proof.tier,
             proof.program_log_height,
@@ -653,6 +711,33 @@ impl ConfidentialExecutor for AggExecutor {
 
     fn warm_auth(&self) {
         self.inner.warm_auth()
+    }
+
+    /// Forwarded (Task 2b): the default would refuse every blob and fail a multisig chain's startup.
+    fn install_msauth_vk(&self, blob: &[u8]) -> Result<(), String> {
+        ConfidentialExecutor::install_msauth_vk(&self.inner, blob)
+    }
+
+    fn build_msauth_key(&self) -> Result<(), String> {
+        ConfidentialExecutor::build_msauth_key(&self.inner)
+    }
+
+    /// Forwarded (Task 3): the default would leave the inner executor's msauth path shut and
+    /// refuse every multisig auth proof on a chain that names `hc_auth_multisig`.
+    fn enable_auth_multisig(&self) {
+        ConfidentialExecutor::enable_auth_multisig(&self.inner)
+    }
+
+    fn auth_header(&self, proof: &[u8]) -> Result<(randprotocol_core::confidential::AuthShape, Word8, Option<u64>), ConfidentialError> {
+        self.inner.auth_header(proof)
+    }
+
+    fn warm_auth_multisig(&self) {
+        ConfidentialExecutor::warm_auth_multisig(&self.inner)
+    }
+
+    fn auth_multisig_key_ready(&self) -> bool {
+        ConfidentialExecutor::auth_multisig_key_ready(&self.inner)
     }
 
     /// Forwarded, like `max_callable_program_words` (a default would switch the rule off).
@@ -882,11 +967,45 @@ pub(crate) fn fixture_proof(k: usize) -> randprotocol_zkvm::machine::Proof {
     postcard::from_bytes(&bytes[32..]).expect("a fixture proof decodes")
 }
 
+/// A tier-10 Test-profile zkVM proof carrying one modq block (`modq_log_height = 10`): the
+/// zkVM's `executor::fixtures::one_modq_ntt_program`, proved once per process (~8 s). The
+/// aggregate-path refusal tests feed it where an inner proof's header is decoded.
+#[cfg(test)]
+pub(crate) fn modq_fixture_proof_bytes() -> &'static [u8] {
+    static BYTES: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+    BYTES.get_or_init(|| {
+        use randprotocol_zkvm::machine::{Machine, ProveOptions, Tier};
+        let program = randprotocol_zkvm::executor::fixtures::one_modq_ntt_program();
+        let (proof, _) = Machine::new(FriProfile::Test)
+            .prove_with_options(&program, &[], &[], Some(Tier(10)), ProveOptions::default())
+            .expect("the one-NTT fixture proves at tier 10");
+        assert_eq!(proof.modq_log_height, 10, "one modq block");
+        proof.to_bytes()
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use randprotocol_core::confidential::StubExecutor;
     use randprotocol_core::types::FriProfile as CoreProfile;
+
+    /// All three phase-4 methods are forwarded, never left at a default: the wrapper answers exactly
+    /// what the bare executor answers.
+    #[test]
+    fn the_phase_4_auth_methods_are_forwarded() {
+        use randprotocol_core::confidential::AuthShape;
+        use randprotocol_zkvm::machine::Backend;
+        let ex = AggExecutor::new(FriProfile::Test);
+        let bare = ZkExecutor::new(FriProfile::Test);
+        assert_eq!(ex.auth_header(b"junk"), ConfidentialExecutor::auth_header(&bare, b"junk"));
+        let (single, c, _) = randprotocol_zkvm::executor::prove_auth(FriProfile::Test, &randprotocol_zkvm::notes::SpendKey([7; 8]), &[6; 8], &[0; 8], Backend::Cpu).unwrap();
+        assert_eq!(ex.auth_header(&single), ConfidentialExecutor::auth_header(&bare, &single));
+        assert_eq!(ex.auth_header(&single).unwrap().0, AuthShape::SingleKey);
+        assert_eq!(ex.auth_header(&single).unwrap().1, c);
+        assert!(!ex.auth_multisig_key_ready(), "nothing warmed yet, as the bare executor says");
+        assert_eq!(ex.auth_multisig_key_ready(), ConfidentialExecutor::auth_multisig_key_ready(&bare));
+    }
 
     /// The covered-bundle record admission would assemble for fixture `k`: its declared shape
     /// read off the proof's stored header, and its `pv::NUM` public values.
@@ -1145,6 +1264,41 @@ mod tests {
         assert!(w.auth_gas_limit(b"junk").is_err(), "not the trait default");
     }
 
+    /// Constraint set 9: the `decode_call` mirror refuses what `check_decoded` refuses for a call,
+    /// by the same message, on an honest tier-10 one-modq-block proof — and builds nothing.
+    #[test]
+    fn decode_call_refuses_a_modq_bearing_call_proof_like_verify_call() {
+        let w = AggExecutor::new(FriProfile::Test);
+        let zk = ZkExecutor::new(FriProfile::Test);
+        let bytes = modq_fixture_proof_bytes();
+        let program = randprotocol_zkvm::executor::fixtures::one_modq_ntt_program();
+        let code_hash = program.digest().iter().flat_map(|w| w.to_le_bytes()).collect();
+        let record = ProgramRecord { id: randprotocol_core::Hash::digest(b"modq"), base_pc: 0, words: program.words.clone(), code_hash, deployed_at: 0, public_digest: None, public_len: 0 };
+        let want = ConfidentialError::InvalidProof("a call proof declares no modq table".into());
+        assert_eq!(w.decode_call(&record, bytes).unwrap_err(), want);
+        assert_eq!(zk.verify_call(&record, bytes).unwrap_err(), want, "the zkVM's own verdict, by the same words");
+        assert_eq!(zk.cached_keys(), 0, "refused before any key");
+        assert_eq!(w.program_builds() + w.tree_builds(), 0);
+    }
+
+    /// Constraint set 9 / circuits Task 9b: an inner proof declaring a modq table never becomes a
+    /// covered record, so it never reaches `verify_aggregate`, `verify_tree` or the tree's
+    /// bottom-up recompute (each takes `CoveredBundle`s, whose `DeclaredShape` has no modq field:
+    /// the refusal is where the header is read). A chip-free fixture still assembles, field for
+    /// field what `storage::raw_proof_facts` always read.
+    #[test]
+    fn an_inner_proof_declaring_a_modq_table_never_becomes_a_covered_record() {
+        let ex = AggExecutor::new(FriProfile::Test);
+        let p = randprotocol_zkvm::executor::decode_canonical(modq_fixture_proof_bytes()).unwrap();
+        let refusal = ConfidentialError::InvalidAggregateProof(INNER_MODQ_REFUSAL.into());
+        assert_eq!(check_inner_chip_free(&p), Err(refusal.clone()));
+        assert_eq!(covered_bundle_of(&p, CoreProfile::Test).unwrap_err(), refusal);
+        let honest = fixture_proof(0);
+        assert_eq!(check_inner_chip_free(&honest), Ok(()));
+        assert_eq!(covered_bundle_of(&honest, CoreProfile::Test), Ok(covered(0).1));
+        assert_eq!(ex.program_builds() + ex.tree_builds(), 0, "nothing reached the rVM");
+    }
+
     /// Every remaining forwarder answers exactly what the bare zkVM executor answers on the same
     /// inputs — hashes, digests, program checks, the plain (non-hardened) call path, and the
     /// bundle/auth verifications. A wrapper method left at the trait default would differ here
@@ -1250,8 +1404,23 @@ mod tests {
         );
     }
 
+    /// circuits recursion/docs/09 §5's re-vendor checklist: the node's production aggregate program
+    /// digest is the phase-4 + MODQ pin, so a stale admission list fails here instead of verifying
+    /// an old program under the new opcode 25/27 semantics. The production bundle shape is the
+    /// fixture shape at the production profile (the heights are the trace's, not the FRI
+    /// profile's), as circuits' `tests/aggregate.rs` builds it; the pin is that test's
+    /// (`dc350ecf…` pre-phase-4, `e0eede8b…` at phase 4, `8bc2cecb…` with the MODQ chip).
+    #[test]
+    fn the_production_aggregate_program_digest_is_the_phase_4_modq_pin() {
+        let (mut shape, _) = covered(0);
+        shape.profile = CoreProfile::Production;
+        let got = AggExecutor::new(FriProfile::Production).aggregate_program_digest(&shape).expect("the production shape builds");
+        let hex: String = got.iter().map(|w| format!("{w:016x}")).collect();
+        assert_eq!(hex, "8bc2cecbd30b975ec15a5e11354434bd7e1c2814d46dd0acc1d92b3ff944d8c7");
+    }
+
     /// Audit v3, AGG-3: the spec admits three rVM tiers (production {21, 22, 23} at constraint
-    /// set 8, {20, 21, 22} since the phase-2 row cuts) and nothing checked it. `Machine::verify` builds the verifier key for whatever tier the proof declares *before*
+    /// set 8, {20, 21, 22} since the phase-2 row cuts, {19, 20, 21} since rVM phase 4) and nothing checked it. `Machine::verify` builds the verifier key for whatever tier the proof declares *before*
     /// verifying the proof, so a proposer could put an invalid aggregate at an unwarmed tier in a
     /// block and every replica would pay a 30–70 s key build — on the consensus loop, at block
     /// apply — before refusing it.
@@ -1260,7 +1429,7 @@ mod tests {
         for t in admitted_tiers(FriProfile::Production) {
             assert!(check_tier(FriProfile::Production, *t).is_ok(), "tier {t} is admitted");
         }
-        for t in [8u8, 18, 19, 23, 255] {
+        for t in [8u8, 18, 22, 23, 255] {
             match check_tier(FriProfile::Production, t) {
                 Err(ConfidentialError::InvalidAggregateProof(m)) => {
                     assert!(m.contains(&t.to_string()), "the refusal names the tier: {m}")
@@ -1272,7 +1441,9 @@ mod tests {
         assert!(check_tier(FriProfile::Test, 18).is_ok());
         assert!(check_tier(FriProfile::Test, 19).is_ok());
         assert!(check_tier(FriProfile::Production, 18).is_err());
-        assert!(check_tier(FriProfile::Production, 19).is_err());
+        // rVM phase 4: production N=1 is 315 391 rows, tier 19, admitted; tier 22 no longer is.
+        assert!(check_tier(FriProfile::Production, 19).is_ok());
+        assert!(check_tier(FriProfile::Production, 22).is_err());
         assert!(check_tier(FriProfile::Test, 21).is_err());
         assert!(check_tier(FriProfile::Test, 23).is_err());
     }
@@ -1313,6 +1484,11 @@ mod tests {
     /// (`~/rand-agg-512-results/out/fixtures`; the droplet sync had brought only the logs), so the
     /// list and its digest moved once more with the notes (`5e3d7fb2…` → `3534960f…`) — data, not
     /// program: the vk digest is unchanged, as `recursion/docs/04` says of the inner machine.
+    /// Constraint set 9 (the MODQ chip, circuits `57fb9dc`, 2026-10-11) moved the inner shape and
+    /// the proof encoding: the vk digest moved for the first time since constraint set 8
+    /// (`346ee184…` → `1b0c4b00…`, circuits recursion/docs/09 §6), the fixtures were re-proved
+    /// (`scripts/recursion-fixtures.sh`), and the list and its digest moved with both
+    /// (`3534960f…` → `3753f2fd…`).
     #[test]
     fn the_admission_recompute_reproduces_the_pinned_vectors_byte_for_byte() {
         use p3_field::PrimeField64;
@@ -1328,7 +1504,7 @@ mod tests {
         // The inner vk digest, a data-independent constant of the shape.
         assert_eq!(
             hex_words(&randprotocol_rvm::shape::inner_vk_digest(&vk.shape, &vk.key)),
-            "346ee1841980e46a3501f5b04cdf40dd3208e5b1c67360285353cf7a0b735fb9",
+            "1b0c4b0043dd5d00d710f10048bfde989a955034d7fd52f1a85595a61339ddc7",
             "the pinned inner_vk_digest"
         );
         // The 118-word interface list, built the way admission builds it: from the covered
@@ -1339,7 +1515,7 @@ mod tests {
         assert_eq!(hex_words(&list), INTERFACE_LIST_HEX, "the pinned 118-word interface list");
         assert_eq!(
             hex_words(&randprotocol_rvm::public_values::public_digest(&list)),
-            "3534960f6757e6e034518a5a1926f6107c9cda7c9d5d96296b6d4ed5c3984629",
+            "3753f2fd7ba2091910f1a5eb6b722c3b55e71e7661854c058d95ed446cb186b4",
             "the pinned interface digest"
         );
     }
@@ -1352,34 +1528,34 @@ mod tests {
     /// `docs/02-aggregate.md`'s worked example: the 118-word interface list for the 3-proof
     /// test-profile fixture set, each word the canonical `u64` as 16 lowercase hex chars.
     const INTERFACE_LIST_HEX: &str = concat!(
-        "346ee1841980e46a3501f5b04cdf40dd3208e5b1c67360285353cf7a0b735fb9",
+        "1b0c4b0043dd5d00d710f10048bfde989a955034d7fd52f1a85595a61339ddc7",
         "000000000000000300000000a662000000000000a662000100000000a6620002",
         "00000000a662000300000000a662000400000000a662000500000000a6620006",
-        "00000000a66200070000000000000000000000000000000e00000000b6c9c0dc",
-        "000000009750a10a00000000c111097f00000000686c450c00000000a31856a0",
-        "00000000724c667300000000a6cf2e6a00000000c22612ba000000006f35274a",
+        "00000000a66200070000000000000000000000000000000e0000000009798e88",
+        "000000001bc1014400000000c6454ed8000000006b17834200000000f8f1a540",
+        "000000005c25de80000000007983d65e00000000841b3716000000006f35274a",
         "000000000371953700000000a8a42560000000004b291c6600000000b7c2de0e",
-        "00000000d6bf7fcf00000000182b470b00000000fb4abd6c000000001db4f72d",
-        "000000004852186000000000351c3f410000000001a6c33700000000f692eaf4",
-        "00000000fbf5508d00000000ae3d9c4d000000009d7a3bc200000000934a2759",
+        "00000000d6bf7fcf00000000182b470b00000000fb4abd6c00000000d68ddbe1",
+        "0000000012f885a60000000032d1718800000000c3bc890400000000d7286a18",
+        "0000000056171f8a00000000dc91a25d000000008f77eb5a00000000934a2759",
         "00000000d5389ac8000000002e612784000000008639ed090000000085f58a21",
         "000000004448d889000000006bb9c915000000000671dc2c0000000000004fff",
-        "0000000000000000000000000000000e00000000d89b0c4e000000000c79315f",
-        "0000000054d269dd000000002d93469600000000373d607000000000efe6b09b",
-        "00000000c8a1f6da000000008f300cc6000000006f35274a0000000003719537",
+        "0000000000000000000000000000000e000000006c3312a900000000bb1b0223",
+        "00000000d9e09f5b000000001d46c05b00000000d1be87c4000000007b76acd3",
+        "000000005e7267ff00000000c4731095000000006f35274a0000000003719537",
         "00000000a8a42560000000004b291c6600000000b7c2de0e00000000d6bf7fcf",
-        "00000000182b470b00000000fb4abd6c00000000bf4eccca00000000930235f1",
-        "0000000039c139bf000000007ffa79d900000000276ab59900000000b260698b",
-        "000000009bf06006000000008ed2b5ea00000000934a275900000000d5389ac8",
+        "00000000182b470b00000000fb4abd6c000000004b556bca00000000341d2f5f",
+        "0000000079f436080000000091f8e29c000000001ba6f2fd00000000ad68b2ba",
+        "0000000013fa3f2300000000490af7f100000000934a275900000000d5389ac8",
         "000000002e612784000000008639ed090000000085f58a21000000004448d889",
         "000000006bb9c915000000000671dc2c0000000000004fff0000000000000000",
-        "000000000000000e0000000084b7fba400000000917c878a0000000054d35f8f",
-        "00000000e901961100000000e6cb99f80000000088b794b10000000098fcab7f",
-        "00000000d61a1159000000006f35274a000000000371953700000000a8a42560",
+        "000000000000000e00000000d74313f3000000004675ac4000000000f4c1f8eb",
+        "00000000a9cf0890000000005dda21530000000043e32a4d0000000002ecb55a",
+        "000000005e6e3049000000006f35274a000000000371953700000000a8a42560",
         "000000004b291c6600000000b7c2de0e00000000d6bf7fcf00000000182b470b",
-        "00000000fb4abd6c00000000101f1f09000000001820409400000000f239b1a0",
-        "00000000d2e4449100000000db29d5cc000000000a2fab2700000000ae681b7e",
-        "00000000bdb2470100000000934a275900000000d5389ac8000000002e612784",
+        "00000000fb4abd6c00000000a6a7204c00000000dbb032c800000000e550ab3e",
+        "000000004cc1905e000000007a603b2a00000000379776a200000000c7d34ee3",
+        "000000003dc30f7b00000000934a275900000000d5389ac8000000002e612784",
         "000000008639ed090000000085f58a21000000004448d889000000006bb9c915",
         "000000000671dc2c0000000000004fff",
     );
@@ -1482,15 +1658,17 @@ mod tests {
     /// node lib suite runs without the cache; `the_test_tree_heights_are_the_cached_proofs` holds
     /// them to the cache wherever it is present.
     const TEST_LEAF: RvmHeights = RvmHeights { tier: 18, reg_log_height: 19, ram_log_height: 19, poseidon2_log_height: 14, reduce_log_height: 16 };
-    const TEST_STEP: RvmHeights = RvmHeights { tier: 19, reg_log_height: 20, ram_log_height: 20, poseidon2_log_height: 15, reduce_log_height: 16 };
-    const TEST_ROOT: RvmHeights = RvmHeights { tier: 19, reg_log_height: 20, ram_log_height: 20, poseidon2_log_height: 15, reduce_log_height: 17 };
+    // rVM phase 4 (circuits docs/09 §7): both steps are tier 18 and both cross 2^16 reduce rows, so
+    // the root declares S_T's header words and the fixed point is level 2 (was level 3, tier 19).
+    const TEST_STEP: RvmHeights = RvmHeights { tier: 18, reg_log_height: 19, ram_log_height: 20, poseidon2_log_height: 15, reduce_log_height: 17 };
+    const TEST_ROOT: RvmHeights = RvmHeights { tier: 18, reg_log_height: 19, ram_log_height: 20, poseidon2_log_height: 15, reduce_log_height: 17 };
 
     /// circuits `recursion/tests/pins.json`'s `tree_test` keys (`vk_leaf`, `vk_t_leaf`, `vk_int`),
     /// as canonical u64 limbs: what the rVM's own suite computes from the proved shapes.
-    const PIN_VK_LEAF: [u64; 4] = [1769152780461762224, 4754121159208375271, 16285051620565002471, 12356170513791122891];
-    const PIN_VK_T_LEAF: [u64; 4] = [7711328338169539612, 5984874271003933741, 17134834717916042633, 2542356665053237370];
-    const PIN_VK_INT: [u64; 4] = [12189568167191873679, 7035563939045772652, 12535684755110529647, 4848701472125205360];
-    const PIN_VK_FIX: [u64; 4] = [4756771443877942240, 18437901406829798119, 13732813924430148200, 10825047408558662485];
+    /// rVM phase 4 dropped `vk_fix` (the fixed point is level 2, `vk_int` itself: docs/09 §7).
+    const PIN_VK_LEAF: [u64; 4] = [8319022251449045440, 6921460171031583545, 12120586048388560564, 2237657693139026209];
+    const PIN_VK_T_LEAF: [u64; 4] = [149934054759036529, 11853972217771236064, 7974370166788545537, 4681341164698736412];
+    const PIN_VK_INT: [u64; 4] = [17974589521606301101, 12194447673073698417, 12600030651550503010, 948039196462741351];
 
     /// A tree proof from `$RECURSION_FIXTURES/tree/{name}.rvmproof` (the bare postcard rVM proof),
     /// with `fixture_proof`'s loud failure.
@@ -1622,7 +1800,8 @@ mod tests {
     /// The deferred 3a M6 and what makes a section unservable: a leaf size past the rVM's N
     /// ceiling for the shape (no leaf can be proved), a pinned reduce height that is not canonical
     /// for its program (no honest proof declares it), and a `max_depth` past the listed levels
-    /// whose last entry is not a fixed point (the test list's is not: docs/08 §5). Each refuses
+    /// whose last entry is not a fixed point (since rVM phase 4 the two-level test list's last
+    /// entry is one, docs/09 §7, so the list cut to level 1 alone stands in). Each refuses
     /// startup as `Unbuildable`, before any pin is compared.
     #[test]
     fn a_tree_section_the_rvm_cannot_serve_refuses_startup() {
@@ -1640,16 +1819,17 @@ mod tests {
         let mut t = good.clone();
         t.steps[0].heights.reduce_log_height += 1;
         refused(&t, "canonical");
-        refused(&TreeConfig { max_depth: 3, ..good.clone() }, "fixed point");
+        refused(&TreeConfig { steps: good.steps[..1].to_vec(), max_depth: 2, ..good.clone() }, "fixed point");
         refused(&TreeConfig { steps: Vec::new(), ..good.clone() }, "EmptyTreeSteps");
     }
 
-    /// The test list with its fixed point (docs/08 §5: level 3's program, `rv32t` at the root's
-    /// shape, is its own): three listed levels admit a `max_depth` past the list, the rebuilt
-    /// `vk_fix` is circuits' pin, and the startup check passes where the two-level list is
-    /// refused (`a_tree_section_the_rvm_cannot_serve_refuses_startup`).
+    /// The test list's fixed point (rVM phase 4, circuits docs/09 §7: it moved from level 3 to
+    /// level 2): `rv32t` at the root's shape is `rv32t_int` itself, so the two listed levels
+    /// admit a `max_depth` past the list, a third entry at the root's heights rebuilds level 2's
+    /// program and `vk_int` exactly, and the startup check passes. (The three-entry list and its
+    /// `vk_fix` pin are gone with the level-3 fixed point.)
     #[test]
-    fn a_listed_fixed_point_admits_a_deeper_max_depth() {
+    fn the_listed_two_levels_are_a_fixed_point_and_admit_a_deeper_max_depth() {
         use p3_field::PrimeField64;
         let ex = AggExecutor::new(FriProfile::Test);
         let mut t = test_tree_cfg();
@@ -1658,13 +1838,20 @@ mod tests {
             FriProfile::Test,
             &inner,
             rvm_heights(TEST_LEAF),
+            &[rvm_heights(TEST_STEP), rvm_heights(TEST_ROOT)],
+        )
+        .unwrap();
+        assert!(s.fixed_point(), "level 2 is the fixed point");
+        let three = randprotocol_rvm::aggregate::TreeShapes::build(
+            FriProfile::Test,
+            &inner,
+            rvm_heights(TEST_LEAF),
             &[rvm_heights(TEST_STEP), rvm_heights(TEST_ROOT), rvm_heights(TEST_ROOT)],
         )
         .unwrap();
-        assert!(s.fixed_point(), "the third entry is the fixed point");
         let u = |d: [randprotocol_rvm::isa::F; 4]| d.map(|f| f.as_canonical_u64());
-        t.steps.push(TreeStepPin { heights: TEST_ROOT, program_digest: u(s.steps[2].program.digest()), key: u(s.keys().step_keys[2]) });
-        assert_eq!(t.steps[2].key, PIN_VK_FIX, "vk_fix, circuits' pin");
+        assert_eq!(u(three.steps[2].program.digest()), u(s.steps[1].program.digest()), "level 3 repeats level 2's program");
+        assert_eq!(u(three.keys().step_keys[2]), PIN_VK_INT, "and its key is vk_int");
         t.max_depth = 5;
         check_tree_pins(&ex, &t).expect("a fixed point past the list serves every deeper level");
     }
@@ -1790,6 +1977,24 @@ mod tests {
     }
 
     impl ConfidentialExecutor for AsProvedBinding<'_> {
+        fn auth_header(&self, proof: &[u8]) -> Result<(randprotocol_core::confidential::AuthShape, randprotocol_core::notes::Word8, Option<u64>), randprotocol_core::confidential::ConfidentialError> {
+            self.ex.auth_header(proof)
+        }
+        fn warm_auth_multisig(&self) {
+            self.ex.warm_auth_multisig()
+        }
+        fn auth_multisig_key_ready(&self) -> bool {
+            self.ex.auth_multisig_key_ready()
+        }
+        fn install_msauth_vk(&self, blob: &[u8]) -> Result<(), String> {
+            self.ex.install_msauth_vk(blob)
+        }
+        fn enable_auth_multisig(&self) {
+            self.ex.enable_auth_multisig()
+        }
+        fn build_msauth_key(&self) -> Result<(), String> {
+            self.ex.build_msauth_key()
+        }
         fn check_program(&self, base_pc: u32, words: &[u32]) -> Result<Vec<u8>, ConfidentialError> {
             self.ex.check_program(base_pc, words)
         }

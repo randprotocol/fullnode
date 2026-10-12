@@ -165,6 +165,7 @@ fn build_with(n: u8, validators: u8, epoch_blocks: u64, all_signers: bool, bridg
         fees: None,
         incremental_nullifier_root: None,
         perps: None,
+        hc_auth_multisig: None,
     };
     let gs = genesis.build(&StubExecutor).unwrap();
     let mut cfg = ConsensusConfig::new(1, gs.validators.clone(), gs.hash());
@@ -1598,6 +1599,7 @@ fn one_node_parts() -> (ConsensusConfig, crate::genesis::GenesisState, Keypair) 
         fees: None,
         incremental_nullifier_root: None,
         perps: None,
+        hc_auth_multisig: None,
     };
     let gs = genesis.build(&StubExecutor).unwrap();
     let mut cfg = ConsensusConfig::new(1, gs.validators.clone(), gs.hash());
@@ -2226,6 +2228,7 @@ fn aggregation_node_with(
         fees: None,
         incremental_nullifier_root: None,
         perps: None,
+        hc_auth_multisig: None,
     };
     let mut gs = genesis.build(&StubExecutor).unwrap();
     // Register the aggregator directly on the genesis ledger the node builds on (the register
@@ -3636,6 +3639,22 @@ impl Counted {
 }
 
 impl ConfidentialExecutor for Counted {
+    fn auth_header(&self, proof: &[u8]) -> Result<(crate::confidential::AuthShape, crate::notes::Word8, Option<u64>), crate::confidential::ConfidentialError> {
+        self.tick().auth_header(proof)
+    }
+    fn warm_auth_multisig(&self) {}
+    fn auth_multisig_key_ready(&self) -> bool {
+        true
+    }
+    fn install_msauth_vk(&self, blob: &[u8]) -> Result<(), String> {
+        self.tick().install_msauth_vk(blob)
+    }
+    fn enable_auth_multisig(&self) {
+        self.tick().enable_auth_multisig()
+    }
+    fn build_msauth_key(&self) -> Result<(), String> {
+        self.tick().build_msauth_key()
+    }
     fn check_program(&self, base_pc: u32, words: &[u32]) -> Result<Vec<u8>, crate::confidential::ConfidentialError> {
         self.tick().check_program(base_pc, words)
     }

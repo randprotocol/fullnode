@@ -70,6 +70,14 @@ const NO_KECCAK: u8 = 0;
 /// this chain deploys calls `SYS_SHA256`, and `warm`/`warm_bundle` precompute no sha256 class.
 const NO_SHA256: u8 = 0;
 
+/// Constraint set 9 (private multisig phase 4): the modq table's analogue of `NO_KECCAK` — `0`
+/// declares no modq table. Every proof but the multisig auth guest's must declare it: a bundle and
+/// a single-key auth proof by the exact pin (`check_decoded`), every call, hardened call, invoke
+/// and state proof by its own refusal, before any key is built; and no aggregate path hands a
+/// modq-bearing inner proof to the chip-free recursion verifier (`randprotocol-node`'s
+/// `agg_executor`). Only [`ZkExecutor::msauth_heights`] declares another value.
+const NO_MODQ: u8 = 0;
+
 /// The one tier a bundle proof may declare (zkvm I1). The hidden-asset guest has a single
 /// execution shape up to the dummy skip and the Merkle bit branch, so *every* witness a prover
 /// can build — the ten input shapes and the adversarial cycle-worst one — lands here, measured by
@@ -84,6 +92,205 @@ const BUNDLE_TIER: usize = 14;
 /// `the_auth_guest_publishes_c_and_lands_at_tier_10`) — so, like [`BUNDLE_TIER`], it is pinned,
 /// and a junk header cannot make a node build another key.
 pub const AUTH_TIER: usize = 10;
+
+/// The one tier a multisig auth proof (private multisig phase 4, `guests::compiled::msauth`) may
+/// declare: the vendored `msauth::MSAUTH_TIER` (the MODQ ruling: tier 18 only), pinned like
+/// [`AUTH_TIER`]; `guest_provenance.rs` pins 18 and core mirrors it as `MSAUTH_PROOF_TIER`.
+pub const MSAUTH_TIER: usize = crate::msauth::MSAUTH_TIER.0;
+
+/// The multisig auth guest's refusal sentinel: guest-sdk's panic word, written to output 7 when a
+/// witness does not authorise (below threshold, a bad signature, a path off the policy root).
+pub const MSAUTH_REFUSAL: u32 = 0xdead_beef;
+
+/// The whole header a multisig auth proof must declare (spec §3.1): the tier and all seven log
+/// heights, each compared **exactly** — `mem_log_height` included (R-hide: it would otherwise
+/// grow with the number of signers). [`ZkExecutor::msauth_heights`] is the one value. Serde
+/// because it is also the header shape of the precomputed verifier key blob ([`msauth_vk`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct MsauthShape {
+    pub tier: usize,
+    pub program_log_height: u8,
+    pub input_log_height: u8,
+    pub keccak_log_height: u8,
+    pub sha256_log_height: u8,
+    pub modq_log_height: u8,
+    pub public_log_height: u8,
+    pub mem_log_height: u8,
+}
+
+/// The precomputed msauth verifier key (plan Task 2b, spec §3.6).
+///
+/// The tier-18 msauth key costs 78.6 s and ~4 GB to build (Task 2's measurement), and the fleet's
+/// validators are `s-2vcpu-4gb`, so a node **loads** it instead. The key file is exactly the
+/// vendored machine's `VerifierKeyBlob::to_bytes()` (no wrapper of ours), so its pin is the
+/// SHA-256 of the file bytes — the digest `Machine::install_verifier_key_pinned` checks on the
+/// raw bytes before it decodes anything (the blob is a trust root: a crafted preprocessed
+/// commitment could make forged proofs verify). There is one location, beside the binary
+/// (`/usr/local/bin/msauth-vk-production.bin`; `--msauth-vk` / `RAND_MSAUTH_VK` override it), and
+/// a node on a chain naming `hc_auth_multisig` refuses to start without the pinned blob.
+pub mod msauth_vk {
+    use super::{MsauthShape, ZkExecutor};
+    use crate::machine::{FriProfile, Machine, Tier};
+    pub use crate::machine::{InstallKeyError, VerifierKeyBlob, VerifierKeyShape};
+    use serde::Serialize;
+
+    /// No blob hashes to this: the value a pin holds until its blob exists.
+    pub const PIN_PENDING: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+
+    /// SHA-256 of `msauth-vk-production.bin`, the release asset every validator installs at
+    /// `/usr/local/bin/msauth-vk-production.bin`. Consensus-critical (a wrong commitment could let
+    /// a forged multisig proof verify): `tests/guest_provenance.rs` and `deploy/roll-all.sh` check
+    /// it. 23 754 bytes, from `rand-node keygen-msauth-vk --profile production` at circuits
+    /// d217252 (constraint set 9); deterministic, so any host regenerates it byte for byte.
+    pub const MSAUTH_VK_SHA256_PRODUCTION: &str = "68facb06c7f321aaf1d4d541acf6b5c0e9d7f17788ed1c9add6c5a8a8f7acd30";
+    /// SHA-256 of `crates/randprotocol-zkvm/keys/msauth-vk-test.bin` (tests only; 23 754 bytes).
+    pub const MSAUTH_VK_SHA256_TEST: &str = "c82250e7e7f8ca94246dc512091c1dafe402d5c0f6f4503e585d9381319443f5";
+
+    /// This build's pin for `profile`.
+    pub fn pin(profile: FriProfile) -> &'static str {
+        match profile {
+            FriProfile::Production => MSAUTH_VK_SHA256_PRODUCTION,
+            FriProfile::Test => MSAUTH_VK_SHA256_TEST,
+        }
+    }
+
+    /// The fixed file name for `profile`, beside the running binary: `msauth-vk-<profile>.bin`.
+    pub fn file_name(profile: FriProfile) -> &'static str {
+        match profile {
+            FriProfile::Production => "msauth-vk-production.bin",
+            FriProfile::Test => "msauth-vk-test.bin",
+        }
+    }
+
+    /// The SHA-256 of `bytes`, lowercase hex: what every pin and every deploy check compares, and
+    /// the digest the vendored `Machine::install_verifier_key_pinned` checks on the raw bytes
+    /// (`crate::sha256::sha256`, the same function) before it decodes anything.
+    pub fn digest(bytes: &[u8]) -> String {
+        hex(&crate::sha256::sha256(bytes))
+    }
+
+    fn hex(d: &[u8; 32]) -> String {
+        d.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// A 64-hex-character pin as the 32 bytes the machine compares; `None` if malformed.
+    pub fn pin_bytes(pin: &str) -> Option<[u8; 32]> {
+        if pin.len() != 64 {
+            return None;
+        }
+        let mut out = [0u8; 32];
+        for (i, o) in out.iter_mut().enumerate() {
+            *o = u8::from_str_radix(pin.get(2 * i..2 * i + 2)?, 16).ok()?;
+        }
+        Some(out)
+    }
+
+    /// The machine's key-cache shape for the msauth header (the memory height is not part of a
+    /// key: every valid memory height yields the same `CommonData`).
+    pub fn key_shape(s: MsauthShape) -> VerifierKeyShape {
+        VerifierKeyShape {
+            tier: Tier(s.tier),
+            program_log_height: s.program_log_height,
+            input_log_height: s.input_log_height,
+            keccak_log_height: s.keccak_log_height,
+            sha256_log_height: s.sha256_log_height,
+            modq_log_height: s.modq_log_height,
+            public_log_height: s.public_log_height,
+        }
+    }
+
+    /// Where the msauth key came from: `rand_status.msauth_key`.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+    #[serde(rename_all = "snake_case")]
+    pub enum MsauthKeySource {
+        /// Installed from the pinned blob.
+        Loaded,
+        /// Built on this host (`--build-msauth-key`, development only).
+        Built,
+        /// The chain has no `hc_auth_multisig`, so there is no key.
+        #[default]
+        Absent,
+    }
+    impl MsauthKeySource {
+        pub fn as_str(self) -> &'static str {
+            match self {
+                MsauthKeySource::Loaded => "loaded",
+                MsauthKeySource::Built => "built",
+                MsauthKeySource::Absent => "absent",
+            }
+        }
+    }
+
+    /// Why a blob was refused. Each refusal names its field; the node turns any of them into a
+    /// startup failure.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum MsauthVkError {
+        Digest { got: String, want: String },
+        Decode(String),
+        Profile { got: FriProfile, want: FriProfile },
+        Shape { got: VerifierKeyShape, want: VerifierKeyShape },
+        /// The machine's own install refused it (format, constraint set, structure, lookups,
+        /// a filled slot).
+        Install(String),
+    }
+    impl std::fmt::Display for MsauthVkError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                MsauthVkError::Digest { got, want } => write!(f, "msauth key blob digest: has sha256 {got}, not the pinned {want}"),
+                MsauthVkError::Decode(e) => write!(f, "msauth key blob does not decode: {e}"),
+                MsauthVkError::Profile { got, want } => write!(f, "msauth key blob profile is {got:?}, this node runs {want:?}"),
+                MsauthVkError::Shape { got, want } => write!(f, "msauth key blob shape {got:?} is not the pinned msauth shape {want:?}"),
+                MsauthVkError::Install(e) => write!(f, "the machine refused the msauth key: {e}"),
+            }
+        }
+    }
+    impl std::error::Error for MsauthVkError {}
+
+    /// The checks the node names itself, in order: the SHA-256 of the file bytes equals
+    /// `want_digest` (before anything is decoded); the bytes decode; the header's profile is
+    /// `profile`; its shape is exactly [`ZkExecutor::msauth_heights`]. The machine's install
+    /// repeats the digest check and adds format, constraint set, structure and lookups.
+    pub fn check(blob: &[u8], want_digest: &str, profile: FriProfile) -> Result<VerifierKeyBlob, MsauthVkError> {
+        let got = digest(blob);
+        if got != want_digest {
+            return Err(MsauthVkError::Digest { got, want: want_digest.to_string() });
+        }
+        let b = VerifierKeyBlob::from_bytes(blob).map_err(|e| MsauthVkError::Decode(format!("{e:?}")))?;
+        if b.profile != profile {
+            return Err(MsauthVkError::Profile { got: b.profile, want: profile });
+        }
+        let want = key_shape(ZkExecutor::msauth_heights());
+        if b.shape != want {
+            return Err(MsauthVkError::Shape { got: b.shape, want });
+        }
+        Ok(b)
+    }
+
+    /// The key file for `profile`: the full build on a fresh machine, exported at the pinned
+    /// msauth shape (the `rand-node keygen-msauth-vk` body; a big host only — 78.6 s / ~4 GB at
+    /// Production).
+    pub fn blob(profile: FriProfile) -> Result<Vec<u8>, MsauthVkError> {
+        Ok(machine_export(&Machine::new(profile), ZkExecutor::msauth_heights()))
+    }
+
+    pub(super) fn machine_export(machine: &Machine, s: MsauthShape) -> Vec<u8> {
+        machine
+            .export_verifier_key_with_modq(Tier(s.tier), s.program_log_height, s.input_log_height, s.keccak_log_height, s.sha256_log_height, s.modq_log_height, s.public_log_height)
+            .to_bytes()
+    }
+
+    /// `machine.install_verifier_key_pinned(bytes, pin)`. After `Ok`, `verify`/`verify_public` at
+    /// that shape use the installed (non-evictable) key and build nothing.
+    pub(super) fn machine_install(machine: &Machine, bytes: &[u8], pin: &str) -> Result<(), MsauthVkError> {
+        let want = pin_bytes(pin).ok_or_else(|| MsauthVkError::Digest { got: digest(bytes), want: pin.to_string() })?;
+        machine.install_verifier_key_pinned(bytes, &want).map_err(|e| match e {
+            InstallKeyError::Pin { got } => MsauthVkError::Digest { got: hex(&got), want: pin.to_string() },
+            InstallKeyError::Decode(d) => MsauthVkError::Decode(d),
+            InstallKeyError::Profile { blob, machine } => MsauthVkError::Profile { got: blob, want: machine },
+            other => MsauthVkError::Install(format!("{other:?}")),
+        })
+    }
+}
 
 /// The highest tier a *call* proof may declare (deep scan 2026-09-24, zkvm), enforced by
 /// `verify_call` before any verifier key is built, so it is a validity rule (admission and block
@@ -217,8 +424,8 @@ pub fn non_canonical(proof: &Proof) -> Option<String> {
     if let Some(bits) = proof.batch.degree_bits.iter().find(|&&bits| bits > MAX_HONEST_DEGREE_BITS) {
         return Some(format!("degree bits {bits} where no accepted proof declares more than {MAX_HONEST_DEGREE_BITS}"));
     }
-    if proof.keccak_log_height == NO_KECCAK
-        && proof.sha256_log_height == NO_SHA256
+    let no_table = proof.keccak_log_height == NO_KECCAK && proof.sha256_log_height == NO_SHA256 && proof.modq_log_height == NO_MODQ;
+    if no_table
         && TIERS.contains(&proof.tier.0)
         && proof.mem_log_height != proof.tier.min_mem_log_height()
     {
@@ -232,12 +439,20 @@ pub fn non_canonical(proof: &Proof) -> Option<String> {
     // INT-5 residual (issue #56): with a hash table the honest height depends on how many
     // accesses the run made, which the header does not carry, so it is capped rather than pinned
     // — at the most the declared shape can honestly need.
-    if (proof.keccak_log_height != NO_KECCAK || proof.sha256_log_height != NO_SHA256) && TIERS.contains(&proof.tier.0) {
-        let ceiling = hash_bearing_mem_log_height_ceiling(proof.tier, proof.keccak_log_height, proof.sha256_log_height);
+    //
+    // Constraint set 9: a modq table is traffic too (five `MEMORY` interactions a row), so a
+    // modq-bearing proof takes the ceiling rule, never the plain `t + 2` pin.
+    if !no_table && TIERS.contains(&proof.tier.0) {
+        let ceiling = hash_bearing_mem_log_height_ceiling_with_modq(
+            proof.tier,
+            proof.keccak_log_height,
+            proof.sha256_log_height,
+            proof.modq_log_height,
+        );
         if proof.mem_log_height > ceiling {
             return Some(format!(
-                "memory height {} above the {ceiling} the honest prover can need (tier {}, keccak {}, sha256 {})",
-                proof.mem_log_height, proof.tier.0, proof.keccak_log_height, proof.sha256_log_height
+                "memory height {} above the {ceiling} the honest prover can need (tier {}, keccak {}, sha256 {}, modq {})",
+                proof.mem_log_height, proof.tier.0, proof.keccak_log_height, proof.sha256_log_height, proof.modq_log_height
             ));
         }
     }
@@ -262,10 +477,16 @@ pub fn non_canonical(proof: &Proof) -> Option<String> {
     // traces, one matrix per chip that has any). The verifier checks only the nesting — round,
     // matrix, point — and appends whatever it finds; the count per point is the prover's to
     // choose as far as that layer is concerned.
-    let preprocessed = crate::machine::chips(
+    //
+    // Constraint set 9 (pre-flight finding 1): the modq table has 16 preprocessed columns, so a
+    // modq-bearing proof's preprocessed round holds one more matrix; counting `chips(t, k, s)`
+    // named every honest msauth proof non-canonical (refused by the pool, and by consensus under
+    // `hardening_v6`). `tests/auth_modq_canonical.rs` guards it.
+    let preprocessed = crate::machine::chips_with_modq(
         if TIERS.contains(&proof.tier.0) { proof.tier } else { Tier(TIERS[0]) },
         clamped_hash_log_height(proof.keccak_log_height, crate::tables::keccak::MAX_LOG_HEIGHT),
         clamped_hash_log_height(proof.sha256_log_height, crate::tables::sha256::MAX_LOG_HEIGHT),
+        clamped_hash_log_height(proof.modq_log_height, crate::tables::modq::MAX_LOG_HEIGHT),
     )
     .iter()
     .filter(|c| p3_air::BaseAir::<crate::machine::Val>::preprocessed_width(*c) > 0)
@@ -306,12 +527,20 @@ pub fn non_canonical(proof: &Proof) -> Option<String> {
 /// in place of the verifier's `MAX_MEM_LOG_HEIGHT − (t + 2) + 1` (up to a dozen), and the height
 /// still says, to within that bit, whether the run's accesses spilled past `2^(t+2)`.
 pub fn hash_bearing_mem_log_height_ceiling(tier: Tier, keccak_log_height: u8, sha256_log_height: u8) -> u8 {
+    hash_bearing_mem_log_height_ceiling_with_modq(tier, keccak_log_height, sha256_log_height, NO_MODQ)
+}
+
+/// [`hash_bearing_mem_log_height_ceiling`] with the modq table's declared height (constraint set
+/// 9): its traffic is at most five `MEMORY` interactions a row (MODQ spec §0), so `rows(m) · 5`
+/// more accesses. `0` declares no modq table and adds nothing.
+pub fn hash_bearing_mem_log_height_ceiling_with_modq(tier: Tier, keccak_log_height: u8, sha256_log_height: u8, modq_log_height: u8) -> u8 {
     let rows = |log_height: u8| if log_height == 0 { 0u128 } else { 1u128 << log_height.min(63) };
     let cpu = 4 * (tier.cpu_height() as u128 - 1);
     let keccak = rows(keccak_log_height) / crate::tables::keccak::BLOCK as u128 * (2 * crate::keccak::WORDS) as u128;
     let sha256 = rows(sha256_log_height) / crate::tables::sha256::BLOCK as u128
         * (crate::sha256::WORDS + crate::sha256::STATE_WORDS) as u128;
-    let needed = (cpu + keccak + sha256 + 1).next_power_of_two().trailing_zeros() as u8;
+    let modq = rows(modq_log_height) * 5;
+    let needed = (cpu + keccak + sha256 + modq + 1).next_power_of_two().trailing_zeros() as u8;
     tier.min_mem_log_height().max(needed).min(crate::machine::MAX_MEM_LOG_HEIGHT)
 }
 
@@ -347,10 +576,14 @@ const _: () = {
     assert!(crate::tables::public::MAX_LOG_HEIGHT <= mem);
     assert!(crate::tables::keccak::MAX_LOG_HEIGHT <= mem);
     assert!(crate::tables::sha256::MAX_LOG_HEIGHT <= mem);
+    assert!(crate::tables::modq::MAX_LOG_HEIGHT <= mem);
     // cpu 2^t, alu 2^(t+1), poseidon2 2^(t+2), the memory floor t+2: the tallest tier's.
     assert!(TIERS[TIERS.len() - 1] + 2 <= mem as usize);
     assert!(crate::tables::range::HEIGHT <= 1 << mem && crate::tables::nibble::HEIGHT <= 1 << mem);
 };
+// Constraint set 9 (pre-flight finding 18): the modq table's extended height (its log height plus
+// the zk doubling) is inside the bound too.
+const _: () = assert!(crate::tables::modq::MAX_LOG_HEIGHT as usize + 1 <= MAX_HONEST_DEGREE_BITS);
 
 /// ZKV-4: a declared keccak or sha256 height as `machine::chips` may be handed it before
 /// `check_declared_heights` has run. `chips` shifts by the height to size the table (a debug-build
@@ -386,10 +619,13 @@ pub fn honest_fri_arities(proof: &Proof) -> Option<Vec<u8>> {
     if proof.batch.degree_bits.iter().any(|&bits| bits > MAX_HONEST_DEGREE_BITS) {
         return None;
     }
-    let chips = crate::machine::chips(
+    // Constraint set 9: with the modq table, or a modq-bearing proof's instance count never
+    // matches, the schedule is `None` and the arity rule silently skips it (VERIFIER-2).
+    let chips = crate::machine::chips_with_modq(
         proof.tier,
         clamped_hash_log_height(proof.keccak_log_height, crate::tables::keccak::MAX_LOG_HEIGHT),
         clamped_hash_log_height(proof.sha256_log_height, crate::tables::sha256::MAX_LOG_HEIGHT),
+        clamped_hash_log_height(proof.modq_log_height, crate::tables::modq::MAX_LOG_HEIGHT),
     );
     if chips.len() != proof.batch.degree_bits.len() {
         return None;
@@ -479,20 +715,49 @@ pub struct ZkExecutor {
     /// every validator at once when a proposal carries it). `decode_and_check` pins every
     /// component of a bundle proof's key (tier, all three heights the prover chooses, both hash
     /// tables absent), so this cache only ever holds that one key and nothing a program can
-    /// deploy reaches it. The vendored cache itself (FIFO, no single-flight) is upstream's.
+    /// deploy reaches it. (The history above is the FIFO cache of the time; the vendored cache is
+    /// now LRU and single-flight per shape — each slot an `Arc<OnceLock>`, #54 — and is
+    /// upstream's either way.)
     bundle_machine: Machine,
     /// The auth guest's own `Machine` (split authorisation), for the same reason as
     /// `bundle_machine`: `decode_and_check` pins every component of an auth proof's key
     /// ([`AUTH_TIER`], the guest's heights, no hash table), so this cache holds that one key and
     /// neither a deploy nor a bundle can evict it.
     auth_machine: Machine,
+    /// The msauth guest's own `Machine` (private multisig phase 4), for `auth_machine`'s reason:
+    /// [`ZkExecutor::verify_msauth_proof`] pins every component of a multisig auth proof's key
+    /// before it asks, so its cache only ever holds the one tier-18 key, which neither a deploy,
+    /// a bundle nor a single-key auth proof can evict.
+    msauth_machine: Machine,
+    /// The tier-18 msauth verifier key, built once (spec §3.5, pre-flight finding 3): measured at
+    /// Production on the 48 GB laptop at 78.6 s and ~4.0 GB peak (and resident after, on macOS's
+    /// allocator — the key itself is a commitment and lookups), on 2–4 GB validators, so four
+    /// verify workers and the warm thread must never each build one; Task 2b has the node LOAD a
+    /// precomputed key instead of building it. `get_or_init` is the single flight: the first caller
+    /// builds, every other waits for it and receives the same `Arc`. Filled by
+    /// [`ZkExecutor::warm_auth_multisig`] (which `node::warm` runs first on a chain naming
+    /// `hc_auth_multisig`) or by the first msauth verify; [`ZkExecutor::msauth_key_ready`] is the
+    /// mempool's "warm yet?" read.
+    msauth_key: std::sync::OnceLock<std::sync::Arc<p3_batch_stark::CommonData<crate::machine::Config>>>,
+    /// How many times the `msauth_key` initialiser ran — at most once ([`ZkExecutor::msauth_key_builds`]).
+    msauth_key_builds: std::sync::atomic::AtomicUsize,
+    /// Where the msauth key came from (Task 2b): set once, `Loaded` by
+    /// [`ZkExecutor::install_msauth_vk`], `Built` by the build; unset reads as `Absent`.
+    msauth_key_source: std::sync::OnceLock<msauth_vk::MsauthKeySource>,
+    /// Whether this executor runs a chain whose genesis names `hc_auth_multisig` (plan Task 3, the
+    /// Task 2b review's carried note): set once by [`ZkExecutor::enable_auth_multisig`] — which
+    /// `node::load_genesis` calls exactly for such a genesis — and never cleared. Off, the msauth
+    /// path of `verify_auth` is unreachable: a multisig-`hc` verify is refused by name before any
+    /// decode, so no crafted auth proof can make a node on another chain build the ~4 GB key.
+    msauth_enabled: std::sync::atomic::AtomicBool,
     /// Held across the whole body of `warm` and `warm_bundle` (CPUV-1): at most one warm-up
     /// builds keys at a time on this node, whoever calls it. `node::warm_new_programs` spawns a
     /// blocking task per deploy-carrying commit and the startup warm runs beside them, so before
     /// this the builds overlapped — six at once peaked at 1.58 GB against 2 GB droplets. A queued
     /// warm-up waits here holding nothing but a blocking-pool thread. It does not serialise the
-    /// admission workers' own key builds on a cache miss (`Machine::verifier_key` has no
-    /// single-flight); those are bounded by the four verify workers instead.
+    /// admission workers' own key builds on a cache miss; those are single-flight per shape in
+    /// the vendored cache (#54: concurrent callers of one shape wait for one build) and bounded
+    /// across shapes by the four verify workers.
     warm_lock: std::sync::Mutex<()>,
     /// How many `warm`/`warm_bundle` bodies are running right now, and the most that ever ran at
     /// once — [`ZkExecutor::peak_concurrent_warms`], the observable CPUV-1's serialisation is
@@ -507,6 +772,11 @@ impl ZkExecutor {
             machine: Machine::new(profile),
             bundle_machine: Machine::new(profile),
             auth_machine: Machine::new(profile),
+            msauth_machine: Machine::new(profile),
+            msauth_key: std::sync::OnceLock::new(),
+            msauth_key_builds: std::sync::atomic::AtomicUsize::new(0),
+            msauth_key_source: std::sync::OnceLock::new(),
+            msauth_enabled: std::sync::atomic::AtomicBool::new(false),
             warm_lock: std::sync::Mutex::new(()),
             warms_in_flight: std::sync::atomic::AtomicUsize::new(0),
             peak_warms: std::sync::atomic::AtomicUsize::new(0),
@@ -650,6 +920,14 @@ impl ZkExecutor {
         exact: bool,
         pinned_tier: usize,
     ) -> Result<Proof, ConfidentialError> {
+        // Constraint set 9: a modq table is the multisig auth guest's alone, and that guest has
+        // its own path (`decode_and_check_msauth`). A call, hardened call, invoke or state proof
+        // (`exact` false) declaring one is refused here, before anything is sized from the header
+        // and before any key — otherwise any caller could make a validator build modq-bearing
+        // call keys, the DoS the call tier cap closed. No deployed program issues `SYS_MODQ`.
+        if proof.modq_log_height != NO_MODQ && !exact {
+            return Err(ConfidentialError::InvalidProof("a call proof declares no modq table".into()));
+        }
         check_declared_heights(
             proof.tier,
             proof.program_log_height,
@@ -691,12 +969,16 @@ impl ZkExecutor {
         // `pinned_tier` is that one tier: [`BUNDLE_TIER`] for a bundle proof, [`AUTH_TIER`] for
         // an auth proof (split authorisation, whose guest is straight-line). Unread when `exact`
         // is false.
+        //
+        // Constraint set 9: and the modq table, absent (`NO_MODQ`) — a bundle and a single-key
+        // auth proof declare none (MODQ spec §6 item 5).
         if exact
             && (proof.tier != Tier(pinned_tier)
                 || proof.keccak_log_height != NO_KECCAK
-                || proof.sha256_log_height != NO_SHA256)
+                || proof.sha256_log_height != NO_SHA256
+                || proof.modq_log_height != NO_MODQ)
         {
-            return Err(ConfidentialError::InvalidProof("tier or hash-table height not the pinned guest's".into()));
+            return Err(ConfidentialError::InvalidProof("tier, hash-table or modq height not the pinned guest's".into()));
         }
         // Reproduces `Machine::verify`'s own equality check, which is simultaneously the check
         // that the batch's *instance count* matches what `chips` would build — nine mandatory
@@ -946,6 +1228,318 @@ impl ZkExecutor {
             .verify_public(hc_auth, binding, &p)
             .map_err(|e| ConfidentialError::InvalidProof(format!("{e:?}")))?;
         published_digest(&p.public_values)
+    }
+
+    /// The multisig auth guest (private multisig phase 4, `guests::compiled::msauth`, circuits
+    /// Task 8's `msauth.bin`): `msk`, `salt`, a threshold and `M_MAX` signer slots in (each a
+    /// Dilithium2 key, signature and Merkle path), `c = H(AUTH, nk_ms, salt)` out, where
+    /// `nk_ms = H(NK_MS, msk ‖ policy)`. Assembled once per process, like the other guests.
+    pub fn msauth_program() -> &'static Program {
+        static MSAUTH: std::sync::OnceLock<Program> = std::sync::OnceLock::new();
+        MSAUTH.get_or_init(crate::guests::compiled::msauth)
+    }
+
+    /// Digest of the multisig auth guest — what a genesis names as `hc_auth_multisig`
+    /// (`tests/guest_provenance.rs` pins it).
+    pub fn hc_auth_multisig() -> Word8 {
+        Self::msauth_program().digest()
+    }
+
+    /// The header every multisig auth proof declares (spec §3.1): [`MSAUTH_TIER`], the guest's
+    /// program height, the fixed `MSAUTH_WORDS` witness' input height, the transaction binding's
+    /// public height, and the vendored prover's floors (`msauth::pinned_options()`) for keccak,
+    /// modq and memory; no sha256 table. The vendored `msauth::PINNED_*` literals are the same
+    /// numbers (`tests/auth_msauth.rs` checks both).
+    pub fn msauth_heights() -> MsauthShape {
+        let o = crate::msauth::pinned_options();
+        let (plh, ilh, pubh) = pinned_heights(Self::msauth_program(), crate::msauth::MSAUTH_WORDS);
+        MsauthShape {
+            tier: MSAUTH_TIER,
+            program_log_height: plh,
+            input_log_height: ilh,
+            keccak_log_height: o.min_keccak_log_height,
+            sha256_log_height: NO_SHA256,
+            modq_log_height: o.min_modq_log_height,
+            public_log_height: pubh,
+            mem_log_height: o.min_mem_log_height,
+        }
+    }
+
+    /// The first header word of `p` that is not the multisig shape's, by name; `None` when all
+    /// eight (tier and seven heights) are exactly [`Self::msauth_heights`].
+    fn msauth_header_mismatch(p: &Proof) -> Option<&'static str> {
+        let s = Self::msauth_heights();
+        let fields: [(&'static str, bool); 8] = [
+            ("tier", p.tier.0 == s.tier),
+            ("program_log_height", p.program_log_height == s.program_log_height),
+            ("input_log_height", p.input_log_height == s.input_log_height),
+            ("keccak_log_height", p.keccak_log_height == s.keccak_log_height),
+            ("sha256_log_height", p.sha256_log_height == s.sha256_log_height),
+            ("modq_log_height", p.modq_log_height == s.modq_log_height),
+            ("public_log_height", p.public_log_height == s.public_log_height),
+            ("mem_log_height", p.mem_log_height == s.mem_log_height),
+        ];
+        fields.iter().find(|(_, ok)| !ok).map(|(name, _)| *name)
+    }
+
+    /// Whether `p` declares the single-key auth guest's pinned header: [`AUTH_TIER`], its
+    /// program, input and public heights, and no keccak, sha256 or modq table. (Its memory height
+    /// is the tier's `t + 2`, a canonical-proof rule, `non_canonical`.)
+    fn is_single_key_header(p: &Proof) -> bool {
+        let (plh, ilh, pubh) = Self::auth_heights();
+        p.tier == Tier(AUTH_TIER)
+            && (p.program_log_height, p.input_log_height, p.public_log_height) == (plh, ilh, pubh)
+            && (p.keccak_log_height, p.sha256_log_height, p.modq_log_height) == (NO_KECCAK, NO_SHA256, NO_MODQ)
+    }
+
+    /// Which auth guest's pinned header `proof` declares (spec §3.1), from its canonical decode
+    /// alone: the single-key one, the multisig one (all eight words exact), or neither
+    /// (`InvalidProof`). Nothing verified and nothing built.
+    ///
+    /// A header read only — no ranges, no degree bits, no public-value layout. **The ledger
+    /// (Task 4) must use `auth_header` ([`Self::auth_header_of`]), which runs the chosen shape's
+    /// full structural checks in the same decode; this is a test and tooling convenience.**
+    pub fn auth_shape_of(proof: &[u8]) -> Result<randprotocol_core::confidential::AuthShape, ConfidentialError> {
+        use randprotocol_core::confidential::AuthShape;
+        let p = decode_canonical(proof)?;
+        if Self::is_single_key_header(&p) {
+            Ok(AuthShape::SingleKey)
+        } else if Self::msauth_header_mismatch(&p).is_none() {
+            Ok(AuthShape::Multisig)
+        } else {
+            Err(ConfidentialError::InvalidProof("an auth proof of neither pinned shape".into()))
+        }
+    }
+
+    /// Every check that must precede the msauth `verify_public`, on a decoded proof: the exact
+    /// header (all eight words — a junk header costs comparisons, never a tier-18 key build), the
+    /// machine's own ranges, the degree-bits vector of the pinned shape (which is also the
+    /// instance-count check), and the public-value layout.
+    fn check_msauth_decoded(&self, proof: Proof) -> Result<Proof, ConfidentialError> {
+        if let Some(field) = Self::msauth_header_mismatch(&proof) {
+            return Err(ConfidentialError::InvalidProof(format!("not the multisig auth guest's shape: {field}")));
+        }
+        let s = Self::msauth_heights();
+        crate::machine::check_declared_heights_with_modq(
+            proof.tier,
+            proof.program_log_height,
+            proof.input_log_height,
+            proof.keccak_log_height,
+            proof.sha256_log_height,
+            proof.modq_log_height,
+            proof.public_log_height,
+            proof.mem_log_height,
+        )
+        .map_err(|e| ConfidentialError::InvalidProof(format!("declared shape: {e:?}")))?;
+        let want = self.msauth_machine.log_ext_degrees_with_modq(
+            Tier(s.tier),
+            s.program_log_height,
+            s.input_log_height,
+            s.keccak_log_height,
+            s.sha256_log_height,
+            s.modq_log_height,
+            s.public_log_height,
+            s.mem_log_height,
+        );
+        if proof.batch.degree_bits != want {
+            return Err(ConfidentialError::InvalidProof("degree bits".into()));
+        }
+        if proof.public_values.len() != pv::NUM {
+            return Err(ConfidentialError::MalformedProof);
+        }
+        if proof.public_values[pv::OUT0..pv::OUT0 + 8].iter().any(|v| *v > u32::MAX as u64) {
+            return Err(ConfidentialError::InvalidProof("output not a u32".into()));
+        }
+        if proof.public_values[pv::IN0..pv::IN0 + 8].iter().any(|v| *v > u32::MAX as u64) {
+            return Err(ConfidentialError::InvalidProof("H_IN word not a u32".into()));
+        }
+        Ok(proof)
+    }
+
+    /// [`Self::check_msauth_decoded`] over proof bytes (the canonical decode first).
+    fn decode_and_check_msauth(&self, proof: &[u8]) -> Result<Proof, ConfidentialError> {
+        self.check_msauth_decoded(decode_canonical(proof)?)
+    }
+
+    /// The `c` a multisig auth proof publishes, after the structural checks at the pinned shape.
+    /// Nothing verified.
+    pub fn msauth_proof_commit(&self, proof: &[u8]) -> Result<Word8, ConfidentialError> {
+        published_digest(&self.decode_and_check_msauth(proof)?.public_values)
+    }
+
+    /// The multisig half of `ConfidentialExecutor::verify_auth`: the proof decoded at the pinned
+    /// shape (refused there, before any key, if it is not exactly it), the one msauth key taken
+    /// through the single flight, the proof verified against `hc` with `binding` as its public
+    /// segment, and the `c` it publishes returned.
+    ///
+    /// The key: `msauth_key` holds the `Arc` the msauth machine's own cache slot holds (the same
+    /// allocation), so `verify_public`'s lookup of the identical 7-tuple finds it built. The
+    /// machine's cache only ever sees this one shape (the header is pinned before it is asked),
+    /// so its slot is never evicted.
+    pub fn verify_msauth_proof(&self, hc: &Word8, proof: &[u8], binding: &[u32; TX_BINDING_WORDS]) -> Result<Word8, ConfidentialError> {
+        let p = self.decode_and_check_msauth(proof)?;
+        let _key = self.msauth_key();
+        self.msauth_machine
+            .verify_public(hc, binding, &p)
+            .map_err(|e| ConfidentialError::InvalidProof(format!("{e:?}")))?;
+        published_digest(&p.public_values)
+    }
+
+    /// Open the msauth path of `verify_auth` (see the `msauth_enabled` field): this executor runs
+    /// a chain whose genesis names `hc_auth_multisig`. `node::load_genesis` calls it for exactly
+    /// such a genesis; a wallet or a test that verifies multisig auth proofs calls it itself.
+    pub fn enable_auth_multisig(&self) {
+        self.msauth_enabled.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Whether [`Self::enable_auth_multisig`] has been called.
+    pub fn auth_multisig_enabled(&self) -> bool {
+        self.msauth_enabled.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// The msauth key, built at most once ([`Self::msauth_key_with`] over the tier-18 build).
+    fn msauth_key(&self) -> std::sync::Arc<p3_batch_stark::CommonData<crate::machine::Config>> {
+        self.msauth_key_with(|| {
+            let _ = self.msauth_key_source.set(msauth_vk::MsauthKeySource::Built);
+            let s = Self::msauth_heights();
+            self.msauth_machine.verifier_key_with_modq(
+                Tier(s.tier),
+                s.program_log_height,
+                s.input_log_height,
+                s.keccak_log_height,
+                s.sha256_log_height,
+                s.modq_log_height,
+                s.public_log_height,
+            )
+        })
+    }
+
+    /// The single flight itself: `msauth_key.get_or_init(build)`, counting the builds. Every
+    /// concurrent caller waits for the first one's `build` and receives its `Arc`. `build` is a
+    /// parameter only so the unit test can stand a cheap key in for the tier-18 one.
+    fn msauth_key_with(
+        &self,
+        build: impl FnOnce() -> std::sync::Arc<p3_batch_stark::CommonData<crate::machine::Config>>,
+    ) -> std::sync::Arc<p3_batch_stark::CommonData<crate::machine::Config>> {
+        self.msauth_key
+            .get_or_init(|| {
+                self.msauth_key_builds.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                build()
+            })
+            .clone()
+    }
+
+    /// Install the precomputed msauth verifier key from the key file's bytes (Task 2b, spec
+    /// §3.6), instead of building it: [`msauth_vk::check`] against this build's pin for this
+    /// executor's profile (digest, decode, profile, shape), then the machine's install, then the
+    /// single-flight slot filled from the machine's cache (no build). Afterwards
+    /// [`Self::msauth_key_ready`] is true and [`Self::msauth_key_source`] is `Loaded`.
+    pub fn install_msauth_vk(&self, blob: &[u8]) -> Result<(), msauth_vk::MsauthVkError> {
+        self.install_msauth_vk_with_pin(blob, msauth_vk::pin(self.msauth_machine.profile))
+    }
+
+    /// [`Self::install_msauth_vk`] against a given pin: the tests' way to reach the header checks
+    /// with a synthetic blob (no real blob hashes to a test's own digest otherwise).
+    #[doc(hidden)]
+    pub fn install_msauth_vk_with_pin(&self, blob: &[u8], pin: &str) -> Result<(), msauth_vk::MsauthVkError> {
+        msauth_vk::check(blob, pin, self.msauth_machine.profile)?;
+        msauth_vk::machine_install(&self.msauth_machine, blob, pin)?;
+        let s = Self::msauth_heights();
+        // The machine holds the installed key in its slot for the 7-tuple, so this lookup returns
+        // it without a build; the `OnceLock` is the readiness flag, not a second copy.
+        self.msauth_key.get_or_init(|| {
+            self.msauth_machine.verifier_key_with_modq(
+                Tier(s.tier),
+                s.program_log_height,
+                s.input_log_height,
+                s.keccak_log_height,
+                s.sha256_log_height,
+                s.modq_log_height,
+                s.public_log_height,
+            )
+        });
+        let _ = self.msauth_key_source.set(msauth_vk::MsauthKeySource::Loaded);
+        Ok(())
+    }
+
+    /// After a `--build-msauth-key` build: the built key exported (from the machine's cache, no
+    /// second build) and its SHA-256 compared with this build's pin. A mismatch means this host
+    /// built a key the fleet's pinned blob does not match — a dependency, constraint-set or
+    /// profile drift — and is reported, never ignored.
+    pub fn check_built_msauth_key(&self) -> Result<(), String> {
+        let got = msauth_vk::digest(&msauth_vk::machine_export(&self.msauth_machine, Self::msauth_heights()));
+        let want = msauth_vk::pin(self.msauth_machine.profile);
+        if got == want {
+            Ok(())
+        } else {
+            Err(format!("the msauth key built here has sha256 {got}, not this build's pin {want}: the pinned blob and this build disagree"))
+        }
+    }
+
+    /// Where this executor's msauth key came from: `Loaded`, `Built`, or `Absent` (neither yet).
+    pub fn msauth_key_source(&self) -> msauth_vk::MsauthKeySource {
+        self.msauth_key_source.get().copied().unwrap_or_default()
+    }
+
+    /// A test instrument: how many verifier keys the msauth machine itself has built — 0 after a
+    /// load, which is what "the node never builds the key" means.
+    #[doc(hidden)]
+    pub fn msauth_machine_key_builds(&self) -> usize {
+        self.msauth_machine.key_builds()
+    }
+
+    /// 0 before the msauth key is built, 1 after; never more (the key is one `OnceLock`).
+    pub fn cached_msauth_keys(&self) -> usize {
+        self.msauth_key.get().is_some() as usize
+    }
+
+    /// Whether the msauth key is built — the mempool defers a multisig auth proof, retryably,
+    /// until it is (spec §3.5); `ConfidentialExecutor::auth_multisig_key_ready` (Task 4) is this.
+    pub fn msauth_key_ready(&self) -> bool {
+        self.msauth_key.get().is_some()
+    }
+
+    /// A test instrument: how many times the msauth key's builder ran (0 or 1).
+    #[doc(hidden)]
+    pub fn msauth_key_builds(&self) -> usize {
+        self.msauth_key_builds.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Precompute the multisig auth guest's one verifier key (spec §3.4–3.5), under the warm lock
+    /// like every warm-up. A node calls it, first, only on a chain whose genesis names
+    /// `hc_auth_multisig`; there the key is already loaded from the pinned blob, so this finds the
+    /// slot filled and builds nothing. The `ConfidentialExecutor` method of the same name.
+    pub fn warm_auth_multisig(&self) {
+        self.warming(|| {
+            let _ = self.msauth_key();
+        })
+    }
+
+    /// `ConfidentialExecutor::auth_multisig_key_ready`: [`Self::msauth_key_ready`].
+    pub fn auth_multisig_key_ready(&self) -> bool {
+        self.msauth_key_ready()
+    }
+
+    /// `ConfidentialExecutor::auth_header` (Task 4; spec §3.2, pre-flight finding 14): one
+    /// canonical decode, then the shape's exact checks, then the shape, the published `c` and the
+    /// declared `pv::GAS` together. Routing: a header that is exactly the single-key one (tier,
+    /// program, input, public, no hash or modq table) takes the single-key checks; every other
+    /// header takes the multisig checks, whose refusal names the first word that is not the
+    /// pinned one (`"not the multisig auth guest's shape: <field>"`). A proof of neither shape is
+    /// `InvalidProof` either way, before any key is built.
+    pub fn auth_header_of(
+        &self,
+        proof: &[u8],
+    ) -> Result<(randprotocol_core::confidential::AuthShape, Word8, Option<u64>), ConfidentialError> {
+        use randprotocol_core::confidential::AuthShape;
+        let p = decode_canonical(proof)?;
+        let (shape, p) = if Self::is_single_key_header(&p) {
+            let (plh, ilh, pubh) = Self::auth_heights();
+            (AuthShape::SingleKey, self.check_decoded(p, plh, ilh, pubh, true, AUTH_TIER)?)
+        } else {
+            (AuthShape::Multisig, self.check_msauth_decoded(p)?)
+        };
+        Ok((shape, published_digest(&p.public_values)?, Some(p.public_values[pv::GAS])))
     }
 
     /// `ConfidentialExecutor::verify_bundle` for a hidden bundle proof: verified against `hc`
@@ -1484,17 +2078,37 @@ impl ConfidentialExecutor for ZkExecutor {
         self.hidden_bundle_proof_digest_for(hc_bundle, proof)
     }
 
+    /// Either pinned auth shape (private multisig phase 4): the single-key guest's or the
+    /// multisig guest's `c`, after that shape's structural checks ([`ZkExecutor::auth_header_of`]).
     fn auth_proof_digest(&self, proof: &[u8]) -> Result<Word8, ConfidentialError> {
-        self.auth_proof_commit(proof)
+        Ok(self.auth_header_of(proof)?.1)
     }
 
+    /// Dispatched on `hc` (spec §3.4): the genesis' `hc_auth_multisig` — the multisig guest's
+    /// digest — takes the msauth path, every other `hc` the single-key one. Each path pins its
+    /// own full shape before building a key, so a single-key proof sent with the msauth `hc` dies
+    /// in the msauth shape check and the reverse in the single-key one: the ledger's choice of
+    /// `hc` by shape and this choice of machine by `hc` cannot disagree into a verify.
+    ///
+    /// Plan Task 3: the msauth path is gated on the genesis field. On an executor that was not
+    /// told its chain names `hc_auth_multisig` ([`ZkExecutor::enable_auth_multisig`]) the msauth
+    /// `hc` is refused here, before any decode and without touching the msauth key.
     fn verify_auth(
         &self,
         hc_auth: &Word8,
         proof: &[u8],
         binding: &[u32; TX_BINDING_WORDS],
     ) -> Result<Word8, ConfidentialError> {
-        self.verify_auth_proof(hc_auth, proof, binding)
+        if *hc_auth == Self::hc_auth_multisig() {
+            if !self.auth_multisig_enabled() {
+                return Err(ConfidentialError::InvalidProof(
+                    "a multisig auth proof on a chain without hc_auth_multisig".into(),
+                ));
+            }
+            self.verify_msauth_proof(hc_auth, proof, binding)
+        } else {
+            self.verify_auth_proof(hc_auth, proof, binding)
+        }
     }
 
     /// Constraint set 8: `pv::GAS` of the canonically decoded proof — a decode, no verification
@@ -1509,10 +2123,11 @@ impl ConfidentialExecutor for ZkExecutor {
 
     /// Constraint set 8, split authorisation: `pv::GAS` of an auth proof decoded at the auth
     /// guest's pinned shape (tier 10, its heights, no hash table) — a decode, no verification.
+    ///
+    /// Private multisig phase 4: either pinned shape ([`ZkExecutor::auth_header_of`]); the
+    /// multisig pin is `gas::msauth_gas_limit_pin`, the ledger's to compare.
     fn auth_gas_limit(&self, proof: &[u8]) -> Result<Option<u64>, ConfidentialError> {
-        let (plh, ilh, pubh) = Self::auth_heights();
-        let p = self.decode_and_check(proof, plh, ilh, pubh, true, AUTH_TIER)?;
-        Ok(Some(p.public_values[pv::GAS]))
+        Ok(self.auth_header_of(proof)?.2)
     }
 
     fn verify_bundle(
@@ -1524,6 +2139,10 @@ impl ConfidentialExecutor for ZkExecutor {
         self.verify_hidden_bundle(hc_bundle, proof, binding)
     }
 
+    fn non_canonical_proof(&self, proof: &[u8]) -> Option<String> {
+        non_canonical_proof(proof)
+    }
+
     /// The bundle guest's verifier key. Unlike `warm`, this needs no guessing: the guest is
     /// pinned, so its `(tier, program_log_height, input_log_height, keccak_log_height,
     /// sha256_log_height, public_log_height)` is a single known sextuple — tier 14, which is
@@ -1531,15 +2150,37 @@ impl ConfidentialExecutor for ZkExecutor {
     /// case), `NO_KECCAK` and `NO_SHA256` since the guest issues neither hash syscall, and the
     /// transaction binding's public height (`bundle_heights`), since every bundle proof commits
     /// to it.
-    fn non_canonical_proof(&self, proof: &[u8]) -> Option<String> {
-        non_canonical_proof(proof)
-    }
-
     fn warm_bundle(&self) {
         self.warming(|| {
             let (plh, ilh, pubh) = Self::bundle_heights();
             let _ = self.bundle_machine.verifier_key(Tier(BUNDLE_TIER), plh, ilh, NO_KECCAK, NO_SHA256, pubh);
         })
+    }
+
+    fn install_msauth_vk(&self, blob: &[u8]) -> Result<(), String> {
+        ZkExecutor::install_msauth_vk(self, blob).map_err(|e| e.to_string())
+    }
+
+    fn enable_auth_multisig(&self) {
+        ZkExecutor::enable_auth_multisig(self)
+    }
+
+    fn build_msauth_key(&self) -> Result<(), String> {
+        ZkExecutor::warm_auth_multisig(self);
+        self.check_built_msauth_key()
+    }
+
+    /// [`ZkExecutor::auth_header_of`]: header, degree bits and `pv::NUM` checked per shape.
+    fn auth_header(&self, proof: &[u8]) -> Result<(randprotocol_core::confidential::AuthShape, Word8, Option<u64>), ConfidentialError> {
+        self.auth_header_of(proof)
+    }
+
+    fn warm_auth_multisig(&self) {
+        ZkExecutor::warm_auth_multisig(self)
+    }
+
+    fn auth_multisig_key_ready(&self) -> bool {
+        ZkExecutor::auth_multisig_key_ready(self)
     }
 
     /// The auth guest's one key ([`AUTH_TIER`], its pinned heights, no hash table) — the only key
@@ -2012,6 +2653,76 @@ pub fn prove_bundle_for_with_limit(
     Ok((proof.to_bytes(), exec.outputs, proof.tier.0 as u8))
 }
 
+/// The multisig auth guest in the emulator (no proof): its published `c` for this witness and
+/// binding, or `Err` naming the refusal — the guest's sentinel ([`MSAUTH_REFUSAL`] in output 7:
+/// below threshold, a signature over another binding, a key off the policy root), a run that did
+/// not halt inside [`MSAUTH_TIER`]'s cycles, or a witness of the wrong width. The wallet's
+/// pre-flight before the minutes-long prove.
+pub fn run_msauth(inputs: &[u32], binding: &[u32; TX_BINDING_WORDS]) -> Result<Word8, String> {
+    if inputs.len() != crate::msauth::MSAUTH_WORDS {
+        return Err(format!("msauth inputs must be exactly {} words, got {}", crate::msauth::MSAUTH_WORDS, inputs.len()));
+    }
+    let exec = crate::emulator::execute(ZkExecutor::msauth_program(), inputs, binding, Tier(MSAUTH_TIER).max_cycles())
+        .map_err(|e| format!("the multisig auth guest refused this witness (execute: {e:?})"))?;
+    if !exec.halted || exec.outputs[7] == MSAUTH_REFUSAL {
+        return Err("the multisig auth guest refused this witness (sentinel)".into());
+    }
+    Ok(std::array::from_fn(|i| exec.outputs[i]))
+}
+
+/// The multisig auth proof (private multisig phase 4), through the vendored
+/// `msauth::prove_msauth`: the witness' shape pre-flight at the pinned header, the prove at
+/// [`MSAUTH_TIER`] under `msauth::pinned_options()` (every variable height floored at its
+/// `M_MAX` value, R-hide; `gas_limit: None`, so `pv::GAS` is the header's ceiling, R-gas), and the
+/// returned proof's own header checked against the pins. CPU only (`prove_with` takes no
+/// options). Returns (proof bytes, the published `c`, tier). Tier 18: minutes and tens of GB.
+pub fn prove_msauth(profile: FriProfile, inputs: &[u32], binding: &[u32; TX_BINDING_WORDS]) -> Result<(Vec<u8>, Word8, u8), String> {
+    if inputs.len() != crate::msauth::MSAUTH_WORDS {
+        return Err(format!("msauth inputs must be exactly {} words, got {}", crate::msauth::MSAUTH_WORDS, inputs.len()));
+    }
+    let proof = crate::msauth::prove_msauth(&Machine::new(profile), ZkExecutor::msauth_program(), inputs, binding)?;
+    let c = published_digest(&proof.public_values).map_err(|e| format!("{e}"))?;
+    Ok((proof.to_bytes(), c, proof.tier.0 as u8))
+}
+
+/// Fixtures shared by node-local tests (`tests/auth_modq_canonical.rs`, `tests/executor.rs`,
+/// `randprotocol-node`'s aggregate-path tests). Not an API.
+#[doc(hidden)]
+pub mod fixtures {
+    use crate::asm::{ops::*, Assembler};
+    use crate::isa::{BranchCond, Program, REG_ZERO};
+    use crate::modq::{Args, Op};
+
+    /// A tier-10 guest with exactly one `MODQ` block (`modq_log_height = 10`): poly 0 of the arena
+    /// at word `BASE_WORDS` gets coefficients `i · 7919 mod 2^23` (all below 2^24) for its first
+    /// 128 slots (the rest stay zero: 256 iterations of the fill loop would not fit tier 10's
+    /// 1 023 cycles), then one `MODQ` NTT writes poly 1 from poly 0, then halt.
+    pub fn one_modq_ntt_program() -> Program {
+        const BASE_WORDS: u32 = 0x1000; // byte 0x4000, above the code
+        const PTR: u32 = 25;
+        const VAL: u32 = 26;
+        const CTR: u32 = 27;
+        const STEP: u32 = 28;
+        const MASK: u32 = 29;
+        let mut a = Assembler::new(0);
+        a.extend(li(PTR, (BASE_WORDS * 4) as i32)); // byte address of poly 0
+        a.extend(li(VAL, 0));
+        a.extend(li(CTR, 128));
+        a.extend(li(STEP, 7919));
+        a.extend(li(MASK, 0x7f_ffff));
+        a.label("fill");
+        a.push(sw(PTR, VAL, 0));
+        a.push(addi(PTR, PTR, 4));
+        a.push(add(VAL, VAL, STEP));
+        a.push(and(VAL, VAL, MASK)); // VAL = (VAL + 7919) & (2^23 - 1)
+        a.push(addi(CTR, CTR, -1));
+        a.branch(BranchCond::Ne, CTR, REG_ZERO, "fill");
+        a.extend(call_modq(BASE_WORDS, Args { op: Op::Ntt, out: 1, a: 0, b: 0 }.encode()));
+        a.extend(halt());
+        a.assemble()
+    }
+}
+
 fn prove_pinned_bundle(
     profile: FriProfile,
     program: &Program,
@@ -2126,6 +2837,13 @@ mod tests {
                         crate::gas::gas_max(Tier(t as usize), k, sh),
                         "tier {t}, keccak 2^{k}, sha256 2^{sh}"
                     );
+                    for m in [0u8, 10, 12, 14, 16] {
+                        assert_eq!(
+                            randprotocol_core::gas::gas_max_with_modq(t, k, sh, m),
+                            crate::gas::gas_max_with_modq(Tier(t as usize), k, sh, m),
+                            "tier {t} keccak {k} sha256 {sh} modq {m}"
+                        );
+                    }
                     checked += 1;
                 }
             }
@@ -2808,5 +3526,66 @@ mod tests {
         );
         assert!(zk.verify_perp(&hc, 12, &segment, &high).is_ok());
         assert_eq!(zk.verify_perp(&hc, 20, &segment, b"junk"), Err(ConfidentialError::MalformedProof));
+    }
+
+    /// Constraint set 9: a modq table is the msauth guest's alone. A bundle, a single-key auth proof
+    /// and a call declaring one are refused by header, before any key is built.
+    #[test]
+    fn a_modq_table_is_refused_on_every_proof_but_msauth() {
+        use super::*;
+        let ex = ZkExecutor::new(FriProfile::Test);
+        let (auth, _, _) = prove_auth(FriProfile::Test, &crate::notes::SpendKey([7; 8]), &[6; 8], &[0; 8], Backend::Cpu).unwrap();
+        let mut p = decode_canonical(&auth).unwrap();
+        p.modq_log_height = 10;
+        let (plh, ilh, pubh) = ZkExecutor::auth_heights();
+        match ex.check_decoded(p, plh, ilh, pubh, true, AUTH_TIER) {
+            Err(ConfidentialError::InvalidProof(why)) => assert!(why.contains("modq"), "{why}"),
+            other => panic!("{:?}", other.map(|_| ())),
+        }
+        // The bundle's exact pin is the same branch (`pinned_tier` = `BUNDLE_TIER`).
+        let mut p = decode_canonical(&auth).unwrap();
+        p.modq_log_height = 10;
+        p.tier = Tier(BUNDLE_TIER);
+        p.mem_log_height = Tier(BUNDLE_TIER).min_mem_log_height();
+        assert!(matches!(ex.check_decoded(p, plh, ilh, pubh, true, BUNDLE_TIER), Err(ConfidentialError::InvalidProof(_))));
+        // And a call (`exact` false), by its own message.
+        let mut p = decode_canonical(&auth).unwrap();
+        p.modq_log_height = 10;
+        match ex.check_decoded(p, 0, 0, 0, false, 0) {
+            Err(ConfidentialError::InvalidProof(why)) => assert!(why.contains("declares no modq table"), "{why}"),
+            other => panic!("{:?}", other.map(|_| ())),
+        }
+        assert_eq!(ex.cached_keys() + ex.cached_bundle_keys() + ex.cached_msauth_keys(), 0);
+    }
+
+    /// Spec §3.5 (pre-flight finding 3): the msauth key is single-flight. Eight threads asking for
+    /// it at once run one build and all receive the same `Arc`. The builder here is a cheap
+    /// tier-10 key standing in for the tier-18 one (`tests/auth_msauth.rs`'s ignored
+    /// `measure_the_msauth_verifier_key_build_alone` runs the real build eight-wide).
+    #[test]
+    fn eight_concurrent_msauth_key_requests_build_once() {
+        use super::*;
+        let ex = std::sync::Arc::new(ZkExecutor::new(FriProfile::Test));
+        let (plh, ilh, pubh) = ZkExecutor::auth_heights();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let keys: Vec<_> = (0..8)
+            .map(|_| {
+                let (ex, barrier) = (ex.clone(), barrier.clone());
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    ex.msauth_key_with(|| {
+                        std::thread::sleep(std::time::Duration::from_millis(50));
+                        ex.auth_machine.verifier_key(Tier(AUTH_TIER), plh, ilh, NO_KECCAK, NO_SHA256, pubh)
+                    })
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|h| h.join().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(ex.msauth_key_builds(), 1, "one build for eight callers");
+        assert!(keys.iter().all(|k| std::sync::Arc::ptr_eq(k, &keys[0])), "every caller holds the one key");
+        assert_eq!(ex.cached_msauth_keys(), 1);
+        assert!(ex.msauth_key_ready());
     }
 }

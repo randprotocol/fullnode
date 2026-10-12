@@ -463,6 +463,12 @@ table (`docs/superpowers/specs/2026-09-28-gas-model-design.md` §4.2, `docs/fees
   it once more, `c90b3f0a…74d8` →
   `dc350ecf6b60af74f4bb032bdf607c3fa0fbd6317705f0b1077e71b455e38ba0`; the rate-¼ rVM profile
   vendored with it (`docs/07-rvm-rate-quarter.md`) moves rVM keys and proofs, not the digest.
+  rVM phase 4 and constraint set 9 (circuits `57fb9dc`, vendored at `d217252`, 2026-10-11) moved it
+  twice more, `dc350ecf…8ba0` → `e0eede8b…b6c3` (Merkle spans) →
+  `8bc2cecbd30b975ec15a5e11354434bd7e1c2814d46dd0acc1d92b3ff944d8c7` (the MODQ chip), and with the
+  chip the inner `inner_vk_digest` moved too, to
+  `1b0c4b0043dd5d00d710f10048bfde989a955034d7fd52f1a85595a61339ddc7` (`agg_executor.rs`'s pinned
+  tests; `docs/aggregation.md`, `docs/zkvm.md` §8a).
 
 Every verifier key changes (the cpu AIR changes), so constraint set 8 rides only a chain cut —
 chain 18, which also carries `hardening_v6` and the genesis `gas` section (`docs/fees.md` §1.1,

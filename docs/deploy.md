@@ -112,6 +112,9 @@ rand status
 rand-node verify --datadir /root/data-<letter>-<genesis8> --mode full   # stop the service first
 ```
 
+On a chain whose genesis names `hc_auth_multisig`, `rand-node verify` loads the pinned msauth
+verifier key exactly as `run` does (below, "The msauth verifier key") and refuses to verify without it.
+
 ### Reserved peers (audit v6, NET-1)
 
 A node accepts at most 256 established and 64 half-open inbound connections, and a libp2p
@@ -321,6 +324,71 @@ release's `rand-node` and `rand` and their shas — the bytes `roll-all.sh` kept
 `/root/rand-node.prev`. A partial rollback is the same mixed window: while more than a third of
 the stake is on the old build, the new leaders' views time out and commits can stop. Nothing is
 written to disk that the old build cannot read, so the rollback needs no resync.
+
+## The msauth verifier key (private multisig, v0.8.0 onward)
+
+A node on a chain whose genesis names `hc_auth_multisig` verifies multisig authorisations at tier
+18, and the verifier key for that shape costs ~80 s and ~4 GB to build — more than an
+`s-2vcpu-4gb` validator can spare. So the key is built once, on a big host, and shipped:
+
+- **The file.** `msauth-vk-production.bin`, the vendored machine's `VerifierKeyBlob` serialised
+  whole, made by `rand-node keygen-msauth-vk --profile production --out FILE` (prints
+  `sha256 <hex>  bytes <n>`). It ships as a release asset listed in the signed `SHA256SUMS`.
+- **The pin.** Its SHA-256 is compiled into the build (`MSAUTH_VK_SHA256_PRODUCTION`;
+  `rand-node keygen-msauth-vk --print-pinned production` prints it, `--check FILE` prints a
+  file's). At circuits d217252 (constraint set 9) the production blob is 23 754 bytes with
+  SHA-256 `68facb06c7f321aaf1d4d541acf6b5c0e9d7f17788ed1c9add6c5a8a8f7acd30`; the keygen is deterministic (any host regenerates it byte for byte, ~25 s and
+  ~4 GB peak on an M-series laptop). Both blobs are committed, so a release tree carries
+  them: `crates/randprotocol-zkvm/keys/msauth-vk-production.bin` and, for tests,
+  `crates/randprotocol-zkvm/keys/msauth-vk-test.bin` (SHA-256 `c82250e7e7f8ca94246dc512091c1dafe402d5c0f6f4503e585d9381319443f5`). The vendored `Machine::install_verifier_key_pinned` checks it on the raw bytes before
+  decoding anything: the blob is a trust root (a crafted preprocessed commitment could let a
+  forged proof verify), so an unpinned file is never decoded.
+- **The location.** Beside the binary: `/usr/local/bin/msauth-vk-production.bin` on the fleet
+  (`msauth-vk-<profile>.bin` next to whatever `rand-node` runs). `--msauth-vk <path>`, else
+  `RAND_MSAUTH_VK`, overrides it. A developer's binary — one running from this checkout's own
+  `target/` (`cargo run`, `target/release/rand-node`) with nothing beside it — falls back to the
+  committed `crates/randprotocol-zkvm/keys/msauth-vk-<profile>.bin` only in a debug build or with
+  `RAND_MSAUTH_VK_DEV_FALLBACK=1` (pin-checked the same). A binary anywhere else, including one a
+  fleet host built in its own checkout and installed to `/usr/local/bin`, reads the fixed path
+  only, and a missing file there fails the start.
+- **The startup failure.** On a multisig chain a missing or refused file stops the start,
+  naming the path, the file's SHA-256 and the expected one. There is no automatic fallback
+  build; only `--build-msauth-key` (development, a ≥ 8 GB host, never set by a deploy script)
+  builds the key. `rand_status.msauth_key` reports `loaded`, `built` or `absent` (no
+  `hc_auth_multisig` on this chain).
+- **`rand-node verify` too.** The offline replay loads the same blob the same way: the fixed path
+  `/usr/local/bin/msauth-vk-production.bin` (`--msauth-vk` / `RAND_MSAUTH_VK` override it), a loud
+  refusal naming the path and both digests when the file is absent or not the pinned one, and never
+  a build.
+- **The genesis field.** The chain-21 cut writes `hc_auth_multisig` via
+  `rand-node genesis --auth-multisig-guest`; see `deploy/cut-chain21-genesis.sh` (the gate lands
+  with `feat/chain21-msauth`).
+- **The roll.** `deploy/roll-all.sh` takes the blob as its fifth argument (or `MSAUTH_VK`;
+  `NO_MSAUTH_VK=1` for a chain without multisig) and, on each host, checks the copy against the
+  pin of the `rand-node` being installed before installing anything, then installs it beside the
+  binary before any restart. Under `NO_MSAUTH_VK=1` a blob already on a host is still checked
+  against the new build's pin, and the host is skipped on a mismatch. Node A on the laptop gets
+  the same file beside its own binary, checked by that binary's own `--check`/`--print-pinned`.
+  The release workflow ships `msauth-vk-production.bin` beside the binaries, in `SHA256SUMS` and
+  the build attestation, after asserting the built `rand-node` pins it.
+- **The cutover.** `deploy/cutover-fleet-chain21.sh` (owned by the chain-21 cut session) carries
+  the same copy-and-check, per host, before the first start:
+
+  ```bash
+  # msauth verifier key (private multisig, v0.8.0): beside the binary, SHA-256-checked against the
+  # pin of the build being installed, before the first start
+  scp "$MSAUTH_VK" "root@$host:/root/msauth-vk-production.bin.new"
+  ssh "root@$host" 'chmod 755 /root/rand-node.new \
+    && got=$(/root/rand-node.new keygen-msauth-vk --check /root/msauth-vk-production.bin.new) \
+    && want=$(/root/rand-node.new keygen-msauth-vk --print-pinned production) \
+    && [ "$got" = "$want" ] \
+    && install -m 0644 /root/msauth-vk-production.bin.new /usr/local/bin/msauth-vk-production.bin \
+    && rm -f /root/msauth-vk-production.bin.new' \
+    || { echo "cutover: $host msauth key blob is not the pinned one" >&2; exit 1; }
+  ```
+
+  It compares against the pin of the binary being installed on that host (`rand-node.new`), not
+  a pin read on the operator's machine, so a blob and a build from different commits never pair.
 
 ## Release trust
 

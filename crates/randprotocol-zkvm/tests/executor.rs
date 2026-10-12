@@ -423,6 +423,33 @@ fn a_call_with_a_sha256_height_past_the_call_cap_is_refused_before_verify() {
     assert_eq!(ex.cached_keys(), before, "no verifier key was built for the refused call ({err})");
 }
 
+/// Constraint set 9 (private multisig phase 4, spec §4.2): the keccak cap's sibling. A modq table
+/// is the msauth guest's alone, so a call, a hardened call, an invoke and a state proof declaring
+/// one are refused by header before any key is built — otherwise any caller could make a
+/// validator build modq-bearing call keys, the DoS the call tier cap closed. The proof here is an
+/// honest tier-10 one-NTT run (`executor::fixtures`), so only the modq rule refuses it.
+#[test]
+fn a_call_declaring_a_modq_table_is_refused_before_verify() {
+    use randprotocol_zkvm::executor::fixtures::one_modq_ntt_program;
+    use randprotocol_zkvm::machine::{Machine, ProveOptions, Tier};
+    let p = one_modq_ntt_program();
+    let ex = ZkExecutor::new(FriProfile::Test);
+    let rec = record(&p);
+    let (proof, _) = Machine::new(FriProfile::Test).prove_with_options(&p, &[], &[], Some(Tier(10)), ProveOptions::default()).unwrap();
+    assert_eq!(proof.modq_log_height, 10);
+    let bytes = proof.to_bytes();
+    let modq = |r: Result<randprotocol_core::program::CallOutcome, ConfidentialError>| match r {
+        Err(ConfidentialError::InvalidProof(why)) => assert!(why.contains("declares no modq table"), "{why}"),
+        other => panic!("{:?}", other.map(|o| o.tier)),
+    };
+    modq(ex.verify_call(&rec, &bytes));
+    modq(ex.verify_call_hardened(&rec, &bytes, &[0; 8]));
+    modq(ex.decode_call_hardened(&rec, &bytes, &[0; 8]));
+    modq(ex.verify_invoke(&rec, &bytes, &[0; 8]));
+    modq(ex.verify_perp(&p.digest(), 14, &[], &bytes));
+    assert_eq!(ex.cached_keys(), 0, "no verifier key was built for a modq-bearing call");
+}
+
 /// Measurement, not a check (`#[ignore]`d): builds one call verifier key at the *production*
 /// profile and prints its wall time — run under `/usr/bin/time -l` for the peak RSS. The shape
 /// comes from `RAND_KEY_SHAPE="tier,plh,ilh,klh,slh,pubh"`, so the worst admissible header under

@@ -130,7 +130,8 @@ fn the_tree_step_builds_under_the_replays_loop_invariant() {
     // Pinned at the test-profile leaf shape (2026-10-09, tree Task 1a): `rv32t_leaf`'s digest,
     // the test chain's `t_leaf_digest` (M4). Re-pinned at the rVM's rate ¼ (2026-10-09, docs/07,
     // tree Task R): the child's Merkle paths are one level shorter (was bf80794d…ff4d5389).
-    assert_eq!(randprotocol_rvm::programs::digest_hex(&a), "2c586636c4c0f94cdf13b410154679d995eefad11e27371e0786e89e206ccd34", "rv32t_leaf's digest at the test leaf shape");
+    // Phase 4 (2026-10-09, the Merkle spans) re-recorded it: 2c586636… → d8d558ee….
+    assert_eq!(randprotocol_rvm::programs::digest_hex(&a), "d8d558eecb8fbdaaba7eaa93d7d04bae0a47808f31978ecea804f04f7e6e5d93", "rv32t_leaf's digest at the test leaf shape");
 }
 
 /// The program reads the child shape's words and never its committed program: a child program
@@ -358,7 +359,7 @@ fn u64s(v: &[F]) -> Vec<u64> {
 /// The generator (R7): proves whatever `tree/` lacks. Run it once where docs/08 §5 says, then
 /// copy `$RECURSION_FIXTURES/tree/` to every box that runs the suite.
 #[test]
-#[ignore = "tree Task 1b: proves the test tree's steps and root (tier 19, tests/pins.json tree_test.step_leaf_tier; 34.3 GB max RSS measured for a step, 33.2 GB for the root) — this 48 GB laptop, one proving process at a time"]
+#[ignore = "tree Task 1b: proves the test tree's steps and root (tier 18 since phase 4, tier 19 before; tests/pins.json tree_test.step_leaf_tier; re-run 2026-10-11 in 1821 s, docs/measurements/2026-10-11-tree-test-fixtures-phase4-laptop.log; at tier 19 34.3 GB max RSS measured for a step, 33.2 GB for the root) — this 48 GB laptop, one proving process at a time"]
 fn generate_test_tree_fixtures() {
     ALLOW_STEP_PROVING.store(true, Ordering::SeqCst);
     let t = test_tree();
@@ -402,13 +403,17 @@ fn emulated_shape(program: &Arc<Program>, exec: &Execution) -> RvmShape {
     RvmShape::of(P, program, tier, tr.reg_log_height, tr.ram_log_height, tr.poseidon2_log_height, tr.reduce_log_height)
 }
 
-/// R3 (amended, fix round 1), the recorded verdict: `rv32t_int`, built for S_T, does *not* verify
-/// its own output at the test profile. Its two passes over tier-19 children run more reduce rows
-/// than `rv32t_leaf`'s two over tier-18 leaves (each child one more FRI fold level), the reduce
-/// table crosses 2^16, and the root declares another reduce height and arity schedule. The tape
-/// builder refuses the root as a child of S_T. Both header-word lists are pinned (docs/08 §5).
+/// R3, as measured: `rv32t_int`, built for S_T, verifies its own output at the test profile.
+/// Before phase 4 (docs/08 §5) it did not: its two passes over tier-19 children crossed 2^16 reduce
+/// rows while `rv32t_leaf`'s two over tier-18 leaves did not, so the root declared another reduce
+/// height and arity schedule. Phase 4 (2026-10-09, the Merkle spans; ruling 10) re-recorded it:
+/// both steps are tier 18 and both cross 2^16 (32 912 and 33 328 reduce rows per child), the
+/// root declares S_T's words exactly, so `rv32t` at S_root is `rv32t_int`, and the tape builder
+/// accepts the root pair as children of S_root — the fixed point is level 2. (Under S_T itself,
+/// whose key is `rv32t_leaf`'s, the replay refuses the root: the hinted cap is the child's own.)
+/// Both header-word lists and the reduce rows stay pinned (docs/09).
 #[test]
-fn the_interior_step_does_not_verify_its_own_output_at_the_test_profile() {
+fn the_interior_step_verifies_its_own_output_at_the_test_profile() {
     use randprotocol_rvm::tables::reduce::program_rows;
     let t = test_tree();
     let (per_leaf, per_int) = (program_rows(&t.t_leaf), program_rows(&t.t_int));
@@ -416,49 +421,58 @@ fn the_interior_step_does_not_verify_its_own_output_at_the_test_profile() {
         S_T {:?} root {:?}", 2 * per_leaf, 2 * per_int, t.s_step.header_words(), t.s_root.header_words());
     assert_eq!(per_leaf as usize, common::pin("tree_test", "step_leaf_reduce_rows_per_child"));
     assert_eq!(per_int as usize, common::pin("tree_test", "step_int_reduce_rows_per_child"));
-    assert!(2 * per_leaf < 1 << 16 && 2 * per_int > 1 << 16, "the crossing: rv32t_leaf under 2^16, rv32t_int over it");
+    assert!(2 * per_leaf > 1 << 16 && 2 * per_int > 1 << 16, "both steps cross 2^16 reduce rows (rv32t_leaf no longer under it)");
     let words = |s: &RvmShape| u64s(&s.header_words());
-    assert_eq!(words(&t.s_step), [19, 20, 20, 15, 16, 18, 16, 1, 1, 2, 1, 3, 3, 1, 3, 2, 3, 1], "S_T");
-    assert_eq!(words(&t.s_root), [19, 20, 20, 15, 17, 18, 16, 1, 1, 1, 2, 3, 3, 1, 3, 2, 3, 1], "the root");
-    assert!(!t.s_root.same_step_words(&t.s_step), "R3: rv32t_int's own proofs declare another shape");
+    assert_eq!(words(&t.s_step), [18, 19, 20, 15, 17, 17, 16, 1, 1, 1, 2, 3, 3, 1, 3, 2, 3, 1], "S_T");
+    assert_eq!(words(&t.s_root), [18, 19, 20, 15, 17, 17, 16, 1, 1, 1, 2, 3, 3, 1, 3, 2, 3, 1], "the root");
+    assert!(t.s_root.same_step_words(&t.s_step), "R3, measured: rv32t_int's own proofs declare S_T's words");
+    // The step program reads the child shape's words only, so the program for children of S_root
+    // is the program for children of S_T: rv32t_int.
+    assert_eq!(tree_step_program_digest(&t.s_root), t.t_int.digest(), "rv32t at S_root is rv32t_int");
+    // The tape builder takes the root pair as children of S_root (the root's own shape, whose key
+    // is rv32t_int's preprocessed commit). Under S_T itself — the same words, but rv32t_leaf's
+    // program and so rv32t_leaf's key — the shape check passes and the replay refuses the root
+    // (not a proof under that key): the hinted cap must be the child's own.
+    assert!(
+        WitnessTape::build_tree_step(P, &t.s_root, [&t.root, &t.root], B).is_ok(),
+        "rv32t_int takes its own proofs as children"
+    );
     assert_eq!(
         WitnessTape::build_tree_step(P, &t.s_step, [&t.root, &t.root], B).err(),
-        Some(TapeError::Replay(randprotocol_rvm::reference::ReplayError::Shape)),
-        "rv32t_int cannot take its own proofs as children"
+        Some(TapeError::Replay(randprotocol_rvm::reference::ReplayError::Constraints(0))),
+        "under S_T's key the root passes the shape check and fails the replay"
     );
 }
 
-/// R3 (amended): the fixed point is reached at level 3. A third step program, built for the
-/// root's shape S_root, emulated over (root, root): accepted, publishing `[vk_int ‖ 2 ‖ B ‖ D ‖ D]`,
-/// and its own proofs would declare S_root's words again, so it is the program for every level
-/// ≥ 3 (it verifies itself). Emulation only: the heights are `build_traces`' over the run, the
-/// rule `prove` uses; the same method reproduces the proved root's shape from (step-0, step-1).
-/// The test profile's lists: 3 step programs, 4 keys (`vk_leaf`, `vk_t_leaf`, `vk_int`, `vk_fix`).
+/// R3, as measured: the fixed point is reached at level 2. The step program built for the root's
+/// shape S_root is `rv32t_int` itself (the same digest), emulated over (root, root): accepted,
+/// publishing `[vk_int ‖ 2 ‖ B ‖ D ‖ D]`, and its own proofs would declare S_root's words again,
+/// so it is the program for every level ≥ 2. Emulation only: the heights are `build_traces`' over
+/// the run, the rule `prove` uses; the same method reproduces the proved root's shape from
+/// (step-0, step-1). The test profile's lists: 2 step programs, 3 keys (`vk_leaf`, `vk_t_leaf`,
+/// `vk_int`). Before phase 4 the fixed point was level 3, a third program `T_FIX_TEST` with its own
+/// key `vk_fix` (docs/08 §5); phase 4 (2026-10-09, the Merkle spans; ruling 10) re-recorded it:
+/// level 3 → level 2, and `T_FIX_TEST`, `vk_fix` and `step_fix_cpu_rows` are dropped.
 #[test]
-fn a_third_step_program_at_the_roots_shape_is_the_fixed_point() {
+fn the_step_program_at_the_roots_shape_is_rv32t_int_the_fixed_point() {
     let t = test_tree();
     let int_run = emulate_step(&t.s_step, &t.t_int, &t.steps[0], &t.steps[1], B).expect("rv32t_int accepts the steps");
     assert_eq!(emulated_shape(&t.t_int, &int_run).header_words(), t.s_root.header_words(),
         "the emulated shape method reproduces the proved root's");
 
-    let t_fix = Arc::new(verify_rv32t(&t.s_root, Checkpoints::Off).program);
-    assert_ne!(t_fix.digest(), t.t_int.digest(), "a third program");
-    let exec = emulate_step(&t.s_root, &t_fix, &t.root, &t.root, B).expect("the level-3 program accepts two roots");
+    let t_root = Arc::new(verify_rv32t(&t.s_root, Checkpoints::Off).program);
+    assert_eq!(t_root.digest(), t.t_int.digest(), "the step program at S_root is rv32t_int itself");
+    assert_eq!(randprotocol_rvm::programs::digest_hex(&t_root), T_INT_TEST, "the fixed-point step program at S_root");
+    let exec = emulate_step(&t.s_root, &t_root, &t.root, &t.root, B).expect("rv32t_int accepts two roots");
     let vk_int = inner_vk_digest(&t.s_root, &RvmKey::of(P, &t.s_root));
     assert_eq!(exec.public, host_step(&vk_int, B, &t.root, &t.root), "it publishes vk_int, the root's key");
-    let s_fix = emulated_shape(&t_fix, &exec);
-    let reduce_rows = randprotocol_rvm::tables::reduce::program_rows(&t_fix);
-    eprintln!("TREE_TEST_FIX rows {} tier {} reduce rows per child {reduce_rows} t_fix {} vk_fix {:?} S_fix {:?}",
-        exec.cpu_rows(), s_fix.tier, randprotocol_rvm::programs::digest_hex(&t_fix),
-        u64s(&inner_vk_digest(&s_fix, &RvmKey::of(P, &s_fix))), u64s(&s_fix.header_words()));
-    assert!(s_fix.same_step_words(&t.s_root), "level 3 is a fixed point: {:?} vs {:?}", s_fix.header_words(), t.s_root.header_words());
-    assert_eq!(verify_rv32t(&s_fix, Checkpoints::Off).program.digest(), t_fix.digest(),
+    let s_next = emulated_shape(&t_root, &exec);
+    eprintln!("TREE_TEST_FIX rows {} tier {} S_next {:?}", exec.cpu_rows(), s_next.tier, u64s(&s_next.header_words()));
+    assert!(s_next.same_step_words(&t.s_root), "level 2 is a fixed point: {:?} vs {:?}", s_next.header_words(), t.s_root.header_words());
+    assert_eq!(verify_rv32t(&s_next, Checkpoints::Off).program.digest(), t.t_int.digest(),
         "the program for its own proofs is itself");
-    assert_eq!(exec.cpu_rows(), common::pin("tree_test", "step_fix_cpu_rows"));
-    let vk_fix = u64s(&inner_vk_digest(&s_fix, &RvmKey::of(P, &s_fix)));
-    let pinned: Vec<u64> = (0..4).map(|k| common::pin_u64("tree_test", &format!("vk_fix_{k}"))).collect();
-    assert_eq!(vk_fix, pinned, "vk_fix, the key of the fixed-point program's own proofs (children of levels ≥ 4)");
-    assert_eq!(randprotocol_rvm::programs::digest_hex(&t_fix), T_FIX_TEST, "the fixed-point step program at S_root");
+    assert_eq!(inner_vk_digest(&s_next, &RvmKey::of(P, &s_next)), pinned_key("vk_int"),
+        "the key of the fixed-point program's own proofs is vk_int (children of levels ≥ 3)");
 }
 
 /// Review Focus 1 (R5, second half): children of a foreign program with identical shape words,
@@ -480,11 +494,10 @@ fn a_foreign_program_child_pair_passes_in_program_and_fails_the_root_recompute()
 }
 
 /// The two step programs' digests at the test-profile shapes (M4). History: first pinned by tree
-/// Task 1b.
-const T_LEAF_TEST: &str = "2c586636c4c0f94cdf13b410154679d995eefad11e27371e0786e89e206ccd34";
-const T_INT_TEST: &str = "04b1677122526e51c0d278375b0c30ebd37f94ba8a2afed3cd3e019ecdc3c226";
-/// The level-3 program, `rv32t` at the root's shape S_root: the fixed point (R3 amended, fix round 1).
-const T_FIX_TEST: &str = "08abf188e201e55d7b494f89394651f3ef10c6ebdfd00f825ce4c7b0795ff396";
+/// Task 1b. Phase 4 (2026-10-09, the Merkle spans) re-recorded `T_LEAF_TEST`: 2c586636… → d8d558ee….
+const T_LEAF_TEST: &str = "d8d558eecb8fbdaaba7eaa93d7d04bae0a47808f31978ecea804f04f7e6e5d93";
+/// Phase 4 (2026-10-09, the Merkle spans) re-recorded `T_INT_TEST`: 04b16771… → a222637e….
+const T_INT_TEST: &str = "a222637e1eb9333b16b820bbacceaac9ea0e5d4cebfc5379d170796a2ac6dc62";
 
 #[test]
 fn the_test_tree_program_digests_are_pinned() {
@@ -512,12 +525,13 @@ fn pinned_key(name: &str) -> [F; 4] {
     std::array::from_fn(|k| F::from_u64(common::pin_u64("tree_test", &format!("{name}_{k}"))))
 }
 
-/// The test profile's four keys (R2 amended): `vk_leaf`, then the step list `[vk_t_leaf, vk_int,
-/// vk_fix]`, the last repeating, all from `tree_test`'s pins. The first three are also computed
-/// from the proved shapes and held to their pins; `vk_fix` has no proof (level 3 is emulated).
+/// The test profile's three keys (R2 amended): `vk_leaf`, then the step list `[vk_t_leaf, vk_int]`,
+/// the last repeating, all from `tree_test`'s pins, each computed from the proved shapes and held
+/// to its pin. Phase 4 (2026-10-09, the Merkle spans; ruling 10) re-recorded it: four keys → three
+/// (`vk_fix` dropped: the fixed point is level 2, so `vk_int` repeats).
 fn test_keys() -> TreeKeys {
     let (l, t) = (leaves(), test_tree());
-    let keys = TreeKeys { vk_leaf: pinned_key("vk_leaf"), step_keys: vec![pinned_key("vk_t_leaf"), pinned_key("vk_int"), pinned_key("vk_fix")] };
+    let keys = TreeKeys { vk_leaf: pinned_key("vk_leaf"), step_keys: vec![pinned_key("vk_t_leaf"), pinned_key("vk_int")] };
     assert_eq!(inner_vk_digest(&l.shape, &l.key), keys.vk_leaf, "vk_leaf, the test leaf's key");
     assert_eq!(inner_vk_digest(&t.s_step, &RvmKey::of(P, &t.s_step)), keys.step_keys[0], "vk_t_leaf, S_T's key");
     assert_eq!(inner_vk_digest(&t.s_root, &RvmKey::of(P, &t.s_root)), keys.step_keys[1], "vk_int, S_root's key");
@@ -594,9 +608,9 @@ fn verify_tree_names_every_refusal() {
         "a flat proof (a leaf) is not a depth-1 tree");
     assert!(matches!(vt(&t.t_int, &t.root, &c4, B, 1, &TreeKeys { vk_leaf: k.vk_leaf, step_keys: k.step_keys.clone() }), Err(VerifyTreeError::TreeLayout { covers: 4, leaf_size: 1 })),
         "the root presented at the wrong depth");
-    let wrong_level2 = TreeKeys { vk_leaf: k.vk_leaf, step_keys: vec![k.step_keys[1], k.step_keys[1], k.step_keys[2]] };
+    let wrong_level2 = TreeKeys { vk_leaf: k.vk_leaf, step_keys: vec![k.step_keys[1], k.step_keys[1]] };
     assert!(matches!(vt(&t.t_int, &t.root, &c4, B, 2, &wrong_level2), Err(VerifyTreeError::TreeRootDigest)),
-        "level 2 recomputed under level 3's key");
+        "level 2 recomputed under level 3's key (vk_int, the last entry repeating)");
     let wrong_level1 = TreeKeys { vk_leaf: k.step_keys[0], step_keys: k.step_keys.clone() };
     assert!(matches!(vt(&t.t_int, &t.root, &c4, B, 2, &wrong_level1), Err(VerifyTreeError::TreeRootDigest)),
         "level 1 recomputed under level 2's key");
@@ -662,7 +676,7 @@ fn verify_tree_selects_the_per_level_key_with_the_last_entry_repeating() {
     }
 }
 
-/// The real test tree's depth-2 root does not read `vk_fix` (or `vk_int`): replacing the unused
+/// The real test tree's depth-2 root does not read `vk_int`: replacing the unused
 /// tail of the pinned list leaves `verify_tree`'s recompute, and its acceptance, unchanged.
 #[test]
 fn an_unused_trailing_key_leaves_the_test_roots_digest_unchanged() {
@@ -678,8 +692,10 @@ fn an_unused_trailing_key_leaves_the_test_roots_digest_unchanged() {
 }
 
 /// What the node rebuilds from a genesis (`TreeShapes::build` over the pinned heights: the leaf's,
-/// then the per-level step list `[S_T, S_root, S_root]`) is the test tree's own programs and
-/// keys, the third entry the fixed point (Task 1b's `T_FIX_TEST`, `vk_fix`).
+/// then the per-level step list `[S_T, S_root]`) is the test tree's own programs and keys, the
+/// second entry the fixed point (`T_INT_TEST`, `vk_int`). Phase 4 (2026-10-09, the Merkle spans;
+/// ruling 10) re-recorded it: `[S_T, S_root, S_root]` with `T_FIX_TEST`/`vk_fix` → `[S_T, S_root]`;
+/// the list that is not a fixed point is now `[S_T]` alone.
 #[test]
 fn the_tree_shapes_rebuild_the_test_tree_programs_and_keys() {
     let (l, t) = (leaves(), test_tree());
@@ -687,23 +703,23 @@ fn the_tree_shapes_rebuild_the_test_tree_programs_and_keys() {
     assert_eq!(h_leaf, l.shape.heights());
     assert_eq!(RvmShape::try_of_heights(P, &l.program, h_leaf).unwrap(), l.shape, "the heights round-trip");
     let (h_t, h_root) = (RvmHeights::of_proof(&t.steps[0]), RvmHeights::of_proof(&t.root));
-    let s = TreeShapes::build(P, &l.inner, h_leaf, &[h_t, h_root, h_root]).unwrap();
+    let s = TreeShapes::build(P, &l.inner, h_leaf, &[h_t, h_root]).unwrap();
     let digests: Vec<String> = s.steps.iter().map(|x| randprotocol_rvm::programs::digest_hex(&x.program)).collect();
-    assert_eq!(digests, [T_LEAF_TEST, T_INT_TEST, T_FIX_TEST], "the per-level step programs");
+    assert_eq!(digests, [T_LEAF_TEST, T_INT_TEST], "the per-level step programs");
     assert_eq!(s.leaf, l.shape);
     assert_eq!(s.steps[0], t.s_step);
     assert_eq!(s.steps[1], t.s_root);
     assert!(s.fixed_point(), "the last entry's program verifies its own proofs");
     assert_eq!(s.keys(), test_keys());
-    for (level, want) in [(1, T_LEAF_TEST), (2, T_INT_TEST), (3, T_FIX_TEST), (9, T_FIX_TEST)] {
+    for (level, want) in [(1, T_LEAF_TEST), (2, T_INT_TEST), (3, T_INT_TEST), (9, T_INT_TEST)] {
         assert_eq!(randprotocol_rvm::programs::digest_hex(s.root_program(level).unwrap()), want, "the root program at depth {level}");
     }
-    for (level, want) in [(1, &s.leaf), (2, &s.steps[0]), (3, &s.steps[1]), (4, &s.steps[2]), (9, &s.steps[2])] {
+    for (level, want) in [(1, &s.leaf), (2, &s.steps[0]), (3, &s.steps[1]), (4, &s.steps[1]), (9, &s.steps[1])] {
         assert!(std::ptr::eq(s.child_at(level).unwrap(), want), "the child shape at level {level}");
     }
     assert!(s.child_at(0).is_none() && s.step_at(0).is_none() && s.root_program(0).is_none(), "levels are 1-based");
-    let two = TreeShapes::build(P, &l.inner, h_leaf, &[h_t, h_root]).unwrap();
-    assert!(!two.fixed_point(), "rv32t_int's proofs are not of the shape it was built for (R3)");
+    let one = TreeShapes::build(P, &l.inner, h_leaf, &[h_t]).unwrap();
+    assert!(!one.fixed_point(), "rv32t_leaf's proofs are not of the shape it was built for: [S_T] alone is not a fixed point");
     assert!(matches!(TreeShapes::build(P, &l.inner, h_leaf, &[]), Err(randprotocol_rvm::shape::ShapeError::EmptyTreeSteps)));
     // M-3: an empty list put together by hand (the fields are public) answers None, never panics,
     // as `TreeKeys::at_level` does; `aggregate_tree` refuses it before proving.
@@ -742,21 +758,25 @@ fn the_test_tree_genesis_section_prints_as_the_nodes_tree_config() {
 
 /// `aggregate_tree`'s refusals that come before any proving: a count that is not L·2^d (d ≥ 1),
 /// and a depth past a list whose last entry is not a fixed point (its program would not verify
-/// the level below it).
+/// the level below it). Phase 4 (2026-10-09, the Merkle spans; ruling 10) re-recorded the second
+/// case: `[S_T, S_root]` is a fixed point since phase 4, so the non-fixed list is `[S_T]` alone,
+/// refused at level 2 (was `[S_T, S_root]`, refused at level 3).
 #[test]
 fn aggregate_tree_refuses_a_bad_layout_and_a_depth_past_a_non_fixed_list_before_proving() {
     let (l, t) = (leaves(), test_tree());
     let m = Machine::new(P);
-    let s = TreeShapes::build(P, &l.inner, RvmHeights::of_proof(&l.proofs[0]),
-        &[RvmHeights::of_proof(&t.steps[0]), RvmHeights::of_proof(&t.root)]).unwrap();
+    let s = TreeShapes::build(P, &l.inner, RvmHeights::of_proof(&l.proofs[0]), &[RvmHeights::of_proof(&t.steps[0])]).unwrap();
+    assert!(!s.fixed_point(), "[S_T] alone is not a fixed point");
     let bundle = |k: usize| postcard::from_bytes::<BundleProof>(&postcard::to_allocvec(&l.bundles[k % 4]).unwrap()).unwrap();
     let proofs = |n: usize| -> Vec<BundleProof> { (0..n).map(bundle).collect() };
     for (n, leaf_size) in [(0, 1), (1, 1), (3, 1), (4, 0), (6, 2), (2, 2), (12, 1)] {
         assert!(matches!(aggregate_tree(&m, &l.inner, &s, &proofs(n), B, leaf_size),
             Err(AggregateError::TreeLayout { covers, leaf_size: ls }) if covers == n && ls == leaf_size), "{n} proofs at L = {leaf_size}");
     }
-    assert!(matches!(aggregate_tree(&m, &l.inner, &s, &proofs(8), B, 1), Err(AggregateError::TreeShape { level: 3 })),
-        "depth 3 over a two-entry list that is not a fixed point");
+    assert!(matches!(aggregate_tree(&m, &l.inner, &s, &proofs(4), B, 1), Err(AggregateError::TreeShape { level: 2 })),
+        "depth 2 over a one-entry list that is not a fixed point");
+    assert!(matches!(aggregate_tree(&m, &l.inner, &s, &proofs(8), B, 1), Err(AggregateError::TreeShape { level: 2 })),
+        "depth 3 over the same list");
 }
 
 /// R5, second half, through the chain-facing call (deferred from Task 1b): a step over two

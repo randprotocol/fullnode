@@ -57,6 +57,7 @@ fn genesis(validator: &Keypair) -> Genesis {
         fees: None,
         incremental_nullifier_root: None,
         perps: None,
+        hc_auth_multisig: None,
     }
 }
 
@@ -120,6 +121,7 @@ async fn the_hosted_prover_answers_beside_the_node_and_its_exit_stops_the_node()
         apply_inline: false,
         prune_history: None,
         gas_policy: None,
+        msauth: Default::default(),
     })
     .await
     .expect("node starts");
@@ -194,6 +196,7 @@ async fn the_node_stops_cleanly_on_shutdown_with_its_prover() {
         apply_inline: false,
         prune_history: None,
         gas_policy: None,
+        msauth: Default::default(),
     })
     .await
     .unwrap();

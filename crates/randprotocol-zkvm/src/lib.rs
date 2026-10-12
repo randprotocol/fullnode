@@ -4,7 +4,7 @@ pub mod guests;
 pub mod emulator;
 pub mod tables;
 pub mod machine;
-/// Vendored: constraint set 8's gas meter (`gas_of`, `row_gas`, `gas_max`, the weights).
+/// Vendored: constraint set 9's gas meter (`gas_of`, `row_gas`, `gas_max`, `MODQ_GAS`, the weights).
 pub mod gas;
 /// Vendored: HCS-1's stable key derivation, written for the next constraint set, not wired in.
 pub mod key_derivation_v2;
@@ -13,6 +13,14 @@ pub mod poseidon2_constants;
 pub mod hash;
 pub mod keccak;
 pub mod sha256;
+/// Vendored (private multisig phase 4): the `MODQ` syscall's host model (`Args`, the ops over Z_q).
+pub mod modq;
+/// Vendored (private multisig phase 4): the `msauth` guest's host model — layout, tags 65-69, witness.
+pub mod msauth;
+/// Vendored (private multisig phase 4): host-side Keccak for `dilithium-core` (tests and witnesses).
+/// Not on wasm32, where `dilithium-core`'s `asm!` barrier does not compile (`Cargo.toml`).
+#[cfg(not(target_arch = "wasm32"))]
+pub mod dilithium_host;
 pub mod sbpf;
 pub mod notes;
 /// Node-local (not vendored): the hidden-asset bundle's layout, digest and witness builder.

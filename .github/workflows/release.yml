@@ -181,8 +181,19 @@ jobs:
           set -euo pipefail
           mkdir dist
           cp target/release/rand-node target/release/rand target/release/rand-prover dist/
-          ( cd dist && sha256sum rand-node rand rand-prover > SHA256SUMS && cat SHA256SUMS )
+          # The precomputed msauth verifier key (private multisig): the committed blob, shipped
+          # beside the binaries and installed at /usr/local/bin/msauth-vk-production.bin.
+          cp crates/randprotocol-zkvm/keys/msauth-vk-production.bin dist/
+          ( cd dist && sha256sum rand-node rand rand-prover msauth-vk-production.bin > SHA256SUMS && cat SHA256SUMS )
           dist/rand-node --version
+      - name: The msauth key blob is the one this rand-node pins
+        working-directory: fullnode
+        run: |
+          set -euo pipefail
+          got=$(dist/rand-node keygen-msauth-vk --check dist/msauth-vk-production.bin)
+          want=$(dist/rand-node keygen-msauth-vk --print-pinned production)
+          echo "msauth-vk-production.bin sha256 $got, pinned $want"
+          [ "$got" = "$want" ] || { echo "::error::dist/msauth-vk-production.bin ($got) is not the pin compiled into dist/rand-node ($want)"; exit 1; }
       - name: Build provenance
         uses: actions/attest-build-provenance@96278af6caaf10aea03fd8d33a09a777ca52d62f # v3.2.0
         with:
@@ -190,6 +201,7 @@ jobs:
             fullnode/dist/rand-node
             fullnode/dist/rand
             fullnode/dist/rand-prover
+            fullnode/dist/msauth-vk-production.bin
       - name: The release
         working-directory: fullnode
         env:
@@ -232,4 +244,4 @@ jobs:
           prerelease=""
           case "$TAG" in *-rc*|*-alpha*|*-beta*) prerelease="--prerelease" ;; esac
           gh release create "$TAG" --repo "$REPO" --verify-tag --title "$TAG" --notes-file notes.md $prerelease \
-            dist/rand-node dist/rand dist/rand-prover dist/SHA256SUMS
+            dist/rand-node dist/rand dist/rand-prover dist/msauth-vk-production.bin dist/SHA256SUMS

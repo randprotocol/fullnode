@@ -585,23 +585,16 @@ fn raw_proof_facts(
 ) -> Result<randprotocol_core::types::CoveredBundle> {
     let proof: randprotocol_zkvm::machine::Proof = postcard::from_bytes(proof)
         .map_err(|_| StorageError::Corrupt(format!("covered bundle {tx_hash}'s proof does not decode")))?;
-    let public_values: [u64; randprotocol_core::types::pv::NUM] = proof
-        .public_values
-        .clone()
-        .try_into()
-        .map_err(|_| StorageError::Corrupt(format!("covered bundle {tx_hash}'s public values are not pv::NUM words")))?;
-    Ok(randprotocol_core::types::CoveredBundle {
-        public_values,
-        shape: randprotocol_core::types::DeclaredShape {
-            profile,
-            tier: proof.tier.0 as u8,
-            program_log_height: proof.program_log_height,
-            input_log_height: proof.input_log_height,
-            keccak_log_height: proof.keccak_log_height,
-            sha256_log_height: proof.sha256_log_height,
-            public_log_height: proof.public_log_height,
-            mem_log_height: proof.mem_log_height,
-        },
+    // Constraint set 9: `agg_executor::covered_bundle_of` refuses an inner proof declaring a modq
+    // table (the recursion verifier is chip-free) — unreachable on an honest chain, whose bundle
+    // admission pins `modq_log_height = 0`, so a stored one is corruption. It surfaces as
+    // `StorageError::Corrupt` here, which `node::assemble_covered` reports to admission as
+    // `CoverStoreCorrupt` (and `verify_chain`/the pruning pass as a storage error).
+    crate::agg_executor::covered_bundle_of(&proof, profile).map_err(|e| match e {
+        randprotocol_core::confidential::ConfidentialError::MalformedProof => {
+            StorageError::Corrupt(format!("covered bundle {tx_hash}'s public values are not pv::NUM words"))
+        }
+        e => StorageError::Corrupt(format!("covered bundle {tx_hash}: {e}")),
     })
 }
 
@@ -4424,6 +4417,7 @@ pub(crate) mod fixtures {
             hardening_v6: None,
             hc_auth: None,
             fees: None,
+            hc_auth_multisig: None,
         }
     }
 
@@ -4585,6 +4579,7 @@ pub(crate) mod fixtures {
             hardening_v6: None,
             hc_auth: None,
             fees: None,
+            hc_auth_multisig: None,
         };
         (gs, secrets)
     }
@@ -5779,6 +5774,23 @@ pub(crate) use fixtures::height_key_for_test;
 mod tests {
     use super::fixtures::*;
     use super::*;
+
+    /// Constraint set 9 / circuits Task 9b: the covered-record reader every aggregate and tree
+    /// verify is fed from (`covered_record`, and the pruning pass that writes the marker form)
+    /// refuses an inner proof declaring a modq table, by the aggregate paths' own words, and still
+    /// reads a chip-free one as it always did.
+    #[test]
+    fn a_stored_bundle_declaring_a_modq_table_is_no_covered_record() {
+        let hash = Hash::digest(b"modq-bundle");
+        match raw_proof_facts(&hash, crate::agg_executor::modq_fixture_proof_bytes(), randprotocol_core::types::FriProfile::Test) {
+            Err(StorageError::Corrupt(m)) => assert!(m.contains(crate::agg_executor::INNER_MODQ_REFUSAL), "{m}"),
+            other => panic!("{other:?}"),
+        }
+        let honest = crate::agg_executor::fixture_proof(0);
+        let record = raw_proof_facts(&hash, &honest.to_bytes(), randprotocol_core::types::FriProfile::Test).unwrap();
+        assert_eq!(record.shape.tier, honest.tier.0 as u8);
+        assert_eq!(record.public_values.to_vec(), honest.public_values);
+    }
     use randprotocol_core::confidential::StubExecutor;
     use randprotocol_core::ledger::ANCHOR_WINDOW;
     use randprotocol_core::Transaction;

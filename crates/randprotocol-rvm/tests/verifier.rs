@@ -74,6 +74,17 @@ fn the_witness_tape_layout_is_pinned() {
 }
 
 #[test]
+fn a_declared_modq_table_is_refused_by_name_in_shape_matches() {
+    let (mut p, shape, _key) = one_test_proof();
+    assert_eq!(p.proof.modq_log_height, 0, "the fixture is chip-free");
+    assert!(shape.matches(&p.proof), "an honest chip-free proof passes");
+    p.proof.modq_log_height = 10;
+    assert!(!shape.matches(&p.proof), "a proof declaring a modq table is refused by name");
+    p.proof.modq_log_height = 0;
+    assert!(shape.matches(&p.proof), "and it is that field alone that was refused");
+}
+
+#[test]
 fn the_host_transcript_replay_reproduces_machine_verifys_acceptance() {
     let (p, shape, key) = one_test_proof();
     let m = Machine::new(FriProfile::Test);
@@ -342,8 +353,7 @@ fn a_commit_phase_leaf_and_its_restored_path_recompute_the_rounds_commitment() {
         let bits: Vec<Felt> = (0..levels)
             .map(|k| b.constant(F::from_u64(((index >> k) & 1) as u64)))
             .collect();
-        let root = Digest(b.alloc(4));
-        hash::merkle_walk(&mut b, leaf, &bits, sibs, levels, root);
+        let root = hash::merkle_walk(&mut b, leaf, &bits, sibs, levels);
         for i in 0..4 {
             let v = b.load(root.0, i);
             b.public(v);
@@ -451,15 +461,13 @@ fn an_input_rounds_leaf_group_and_restored_path_recompute_the_preprocessed_cap()
         let bits: Vec<Felt> = (0..levels)
             .map(|k| b.constant(F::from_u64(((index >> k) & 1) as u64)))
             .collect();
-        let root = Digest(b.alloc(4));
-        hash::merkle_walk_with_injections(
+        let root = hash::merkle_walk_with_injections(
             &mut b,
             leaf,
             &bits,
             sibs,
             levels,
             &[hash::Injection { after_level, rows, n_cells: short_cells }],
-            root,
         );
         for i in 0..4 {
             let v = b.load(root.0, i);
@@ -718,8 +726,10 @@ fn phase_5_costs_the_measured_number_of_rows_per_inner_proof() {
     // VERIFIER-1's per-round assertion hashes nothing; constraint set 8 moved it 11 852 → 11 875:
     // the cpu table's `GAS` column widens every opened main-trace leaf, and the 35th public value
     // is observed and sponged — phase 8's list is 40 words, still ten permutations); the
-    // production one lives in `docs/00-recursion-vm.md` and `pins.json`.
-    assert_eq!(exec.permutations(), 11_875, "51 transcript duplexes in phases 0–4, the rest is the query phase and phase 8's digest");
+    // production one lives in `docs/00-recursion-vm.md` and `pins.json`. MODQ chip (2026-10-11,
+    // private multisig phase 3): the inner cpu gained SYS_MODQ (283 columns), which widens every
+    // opened main-trace leaf: 11 875 → 11 894.
+    assert_eq!(exec.permutations(), 11_894, "51 transcript duplexes in phases 0–4, the rest is the query phase and phase 8's digest");
 }
 
 /// Every assertion phase 5 makes is a *named* checkpoint, and the names are the interface Task 6's
@@ -772,7 +782,9 @@ fn phase_5s_assertions_are_all_named() {
 /// checks the own slot by the indicator dot product — a change of the shared pipeline):
 /// `39bb6b8d…3352` → `af0c16e8…6c7b`. Phase 3's Cut E2 re-recorded it (2026-10-06: each committed row's
 /// buffer gains the two fold-result cells after its salts, `hint_array_padded`, in both builds, so
-/// every later cell address moves): `af0c16e8…6c7b` → `c580415b…5e6c`.
+/// every later cell address moves): `af0c16e8…6c7b` → `c580415b…5e6c`. Phase 4's D2 re-recorded it (2026-10-09: the walk returns its leaf, no out cell, in both builds): `c580415b…5e6c` → `759b015d…9b4e`.
+/// MODQ chip (2026-10-11, private multisig phase 3): the inner cpu gained SYS_MODQ (283 columns; the
+/// Off replay compiles the inner AIR and embeds its key): `759b015d…9b4e` → `ac1f08cf…d406`.
 #[test]
 fn the_off_replay_reproduces_the_pre_liveness_program_byte_for_byte() {
     use randprotocol_rvm::dsl::Liveness;
@@ -788,7 +800,7 @@ fn the_off_replay_reproduces_the_pre_liveness_program_byte_for_byte() {
     let off = verify_rv32_with(&shape, &key, Checkpoints::Off, Liveness::Off, randprotocol_rvm::programs::Precompiles::Off);
     assert_eq!(
         randprotocol_rvm::programs::digest_hex(&off.program),
-        "c580415bdaccf7888e7602e793198874e39e0bda8951d11ef6e47ed029455e6c",
+        "ac1f08cfc4aa66420718102d8b2eef9e157fb0a3aa94568c762e1313364fd406",
         "the Off replay must reproduce the pre-Task-7 stream byte for byte (plus VERIFIER-1's \
          per-round assertions, and constraint set 7's and 8's inner changes)"
     );
@@ -833,15 +845,19 @@ fn the_off_replay_reproduces_the_pre_liveness_program_byte_for_byte() {
 /// whole, its own slot checked by one register-addressed `LOADE`): `8a2d166f…8509` → `9a43596f…4aa9`.
 /// Re-registered for phase 3's Cut E2 (`FOLD`, the fold in the reduce chip): `9a43596f…4aa9` →
 /// `f66aa580…6f63`. Re-registered for phase 3's Cut F (`POW`, the index powers in the reduce chip):
-/// `f66aa580…6f63` → `df3a18b8…1073`.
+/// `f66aa580…6f63` → `df3a18b8…1073`. Phase 4 (2026-10-09, the Merkle spans) re-recorded it:
+/// `df3a18b8…1073` → `1bcbcec9…1fba` (program changes all four: the cap select by register-offset
+/// `LOAD`, the re-homing reloads, the in-place Merkle walk, `SPONGE`/`COMPRESS` immediates).
+/// MODQ chip (2026-10-11, private multisig phase 3): the inner cpu gained SYS_MODQ (283 columns; an
+/// inner shape and key change): `1bcbcec9…1fba` → `e26f37e3…41a0`.
 #[test]
 fn the_aggregate_program_digest_is_unchanged_by_rvm_constraint_fixes() {
     let (_p, shape, key) = one_test_proof();
     let vp = randprotocol_rvm::programs::verify_rv32n(&shape, &key, Checkpoints::Off);
     assert_eq!(
         randprotocol_rvm::programs::digest_hex(&vp.program),
-        "df3a18b8d3294a591a2e8fd79f5430550cd9f09afcff6fc8aea89cc1bfaf1073",
-        "the aggregate program's digest at the Test fixture shape, as re-registered for phase 3's Cut F"
+        "e26f37e3682a42d2f9835dca49ac0ad7408ca27f24bc34867d5f2efb28a241a0",
+        "the aggregate program's digest at the Test fixture shape, as re-registered for phase 4's Merkle spans"
     );
 }
 

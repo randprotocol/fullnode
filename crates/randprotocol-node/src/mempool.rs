@@ -57,6 +57,22 @@ pub enum MempoolError {
     AttestationConflict(Hash),
     #[error("mempool full")]
     Full,
+    /// Private multisig phase 4 (spec §3.5): a multisig auth proof arrived before this node's
+    /// multisig auth verifier key is ready. Retryable — not `Invalid`, so never judged permanent,
+    /// never `RefusedCache`d, and no peer is penalised for it.
+    #[error("{0}")]
+    Warming(&'static str),
+}
+
+/// The refusal a `Warming` deferral carries, as `rand_sendTransaction` reports it.
+pub const MSAUTH_WARMING: &str = "the multisig auth key is still warming; retry in a minute";
+
+impl MempoolError {
+    /// Whether the same transaction may succeed if sent again later, unchanged: a deferral
+    /// (`Warming`) or a full pool. Everything else is a verdict on the transaction or its conflicts.
+    pub fn is_retryable(&self) -> bool {
+        matches!(self, MempoolError::Warming(_) | MempoolError::Full)
+    }
 }
 
 /// What a transaction claims of the pool, as [`Mempool::precheck`] worked it out: the commitments
@@ -634,10 +650,34 @@ impl Mempool {
         let mut c = c;
         let pricing = self.gas_policy_floor(tx, ledger, executor).map_err(MempoolError::Invalid)?;
         (c.floor, c.gas_limit) = (pricing.floor, pricing.gas_limit);
+        Self::defer_until_msauth_warm(tx, ledger, executor)?;
         // Before any proof is verified for it: a transaction the byte cap would refuse costs no
         // verification (audit v6, CH-7).
         c.evict = self.make_room(tx, c.floor, ledger)?;
         Ok(c)
+    }
+
+    /// Private multisig phase 4 (spec §3.5): on a chain whose genesis names `hc_auth_multisig`,
+    /// a multisig-shaped auth proof waits — `Warming`, retryable — until the executor's multisig
+    /// key is ready, so admission never makes the verify thread wait on it (block validation
+    /// does wait: it never defers). Only on such a chain: elsewhere a multisig proof is the
+    /// ledger's permanent `InvalidAuthProof`, and deferring it would have it retried forever. A
+    /// header that does not decode is left to the ledger's verdict too.
+    ///
+    /// Readiness first: once the key is ready — always, on a node that loaded its blob — no auth
+    /// proof is decoded here at all. This runs on the node loop for every gossiped or submitted
+    /// transaction, and the ledger's `check_auth_fields` decodes the header on the verify worker
+    /// anyway; a decode here only while the key is cold costs nothing in steady state and gives
+    /// no per-message decode lever.
+    fn defer_until_msauth_warm(tx: &Transaction, ledger: &Ledger, executor: &dyn ConfidentialExecutor) -> Result<(), MempoolError> {
+        if ledger.hc_auth_multisig().is_none() || executor.auth_multisig_key_ready() {
+            return Ok(());
+        }
+        let Some(b) = tx.bundle.as_ref().filter(|b| !b.auth_proof.is_empty()) else { return Ok(()) };
+        match executor.auth_header(&b.auth_proof) {
+            Ok((randprotocol_core::confidential::AuthShape::Multisig, _, _)) => Err(MempoolError::Warming(MSAUTH_WARMING)),
+            _ => Ok(()),
+        }
     }
 
     /// RESCAN-LEDGER-1's admission policy (`admission::minter_not_allowed`) against this pool's
@@ -3995,5 +4035,248 @@ mod tests {
         m.prune(&deleted);
         assert_eq!(m.len(), 1, "a price is not staleness");
         assert_eq!(m.candidates(&created, 10), vec![rewrite]);
+    }
+
+    // ---- Private multisig phase 4: a multisig auth proof waits for the key (spec §3.5) ----------
+
+    mod msauth_warming {
+        use super::*;
+        use randprotocol_core::confidential::{AuthShape, ConfidentialError, ConfidentialExecutor};
+        use randprotocol_core::ledger::aggregation::{TreeConfig, TreeDigests};
+        use randprotocol_core::notes::BundleDigestInput;
+        use randprotocol_core::program::{CallOutcome, ProgramRecord};
+        use randprotocol_core::types::{CoveredBundle, DeclaredShape, TX_BINDING_WORDS};
+        use randprotocol_core::TxError;
+
+        /// The multisig auth guest the test chain pins (genesis `hc_auth_multisig`).
+        const HCM: Word8 = [23; 8];
+        /// The auth commitment the bundle and its proof carry.
+        const C: Word8 = [0xc0; 8];
+
+        /// The stub — every trait method forwarded, defaulted ones included, so the two never
+        /// silently diverge — with its multisig auth key not ready (`ready: false`, the default),
+        /// and a count of `auth_header` calls.
+        #[derive(Default)]
+        struct Cold {
+            ready: bool,
+            headers: std::sync::atomic::AtomicUsize,
+        }
+
+        impl Cold {
+            fn warm() -> Self {
+                Cold { ready: true, ..Cold::default() }
+            }
+            fn headers(&self) -> usize {
+                self.headers.load(std::sync::atomic::Ordering::SeqCst)
+            }
+        }
+
+        impl ConfidentialExecutor for Cold {
+            fn auth_multisig_key_ready(&self) -> bool {
+                self.ready
+            }
+            fn auth_header(&self, proof: &[u8]) -> Result<(AuthShape, Word8, Option<u64>), ConfidentialError> {
+                self.headers.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                StubExecutor.auth_header(proof)
+            }
+            fn warm_auth_multisig(&self) {
+                StubExecutor.warm_auth_multisig()
+            }
+            fn install_msauth_vk(&self, blob: &[u8]) -> Result<(), String> {
+                StubExecutor.install_msauth_vk(blob)
+            }
+            fn enable_auth_multisig(&self) {
+                StubExecutor.enable_auth_multisig()
+            }
+            fn build_msauth_key(&self) -> Result<(), String> {
+                StubExecutor.build_msauth_key()
+            }
+            fn check_program(&self, base_pc: u32, words: &[u32]) -> Result<Vec<u8>, ConfidentialError> {
+                StubExecutor.check_program(base_pc, words)
+            }
+            fn max_callable_program_words(&self, public_segment_words: usize) -> Option<usize> {
+                StubExecutor.max_callable_program_words(public_segment_words)
+            }
+            fn verify_call(&self, program: &ProgramRecord, proof: &[u8]) -> Result<CallOutcome, ConfidentialError> {
+                StubExecutor.verify_call(program, proof)
+            }
+            fn decode_call(&self, program: &ProgramRecord, proof: &[u8]) -> Result<CallOutcome, ConfidentialError> {
+                StubExecutor.decode_call(program, proof)
+            }
+            fn verify_call_hardened(&self, program: &ProgramRecord, proof: &[u8], segment: &[u32]) -> Result<CallOutcome, ConfidentialError> {
+                StubExecutor.verify_call_hardened(program, proof, segment)
+            }
+            fn decode_call_hardened(&self, program: &ProgramRecord, proof: &[u8], segment: &[u32]) -> Result<CallOutcome, ConfidentialError> {
+                StubExecutor.decode_call_hardened(program, proof, segment)
+            }
+            fn verify_invoke(&self, program: &ProgramRecord, proof: &[u8], segment: &[u32]) -> Result<CallOutcome, ConfidentialError> {
+                StubExecutor.verify_invoke(program, proof, segment)
+            }
+            fn decode_invoke(&self, program: &ProgramRecord, proof: &[u8], segment: &[u32]) -> Result<CallOutcome, ConfidentialError> {
+                StubExecutor.decode_invoke(program, proof, segment)
+            }
+            fn verify_perp(&self, engine_hc: &Word8, max_tier: u8, segment: &[u32], proof: &[u8]) -> Result<CallOutcome, ConfidentialError> {
+                StubExecutor.verify_perp(engine_hc, max_tier, segment, proof)
+            }
+            fn decode_perp(&self, engine_hc: &Word8, max_tier: u8, segment: &[u32], proof: &[u8]) -> Result<CallOutcome, ConfidentialError> {
+                StubExecutor.decode_perp(engine_hc, max_tier, segment, proof)
+            }
+            fn warm(&self, program: &ProgramRecord) {
+                StubExecutor.warm(program)
+            }
+            fn warm_hardened(&self, program: &ProgramRecord) {
+                StubExecutor.warm_hardened(program)
+            }
+            fn public_digest(&self, words: &[u32]) -> Word8 {
+                StubExecutor.public_digest(words)
+            }
+            fn node_hash(&self, left: &Word8, right: &Word8) -> Word8 {
+                StubExecutor.node_hash(left, right)
+            }
+            fn hash_domain(&self, domain: u32, msg: &[u32]) -> Word8 {
+                StubExecutor.hash_domain(domain, msg)
+            }
+            fn note_commitment(&self, pk: &Word8, from: &Word8, amount: u64, asset: u32, time: u32, r: &Word8) -> Word8 {
+                StubExecutor.note_commitment(pk, from, amount, asset, time, r)
+            }
+            fn bundle_digest(&self, input: &BundleDigestInput) -> Word8 {
+                StubExecutor.bundle_digest(input)
+            }
+            fn bundle_digest_v3(&self, input: &BundleDigestInput) -> Word8 {
+                StubExecutor.bundle_digest_v3(input)
+            }
+            fn bundle_proof_digest(&self, hc_bundle: &Word8, proof: &[u8]) -> Result<Word8, ConfidentialError> {
+                StubExecutor.bundle_proof_digest(hc_bundle, proof)
+            }
+            fn auth_proof_digest(&self, proof: &[u8]) -> Result<Word8, ConfidentialError> {
+                StubExecutor.auth_proof_digest(proof)
+            }
+            fn verify_auth(&self, hc_auth: &Word8, proof: &[u8], binding: &[u32; TX_BINDING_WORDS]) -> Result<Word8, ConfidentialError> {
+                StubExecutor.verify_auth(hc_auth, proof, binding)
+            }
+            fn bundle_gas_limit(&self, proof: &[u8]) -> Result<Option<u64>, ConfidentialError> {
+                StubExecutor.bundle_gas_limit(proof)
+            }
+            fn auth_gas_limit(&self, proof: &[u8]) -> Result<Option<u64>, ConfidentialError> {
+                StubExecutor.auth_gas_limit(proof)
+            }
+            fn verify_bundle(&self, hc: &Word8, proof: &[u8], binding: &[u32; TX_BINDING_WORDS]) -> Result<(), ConfidentialError> {
+                StubExecutor.verify_bundle(hc, proof, binding)
+            }
+            fn warm_bundle(&self) {
+                StubExecutor.warm_bundle()
+            }
+            fn warm_auth(&self) {
+                StubExecutor.warm_auth()
+            }
+            fn non_canonical_proof(&self, proof: &[u8]) -> Option<String> {
+                StubExecutor.non_canonical_proof(proof)
+            }
+            fn aggregate_program_digest(&self, shape: &DeclaredShape) -> Result<[u64; 4], ConfidentialError> {
+                StubExecutor.aggregate_program_digest(shape)
+            }
+            fn check_aggregate_header(&self, proof: &[u8]) -> Result<(), ConfidentialError> {
+                StubExecutor.check_aggregate_header(proof)
+            }
+            fn verify_aggregate(&self, shape: &DeclaredShape, covered: &[CoveredBundle], proof: &[u8], binding: &[u32; 8]) -> Result<Vec<[u32; 8]>, ConfidentialError> {
+                StubExecutor.verify_aggregate(shape, covered, proof, binding)
+            }
+            fn warm_aggregation(&self, shape: &DeclaredShape, max_covers: u32) {
+                StubExecutor.warm_aggregation(shape, max_covers)
+            }
+            fn aggregate_proof_tier(&self, proof: &[u8]) -> Result<u8, ConfidentialError> {
+                StubExecutor.aggregate_proof_tier(proof)
+            }
+            fn tree_digests(&self, tree: &TreeConfig) -> Result<TreeDigests, ConfidentialError> {
+                StubExecutor.tree_digests(tree)
+            }
+            fn verify_tree(&self, tree: &TreeConfig, covered: &[CoveredBundle], proof: &[u8], binding: &[u32; 8], depth: u32) -> Result<Vec<[u32; 8]>, ConfidentialError> {
+                StubExecutor.verify_tree(tree, covered, proof, binding, depth)
+            }
+            fn warm_tree(&self, tree: &TreeConfig) {
+                StubExecutor.warm_tree(tree)
+            }
+        }
+
+        /// This module's ledger with split authorisation on (genesis `hc_auth`).
+        fn v3_ledger_for_pool() -> Ledger {
+            let mut l = ledger();
+            l.set_hc_auth(Some(fixtures::HCA));
+            l
+        }
+
+        /// A v3 transfer whose auth proof is a stub multisig proof by [`HCM`], bound.
+        fn msig_stub_tx(l: &Ledger) -> Transaction {
+            let mut b = fixtures::v3_bundle(l, 40, fixtures::bundle_fee(), (0, 0, 0));
+            b.auth_commit = C;
+            b.proof = StubExecutor::make_bundle_proof(&l.hc_bundle(), &StubExecutor.bundle_digest_v3(&b.digest_input()), &[0; 8]);
+            b.auth_proof = StubExecutor::make_msauth_proof(&HCM, &C, &[0; 8]);
+            StubExecutor::bound(Transaction::shielded(l.chain_id(), b, Action::None))
+        }
+
+        #[test]
+        fn a_multisig_auth_proof_is_deferred_not_refused_until_the_key_is_warm() {
+            let mut l = v3_ledger_for_pool();
+            l.set_hc_auth_multisig(Some(HCM));
+            let tx = msig_stub_tx(&l);
+            let pool = Mempool::new(16);
+            match pool.precheck(&tx, &l, &Cold::default()) {
+                Err(e @ MempoolError::Warming(_)) => assert!(e.is_retryable() && e.to_string().contains("warming"), "{e}"),
+                other => panic!("{:?}", other.map(|_| ())),
+            }
+            assert!(pool.precheck(&tx, &l, &StubExecutor).is_ok(), "warm: admitted to verify");
+            assert!(!MempoolError::Invalid(TxError::AuthMismatch).is_retryable());
+        }
+
+        /// The deferral is never judged: not forwarded, not cached, no peer penalised.
+        #[test]
+        fn a_warming_deferral_is_an_ignore_and_never_cached() {
+            let mut refused = crate::admission::RefusedCache::new(8);
+            let e = MempoolError::Warming(MSAUTH_WARMING);
+            assert_eq!(crate::admission::acceptance_for_pool(&e, Hash::digest(b"w"), &mut refused), crate::admission::Acceptance::Ignore);
+            assert_eq!(refused.len(), 0);
+            assert_eq!(e.to_string(), "the multisig auth key is still warming; retry in a minute");
+        }
+
+        /// Controller note: on a chain WITHOUT `hc_auth_multisig` there is no deferral — a
+        /// multisig proof there is the ledger's permanent refusal, never a retry loop.
+        #[test]
+        fn without_hc_auth_multisig_a_multisig_proof_is_never_deferred() {
+            let l = v3_ledger_for_pool();
+            let tx = msig_stub_tx(&l);
+            assert!(Mempool::new(16).precheck(&tx, &l, &Cold::default()).is_ok(), "the pre-screen leaves it to the ledger");
+            match l.validate(&tx, &Cold::default()) {
+                Err(TxError::InvalidAuthProof(ConfidentialError::InvalidProof(why))) => assert!(why.contains("without hc_auth_multisig"), "{why}"),
+                other => panic!("{other:?}"),
+            }
+            assert!(crate::admission::is_permanent(&l.validate(&tx, &Cold::default()).unwrap_err()));
+        }
+
+        /// Readiness first (review IMPORTANT 1): with the key ready, the pre-screen decodes no auth
+        /// proof at all — single-key or multisig; only while it is cold does it decode, once.
+        #[test]
+        fn a_ready_key_costs_the_pre_screen_no_auth_decode() {
+            let mut l = v3_ledger_for_pool();
+            l.set_hc_auth_multisig(Some(HCM));
+            let single = fixtures::v3_tx(&l, 50, fixtures::bundle_fee(), Action::None);
+            let msig = msig_stub_tx(&l);
+            let warm = Cold::warm();
+            for tx in [&single, &msig] {
+                assert!(Mempool::new(16).precheck(tx, &l, &warm).is_ok());
+            }
+            assert_eq!(warm.headers(), 0, "no decode with the key ready");
+            let cold = Cold::default();
+            assert!(matches!(Mempool::new(16).precheck(&msig, &l, &cold), Err(MempoolError::Warming(_))));
+            assert_eq!(cold.headers(), 1, "exactly one decode while cold");
+        }
+
+        /// A single-key proof is never deferred, cold key or not.
+        #[test]
+        fn a_single_key_auth_proof_is_never_deferred() {
+            let mut l = v3_ledger_for_pool();
+            l.set_hc_auth_multisig(Some(HCM));
+            let tx = fixtures::v3_tx(&l, 50, fixtures::bundle_fee(), Action::None);
+            assert!(Mempool::new(16).precheck(&tx, &l, &Cold::default()).is_ok());
+        }
     }
 }

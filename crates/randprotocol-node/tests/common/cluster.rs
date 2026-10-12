@@ -147,6 +147,7 @@ pub async fn start_in_verify(
         apply_inline: false,
         prune_history,
         gas_policy: None,
+        msauth: Default::default(),
     })
     .await
     .expect("node starts");

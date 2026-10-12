@@ -62,6 +62,15 @@ pub const SYS_READ_PUBLIC: u32 = 6;
 /// (`hash::sponge_hash_len`). A new number rather than a change to `POSEIDON2`, whose digests every
 /// note commitment, nullifier, Merkle root and program digest `hc` a chain holds are built on.
 pub const SYS_POSEIDON2_LEN: u32 = 7;
+/// Private multisig phase 3: `MODQ`, the mod-q coprocessor call (spec 2026-10-11-rvm-modq-chip
+/// §3.1). `a0 = BASE`, a word address; `a1 = op | OUT << 8 | A << 16 | B << 24` (`modq::Args`).
+/// Poly `i` of the arena is words `BASE + 256·i ..`; the op reads its input polys (every word
+/// `< 2^24`) at slot 0 and writes its canonical outputs at slot 1, in one cpu row. Reserved
+/// bits, overlapping operands, a coefficient `>= 2^24` and `BASE > emulator::MODQ_PTR_LIMIT` are
+/// refused (`ExecError::Modq*`).
+pub const SYS_MODQ: u32 = 8;
+/// 35 polys of 256 words: the highest word a call can touch is `BASE + 8 959`.
+pub const MODQ_SPAN_WORDS: u32 = 256 * 35;
 pub const NUM_OUTPUTS: usize = 8;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]

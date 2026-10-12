@@ -1097,7 +1097,7 @@ fn a_mixed_hidden_bundle_proves_at_tier_14_and_verifies_only_against_its_binding
     // key. It is refused on the header alone, before `log_ext_degrees_pub` and before any key
     // is built.
     let machine = Machine::new(FriProfile::Production);
-    let pinned = ConfidentialError::InvalidProof("tier or hash-table height not the pinned guest's".into());
+    let pinned = ConfidentialError::InvalidProof("tier, hash-table or modq height not the pinned guest's".into());
     // Each triple is one `check_declared_heights` admits (keccak's and sha256's floor is 7 since
     // constraint set 7 — 5 and 6 before it — both capped by `tier + 5`), so every one of them
     // reached `verifier_key` before this pin.

@@ -181,6 +181,89 @@ call), so a genesis with `hc_auth` must set `max_block_bytes ≥ 3·max_proof_by
 transfers but no `Call` at Production FRI. The soundness evidence is in
 `docs/confidential.md` ("The hidden-asset bundle guest: soundness").
 
+### Private multisig: the second auth guest (v0.8.0, genesis `hc_auth_multisig`)
+
+Specs: `docs/superpowers/specs/2026-10-11-private-multisig-design.md` (the guest) and
+`docs/superpowers/specs/2026-10-11-private-multisig-phase4-design.md` (this node's side). A genesis
+cut with `rand-node genesis --auth-multisig-guest` (beside `--bundle-guest v3 --auth-guest`) pins a
+second auth guest as `hc_auth_multisig`:
+**`9705f8e2f1bc8561848b29cb8efd57c37e3e39788fa58a5f03304d8019668247`**, **tier 18**
+(`ZkExecutor::hc_auth_multisig()`, pinned as `MSAUTH_HC` in
+`crates/randprotocol-zkvm/tests/guest_provenance.rs`, which also checks this page names it). The field needs `hc_auth` and must differ from it, and
+at the Production profile `Genesis::validate` requires `max_proof_bytes ≥ 4 MiB`
+(`gas::MSAUTH_MIN_PROOF_BYTES`). User-facing: `docs/multisig.md`, "Private accounts", and
+`docs/cli.md`, [`rand multisig-private`](cli.md#rand-multisig-private).
+
+The account's key is a hidden M-of-N policy instead of one spend key. Its `nk` is
+`H(69, msk ‖ policy)`, where `policy = H(68, threshold ‖ signer_root)`, `signer_root` is the
+depth-4 Merkle root (nodes tag 67) over `H(66, pk_i)` for up to `N_MAX` = 16 round-3 Dilithium2 keys
+(`crystals-dilithium` 2.0.0's `dilithium2`, the node's own module), and `msk` is 8 random words every
+signer holds. From `nk` on, everything is a single-key wallet's: the address, the scan key, the
+bundle guest v3 witness, `auth_commit = H(65, nk ‖ salt)`. The multisig auth guest checks, inside
+the proof, at least `threshold` (≤ `M_MAX` = 3) signatures over
+`b"rand-msauth-1" ‖ binding (32 LE bytes)`, each by a distinct signer index on the policy's tree,
+and publishes the same `c` the single-key guest would. A failed check publishes the guest's panic
+sentinel, which never equals an `auth_commit`, so the existing `AuthMismatch` refuses it.
+
+**The two shapes.** The bundle wire, `auth_commit`, the v3 digest, `Transaction::binding` and
+`rand-txid-3` are unchanged; the ledger tells the two auth proofs apart by the header the proof
+declares, and pins each shape exactly before any verifier key is built:
+
+| header word | single-key (`auth_heights()`, `hc_auth`) | multisig (`msauth_heights()`, `hc_auth_multisig`) |
+|---|---|---|
+| `tier` | `AUTH_TIER` = 10 | `MSAUTH_TIER` = 18 |
+| `program_log_height` | of `guests::auth()` | 12 |
+| `input_log_height` | `input_log_height(16)` | 12 (`MSAUTH_WORDS = 17 + M_MAX·967`, always all present) |
+| `keccak_log_height` | 0 | 14 |
+| `sha256_log_height` | 0 | 0 |
+| `modq_log_height` | 0 | 16 (the MODQ chip, constraint set 9: `docs/zkvm.md`) |
+| `public_log_height` | `public_log_height(8)` | 7 |
+| `mem_log_height` | ranged (`non_canonical`) | 20, **exact** |
+| `pv::GAS` under a `gas` section | `gas_max(10,0,0)` = 1 279 | 436 159 (`msauth_gas_limit_pin()`, the header ceiling) |
+
+Every height that could vary with the number of signatures is floored at `M_MAX`'s value and
+compared exactly, so a 1-of-N spend pays and looks like a 3-of-N one: the proof does not tell M.
+
+**Admission order** (`Ledger::check_auth_fields`, then `verify_auth_proof`), on a chain with
+`hc_auth`:
+
+1. an empty auth proof → `AuthMissing`;
+2. one header decode (`ConfidentialExecutor::auth_header`, via `auth_header_of`) gives the shape,
+   the published `c` and the declared gas: the single-key shape is checked against `hc_auth`, the
+   multisig shape against `hc_auth_multisig`, and anything else is `InvalidAuthProof`;
+3. a multisig-shaped proof on a chain without `hc_auth_multisig` → `InvalidAuthProof` ("a multisig
+   auth proof on a chain without hc_auth_multisig"), permanent;
+4. `c ≠ auth_commit` → `AuthMismatch`; under a `gas` section a declared gas other than that shape's
+   pin → `AuthGasLimit`;
+5. the bundle proof, as before; then `verify_auth(hc, proof, binding)` against the shape's guest
+   (the verify cache keys on `hc`, so the two guests never share an entry), its `c` again equal to
+   `auth_commit`.
+
+Every refusal is permanent. The one wait: the mempool defers a multisig-shaped proof with a
+retryable `Warming` only while this node's tier-18 key is still cold (a node that loaded its
+pinned blob at startup is never cold, `docs/deploy.md`, "The msauth verifier key"), and block
+validation waits on the key's single-flight slot rather than refusing. Admission never pins a
+proof's length: the per-transaction cap is `max_proof_bytes`, as for every proof.
+
+**What the chain sees.**
+
+| visible | hidden |
+|---|---|
+| that the auth proof is the multisig shape (its declared heights) | the account, `msk`, `nk` |
+| the bundle's public fields, as for any v3 bundle | N, M, the threshold, the signer keys |
+| the transaction size | which signers signed |
+| | inputs, outputs, amounts, recipients (shielded, as always) |
+
+**Cost.** The guest runs 85 830 / 169 068 / 251 946 cycles at M = 1 / 2 / 3 (a Dilithium2 verify is
+80 572 cycles with the MODQ chip, against 880 102 in software), inside tier 18's 262 143. The
+Production msauth proof's size and prove time are **not yet measured**: the estimate is ≥ 3.4 MB for
+the auth proof and ≈ 4.8 MB with the bundle proof. So the node's floor beside `hc_auth_multisig` is
+a 4 MiB `max_proof_bytes`, and chain 21 is cut at 6 MiB (`max_proof_bytes` 6 291 456,
+`max_block_bytes` 19 922 944 = 3 × 6 MiB + 1 MiB) — the decided chain-21 values; asserted by the cut script on `feat/chain21-msauth` (`a7379a6c`), which merges after this branch. The proof
+is made on the wallet's own machine (≥ 48 GB, minutes; `docs/prover.md` §8). Verifying it needs the
+tier-18 verifier key, which every validator loads from a pinned 23 754-byte blob instead of building
+(`docs/deploy.md`, `docs/node-hardware.md` §9).
+
 ### What is public and what is hidden
 
 | | public on chain | hidden |
@@ -382,6 +465,17 @@ Three things to know about spending:
 Full parameter and error detail is in `docs/rpc.md`; this is the shielded subset with one example
 each. Every example is one HTTP POST of
 `{"jsonrpc":"2.0","id":1,"method":…,"params":…}` to the node's `/`.
+
+**`rand_status`** and **`rand_getLimits`** name the auth guests a wallet must prove against:
+`hc_auth` (split authorisation) and, from v0.8.0, `hc_auth_multisig` — the multisig auth guest's
+digest as hex, `null` on a chain whose genesis has none (§2, "Private multisig"). A wallet offers
+`rand multisig-private` only where it is set. `rand_status.msauth_key` says where this node's tier-18
+verifier key came from (`loaded`, `built` or `absent`).
+
+```json
+→ {"method":"rand_getLimits","params":[]}
+← {…, "hc_auth": "1e4e347f…39c1", "hc_auth_multisig": "9705f8e2…8247", …}
+```
 
 **`rand_getTreeInfo`** — how far a wallet still has to scan.
 
@@ -677,6 +771,12 @@ the amount the guardians signed; `BridgeBurn` burns the asset from one hidden-as
 (spec §6.1), so a caller can disclose what a program ran on without publishing it. `docs/bridge.md`
 and `docs/confidential.md` are the references; a chain turns the bridge on with a `bridge` section in
 its genesis, which is a hard fork for the chains that take it and a no-op for the ones that do not.
+
+**Private multisig (v0.8.0, `hc_auth_multisig`): here, proved locally.** §2's second auth guest.
+The multisig auth proof is made only on the wallet's machine; the bundle proof of a multisig spend
+may still go to a paired prover. **Delegated msauth proving is a follow-up**: a `MultisigAuth`
+witness kind is specified in the phase-4 spec §6.6 (the job carries `hc_auth_multisig`, the
+witness and the binding; the prover advertises its auth guests) and is not built.
 
 Not scheduled yet: slashing and jailing, a nullifier accumulator to replace the per-block
 recomputation of the nullifier root, and proof batching to amortize the ~16 ms warm verify.

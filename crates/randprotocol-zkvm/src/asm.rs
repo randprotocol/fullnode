@@ -152,6 +152,16 @@ pub mod ops {
         v.push(ecall());
         v
     }
+
+    /// Private multisig phase 3: `MODQ` over the arena at word address `base_words` (`a0`) with
+    /// the packed op word `a1` (`modq::Args::encode`).
+    pub fn call_modq(base_words: u32, a1: u32) -> Vec<Instr> {
+        let mut v = li(REG_A7, SYS_MODQ as i32);
+        v.extend(li(REG_A0, base_words as i32));
+        v.extend(li(REG_A1, a1 as i32));
+        v.push(ecall());
+        v
+    }
 }
 
 // ───────────────────────── M3.3: note-layer guest routines ─────────────────────────

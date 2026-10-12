@@ -90,6 +90,10 @@ pub struct Stats {
     pub instrs: usize,
     pub spills: usize,
     pub reloads: usize,
+    /// Phase 4 A: the reloads that landed in an allocatable register (a re-home: the spilled
+    /// handle becomes resident again and keeps its spill cell), not in scratch. Counted in
+    /// `reloads` too.
+    pub rehomes: usize,
     pub perms: usize,
     pub cells: u64,
     /// Peak simultaneously-live handles over the build (Task 7): the number the liveness
@@ -181,6 +185,10 @@ struct Slot {
     konst: Option<F>,
     /// The `r0` handle: reads as the literal register 0, never allocated, never freed.
     zero: bool,
+    /// Written in place after its definition ([`Builder::counted_loop`]'s counter, `FADDI ctr,
+    /// ctr, −1`), so a spill cell it once had goes stale: the replay never re-homes it (phase 4
+    /// A), since a re-homed value's eviction is free only while its cell still holds it.
+    mutable: bool,
 }
 
 /// A pointer: a value slot holding a base address, plus a compile-time cell delta that is folded
@@ -324,7 +332,7 @@ impl Builder {
             return z;
         }
         let id = self.slots.len() as u32;
-        self.slots.push(Slot { width: 1, konst: Some(F::ZERO), zero: true });
+        self.slots.push(Slot { width: 1, konst: Some(F::ZERO), zero: true, mutable: false });
         let z = Felt(id);
         self.zero = Some(z);
         z
@@ -508,7 +516,8 @@ impl Builder {
 
     /// Reserve `cells` cells addressed **absolutely**: no holder register at all — every
     /// `LOAD`/`STORE` compiles to `r0` plus the full address immediate, and a register-only
-    /// address operand (`POSEIDON2`, `SPONGE`) pays one `FADDI` into scratch per use. The
+    /// address operand (`POSEIDON2`, `SPONGE`'s and `COMPRESS`'s state) pays one `FADDI` into
+    /// scratch per use (their second address is an immediate since phase 4). The
     /// pointer therefore claims no register and has no allocation the replay's loop invariant
     /// could see moved — the shape M5.3's interface-sponge state and cursor need: they live
     /// across the counted loop while the body's register pressure churns underneath.
@@ -573,6 +582,19 @@ impl Builder {
         let (id, rd) = self.new_handle(2);
         self.emit(Op::Loade, rd, ro, BRef::Imm(at));
         Ext(id)
+    }
+
+    /// `mem[addr_of(base) + k + off]`, `off` a runtime value: one `LOAD` with the offset's register
+    /// as `ra` and the compile-time address as the immediate. The cpu AIR range-checks the sum, so
+    /// an offset that leaves the address space is unprovable; the caller bounds `off` (D1's cap
+    /// select builds it from two constrained bits, `off ∈ {0, 4, 8, 12}`).
+    pub fn load_offset(&mut self, base: Ptr, k: i64, off: Felt) -> Felt {
+        self.begin();
+        let ro = self.materialise(off.0);
+        let at = imm(self.addr_of(base) as i64 + k);
+        let (id, rd) = self.new_handle(1);
+        self.emit(Op::Load, rd, ro, BRef::Imm(at));
+        Felt(id)
     }
 
     pub fn store_ext(&mut self, p: Ptr, off: i64, v: Ext) {
@@ -699,27 +721,32 @@ impl Builder {
     }
 
     /// One `SPONGE` instruction (Task 9): absorb the four cells at `src` into rate lanes 0–3 of
-    /// the state at `state`, permuted in place by the poseidon2 chip. `Ptr` deltas are folded
-    /// into the registers first, the `poseidon2` rule (`Builder::poseidon2`).
+    /// the state at `state`, permuted in place by the poseidon2 chip. The state's `Ptr` delta is
+    /// folded into a register first, the `poseidon2` rule (`Builder::poseidon2`); `src` is the
+    /// absolute immediate `addr_of(src)` (phase 4 B′), so it costs no register and no `FADDI`.
     pub fn sponge_absorb(&mut self, state: Ptr, src: Ptr) {
         self.begin();
         let ra = self.ptr_reg(state);
-        let rb = self.ptr_reg(src);
-        self.emit(Op::Sponge, RRef::Raw(0), ra, bref_of(rb));
+        // Phase 4 B′: the source block's address is a compile-time constant — an immediate.
+        let at = F::from_u64(self.addr_of(src));
+        self.emit(Op::Sponge, RRef::Raw(0), ra, BRef::Imm(at));
         self.stats.perms += 1;
     }
 
     /// One `COMPRESS` instruction (Cut C): the four-cell digest at `state` and the four-cell
     /// sibling at `sib`, ordered by `bit`, permuted by the poseidon2 chip, lanes 0–3 written back
-    /// over `state`. `bit` must be boolean — the emulator refuses anything else as a build error.
+    /// over `state`. `sib` is the absolute immediate `addr_of(sib)` (phase 4 B): no register, no
+    /// `FADDI` folding its offset. `bit` must be boolean — the emulator refuses anything else as a
+    /// build error.
     /// `bit` rides in the `rd` slot as a read, exactly as `STORE`'s value does: the handle's home
     /// register, or a reload into scratch if it was spilled (`r0` for [`Builder::zero`]).
     pub fn compress_step(&mut self, state: Ptr, sib: Ptr, bit: Felt) {
         self.begin();
         let ra = self.ptr_reg(state);
-        let rb = self.ptr_reg(sib);
+        // Phase 4 B: the sibling's address is a compile-time constant — an immediate.
+        let at = F::from_u64(self.addr_of(sib));
         let rd = self.materialise(bit.0);
-        self.emit(Op::Compress, rd, ra, bref_of(rb));
+        self.emit(Op::Compress, rd, ra, BRef::Imm(at));
         self.stats.perms += 1;
     }
 
@@ -886,6 +913,7 @@ impl Builder {
         self.begin();
         let rn = self.materialise(n.0);
         let (ctr, rc) = self.new_handle(1);
+        self.slots[ctr as usize].mutable = true;
         self.emit(Op::Mov, rc, rn, BRef::Imm(F::ZERO));
 
         let loop_id = self.next_loop;
@@ -1133,7 +1161,7 @@ impl Builder {
     /// A fresh handle: the slot, then the `Def` entry the replay allocates a home for.
     fn new_handle(&mut self, width: u8) -> (u32, RRef) {
         let id = self.slots.len() as u32;
-        self.slots.push(Slot { width, konst: None, zero: false });
+        self.slots.push(Slot { width, konst: None, zero: false, mutable: false });
         self.ops.push(Op2::Def { id, width });
         (id, RRef::Home(id, 0))
     }
@@ -1277,6 +1305,13 @@ impl Builder {
         let mut stats = self.stats;
         let mut loop_snap: Vec<(u32, Vec<Option<u8>>, Vec<Option<u64>>)> = Vec::new();
         let mut branch_snap: Vec<(Vec<Option<u8>>, Vec<Option<u64>>)> = Vec::new();
+        // Phase 4 A, re-homing. `clean[id]`: the handle is resident *and* its spill cell still
+        // holds its value (it was re-homed from that cell and not written since), so evicting it
+        // needs no `STORE`. `branch_depth` counts open `if_eq` bodies, `loop_tops` the open loops'
+        // `LoopTop` indices (innermost last).
+        let mut clean: Vec<bool> = vec![false; self.slots.len()];
+        let mut branch_depth = 0usize;
+        let mut loop_tops: Vec<u32> = Vec::new();
 
         let ops = self.ops;
         for (i, op) in ops.iter().enumerate() {
@@ -1289,6 +1324,57 @@ impl Builder {
                     mat_out.clear();
                 }
                 Op2::Mat { id } => {
+                    if live && home[*id as usize].is_none() {
+                        if let Some(pinned) = rehome_target(
+                            *id,
+                            i,
+                            &ops,
+                            &self.slots,
+                            &def_idx,
+                            &uses,
+                            &home,
+                            &regs,
+                            &residents,
+                            &mat_out,
+                            branch_depth,
+                            &loop_tops,
+                        ) {
+                            let reg = claim(
+                                1,
+                                &pinned,
+                                &mut home,
+                                &mut cells,
+                                &mut regs,
+                                &mut residents,
+                                &mut free_cells_1,
+                                &mut free_cells_2,
+                                &mut arena,
+                                &mut arena_peak,
+                                &mut out,
+                                &mut stats,
+                                live,
+                                &uses,
+                                i as u32,
+                                &self.slots,
+                                &mut live_count,
+                                &clean,
+                            );
+                            // The claim's evictions are spills: tag them so before the `LOAD`.
+                            let tag = span_stack.last().copied().unwrap_or(0);
+                            pc_span.resize(out.len(), tag);
+                            pc_kind.resize(out.len(), PC_SPILL);
+                            let addr = cells[*id as usize].expect("a spilled handle has a cell");
+                            out.push(Instr { op: Op::Load, rd: reg, ra: 0, b: F::from_u64(addr) });
+                            stats.reloads += 1;
+                            stats.rehomes += 1;
+                            home[*id as usize] = Some(reg);
+                            regs[reg as usize] = Some(*id);
+                            residents.push_back(*id);
+                            live_count += 1;
+                            live_max = live_max.max(live_count);
+                            clean[*id as usize] = true;
+                        }
+                    }
                     let r = match home[*id as usize] {
                         Some(r) => r,
                         None => {
@@ -1332,6 +1418,31 @@ impl Builder {
                             }
                         }
                     }
+                    // Phase 4 A (ruling 6): inside a loop, a fresh handle's claim prefers any victim
+                    // over a resident defined before the innermost open loop, and falls back to
+                    // today's choice only when no other victim exists. Such a resident is live
+                    // through `LoopEnd` (its uses are clamped there), so evicting it always trips
+                    // the loop invariant: the preference turns refusals into builds and leaves
+                    // every build that succeeded unchanged. `Liveness::On` only.
+                    if live {
+                        if let Some(&top) = loop_tops.last() {
+                            let held = |rid: u32, set: &[u8]| {
+                                let r = home[rid as usize].expect("resident");
+                                (0..self.slots[rid as usize].width).any(|k| set.contains(&(r + k)))
+                            };
+                            let mut pre_loop: Vec<u8> = Vec::new();
+                            for &rid in residents.iter() {
+                                if def_idx[rid as usize] < top {
+                                    let r = home[rid as usize].expect("resident");
+                                    pre_loop.extend((0..self.slots[rid as usize].width).map(|k| r + k));
+                                }
+                            }
+                            let other = residents.iter().any(|&rid| !held(rid, &pinned) && !held(rid, &pre_loop));
+                            if other {
+                                pinned.extend(pre_loop);
+                            }
+                        }
+                    }
                     let reg = claim(
                         *width,
                         &pinned,
@@ -1350,7 +1461,9 @@ impl Builder {
                         i as u32,
                         &self.slots,
                         &mut live_count,
+                        &clean,
                     );
+                    clean[*id as usize] = false;
                     home[*id as usize] = Some(reg);
                     regs[reg as usize] = Some(*id);
                     if *width == 2 {
@@ -1371,6 +1484,12 @@ impl Builder {
                     scratch_sym += *n as u32;
                 }
                 Op2::Instr { op, rd, ra, b, target, checkpoint } => {
+                    // A write through a handle's home after its definition leaves its spill cell
+                    // stale (only `mutable` handles do this, and they are never re-homed; this
+                    // keeps the invariant local all the same).
+                    if let RRef::Home(h, _) = rd {
+                        clean[*h as usize] = false;
+                    }
                     let rd = resolve_r(*rd, &home, &mat_out, &scratch_slots);
                     let ra = resolve_r(*ra, &home, &mat_out, &scratch_slots);
                     let b = resolve_b(*b, &home, &mat_out, &scratch_slots);
@@ -1381,12 +1500,15 @@ impl Builder {
                     let _ = target;
                 }
                 Op2::LoopTop { id } => {
+                    loop_tops.push(i as u32);
                     loop_snap.push((*id, home.clone(), cells.clone()));
                 }
                 Op2::BranchTop => {
+                    branch_depth += 1;
                     branch_snap.push((home.clone(), cells.clone()));
                 }
                 Op2::BranchEnd => {
+                    branch_depth -= 1;
                     let (was_home, was_cells) = branch_snap.pop().expect("unbalanced if_eq markers");
                     for h in 0..was_home.len() {
                         // Freed in the body (its last use was there): dead on both paths.
@@ -1418,6 +1540,7 @@ impl Builder {
                     span_stack.pop().expect("unbalanced span markers");
                 }
                 Op2::LoopEnd { id } => {
+                    loop_tops.pop();
                     let (want_id, was_home, was_cells) = loop_snap.pop().expect("unbalanced LoopEnd");
                     assert_eq!(*id, want_id, "unbalanced loop markers");
                     for h in 0..was_home.len() {
@@ -1457,6 +1580,7 @@ impl Builder {
                         }
                         live_count -= 1;
                     }
+                    clean[id as usize] = false;
                     if let Some(c) = cells[id as usize].take() {
                         match self.slots[id as usize].width {
                             1 => free_cells_1.push(c),
@@ -1579,6 +1703,98 @@ fn resolve_b(
     }
 }
 
+/// Phase 4 A: whether the `Mat` at buffer index `i` of the spilled handle `id` re-homes it into an
+/// allocatable register (a Belady reload) instead of a scratch slot, and if so the registers the
+/// re-home's claim must not evict. Only under `Liveness::On` (the caller checks). The rule:
+/// 1. `id` is width 1 and not `mutable` (a handle written in place would leave its cell stale);
+/// 2. no `if_eq` body is open (a re-home moves a register on the taken path only);
+/// 3. inside a loop, `id` was defined in the innermost body (a pre-loop handle must end the body
+///    where it started it);
+/// 4. `id` has a next `Mat` after `i`, and a register is vacant or some unpinned resident's next
+///    use is farther than that `Mat`. Pinned: (a) every non-scratch register this group's
+///    materialises already resolved to; (b) every home register the group's following
+///    instructions read or write and every home of its following materialises; (c) inside a
+///    loop, the home of every resident defined before the innermost loop's top.
+#[allow(clippy::too_many_arguments)]
+fn rehome_target(
+    id: u32,
+    i: usize,
+    ops: &[Op2],
+    slots: &[Slot],
+    def_idx: &[u32],
+    uses: &[Vec<u32>],
+    home: &[Option<u8>],
+    regs: &[Option<u32>; NUM_REGS],
+    residents: &VecDeque<u32>,
+    mat_out: &HashMap<u32, u8>,
+    branch_depth: usize,
+    loop_tops: &[u32],
+) -> Option<Vec<u8>> {
+    let slot = &slots[id as usize];
+    if slot.width != 1 || slot.mutable || branch_depth != 0 {
+        return None;
+    }
+    let top = loop_tops.last().copied();
+    if let Some(top) = top {
+        let d = def_idx[id as usize];
+        if d == u32::MAX || d <= top {
+            return None;
+        }
+    }
+    let us = &uses[id as usize];
+    let next_mat = us[us.partition_point(|&u| u <= i as u32)..]
+        .iter()
+        .copied()
+        .find(|&u| matches!(ops[u as usize], Op2::Mat { .. }))?;
+
+    let mut pinned: Vec<u8> = mat_out.values().copied().filter(|r| *r < SCRATCH[0]).collect();
+    for o in ops[i + 1..].iter().take_while(|o| !matches!(o, Op2::Group)) {
+        match o {
+            Op2::Instr { rd, ra, b, .. } => {
+                for r in [*rd, *ra, b_rd_as_rref(b)] {
+                    if let RRef::Home(h, lane) = r {
+                        if let Some(reg) = home[h as usize] {
+                            pinned.push(reg + lane);
+                        }
+                    }
+                }
+            }
+            Op2::Mat { id: h } => {
+                if let Some(reg) = home[*h as usize] {
+                    pinned.push(reg);
+                    if slots[*h as usize].width == 2 {
+                        pinned.push(reg + 1);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    if let Some(top) = top {
+        for &rid in residents {
+            if def_idx[rid as usize] < top {
+                let reg = home[rid as usize].expect("resident");
+                for k in 0..slots[rid as usize].width {
+                    pinned.push(reg + k);
+                }
+            }
+        }
+    }
+
+    let vacant = ALLOCATABLE.iter().any(|&r| regs[r as usize].is_none());
+    let worth = vacant
+        || residents.iter().any(|&rid| {
+            let reg = home[rid as usize].expect("resident");
+            if (0..slots[rid as usize].width).any(|k| pinned.contains(&(reg + k))) {
+                return false;
+            }
+            let u = &uses[rid as usize];
+            let next = u.get(u.partition_point(|&x| x <= i as u32)).copied().unwrap_or(u32::MAX);
+            next > next_mat
+        });
+    worth.then_some(pinned)
+}
+
 /// Claim a free register (or aligned pair), evicting as needed — the pre-liveness `claim`'s two
 /// policies: the oldest resident first (`Off`), or the resident whose next use is farthest (`On`).
 #[allow(clippy::too_many_arguments)]
@@ -1600,6 +1816,7 @@ fn claim(
     at: u32,
     slots: &[Slot],
     live_count: &mut usize,
+    clean: &[bool],
 ) -> u8 {
     loop {
         let vacant = |r: u8| regs[r as usize].is_none();
@@ -1649,7 +1866,20 @@ fn claim(
         if slots[id as usize].width == 2 {
             regs[r as usize + 1] = None;
         }
+        // Phase 4 A: a re-homed handle not written since still has its value in its cell, so
+        // evicting it is free (no `STORE`, no new cell). Only `Liveness::On` re-homes.
+        if clean[id as usize] && cells[id as usize].is_some() {
+            continue;
+        }
         let w = slots[id as usize].width as u64;
+        // A handle that is resident again and dirty keeps the cell it already owns (only a
+        // re-homed handle can own one while resident; `Liveness::Off` never gets here with one).
+        if let Some(addr) = cells[id as usize] {
+            let op = if w == 1 { Op::Store } else { Op::Storee };
+            out.push(Instr { op, rd: r, ra: 0, b: F::from_u64(addr) });
+            stats.spills += 1;
+            continue;
+        }
         let addr = if live {
             match w {
                 1 => free_cells_1.pop().unwrap_or(*arena),

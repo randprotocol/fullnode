@@ -91,13 +91,15 @@ fn heights(what: &str, p: &randprotocol_rvm::machine::Proof) {
 
 /// Leaf `k` of the production tree: `rv32n` over fixtures `2k`, `2k + 1`, emulated (M1), proved,
 /// verified, saved as `tree/Production-leaf-{k}`. Task 0 runs k = 0; Task 2 runs k = 1, 2, 3.
+/// Phase 4 (2026-10-09, the Merkle spans) re-recorded the leaf's tier: 21 → 20 (1 171 511 → 632 175
+/// rows, emulated: `tests/aggregate.rs`'s B3 at N = 2).
 fn prove_leaf(k: usize) {
     let proofs = bundles(L * k, L);
     let vk = inner(&proofs[0]);
     let program = aggregate_program(&vk);
     let tape = WitnessTape::build_n(P, &vk.shape, &vk.key, &proofs, &common::TEST_BINDING).unwrap();
     let rows = execute(&program, &tape.words, MAX_CYCLES).expect("the leaf emulates").cpu_rows();
-    assert_eq!(Tier::for_cycles(rows), Some(Tier(21)), "the production L = 2 leaf is tier 21 ({rows} rows; docs/02 B3: 1 171 511)");
+    assert_eq!(Tier::for_cycles(rows), Some(Tier(20)), "the production L = 2 leaf is tier 20 since phase 4 ({rows} rows; docs/02 B3: 632 175, 1 171 511 at tier 21 after phase 3)");
     println!("leaf {k}: program built, {rows} rows emulated, live {:.2} GB", gb(LIVE.load(Relaxed)));
     let t0 = install();
     let m = Machine::new(P);
@@ -114,7 +116,7 @@ fn prove_leaf(k: usize) {
 
 /// Task 0, run 1 (the 256 GB droplet).
 #[test]
-#[ignore = "tree Task 0: the production rv32n leaf at L = 2 (1 171 511 rows, tier 21; 122-142 GB projected at rate 1/4, docs/07 §4) — the 256 GB droplet"]
+#[ignore = "tree Task 0: the production rv32n leaf at L = 2 (632 175 rows, tier 20 since phase 4; 1 171 511 rows, tier 21 after phase 3, 122-142 GB projected then at rate 1/4, docs/07 §4) — the 256 GB droplet"]
 fn production_leaf_l2() {
     prove_leaf(0);
 }
@@ -151,7 +153,7 @@ fn production_rv32r_over_the_leaf_emulates() {
 
 /// Task 0, run 3 (the 503 GB droplet, hours): the same program proved, under the heap profiler.
 #[test]
-#[ignore = "tree Task 0: rv32r over the production leaf, proved (648 910 rows, tier 20; 64-75 GB projected at rate 1/4, docs/07 §4) — the 256 GB droplet"]
+#[ignore = "tree Task 0: rv32r over the production leaf, proved (347 673 rows, tier 19 since phase 4; 648 910 rows, tier 20 before, 64-75 GB projected then at rate 1/4, docs/07 §4) — the 256 GB droplet"]
 fn production_rv32r_over_the_leaf_proves() {
     let (vp, tape, rows, child) = rv32r_over_leaf();
     assert!(child <= STOP_CHILD_ROWS, "the stop rule holds before anything is proved");
@@ -413,7 +415,7 @@ fn production_rv32t_rows_at_the_emulated_leaf_shape() {
 #[ignore = "tree Task 0 on the laptop: the production leaf emulated (no proof) and rv32r's accepting path counted at its shape — ~2 min, 8 GB"]
 fn production_rv32r_rows_at_the_emulated_leaf_shape() {
     let (_program, leaf_rows, shape) = emulated_leaf_shape();
-    assert_eq!(Tier::for_cycles(leaf_rows), Some(Tier(21)), "the production L = 2 leaf is tier 21 ({leaf_rows} rows)");
+    assert_eq!(Tier::for_cycles(leaf_rows), Some(Tier(20)), "the production L = 2 leaf is tier 20 since phase 4 ({leaf_rows} rows; tier 21 after phase 3)");
     let t = Instant::now();
     let key = RvmKey::of(P, &shape);
     println!("leaf key built in {:.1} s, live {:.2} GB, peak {:.2} GB", t.elapsed().as_secs_f64(), gb(LIVE.load(Relaxed)), gb(heap::PEAK.load(Relaxed)));
@@ -442,6 +444,8 @@ fn production_rv32r_rows_at_the_emulated_leaf_shape() {
 /// and `step_band_hi` are M5's formula over `child_cpu_rows_emulated` and the measured O. At the
 /// rVM's rate ¼ (92 queries) the whole band is tier 21; at rate ⅛ (80 queries) its low end was
 /// tier 20. The measured step (Task 2), not the band, still decides the pinned step tier (R6).
+/// Phase 4 (2026-10-09, the Merkle spans) re-recorded it: tier 21 end to end → tier 20 end to end
+/// (band [1 102 455, 1 491 559] → [590 828, 799 356]; C 648 518 → 347 358, O −29 → +376).
 #[test]
 fn the_pinned_band_is_the_emulated_childs() {
     let child = common::pin("tree_measure", "child_cpu_rows_emulated");
@@ -450,8 +454,8 @@ fn the_pinned_band_is_the_emulated_childs() {
     assert_eq!(hi, common::pin("tree_measure", "step_band_hi"), "step_band_hi is ceil(1.15·(2C + O))");
     assert_eq!(
         (Tier::for_cycles(lo), Tier::for_cycles(step), Tier::for_cycles(hi)),
-        (Some(Tier(21)), Some(Tier(21)), Some(Tier(21))),
-        "the band is tier 21 end to end"
+        (Some(Tier(20)), Some(Tier(20)), Some(Tier(20))),
+        "the band is tier 20 end to end"
     );
 }
 
@@ -460,7 +464,9 @@ fn the_pinned_band_is_the_emulated_childs() {
 // Host class (tree Task 2 rulings): at the rVM's rate ¼ docs/07 §4 projects a tier-21 proof at
 // ≈ 122–197 GB (production N = 2 / N = 3 rows), so the leaves, the steps and the root all run on
 // the 256 GB droplet, one proving process at a time. The steps' emulated rows (1 294 577, tier 21)
-// and band [1 102 455, 1 491 559] are Task R's pins (`tree_measure`).
+// and band [1 102 455, 1 491 559] are Task R's pins (`tree_measure`). Phase 4 (2026-10-09, the
+// Merkle spans) re-recorded them: 1 294 577 → 695 097 rows (tier 21 → 20), band → [590 828, 799 356];
+// the GB projections here are the tier-21 ones, not re-taken.
 
 fn env_index(var: &str, max: usize) -> usize {
     let k: usize = std::env::var(var).unwrap_or_else(|_| panic!("set {var}")).parse().expect("an index");
@@ -470,7 +476,7 @@ fn env_index(var: &str, max: usize) -> usize {
 
 /// Leaves 1–3 (one per process): `TREE_LEAF=k`. Leaf 0 is Task 0's `production_leaf_l2`.
 #[test]
-#[ignore = "tree Task 2: production rv32n leaf k (TREE_LEAF=1..3), 1 171 511 rows tier 21, 122-142 GB projected at rate 1/4 (docs/07 §4) — the 256 GB droplet"]
+#[ignore = "tree Task 2: production rv32n leaf k (TREE_LEAF=1..3), 632 175 rows tier 20 since phase 4 (1 171 511 rows tier 21 after phase 3, 122-142 GB projected then at rate 1/4, docs/07 §4) — the 256 GB droplet"]
 fn production_tree_leaf() {
     let k = env_index("TREE_LEAF", 3);
     assert!(k >= 1, "leaf 0 is Task 0's production_leaf_l2");
@@ -498,8 +504,8 @@ fn emulated_shape(program: &Arc<Program>, exec: &Execution) -> RvmShape {
 /// The production per-level step heights (spec §4.1 R3/R4), from the proved step S_1 and root
 /// S_2, and whether the list's last entry is a fixed point: `[S_1, S_2]` when `rv32t_int`'s own
 /// proofs declare S_1's words (it is the fixed point); otherwise level 3's program, `rv32t` at
-/// S_2, is emulated over (root, root) as Task 1b's
-/// `a_third_step_program_at_the_roots_shape_is_the_fixed_point` does, and the list is
+/// S_2, is emulated over (root, root) as Task 1b's fixed-point test
+/// (`the_step_program_at_the_roots_shape_is_rv32t_int_the_fixed_point`) does, and the list is
 /// `[S_1, S_2, S_3]`, a fixed point when S_3 repeats S_2. When it does not, the three-entry list
 /// is still a valid genesis for `max_depth ≤ 3` (its last entry is read only at level ≥ 4).
 /// Prints the verdict and the list length.
@@ -527,7 +533,7 @@ fn production_step_list(s_step: &RvmShape, s_root: &RvmShape, root: &randprotoco
 /// Step `TREE_STEP=k` ∈ {0, 1}: `rv32t_leaf` over leaves (2k, 2k + 1). Emulated first, against
 /// docs/08 §2's band (M5), then proved under the heap profiler.
 #[test]
-#[ignore = "tree Task 2: production rv32t_leaf step k (TREE_STEP=0|1), 1 294 577 rows emulated, tier 21; 122-197 GB projected at rate 1/4 (docs/07 §4) — the 256 GB droplet"]
+#[ignore = "tree Task 2: production rv32t_leaf step k (TREE_STEP=0|1), 695 097 rows emulated, tier 20 since phase 4 (1 294 577, tier 21 before; 122-197 GB projected then at rate 1/4, docs/07 §4) — the 256 GB droplet"]
 fn production_tree_step() {
     let k = env_index("TREE_STEP", 1);
     let (_vk, program, shape) = production_leaf_shape();
@@ -557,7 +563,7 @@ fn production_tree_step() {
 /// shapes and keys the node rebuilds from the heights (`TreeShapes::build`), and the production
 /// list length read off the next level, emulated at the root's shape (R3).
 #[test]
-#[ignore = "tree Task 2: production rv32t_int root over the two steps (tier 21 expected; 122-197 GB projected at rate 1/4, docs/07 §4), then verify_tree — the 256 GB droplet"]
+#[ignore = "tree Task 2: production rv32t_int root over the two steps (tier 21 expected before phase 4, not re-derived; 122-197 GB projected then at rate 1/4, docs/07 §4), then verify_tree — the 256 GB droplet"]
 fn production_tree_root() {
     let (vk, _program, leaf_shape) = production_leaf_shape();
     let t_leaf = Arc::new(verify_rv32t(&leaf_shape, Checkpoints::Off).program);

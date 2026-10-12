@@ -294,6 +294,9 @@ pub struct NodeStatus {
     /// The auth guest (split authorisation) the genesis pins as `hc_auth`, `null` on a chain
     /// without it. Set, every bundle carries an auth proof against it and `hc_bundle` is v3.
     pub hc_auth: Option<String>,
+    /// The multisig auth guest the genesis pins as `hc_auth_multisig`, `null` where the chain
+    /// has none. Set, the chain admits a multisig spend.
+    pub hc_auth_multisig: Option<String>,
     /// BIND-1 (audit v6): the genesis `binding_domain` — `0` where transaction bindings and
     /// signed action messages bind the chain id alone (chains 14 to 19), `1` where they carry the
     /// genesis hash. Informational: a wallet decides by chain id and its own store's genesis
@@ -314,6 +317,11 @@ pub struct NodeStatus {
     /// computed once, at startup).
     #[serde(default)]
     pub gas_prices: Option<GasPricesStatus>,
+    /// Where this node's multisig auth verifier key came from (plan Task 2b): `"loaded"` from the
+    /// pinned blob, `"built"` here under `--build-msauth-key`, `"absent"` on a chain without
+    /// `hc_auth_multisig`. A multisig chain never runs without the key: a node that could not
+    /// load it refused to start.
+    pub msauth_key: crate::msauth_key::MsauthKeySource,
 }
 
 /// [`NodeStatus::gas_prices`]'s two amounts, decimal strings like every other RAND amount on the
@@ -791,6 +799,9 @@ pub struct ChainLimits {
     /// wallet reads to build a v3 transaction — `nk` and a salt to the bundle guest, the spend
     /// key to its own auth proof — instead of a v1/v2 one.
     pub hc_auth: Option<String>,
+    /// The genesis `hc_auth_multisig` (private multisig), hex, `null` where the chain has none.
+    /// What a wallet reads to know whether this chain admits a multisig spend at all.
+    pub hc_auth_multisig: Option<String>,
     /// Spec 2026-09-28 §8: this node's gas policy (Phase 0), or the chain's own `gas` section
     /// (Phase 1, §7.1) when its genesis carries one — a chain's section always wins, and
     /// [`ChainLimits::with_gas_policy`] never overrides it. `null` when neither applies. Node
@@ -952,6 +963,7 @@ impl ChainLimits {
             envelope_bytes: ledger.envelope_bytes(),
             hardening_v6: ledger.hardening_v6(),
             hc_auth: ledger.hc_auth().map(|h| word8_to_hex(&h)),
+            hc_auth_multisig: ledger.hc_auth_multisig().map(|h| word8_to_hex(&h)),
             gas_price: None,
             byte_price: None,
             gas_metering: None,
@@ -1027,7 +1039,7 @@ impl ChainLimits {
     /// The request-body limit for this chain: [`RPC_MAX_BODY_BYTES`]'s formula over the chain's
     /// own proof and call-envelope caps (spec §8).
     pub const fn rpc_max_body_bytes(&self) -> usize {
-        rpc_max_body_bytes(self.max_proof_bytes, self.max_call_envelope_bytes)
+        rpc_max_body_bytes(self.max_proof_bytes, self.max_call_envelope_bytes, self.hc_auth_multisig.is_some())
     }
 }
 
@@ -1060,8 +1072,10 @@ fn tip_gas_prices(st: &RpcState) -> (u64, u64) {
 ///   call's own (since the hidden-asset bundle no other action carries more than one). Under split
 ///   authorisation (genesis `hc_auth`) it carries **three** — bundle, auth, call — and the genesis
 ///   block cap is sized for three (`gas::min_block_bytes`); this node-policy body cap still counts
-///   two at the cap, which covers every honest v3 `Call`, because the auth proof is one fixed,
-///   small shape (~1.36 MB at production FRI) and a real bundle proof sits far under the cap. This
+///   two at the cap there, which covers every honest v3 `Call`, because the single-key auth proof
+///   is one fixed, small shape (~1.36 MB at production FRI) and a real bundle proof sits far under
+///   the cap. On a genesis with `hc_auth_multisig` (`three_proofs`) it counts **three** at the cap:
+///   the multisig auth proof is ~3.6 MB, not the single-key guest's fixed ~1.36 MB. This
 ///   is the term the retired limit missed: it
 ///   allowed `2 * MAX_PROOF_BYTES + 256 KiB` *in total*, which is one hex-encoded proof, so a
 ///   constraint-set-5 `Call` — measured at 1 321 773 bytes for the fee bundle's proof plus ~1.2 MB
@@ -1072,8 +1086,8 @@ fn tip_gas_prices(st: &RpcState) -> (u64, u64) {
 /// - 64 KiB for the rest: public keys, signatures, hashes, nullifiers and bincode framing.
 ///
 /// Then doubled for the hex encoding, plus 256 KiB for the JSON envelope and headers.
-pub const fn rpc_max_body_bytes(max_proof_bytes: usize, max_call_envelope_bytes: usize) -> usize {
-    2 * (2 * max_proof_bytes
+pub const fn rpc_max_body_bytes(max_proof_bytes: usize, max_call_envelope_bytes: usize, three_proofs: bool) -> usize {
+    2 * ((2 + three_proofs as usize) * max_proof_bytes
         + randprotocol_core::notes::BUNDLE_SLOTS * randprotocol_core::notes::MAX_ENVELOPE_BYTES
         + max_call_envelope_bytes
         + randprotocol_core::gas::MAX_ATTESTATION_BYTES
@@ -1086,6 +1100,7 @@ pub const fn rpc_max_body_bytes(max_proof_bytes: usize, max_call_envelope_bytes:
 pub const RPC_MAX_BODY_BYTES: usize = rpc_max_body_bytes(
     randprotocol_core::gas::MAX_PROOF_BYTES,
     randprotocol_core::types::actions::MAX_CALL_ENVELOPE_BYTES,
+    false,
 );
 
 pub async fn serve(addr: SocketAddr, state: RpcState) -> anyhow::Result<(SocketAddr, tokio::task::JoinHandle<()>)> {
@@ -5379,6 +5394,7 @@ pub(crate) mod tests {
                 "envelope_bytes": null,
                 "hardening_v6": false,
                 "hc_auth": null,
+                "hc_auth_multisig": null,
                 "gas_price": null,
                 "byte_price": null,
                 "gas_metering": null,
@@ -5411,6 +5427,7 @@ pub(crate) mod tests {
                 "envelope_bytes": null,
                 "hardening_v6": false,
                 "hc_auth": null,
+                "hc_auth_multisig": null,
                 "gas_price": null,
                 "byte_price": null,
                 "gas_metering": null,
@@ -5445,6 +5462,7 @@ pub(crate) mod tests {
                 "envelope_bytes": 1860,
                 "hardening_v6": false,
                 "hc_auth": null,
+                "hc_auth_multisig": null,
                 "gas_price": null,
                 "byte_price": null,
                 "gas_metering": null,
@@ -5474,6 +5492,16 @@ pub(crate) mod tests {
         gs.ledger.set_hc_auth(Some([7; 8]));
         let (_d, st) = state_for(&gs);
         assert_eq!(ok(&st, "rand_getLimits", json!([])).await["hc_auth"], json!(word8_to_hex(&[7; 8])));
+        assert!(ok(&st, "rand_getLimits", json!([])).await["hc_auth_multisig"].is_null(), "null without the field");
+        assert!(ok(&st, "rand_status", json!([])).await.as_object().unwrap().contains_key("hc_auth_multisig"));
+        // Private multisig: a wallet reads `hc_auth_multisig` to know whether this chain admits a
+        // multisig spend at all.
+        let mut gs = raised_genesis();
+        gs.ledger.set_hc_auth(Some([7; 8]));
+        gs.ledger.set_hc_auth_multisig(Some([8; 8]));
+        let (_d, st) = state_for(&gs);
+        assert_eq!(ok(&st, "rand_getLimits", json!([])).await["hc_auth_multisig"], json!(word8_to_hex(&[8; 8])));
+        assert_eq!(st.max_body_bytes, rpc_max_body_bytes(8 << 20, ChainLimits::of(&gs.ledger).max_call_envelope_bytes, true));
         // BIND-1: the genesis `binding_domain`, so a wallet can refuse early a chain whose ledger
         // would refuse the form it signs; `0` on every chain without the field (above).
         let mut gs = raised_genesis();
@@ -5615,6 +5643,12 @@ pub(crate) mod tests {
         assert_eq!(v["gas_price"], "100");
         assert_eq!(v["byte_price"], "800");
         assert_eq!(v["gas_metering"], "header");
+    }
+
+    #[test]
+    fn the_rpc_body_cap_counts_three_proofs_on_a_multisig_chain() {
+        let (p, e) = (4 << 20, 65_536);
+        assert_eq!(rpc_max_body_bytes(p, e, true) - rpc_max_body_bytes(p, e, false), 2 * p, "one more hex-encoded proof at the cap");
     }
 
     /// The RPC's local limits follow a 20 MiB ledger (spec §8): the body limit is the same formula
@@ -9658,5 +9692,20 @@ pub(crate) mod tests {
         let v = ok(&st, "rand_status", json!([])).await;
         assert_eq!(v["prune_floor"], 0, "the status struct is filled by the node loop, absent here");
         assert!(v.get("prune_history_secs").is_some());
+    }
+
+    /// Plan Task 2b: `rand_status.msauth_key` names where the multisig auth verifier key came
+    /// from — `"absent"` by default (no `hc_auth_multisig`), `"loaded"` from the pinned blob,
+    /// `"built"` under `--build-msauth-key`.
+    #[tokio::test]
+    async fn rand_status_reports_the_msauth_key_source() {
+        use crate::msauth_key::MsauthKeySource;
+        let (_dir, st, _gs, _blocks) = pruned_state();
+        assert_eq!(ok(&st, "rand_status", json!([])).await["msauth_key"], "absent");
+        for (source, want) in [(MsauthKeySource::Loaded, "loaded"), (MsauthKeySource::Built, "built"), (MsauthKeySource::Absent, "absent")] {
+            st.status.write().unwrap().msauth_key = source;
+            assert_eq!(ok(&st, "rand_status", json!([])).await["msauth_key"], want);
+            assert_eq!(source.as_str(), want);
+        }
     }
 }

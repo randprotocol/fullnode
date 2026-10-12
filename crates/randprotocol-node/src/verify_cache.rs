@@ -17,7 +17,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use randprotocol_core::confidential::{ConfidentialError, ConfidentialExecutor};
+use randprotocol_core::confidential::{AuthShape, ConfidentialError, ConfidentialExecutor};
 use randprotocol_core::crypto::Hash;
 use randprotocol_core::ledger::aggregation::{TreeConfig, TreeDigests};
 use randprotocol_core::notes::{BundleDigestInput, Word8};
@@ -409,6 +409,34 @@ impl ConfidentialExecutor for CachingExecutor {
         self.inner.warm_auth()
     }
 
+    fn install_msauth_vk(&self, blob: &[u8]) -> Result<(), String> {
+        self.inner.install_msauth_vk(blob)
+    }
+
+    /// Forwarded: a wrapper that kept this to itself would leave the inner executor's msauth path
+    /// shut on a chain naming `hc_auth_multisig`, and every multisig auth proof refused.
+    fn enable_auth_multisig(&self) {
+        self.inner.enable_auth_multisig()
+    }
+
+    fn build_msauth_key(&self) -> Result<(), String> {
+        self.inner.build_msauth_key()
+    }
+
+    /// A decode, not a verdict: forwarded, never cached. A multisig proof's verify is
+    /// `verify_auth` under kind 2, keyed by its `hc`, so nothing new is cached for it.
+    fn auth_header(&self, proof: &[u8]) -> Result<(AuthShape, Word8, Option<u64>), ConfidentialError> {
+        self.inner.auth_header(proof)
+    }
+
+    fn warm_auth_multisig(&self) {
+        self.inner.warm_auth_multisig()
+    }
+
+    fn auth_multisig_key_ready(&self) -> bool {
+        self.inner.auth_multisig_key_ready()
+    }
+
     fn non_canonical_proof(&self, proof: &[u8]) -> Option<String> {
         self.inner.non_canonical_proof(proof)
     }
@@ -499,6 +527,10 @@ mod tests {
         /// Answer the defaulted methods as the stub does, for a test that runs a real ledger
         /// (which would refuse `Counting`'s distinctive values); the verifiers still count.
         plain: bool,
+        /// `enable_auth_multisig` calls.
+        multisig_enables: AtomicUsize,
+        /// `warm_auth_multisig` calls.
+        multisig_warms: AtomicUsize,
     }
 
     /// `Counting`'s answer for every `decode_*`: no stub proof decodes to tier 77.
@@ -635,6 +667,42 @@ mod tests {
         }
         fn warm_auth(&self) {
             self.warmed("warm_auth")
+        }
+        fn install_msauth_vk(&self, blob: &[u8]) -> Result<(), String> {
+            if self.plain {
+                return self.stub.install_msauth_vk(blob);
+            }
+            Err(format!("counting: {} bytes", blob.len()))
+        }
+        fn enable_auth_multisig(&self) {
+            self.multisig_enables.fetch_add(1, Ordering::SeqCst);
+            if self.plain {
+                self.stub.enable_auth_multisig()
+            }
+        }
+        fn build_msauth_key(&self) -> Result<(), String> {
+            if self.plain {
+                return self.stub.build_msauth_key();
+            }
+            Err("counting: built".into())
+        }
+        fn auth_header(&self, proof: &[u8]) -> Result<(AuthShape, Word8, Option<u64>), ConfidentialError> {
+            if self.plain {
+                return self.stub.auth_header(proof);
+            }
+            Ok((AuthShape::Multisig, [0x5a; 8], Some(4242)))
+        }
+        fn warm_auth_multisig(&self) {
+            self.multisig_warms.fetch_add(1, Ordering::SeqCst);
+            if self.plain {
+                self.stub.warm_auth_multisig()
+            }
+        }
+        fn auth_multisig_key_ready(&self) -> bool {
+            if self.plain {
+                return self.stub.auth_multisig_key_ready();
+            }
+            false
         }
         fn non_canonical_proof(&self, proof: &[u8]) -> Option<String> {
             if self.plain {
@@ -1036,6 +1104,15 @@ mod tests {
         assert_eq!(ex.check_aggregate_header(&i.aggregate_proof), Err(ConfidentialError::Disabled));
         assert_eq!(ex.aggregate_proof_tier(&i.tree_proof), Ok(99));
         assert_eq!(ex.tree_digests(&i.tree), Ok(TreeDigests { vk_leaf: [9; 4], steps: vec![] }));
+        // The private-multisig methods have no default; each must reach inner.
+        assert_eq!(ex.install_msauth_vk(&[0; 3]), Err("counting: 3 bytes".into()));
+        assert_eq!(ex.build_msauth_key(), Err("counting: built".into()));
+        ex.enable_auth_multisig();
+        assert_eq!(inner.multisig_enables.load(Ordering::SeqCst), 1);
+        assert_eq!(ex.auth_header(&i.auth_proof), Ok((AuthShape::Multisig, [0x5a; 8], Some(4242))));
+        ex.warm_auth_multisig();
+        assert_eq!(inner.multisig_warms.load(Ordering::SeqCst), 1);
+        assert!(!ex.auth_multisig_key_ready());
         // Every decode reaches inner, every time.
         for _ in 0..2 {
             assert_eq!(ex.decode_call(&i.record, &i.call_proof), Ok(DECODED));
@@ -1080,6 +1157,60 @@ mod tests {
         // None of this touched a verifier or the cache.
         assert!(KINDS.iter().all(|k| inner.count(*k) == 0));
         assert_eq!(ex.cache().hits() + ex.cache().misses(), 0);
+    }
+
+    /// The plain `Counting` answers the private-multisig methods as the stub does, through the
+    /// wrapper too.
+    #[test]
+    fn non_cached_msauth_methods_forward_plain() {
+        let inner = Arc::new(Counting::plain());
+        let ex = CachingExecutor::new(inner.clone());
+        let stub = StubExecutor;
+        assert_eq!(ex.install_msauth_vk(&[0; 3]), stub.install_msauth_vk(&[0; 3]));
+        assert_eq!(ex.build_msauth_key(), stub.build_msauth_key());
+        ex.enable_auth_multisig();
+        assert_eq!(inner.multisig_enables.load(Ordering::SeqCst), 1);
+        let msig = StubExecutor::make_msauth_proof(&[23; 8], &[1; 8], &[0; 8]);
+        assert_eq!(ex.auth_header(&msig), stub.auth_header(&msig));
+        ex.warm_auth_multisig();
+        assert_eq!(inner.multisig_warms.load(Ordering::SeqCst), 1);
+        assert_eq!(ex.auth_multisig_key_ready(), stub.auth_multisig_key_ready());
+    }
+
+    /// Spec §3.4: the three phase-4 methods forward, and a multisig verify is an ordinary kind-2
+    /// (`verify_auth`) entry keyed by its `hc` — nothing new is cached. `Counting::plain()`, since
+    /// the test needs the stub's answers (a ready key, a real multisig shape).
+    #[test]
+    fn the_phase_4_methods_forward_and_a_multisig_verify_is_its_own_kind_2_entry() {
+        let inner = Arc::new(Counting::plain());
+        let ex = CachingExecutor::new(inner.clone());
+        let msig = StubExecutor::make_msauth_proof(&[23; 8], &[1; 8], &[0; 8]);
+        assert_eq!(ex.auth_header(&msig).unwrap().0, AuthShape::Multisig);
+        ex.warm_auth_multisig();
+        assert!(ex.auth_multisig_key_ready());
+        assert_eq!(ex.verify_auth(&[23; 8], &msig, &[0; 8]), Ok([1; 8]));
+        assert_eq!(ex.verify_auth(&[23; 8], &msig, &[0; 8]), Ok([1; 8]));
+        assert_eq!(inner.count(Kind::Auth), 1, "cached under (hc, proof, binding)");
+        let _ = ex.verify_auth(&[21; 8], &msig, &[0; 8]);
+        assert_eq!(inner.count(Kind::Auth), 2, "another hc is another entry");
+    }
+
+    /// Plan Task 3 review: the msauth gate opens THROUGH the caching wrapper. Today
+    /// `node::load_genesis` opens it on the bare executor before the wrap; this pins the wrapper
+    /// path so a refactor that enables after wrapping cannot silently turn private multisig off.
+    #[test]
+    fn enabling_auth_multisig_through_the_wrapper_opens_the_msauth_path() {
+        use crate::agg_executor::AggExecutor;
+        use randprotocol_zkvm::executor::ZkExecutor;
+        let hcm = ZkExecutor::hc_auth_multisig();
+        let disabled = ConfidentialError::InvalidProof("a multisig auth proof on a chain without hc_auth_multisig".into());
+        let shut = CachingExecutor::new(Arc::new(AggExecutor::new(randprotocol_zkvm::machine::FriProfile::Test)));
+        assert_eq!(shut.verify_auth(&hcm, b"junk", &[0; 8]), Err(disabled.clone()), "not enabled: refused before any decode");
+        let open = CachingExecutor::new(Arc::new(AggExecutor::new(randprotocol_zkvm::machine::FriProfile::Test)));
+        open.enable_auth_multisig();
+        let got = open.verify_auth(&hcm, b"junk", &[0; 8]);
+        assert_ne!(got, Err(disabled), "enabled through the wrapper: the msauth path decodes");
+        assert_eq!(got, Err(ConfidentialError::MalformedProof));
     }
 
     // ---------------------------------- the reuse contract, through a real ledger (spec §4)

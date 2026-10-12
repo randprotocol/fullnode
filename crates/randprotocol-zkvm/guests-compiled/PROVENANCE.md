@@ -5,12 +5,12 @@ same path under `guests-compiled/` in the public circuits repository
 (<https://github.com/randprotocol/zkp-circuits>). Nothing here is built or edited in this
 repository. The copies are byte-identical to this circuits commit:
 
-circuits: 56b70611724930a5848ac5c0fd32ca2de8e61e2e
+circuits: d217252afde318b2ff51976351f449a685b5832f
 
-(Branch feat/tree-aggregation, not yet on zkp-circuits; 92b750e plus the tree final-review
-fixes, which touched recursion/ tests and docs and research/AGENTS.md only. The files here are
-byte-identical at 71e1a04, the pushed commit both rand-zkvm-cuda revs name: the tree re-vendor
-moved only recursion/.)
+(Branch feat/private-multisig, not yet on zkp-circuits: rVM phase 4 (Merkle spans) and the MODQ
+chip (constraint set 9), with the `dilithium-verify` and `msauth` guests and the
+`dilithium-core` crate. `rand-zkvm-cuda/` and `research/src/poseidon2_constants.rs` are
+byte-identical at 71e1a04, the pushed commit both rand-zkvm-cuda revs name.)
 
 That is the commit `.github/workflows/ci.yml` checks out as `CIRCUITS_PIN`; `tests/guest_provenance.rs`
 refuses a manifest whose commit differs from it.
@@ -22,11 +22,11 @@ checks it from this directory). Three things check the files against it, and aga
   `SHA256SUMS` line, no file here is missing from the manifest, each `bin/<guest>.bin.sha256` names
   the same digest, and the chain-14 bundle guest's `hc` is still the genesis pin (below).
 - CI's `guest-provenance` job: compares each copy byte for byte with circuits at `CIRCUITS_PIN`,
-  runs circuits' rebuild gate (the four guests from source), and recompiles `erc20.runtime.hex`
+  runs circuits' rebuild gate (the six guests from source), and recompiles `erc20.runtime.hex`
   with the pinned `solc`.
 - By hand, anyone: the commands in the table.
 
-## The four guests
+## The six guests
 
 Source: the guest crate `guests-compiled/<guest>/` (`src/main.rs`, `Cargo.toml`, `Cargo.lock`, a
 linker script) plus `guest-sdk/`; `evm` and `sbpf` also link `guests-compiled/evm-core` and
@@ -41,6 +41,13 @@ depend on where it was built.
 | `bin/keccak256.bin` | `bacb79815e2762cbbac0d9f96e398a5576f5907f9707d7dbe02f8e00b66f091d` | `d3bcd0c` | legacy flat binary |
 | `bin/evm.bin` | `5500886fa2fca18dcdce367b5a4a405d2fefa4af5fc9967b4f0c69fe7ae5440d` | `11f54b8` | image container |
 | `bin/sbpf.bin` | `d49f105066b1da5e75e2442ef48f377126ebe423d31ea90d90de2ae53332b759` | `66fb6a7` | image container |
+| `bin/dilithium-verify.bin` | `0fe15156468bcdd18a2933a2f5e5821502c42b6d456230ba5ddc674dd5fd835d` | `9d03734` | image container |
+| `bin/msauth.bin` | `45c48fd52877f702a3d047a733a2c886dc07d21756854bd2f1913ae83d4bf4b3` | `9d03734` | image container |
+
+`dilithium-verify` and `msauth` link `guests-compiled/dilithium-core` (vendored under
+`vendor/circuits/dilithium-core`). `msauth` is the private multisig's M-of-N spend-authority
+guest (`guests::compiled::msauth()`); `dilithium-verify` is the phase-1 measurement guest, used
+by the vendored tests only.
 
 Rebuild and compare, from a circuits checkout at the commit above (needs
 `rustup toolchain install 1.98.1 --target riscv32im-unknown-none-elf --component llvm-tools`, and
@@ -132,7 +139,8 @@ third party cannot rebuild these four guests from the circuits pin, because they
 the audit trail for them is this repository's history alone. Publishing their build inputs in
 circuits under the same pin is the later step.
 
-No genesis pins any of the four vendored guests above (`fib`, `keccak256`, `evm`, `sbpf`). One
+No genesis pins any of the six vendored guests above (`fib`, `keccak256`, `evm`, `sbpf`,
+`dilithium-verify`, `msauth`). One
 reaches a chain only as a program someone deploys (`rand program deploy`), and the chain names it
 by its `hc`.
 
