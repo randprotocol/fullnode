@@ -73,7 +73,13 @@ state root (identical to base `3119a29a`). Suites: core lib 810, node lib 623 (1
 
 ### Constraint set 9 re-vendored (2026-10-11; branch `feat/private-multisig`, commit `6530861f`, NOT pushed)
 
-Circuits `57fb9dc` (`feat/private-multisig`, unpushed; synced with `CUDA_REV=71e1a04`) carries
+The branch's circuits pin is **`d217252`** (`CIRCUITS_PIN` in `.github/workflows/ci.yml`,
+`vendor/circuits/PROVENANCE.md`; synced with `CUDA_REV=71e1a04`). It was first re-vendored at
+`57fb9dc` (this entry), then `c55cfa1` (`emulator_edges` knows syscall 8, `SYS_MODQ`; `074c5141`), then
+`d217252` (`4219d5f5`), which adds over `57fb9dc` the verifier-key blob export/install API
+(`export_verifier_key_with_modq`, `install_verifier_key_pinned`: SHA-256-pinned, lookups recomputed on
+install, installed keys non-evictable) on top of the same constraint set 9; no recursion pin moved
+after `57fb9dc`. Circuits `57fb9dc` (`feat/private-multisig`, unpushed) carries
 **rVM phase 4** (Merkle spans, `recursion/docs/09-phase4-spans.md`) and the **MODQ chip**
 (constraint set 9: every inner verifier key and the proof encoding move, `Proof::modq_log_height`),
 plus the `msauth`/`dilithium-verify` guests and `vendor/circuits/dilithium-core`. **Current pins**

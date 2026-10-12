@@ -557,7 +557,7 @@ Building it is too big for an `s-2vcpu-4gb` droplet, so validators load a pinned
 |---|---|---|---|
 | build (Task 2, `verifier_key_with_modq`) | 78.6 s | ~4.0 GB peak and resident after | — |
 | `keygen-msauth-vk --profile production` | 25.0 s (91 s CPU) | 4.00 GB peak RSS | 23 754 bytes |
-| load (`install_verifier_key_pinned`, Production) | 6.6 ms | +8 MiB resident (2 → 10 MiB) | — |
+| load (`install_verifier_key_pinned`, Production) | 6.6 ms (6.3 ms on a re-run) | +8 MiB resident (2 → 10 MiB) | — |
 | load (Test) | 14.6 ms | +7 MiB resident (3 → 10 MiB) | 23 754 bytes |
 
 The load checks the SHA-256 pin, decodes the `CommonData` and recomputes the packed lookups; it
@@ -565,3 +565,11 @@ does no LDE and no Merkle commit, which is the build's 4 GB.
 
 **To measure on an `s-2vcpu-4gb` droplet (Task 8 / cut rehearsal): RSS after load, and after the
 first tier-18 verify.** glibc may return freed memory where macOS did not.
+
+**The proof itself: not yet measured.** The guest runs 85 830 / 169 068 / 251 946 cycles at
+M = 1 / 2 / 3 signatures, inside tier 18's 262 143 (a Dilithium2 verify is 80 572 cycles with the
+MODQ chip, 880 102 in software). The Production msauth prove (time and peak RSS on the wallet's
+machine, at least 48 GB), the proof's size and a warm tier-18 verify on a validator are the plan's
+Task 2 `MSAUTH-PROD:`/`MSAUTH-TEST:` lines, which have not been taken (a user-terminal run). Until
+they are: the auth proof is estimated at ≥ 3.4 MB (≈ 4.8 MB with the bundle proof), the node's floor
+beside `hc_auth_multisig` is a 4 MiB `max_proof_bytes`, and chain 21 is cut at 6 MiB.

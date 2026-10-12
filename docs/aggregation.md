@@ -460,6 +460,19 @@ both have to clear before a genesis may switch it on.
    phase 3 moved it, rate ¼ did not; `inner_vk_digest` and the interface vectors are unchanged).
    Tiers stay {20, 21, 22} production (N = 1 at 20, N = 2–3 at 21, N = 4–5 at 22) and
    {18, 19, 20} test.
+   **rVM phase 4 and constraint set 9 (circuits `57fb9dc`, vendored at `d217252`, 2026-10-11;
+   `recursion/docs/09-phase4-spans.md`):** Merkle spans (opcodes 25/27 now take an absolute address
+   in their 4th word, under an unchanged key) bring the production inner proof to 315 391 rows, so
+   N = 1 lands at **tier 19** and the node admits tiers **{19, 20, 21}** production ({18, 19, 20}
+   test); the MODQ chip then changed the inner shape. Current pins (`agg_executor.rs`'s tests):
+   production `admitted_shapes[].aggregate_program_digest`
+   **`8bc2cecbd30b975ec15a5e11354434bd7e1c2814d46dd0acc1d92b3ff944d8c7`** (`dc350ecf…8ba0` →
+   `e0eede8b…b6c3` at phase 4 → `8bc2cecb…d8c7` with the MODQ chip) and `inner_vk_digest`
+   **`1b0c4b0043dd5d00d710f10048bfde989a955034d7fd52f1a85595a61339ddc7`** (moved for the first
+   time since constraint set 8; the admission vectors were re-proved with it). Every earlier value
+   in this list is superseded; `crates/randprotocol-node/tests/no_pre_phase4_recursion_pins.rs`
+   refuses the stale full literals in code. No modq-bearing inner proof reaches the chip-free
+   recursion verifier (`docs/zkvm.md` §8a).
    - **The N ceiling: production N ≤ 5.** The reduce chip runs a fixed 196 480 rows a production
      inner proof (39 296 test) and `REDUCE_MAX_LOG_HEIGHT` is 20, so an aggregate verifies only
      while `N × rows + 1 ≤ 2^20`: **N ≤ 5 production, N ≤ 26 test**. Tier 22 holds N ≤ 7 by cpu

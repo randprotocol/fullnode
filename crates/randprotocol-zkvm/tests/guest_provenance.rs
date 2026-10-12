@@ -196,6 +196,19 @@ fn the_auth_guest_is_pinned() {
     );
 }
 
+/// The docs name the pinned multisig auth guest and its tier, as they do hc_auth.
+#[test]
+fn the_docs_name_the_multisig_auth_guest() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let hc = word8_to_hex(&ZkExecutor::hc_auth_multisig());
+    for doc in ["docs/shielded.md", "docs/prover.md", "docs/rpc.md"] {
+        let text = std::fs::read_to_string(root.join(doc)).unwrap();
+        assert!(text.contains("hc_auth_multisig"), "{doc} does not mention hc_auth_multisig");
+    }
+    let shielded = std::fs::read_to_string(root.join("docs/shielded.md")).unwrap();
+    assert!(shielded.contains(&hc) && shielded.contains("tier 18"), "docs/shielded.md names the guest's digest and tier");
+}
+
 /// ZKG-2: the pin above, for every genesis file the repository carries — chain 15 included, which
 /// the chain-14-only test never read. A chain from 14 on pins the hidden-asset guest
 /// (`guests::bundle_hidden()`); chains 6–13 pin the retired 2-in-2-out guest, which still

@@ -154,6 +154,9 @@ request body itself is capped at `2 × (2 × max_proof_bytes + 4 × 2048 + max_c
 16 384 + 64 KiB) + 256 KiB` — 8 867 840 bytes on a default chain, 34 127 872 on a chain-13-sized
 genesis (8 MiB proofs, 64 KiB call envelopes) — computed from the genesis at startup; a body over
 it is `-32600` naming the limit. (`4 × 2048` is the bundle's four envelopes at the envelope cap.)
+On a genesis with `hc_auth_multisig` the first term counts **three** proofs at the cap
+(`3 × max_proof_bytes`: bundle, multisig auth, call), since the multisig auth proof is not the
+single-key guest's small fixed shape (`rpc::rpc_max_body_bytes`).
 
 ### `rand_mint` (testnet faucet)
 Params: `[address]` or `[address, amount]`, where `address` is a `rand1…` shielded address and
@@ -494,7 +497,7 @@ gas policy:
 ```json
 { "max_program_words": 4096, "max_proof_bytes": 2097152, "max_block_bytes": 4194304,
   "max_call_envelope_bytes": 18432, "max_program_public_words": 0, "envelope_bytes": null,
-  "hardening_v6": false, "hc_auth": null, "gas_price": "100", "byte_price": "800",
+  "hardening_v6": false, "hc_auth": null, "hc_auth_multisig": null, "gas_price": "100", "byte_price": "800",
   "gas_metering": "header", "bundle_gas_limit": null, "adjust_bps": null,
   "max_gas_price": null, "max_byte_price": null, "byte_load": null,
   "admission_by_vote": false, "testnet": false, "slashing": null, "binding_domain": 0,
@@ -537,6 +540,13 @@ without it, which a wallet reads as `false`.
 an auth proof: a wallet gives the bundle guest `nk` and a fresh salt and proves the auth guest over
 the spend key and the same binding itself. A node that predates the field answers without it — a
 chain it runs has none.
+
+`hc_auth_multisig` (v0.8.0) is the multisig auth guest the genesis pins (private multisig,
+`docs/shielded.md` §2, "Private multisig: the second auth guest"), hex, or `null`. Set, the chain
+also admits auth proofs of the multisig shape (tier 18), checked against this digest; a wallet
+offers `rand multisig-private` only where it is set. It needs `hc_auth`, and the chain's
+`max_proof_bytes` is then at least 4 MiB at Production. A node that predates the field answers
+without it, which a wallet reads as `null`.
 
 `binding_domain` (audit v6, BIND-1) is the genesis `binding_domain`: `0` — chains 14 to 19, and
 every genesis without the field — where a transaction's binding and every signed action message
@@ -1018,7 +1028,8 @@ Params: `[]`. Result:
   "verify_queue": 0, "mempool_size": 0,
   "is_validator": true, "active_validator": true, "faucet": true, "confidential": true,
   "testnet": false, "fri_profile": "production", "programs": 2, "viewing_keys": 0,
-  "notes": 41, "nullifiers": 12, "tree_root": "6b1d…c4", "hc_bundle": "f07a…19", "hc_auth": null, "binding_domain": 0,
+  "notes": 41, "nullifiers": 12, "tree_root": "6b1d…c4", "hc_bundle": "f07a…19", "hc_auth": null, "hc_auth_multisig": null,
+  "msauth_key": "absent", "binding_domain": 0,
   "address": "2nRdFC…", "peer_id": "12D3KooW...",
   "gas_prices": null
 }
@@ -1074,7 +1085,12 @@ says that key is in the set running the current epoch (spec §8) — a validator
 but whose epoch has not arrived is the first without the second. `notes` is every note the chain has ever created, `nullifiers` every note
 it has ever spent, and `hc_bundle` the bundle guest this chain's proofs are against — a node whose
 build disagrees with the genesis value refuses to start at all. `hc_auth` is the genesis auth guest
-(split authorisation) or `null`, checked against the build the same way. `binding_domain` is the
+(split authorisation) or `null`, checked against the build the same way. `hc_auth_multisig` is the
+genesis multisig auth guest (private multisig) or `null`, as `rand_getLimits` serves it; a build
+whose multisig guest differs refuses to start. `msauth_key` says where this node's tier-18 multisig
+verifier key came from: `"loaded"` (the pinned blob, `docs/deploy.md`, "The msauth verifier key"),
+`"built"` (the development `--build-msauth-key`), or `"absent"` (no `hc_auth_multisig` on this
+chain). `binding_domain` is the
 genesis `binding_domain` (`0` or `1`, BIND-1), as `rand_getLimits` serves it.
 
 `gas_prices` (spec 2026-09-28 §7.1, §8) is `{ "gas_price": "…", "byte_price": "…" }`, the tip
@@ -1907,6 +1923,18 @@ the proof's published digest against the one it computed before it submits anyth
 ## Changelog
 
 What changed for clients, in one place. Newest first.
+
+### v0.8.0 — private multisig: `hc_auth_multisig` (genesis-gated; chain 21 onward)
+
+- `rand_status`, `rand_getLimits`: `hc_auth_multisig` (hex, `null` without it).
+- `rand_status`: `msauth_key` (`"loaded"`, `"built"` or `"absent"`), where the node's tier-18
+  multisig verifier key came from.
+- `rand_sendTransaction`: on a genesis with `hc_auth_multisig` the request-body cap counts three
+  proofs at `max_proof_bytes`. No wire, txid or binding change: a multisig-authorised bundle has
+  the same fields as any v3 bundle, and only its auth proof's declared shape differs
+  (`docs/shielded.md` §2). A multisig-shaped auth proof on a chain without the field is refused
+  `InvalidAuthProof`, permanently; one sent while the node's key is still cold is deferred with a
+  retryable refusal.
 
 ### Unreleased — `rand_getScanLeaves` (node-only)
 

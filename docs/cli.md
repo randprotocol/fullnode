@@ -447,10 +447,14 @@ rand-node bench apply --blocks 10000 --report-every 500 --incremental-nullifier-
 | `--datadir <DATADIR>` | required | data directory (node must not be running) |
 | `--mode <MODE>` | `full` | `quick`, `replay` or `full`, as for `--verify-chain` (no checkpoint here: `rand-node verify` always walks) |
 | `--repair` | off | truncate the damaged tail and rewrite the note, nullifier, anchor and validator families from the replayed ledger; safety state is kept |
+| `--msauth-vk <PATH>` | `$RAND_MSAUTH_VK`, else `msauth-vk-<profile>.bin` beside the binary | the pinned msauth verifier key blob, read only on a chain naming `hc_auth_multisig` |
 
 Exit code 0 if the chain is consistent, 2 if a problem was found and `--repair` was not given.
 Replay re-verifies every bundle proof, so a build whose zkVM constraints differ from the one that
-made the chain will stop at the first bundle (`docs/confidential.md`).
+made the chain will stop at the first bundle (`docs/confidential.md`). On a chain naming
+`hc_auth_multisig` it first loads the pinned msauth verifier key as `run` does (fixed path, `--msauth-vk`
+/ `RAND_MSAUTH_VK` override, refused loudly when absent or of the wrong digest, never built;
+`docs/deploy.md`, "The msauth verifier key").
 
 ### `rand-node db drop-perp-inputs`
 

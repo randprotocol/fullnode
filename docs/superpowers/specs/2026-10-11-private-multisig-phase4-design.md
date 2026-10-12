@@ -757,25 +757,79 @@ laptop):
 
 ## 8. CHANGELOG (v0.8.0) — the release section
 
-The user's decision is option A: v0.8.0 carries this, from chain 21 onward. The plan's Task 10
-edits `CHANGELOG.md` after a one-line in-session confirmation. It keeps lines 30–35 (the
-startup-checkpoint and verify-cache bullets) verbatim, and makes three changes:
+The user's decision is option A: v0.8.0 carries this, from chain 21 onward. The plan's Task 10 is
+split: **10a** (docs) wrote this section; **10b** edits `CHANGELOG.md` after a one-line in-session
+confirmation, pasting the text below and nothing else. It keeps the startup-checkpoint and
+verify-cache bullets (CHANGELOG lines 29–35 at `187af10b`) and the off-loop, aggregate-wire and
+"Chain 21 and later" bullets verbatim, and makes these changes. randprotocol-d7's branch
+`feat/chain21-msauth` (`a7379a6c`) carries its own v0.8.0 draft; 10b reconciles the two, and where
+they differ on the cut's numbers the cut script's asserted values win.
 
-- **The node bullet.** The chain-20 flag-day bullet is withdrawn and replaced by: "**Chain 21
-  onward; not for chain 20.** Constraint set 9 (the MODQ chip) changes every verifier key and the
-  proof encoding: this build refuses chains 18–20 at startup (`CHAINS_THIS_BUILD_CANNOT_RUN`).
-  Chain 20 stays on v0.7.x until chain 21's cut."
-- **Rollback.** "Going back to v0.7.1 is possible only on a chain v0.7.1 runs (18–20); a chain-21
-  database cannot be rolled back across constraint set 9."
-- **Private multisig.** The following bullet goes under "Chain 21 and later, by genesis section":
+**Final proposed text (10a, 2026-10-12).**
 
-> - **Private multisig** (`hc_auth_multisig`): an M-of-N Dilithium2 policy hidden inside a second
->   auth guest (tier 18, the MODQ chip; `M_MAX` 3, `N_MAX` 16). Admission tells the two
->   auth guests apart by the proof's pinned shape, with no wire, txid or binding change; the chain
->   learns only "multisig-authorised". `rand multisig-private new-policy|address|balance|prepare|
->   sign|prove|submit`; the auth proof is proved locally (about 3.6 MB at Production FRI, so a
->   multisig transfer is about 5.1 MB). **Constraint set 9:** every verifier key and the proof
->   encoding change, so this build runs chain 21 on and refuses chains 18–20.
+1. **The header** — `(draft: chain 20 by a flag-day roll; the gated features at chain 21's cut)`
+   becomes `(chain 21 onward)`:
+
+   ```markdown
+   ## v0.8.0 — TAG_DATE (chain 21 onward)
+
+   Tag `TAG_SHA` (fullnode `main`, vendoring circuits `$CIRCUITS`: constraint set 9 — rVM phase 4's
+   Merkle spans and the MODQ chip — with tree aggregation and the scan heads' `viewing.rs`; the
+   branch pins `d217252`). A minor bump, not a patch: the release carries a new constraint set, a
+   node-only wire change (compact blocks) and the consensus rules a new chain needs. What reaches
+   each chain:
+   ```
+
+   (`$CIRCUITS` is the circuits commit `CIRCUITS_PIN` names at the merge; 10b writes the SHA.)
+
+2. **The node bullet** — the "**Chain 20, rolled as a flag day**" bullet is withdrawn and replaced
+   by:
+
+   ```markdown
+   - **Chain 21 onward; not for chain 20.** Constraint set 9 (the MODQ chip) changes every verifier
+     key and the proof encoding: this build refuses chains 18–20 at startup
+     (`CHAINS_THIS_BUILD_CANNOT_RUN`). Chain 20 stays on v0.7.x until chain 21's cut. Compact
+     blocks and the validator hot path's node-only half run on chain 21 from its genesis, so there
+     is no flag-day roll.
+   ```
+
+   (The last sentence is 10a's addition, keeping what the withdrawn bullet said about compact
+   blocks and the hot path; drop it if the user prefers the spec's three sentences alone.)
+
+3. **Private multisig** — a new bullet under "**Chain 21 and later, by genesis section:**", after
+   its existing text:
+
+   ```markdown
+   - **Private multisig** (`hc_auth_multisig`): an M-of-N Dilithium2 policy hidden inside a second
+     auth guest (`9705f8e2…8247`, tier 18, the MODQ chip; `M_MAX` 3, `N_MAX` 16). Admission tells
+     the two auth guests apart by the proof's pinned shape, with no wire, txid or binding change;
+     the chain learns only "multisig-authorised". The multisig auth proof's Production size is
+     unmeasured (estimated ≥ 3.4 MB; a genesis naming the guest needs `max_proof_bytes` ≥ 4 MiB,
+     and chain 21 is cut at 6 MiB with 19 MiB blocks). Wallet: `rand multisig-private
+     new-policy|address|balance|prepare|check|sign|prove|submit` (`docs/cli.md`); the auth proof is
+     proved locally (tier 18, ≥ 48 GB), the bundle proof may go to a paired prover. The signer
+     checks are the pure crate `randprotocol-msig` (`randprotocol_client::multisig_private`,
+     vendored by the clients' core). RPC: `rand_status` and `rand_getLimits` serve
+     `hc_auth_multisig` (hex, `null` without it), `rand_status.msauth_key` where the key came from.
+     Every validator loads the pinned msauth verifier key, `msauth-vk-production.bin` (23 754 B,
+     SHA-256 `68facb06…cd30`), from beside its binary at startup and in `rand-node verify`, and
+     refuses to start without it; `deploy/roll-all.sh` installs it (fifth argument or `MSAUTH_VK`).
+     **Constraint set 9:** every verifier key and the proof encoding change, so this build runs
+     chain 21 on and refuses chains 18–20.
+   ```
+
+4. **Rollback** — the "**Rollback**" paragraph is replaced by:
+
+   ```markdown
+   - **Rollback:** going back to v0.7.1 is possible only on a chain v0.7.1 runs (18–20); a chain-21
+     database cannot be rolled back across constraint set 9.
+   ```
+
+5. **Assets** — `Assets, when signed: rand-node, rand, rand-prover, msauth-vk-production.bin,
+   SHA256SUMS, SHA256SUMS.sig.` (the release workflow ships the blob in `SHA256SUMS` and the build
+   attestation, `docs/deploy.md`).
+
+The same text goes into the PR description.
 
 ## 9. Risks and open points
 

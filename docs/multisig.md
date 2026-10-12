@@ -239,37 +239,93 @@ threshold signatures are not yet standardised or deployed. What is left is N pub
 independent Dilithium2 signatures: 1 312 bytes per key and 2 420 per signature on the wire, with
 the signer set visible.
 
-## Planned: private multisig (the threshold inside the proof)
+## Private accounts (private multisig, v0.8.0)
 
-The way to get both is to move the M-of-N check **into a proof**, so the node verifies one proof
-instead of M signatures and learns nothing about the policy. The design is
-`docs/superpowers/specs/2026-10-11-private-multisig-design.md`; in short:
+A private account moves the M-of-N check **into a proof**, so the node verifies one proof instead
+of M signatures and learns nothing about the policy. It needs a chain whose genesis names
+`hc_auth_multisig` (`rand_status` and `rand_getLimits` serve it; chain 21 onward). The commands are
+[`rand multisig-private`](cli.md#rand-multisig-private); the chain-side rules are
+`docs/shielded.md` §2, "Private multisig: the second auth guest"; the designs are
+`docs/superpowers/specs/2026-10-11-private-multisig-design.md` and
+`docs/superpowers/specs/2026-10-11-private-multisig-phase4-design.md`.
 
-- A **multisig address** is an ordinary `rand1…` address. Its `nk` is derived from a hidden policy
-  (the signers' Dilithium2 keys, the threshold, and a secret the signers share) instead of from one
-  spend key, so its notes sit in the same shielded pool as everyone else's and look the same.
-- Spending one uses the **existing** bundle guest unchanged. What changes is the *auth* proof:
-  a second auth guest, `hc_auth_multisig`, verifies M Dilithium2 signatures over the transaction's
-  binding inside the zkVM and publishes the same `auth_commit` the single-key auth guest does.
-- The chain then sees one fixed-size proof. It does **not** see the account, the signer keys, N,
-  M, the threshold, which signers signed, the amounts or the recipients. It does see that the
-  spend was multisig-authorised (the auth proof's pinned shape differs from the single-key one).
-- Rotation becomes an ordinary M-of-N spend of every note to a new policy's address; the public
-  register's nonce and mempool slot are not needed, because nullifiers already prevent replay.
-- A public account can move its balance into a private one with an ordinary `MultisigPay` to the
-  private address: the payout is a note like any other.
+- A **policy** is up to 16 Dilithium2 signer keys (the same `rand-node keygen` files a public
+  account uses), a threshold `T` from 1 to 3 (`M_MAX`), and `msk`, 8 random words every signer
+  holds. Its `nk` is `H(69, msk ‖ policy)`, so its address is an ordinary `rand1…` address, its
+  notes sit in the one shielded pool, and nobody can tell it from a single-key wallet.
+- **Spending** uses the existing bundle guest unchanged. What changes is the *auth* proof: a second
+  auth guest (tier 18) verifies `T` signatures over the transaction's binding inside the zkVM and
+  publishes the same `auth_commit` the single-key auth guest does.
+- `msk` and the policy are a **viewing** key: every signer can scan the account and read its whole
+  history. Neither can spend without `T` signatures.
 
-How it is built, in order (each phase gated on the one before):
+### Public register or private policy: what each shows
 
-| phase | where | what | gate |
-|---|---|---|---|
-| 1 | `circuits` | a `no_std` Dilithium2 verifier compiled for the rVM (Keccak through the `KECCAK` syscall), byte-identical to `crystals-dilithium` 2.0.0's `dilithium2` | known-answer tests against the node's crate; **cycles per verification measured** |
-| 2 | `circuits` | the multisig auth guest: policy check, up to `M_MAX` signatures over the binding read from the public segment, `c = H(AUTH, nk ‖ salt)` out | cheating suite; tier measured at `M_MAX` ∈ {2, 3, 5} |
-| 3 | `circuits` (only if phase 2 misses tier 19) | a modular-arithmetic / NTT coprocessor chip for `q = 8 380 417`, so a verification costs rows, not hundreds of thousands of cycles | phase 2's tier re-measured under it |
-| 4 | `fullnode` | genesis `hc_auth_multisig`, admission by the auth proof's declared shape, the prover's multisig witness, `rand multisig-private` (address, prepare, sign, prove, submit), wallet scanning by `nk` | a real-proof end-to-end on a test chain |
-| 5 | cut | the genesis section on a chain; the treasury may then move privately | — |
+| | public account (`MultisigPay`, this page above) | private account (`hc_auth_multisig`) |
+|---|---|---|
+| the account | an id on the register | an ordinary `rand1…` address, indistinguishable from any other |
+| balance | every asset's balance, on chain | hidden (shielded notes) |
+| signers, N, threshold | the keys and the threshold, on chain | hidden |
+| which signers signed | the indices, on chain | hidden |
+| a payment's amounts and recipients | the payouts' amounts (recipients shielded) | hidden |
+| what the chain does see | everything above | that the auth proof has the multisig shape, the bundle's public fields, the transaction size |
+| what a signer signs | a 32-byte blake3 digest, checked natively by the node | `b"rand-msauth-1" ‖ binding`, checked inside the proof |
+| cost | a few KB of keys and signatures | a ≥ 3.4 MB auth proof (estimated; the Production size is not yet measured), proved on a ≥ 48 GB machine |
 
-Until phase 4 lands on a chain, the public account above is the only multisig there is.
+A treasury that must be auditable stays public; M-of-N control with the pool's privacy is the
+private account.
+
+### Funding, from anywhere
+
+A private address receives like any other: a shielded transfer, a mint, a bridge deposit — and a
+**public account's `MultisigPay`**, whose payout is a note like any other. So a public treasury
+moves into a private account with an ordinary `MultisigPay` to the private address (the end-to-end
+test does exactly this); the payment is visible on the public side and nothing after it is.
+
+### Rotation is a sweep
+
+There is no register and no nonce. To change the signers, the threshold or `msk`, make a new policy
+and spend every note of the old account to its address: `rand multisig-private prepare --sweep-to
+<new address>`, signed by `T` of the **old** signers. Replay protection is the nullifier, so a
+proposal prepared before the rotation dies when its notes are spent. The old policy still reads
+the old account's history; give the new `msk` only to the new signers.
+
+### The signing domain
+
+A private-account signature is over `b"rand-msauth-1" ‖ binding (32 LE bytes)`; a public account's
+`MultisigPay`/`MultisigRotate` signatures are over a bare 32-byte blake3 digest. The prefix keeps a
+signature made for one from ever being valid for the other, so the same key can sign both without
+one signature moving funds of the other kind.
+
+### What a signer sees, and what it cannot check
+
+`rand multisig-private sign` (and `check`) recomputes the binding from the proposal's bundle, opens
+every output as the sender, and shows each output by its **owner-key fingerprint** — the first 16 hex
+digits of `blake3("rand-msig-owner-1" ‖ pk)` (`randprotocol_msig::owner_fingerprint`) — never by an
+address taken from the proposal's summary. Every output line carries the caveat **"owner key
+verified; delivery key NOT verifiable from this proposal"**. ML-KEM encapsulation is randomised, so a
+proposal cannot prove which KEM key an output's envelope was sealed to: a dishonest coordinator could
+pay the right owner key with an envelope its recipient cannot open. The mitigation today is that the
+coordinator and the recipient confirm the address out of band; a deterministic seal API, which
+would let a signer re-seal and compare, is a follow-up. The checks are the pure, wasm32-clean crate
+`randprotocol-msig` (re-exported as `randprotocol_client::multisig_private`, vendored by the clients'
+core), so a browser signer runs the same code.
+
+### Key reuse
+
+- A signer key on **both** a public account and a private policy links them for anyone who knows
+  the policy: the public register lists the key. `new-policy --public-account <ID>` warns for every
+  such signer; use fresh keys for a private policy.
+- Never sign with a validator key: `sign` warns when the key looks like one (its address is in
+  `rand_getValidators`, or the file is a datadir `node.key.json`).
+- The custody rules below apply unchanged: never two signer keys in one place.
+
+### Not yet
+
+- The auth proof is proved **locally only**; delegating it to a prover is specified (phase-4 spec
+  §6.6) and not built. The bundle proof can go to a paired prover.
+- A bundle spends at most two RAND notes, so `prepare --sweep-to` refuses an account holding more:
+  merge them first (pay the account to itself), then sweep.
 
 ## Reading it
 

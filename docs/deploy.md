@@ -112,6 +112,9 @@ rand status
 rand-node verify --datadir /root/data-<letter>-<genesis8> --mode full   # stop the service first
 ```
 
+On a chain whose genesis names `hc_auth_multisig`, `rand-node verify` loads the pinned msauth
+verifier key exactly as `run` does (below, "The msauth verifier key") and refuses to verify without it.
+
 ### Reserved peers (audit v6, NET-1)
 
 A node accepts at most 256 established and 64 half-open inbound connections, and a libp2p
@@ -353,6 +356,12 @@ A node on a chain whose genesis names `hc_auth_multisig` verifies multisig autho
   build; only `--build-msauth-key` (development, a ≥ 8 GB host, never set by a deploy script)
   builds the key. `rand_status.msauth_key` reports `loaded`, `built` or `absent` (no
   `hc_auth_multisig` on this chain).
+- **`rand-node verify` too.** The offline replay loads the same blob the same way: the fixed path
+  `/usr/local/bin/msauth-vk-production.bin` (`--msauth-vk` / `RAND_MSAUTH_VK` override it), a loud
+  refusal naming the path and both digests when the file is absent or not the pinned one, and never
+  a build.
+- **The genesis field.** The chain-21 cut writes `hc_auth_multisig` via
+  `rand-node genesis --auth-multisig-guest`; see `deploy/cut-chain21-genesis.sh`.
 - **The roll.** `deploy/roll-all.sh` takes the blob as its fifth argument (or `MSAUTH_VK`;
   `NO_MSAUTH_VK=1` for a chain without multisig) and, on each host, checks the copy against the
   pin of the `rand-node` being installed before installing anything, then installs it beside the
