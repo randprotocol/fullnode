@@ -223,7 +223,7 @@ enum Cmd {
     /// spends are proposals that signers sign offline and a proof hides. `new-policy` makes the
     /// policy file (it holds the account's secret `msk`: keep it, share it with the signers
     /// out of band), `prepare` writes a proposal, `sign` is each signer's side, `prove` makes
-    /// the transaction on this machine (tier 18: minutes, at least 48 GB) and `submit` sends it.
+    /// the transaction on this machine (tier 18; minutes; ≈ 76 GB footprint measured at the Test profile; ≥ 96 GB recommended) and `submit` sends it.
     #[command(subcommand, name = "multisig-private")]
     MultisigPrivate(MultisigPrivateCmd),
     /// Run a confidential call: prove locally, pay from a bundle, wait for the receipt.
@@ -1535,7 +1535,7 @@ async fn multisig_private_cmd(prover: bool, cpu: bool, key: &Path, max_prover_fe
             anyhow::ensure!(head + EXPIRY_MARGIN < proposal.expires_at, "the proposal expires at height {} and the head is {head}: prepare again", proposal.expires_at);
             let profile = profile_of(rpc).await?;
             let proving = proving_for(prover, cuda, cpu, key, max_prover_fee)?;
-            eprintln!("proving the auth proof on this machine (tier 18: minutes, at least 48 GB), then the bundle");
+            eprintln!("proving the auth proof on this machine (tier 18; minutes; ≈ 76 GB footprint measured at the Test profile; ≥ 96 GB recommended), then the bundle");
             // A paired prover's bundle reply is held to the chain's proof cap, as `send` holds it.
             let cap = match proving {
                 Proving::Remote(_) => wallet::proof_cap(rpc.limits().await?.as_ref()),

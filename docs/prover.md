@@ -595,7 +595,7 @@ the 4 MiB default included): a 4 MiB block admits transfers but no `Call` at Pro
 whose genesis names `hc_auth_multisig` (`9705f8e2…8247`, `docs/shielded.md` §2), a private multisig
 account's auth proof is the multisig auth guest's, at **tier 18** with the MODQ chip, and it is
 made **on the wallet's own machine only** (`rand multisig-private prove`, `docs/cli.md`): at least
-48 GB and minutes per proof (the Production prove time and size are not yet measured; the estimate
+a peak memory footprint of ≈ 76 GB measured at the Test profile (RSS 22.5 GB; RSS understates it), so a machine with ≥ 96 GB, and minutes per proof (the Production prove time and size are not yet measured; the estimate
 is ≥ 3.4 MB). Its witness holds `msk`, the policy and the signatures — the account's viewing power —
 and no prover advertises the shape. The bundle proof of a multisig spend is an ordinary v3 bundle
 proof over the account's `nk` and may still go to a paired prover (`--prover`), exactly as above. A
