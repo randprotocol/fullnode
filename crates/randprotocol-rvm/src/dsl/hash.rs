@@ -215,22 +215,36 @@ pub fn absorb_staged(b: &mut Builder, st: Ptr, cursor: Ptr, v: Felt) {
 /// `index_bits` are the little-endian bits of the leaf index, already bit-constrained (this function
 /// trusts them: a bit that is not 0 or 1 gives a digest that is neither child order, which is why
 /// `DslChallenger::sample_bits` constrains them where they are born). `siblings` points at
-/// `4·levels` cells, level 0 first. `out` receives the digest reached after `levels` compressions,
-/// which the caller compares with the cap entry at the remaining index — the walk itself never
-/// touches the commitment.
+/// `4·levels` cells, level 0 first. The walk **consumes `leaf`** (D2, phase 4): it overwrites the
+/// four cells with the digest reached after `levels` compressions and returns that digest, which is
+/// `leaf` itself. The caller compares it with the cap entry at the remaining index — the walk
+/// itself never touches the commitment — and must not expect the original leaf afterwards. The
+/// leaf must not alias the siblings, an injection's rows or the hash scratch (refused at build).
 ///
 /// Measured under `Precompiles::Off` (the compiled walk, the differential reference): `33·levels +
 /// 16` rows and `levels` permutations — 33 rows per level (32 for the child select, one for the
 /// permutation) and sixteen for copying the leaf digest in and the result out; the running digest
 /// lives in the permutation's own lanes for the whole walk, so a level costs no copy of its own.
 ///
-/// Measured under `Precompiles::On` (Cut C, the shipped setting): `2·levels + 15` rows and `levels`
-/// permutations — per level one `COMPRESS` plus one `FADDI` folding the sibling `Ptr`'s offset into
-/// a register (level 0's offset is zero, so it has none), and the same sixteen copy rows; the
-/// running digest lives in four dedicated cells instead of the hash scratch.
-pub fn merkle_walk(b: &mut Builder, leaf: Digest, index_bits: &[Felt], siblings: Ptr, levels: usize,
-                   out: Digest) {
-    merkle_walk_with_injections(b, leaf, index_bits, siblings, levels, &[], out);
+/// `Precompiles::On` (the shipped setting), today: `levels` rows and `levels` permutations — one
+/// `COMPRESS` a level, over `leaf` in place, its sibling an absolute immediate (plus, for
+/// [`merkle_walk_with_injections`], each injection's sponge and one more `COMPRESS`). How it got
+/// there:
+/// - Cut C (before phase 4): `2·levels + 15` rows — per level one `COMPRESS` plus one `FADDI`
+///   folding the sibling `Ptr`'s offset into a register (none at level 0), and sixteen rows
+///   copying the leaf digest into four dedicated cells and the result back out.
+/// - D2 (phase 4): the walk compresses over `leaf` and returns it, so the copy in and the copy out
+///   are gone (`2·levels − 1` rows at that point). Measured at the production profile:
+///   386 698 → 366 219 cpu rows over 1 120 walks (`input_root` 137 201 → 129 762, `commit_root`
+///   56 560 → 43 520), about 18 per walk — the sixteen copy rows plus the stores and loads their
+///   cells no longer cost. `Off` keeps the copy out (into `leaf`) as the differential reference.
+/// - B (phase 4): the sibling is `COMPRESS`'s absolute immediate, so the per-level `FADDI` is gone
+///   too (`commit_root`'s FADDI rows at the production profile: 8 560 → 720), leaving `levels`.
+///   Any register traffic left around a walk (a spilled bit's reload, the leaf `Ptr` taken into a register) belongs to the operands,
+///   not to the walk's own row count.
+pub fn merkle_walk(b: &mut Builder, leaf: Digest, index_bits: &[Felt], siblings: Ptr, levels: usize)
+                   -> Digest {
+    merkle_walk_with_injections(b, leaf, index_bits, siblings, levels, &[])
 }
 
 /// A shorter-height matrix group injected into the walk after `after_level`: the `n_cells` at `rows`
@@ -262,13 +276,13 @@ pub struct Injection {
 /// Measured: an injection of `m` cells adds `sponge(m) + 25` rows and `ceil(m/4) + 1` permutations —
 /// 58 rows and four permutations for the nine-cell group a five-column salted matrix comes to.
 ///
-/// Under `Precompiles::On` (Cut C) a level is two rows instead of 33 — the `COMPRESS` and the
-/// `FADDI` that folds the sibling's offset into a register (none at level 0) — and an injection is
-/// its sponge plus one `COMPRESS`; the compiled body below stays the `Off` path, the
-/// differential reference (`tests/precompiles.rs`).
+/// Under `Precompiles::On` a level is one row instead of 33 — the `COMPRESS`, its sibling an
+/// absolute immediate (phase 4 B; Cut C also had a `FADDI` folding the sibling's offset into a
+/// register) — and an injection is its sponge plus one `COMPRESS`; the compiled body below stays
+/// the `Off` path, the differential reference (`tests/precompiles.rs`).
 pub fn merkle_walk_with_injections(b: &mut Builder, leaf: Digest, index_bits: &[Felt],
-                                   siblings: Ptr, levels: usize, injections: &[Injection],
-                                   out: Digest) {
+                                   siblings: Ptr, levels: usize, injections: &[Injection])
+                                   -> Digest {
     assert!(index_bits.len() >= levels,
             "a {levels}-level walk needs {levels} index bits, got {}", index_bits.len());
     assert!(injections.iter().all(|i| i.after_level < levels),
@@ -283,6 +297,21 @@ pub fn merkle_walk_with_injections(b: &mut Builder, leaf: Digest, index_bits: &[
             inj.after_level
         );
     }
+    // D2 (phase 4): the walk writes the digest it reaches over `leaf` and returns it — the leaf is
+    // consumed. It must not alias what the walk still reads.
+    let st = b.hash_scratch();
+    let (lo, hi) = (b.addr_of(leaf.0), b.addr_of(leaf.0) + DIGEST_ELEMS as u64);
+    let overlaps = |p: Ptr, n: u64| {
+        let a = b.addr_of(p);
+        a < hi && lo < a + n
+    };
+    assert!(
+        !overlaps(siblings, (levels * DIGEST_ELEMS) as u64)
+            && injections.iter().all(|inj| !overlaps(inj.rows, inj.n_cells as u64))
+            && !overlaps(st, 16),
+        "the walk consumes its leaf (overwrites it with the digest it reaches): the leaf must not \
+         alias the siblings, an injection's rows or the hash scratch"
+    );
     if b.precompiles() == crate::dsl::Precompiles::On {
         // Cut C: the running digest lives in four dedicated cells (`cur`); one COMPRESS per level
         // selects the children by the bit and writes the parent back over `cur`. An injection is
@@ -290,8 +319,7 @@ pub fn merkle_walk_with_injections(b: &mut Builder, leaf: Digest, index_bits: &[
         // sponge]`, the reference's fixed order (`mmcs/batch.rs:245-262`). `sponge` works in the
         // hash scratch, and `cur` and `tmp` are separate allocations, so the module's aliasing
         // rule holds.
-        let cur = b.alloc(DIGEST_ELEMS as u64);
-        b.copy_cells(cur, 0, leaf.0, 0, DIGEST_ELEMS);
+        let cur = leaf.0;
         let zero = b.zero();
         for (l, &bit) in index_bits.iter().enumerate().take(levels) {
             let sib = b.offset(siblings, (l * DIGEST_ELEMS) as i64);
@@ -302,10 +330,8 @@ pub fn merkle_walk_with_injections(b: &mut Builder, leaf: Digest, index_bits: &[
                 b.compress_step(cur, tmp.0, zero);
             }
         }
-        b.copy_cells(out.0, 0, cur, 0, DIGEST_ELEMS);
-        return;
+        return leaf;
     }
-    let st = b.hash_scratch();
     // The running digest lives in the permutation's own first four lanes for the whole walk: every
     // level reads it from there and writes the next level's `left` back over it, so a level costs no
     // copy at all.
@@ -322,7 +348,38 @@ pub fn merkle_walk_with_injections(b: &mut Builder, leaf: Digest, index_bits: &[
             compress_into_state(b, Digest(a), Digest(tmp_b));
         }
     }
-    b.copy_cells(out.0, 0, st, 0, DIGEST_ELEMS);
+    b.copy_cells(leaf.0, 0, st, 0, DIGEST_ELEMS);
+    leaf
+}
+
+/// D1 (phase 4): the digest a walk reached, checked against the cap entry at index `b0 + 2·b1` by
+/// address, not by an indicator dot product: `off = 4·b0 + 8·b1`, then one register-offset `LOAD`
+/// a lane. `caps` is the four digests as sixteen contiguous cells. The bits must be boolean —
+/// `DslChallenger::sample_bits` constrains every bit where it is born — so `off ∈ {0, 4, 8, 12}`
+/// and the load stays inside the sixteen cells; the cpu AIR range-checks the address regardless.
+/// The pattern is the one `docs/06` Cut E1 ruled sound for the own-slot check.
+///
+/// Build-time preconditions (no instructions emitted): `got` must not overlap the sixteen cap
+/// cells — a digest compared against a window it sits inside proves nothing about the commitment.
+/// The contiguity of the four caps is the caller's (`rv32.rs`'s `assert_cap_eq` asserts it from
+/// the four `Digest`s); here `caps` is already one `Ptr`, and a `Ptr` carries no length to check.
+pub fn assert_cap_entry(b: &mut Builder, got: Digest, caps: Ptr, bits: [Felt; 2], name: &str) {
+    let (g, c) = (b.addr_of(got.0), b.addr_of(caps));
+    let span = 4 * DIGEST_ELEMS as u64;
+    assert!(
+        g + DIGEST_ELEMS as u64 <= c || c + span <= g,
+        "assert_cap_entry: the digest at {g}..{} overlaps the cap cells {c}..{}",
+        g + DIGEST_ELEMS as u64,
+        c + span
+    );
+    let o0 = b.mul_const(bits[0], F::from_u64(DIGEST_ELEMS as u64));
+    let o1 = b.mul_const(bits[1], F::from_u64(2 * DIGEST_ELEMS as u64));
+    let off = b.add(o0, o1);
+    for lane in 0..DIGEST_ELEMS as i64 {
+        let c = b.load_offset(caps, lane, off);
+        let g = b.load(got.0, lane);
+        b.assert_eq(g, c, name);
+    }
 }
 
 /// `[left ‖ right]` into the eight lanes, permuted; the result is lanes `0..4`.

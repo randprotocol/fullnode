@@ -592,6 +592,12 @@ enum Cmd {
         /// with `v1`/`v2` — the two come as a pair (only v3 publishes the commitment).
         #[arg(long)]
         auth_guest: bool,
+        /// Pin this build's multisig auth guest as `hc_auth_multisig` (private multisig): an auth
+        /// proof may then also be a `t`-of-`M` multisig's, verified against this guest. Requires
+        /// `--auth-guest` (the multisig guest authorises bundle guest v3's spends too); at
+        /// production FRI the chain needs `--max-proof-bytes` of at least 4 MiB.
+        #[arg(long, requires = "auth_guest")]
+        auth_multisig_guest: bool,
         /// Turn on the v0.6 rules as validity rules (`hardening_v6`): the pc window, uncallable
         /// deploys, canonical proof shapes and proof-of-work words, the call binding and the
         /// program-table floor. Absent, a node still refuses those at its pool, as policy.
@@ -834,6 +840,11 @@ enum Cmd {
         /// Proof-verification workers (default: the cores minus two, at least four — spec 2026-10-05 §6).
         #[arg(long, value_name = "N")]
         verify_workers: Option<usize>,
+        /// Apply incoming proposals on the consensus loop, as before v0.8.0, instead of on a
+        /// blocking worker (spec 2026-10-11 off-loop apply §4.5): the kill switch. The by-hash
+        /// fetch answer binding is a separate fix and stays on.
+        #[arg(long)]
+        apply_proposals_inline: bool,
         /// Skip the free-memory gate that refuses a prover the machine cannot hold.
         #[arg(long)]
         prover_skip_memory_check: bool,
@@ -857,6 +868,16 @@ enum Cmd {
         /// Units per KiB (or part) of a call's proof and input envelope, from byte 0.
         #[arg(long, default_value_t = randprotocol_core::gas::BYTE_PRICE_DEFAULT)]
         byte_price: u64,
+        /// The precomputed msauth verifier key file (private multisig, read only on a chain
+        /// naming `hc_auth_multisig`). Default: `$RAND_MSAUTH_VK`, else
+        /// `msauth-vk-<profile>.bin` beside this binary (`/usr/local/bin/msauth-vk-production.bin`
+        /// on the fleet). A missing or unpinned file refuses the start.
+        #[arg(long, value_name = "PATH")]
+        msauth_vk: Option<PathBuf>,
+        /// Development only: when the msauth key file is missing, build the key on this host
+        /// (~80 s, ~4 GB at production) instead of refusing to start. Never set by a deploy script.
+        #[arg(long)]
+        build_msauth_key: bool,
     },
     /// Verify the chain in a data directory without running the node.
     Verify {
@@ -869,6 +890,10 @@ enum Cmd {
         /// Truncate the damaged tail (safety state is kept). Without this, only report.
         #[arg(long)]
         repair: bool,
+        /// The precomputed msauth verifier key file, as for `run` (read only on a chain naming
+        /// `hc_auth_multisig`; a missing or unpinned file refuses the verify — it never builds).
+        #[arg(long, value_name = "PATH")]
+        msauth_vk: Option<PathBuf>,
     },
     /// Database maintenance on a stopped node's data directory.
     Db {
@@ -997,6 +1022,21 @@ enum Cmd {
         /// on a chain whose genesis has an `aggregation_tree` section).
         #[arg(long, default_value = "flat", value_parser = parse_layout)]
         layout: randprotocol_core::types::AggregateLayout,
+    },
+    /// The precomputed msauth verifier key (private multisig, plan Task 2b). `--profile P --out
+    /// FILE` builds the key (a big host: ~80 s, ~4 GB at production) and writes the blob, printing
+    /// `sha256 <hex>  bytes <n>`; `--check FILE` prints a file's SHA-256; `--print-pinned P` prints
+    /// this build's pin. A validator loads the blob from beside its binary
+    /// (`/usr/local/bin/msauth-vk-production.bin`) and never builds it.
+    KeygenMsauthVk {
+        #[arg(long, requires = "out")]
+        profile: Option<String>,
+        #[arg(long, requires = "profile")]
+        out: Option<PathBuf>,
+        #[arg(long, conflicts_with_all = ["profile", "out", "print_pinned"])]
+        check: Option<PathBuf>,
+        #[arg(long, value_name = "PROFILE", conflicts_with_all = ["profile", "out"])]
+        print_pinned: Option<String>,
     },
     /// Benchmarks of the node's own paths; no network, no database.
     Bench {
@@ -2457,6 +2497,22 @@ async fn main() -> Result<()> {
                 std::process::exit(2);
             }
         }
+        Cmd::KeygenMsauthVk { profile, out, check, print_pinned } => {
+            use randprotocol_node::msauth_key;
+            if let Some(p) = print_pinned {
+                println!("{}", randprotocol_zkvm::executor::msauth_vk::pin(msauth_key::parse_profile(&p)?));
+            } else if let Some(f) = check {
+                println!("{}", msauth_key::check_file(&f)?);
+            } else if let (Some(p), Some(out)) = (profile, out) {
+                let profile = msauth_key::parse_profile(&p)?;
+                let t0 = std::time::Instant::now();
+                let (digest, bytes) = msauth_key::keygen(profile, &out)?;
+                eprintln!("wrote {} in {:.1?}", out.display(), t0.elapsed());
+                println!("sha256 {digest}  bytes {bytes}");
+            } else {
+                anyhow::bail!("keygen-msauth-vk: give --profile P --out FILE, --check FILE or --print-pinned P");
+            }
+        }
         Cmd::Keygen { out } => {
             let kp = Keypair::generate();
             // Never over an existing file (VK-7): the key at `out` may be the only copy of a seed.
@@ -2493,6 +2549,7 @@ async fn main() -> Result<()> {
             aggregation_tree,
             bundle_guest,
             auth_guest,
+            auth_multisig_guest,
             hardening_v6,
             gas_price,
             byte_price,
@@ -2745,6 +2802,10 @@ async fn main() -> Result<()> {
                     ),
                     None => None,
                 },
+                // Private multisig's auth guest (`--auth-multisig-guest`, only with `--auth-guest`):
+                // this build's digest, never typed; absent otherwise, so a genesis cut without it
+                // hashes byte-for-byte as before.
+                hc_auth_multisig: auth_multisig_guest.then(|| word8_to_hex(&ZkExecutor::hc_auth_multisig())),
             };
             if binding_domain.is_none() && !randprotocol_client::CHAIN_ID_BINDING_CHAIN_IDS.contains(&chain_id) {
                 eprintln!(
@@ -2784,7 +2845,7 @@ async fn main() -> Result<()> {
             }
             std::fs::write(&out, gen.to_json())?;
             println!(
-                "wrote {} (genesis hash {}, {} validators, {} notes, {} blocks/epoch, programs up to {} words, proofs up to {} bytes, blocks up to {} bytes, call envelopes up to {} bytes, program public input up to {} words, faucet {}, confidential {}, fri {}, hc_bundle {}, hc_auth {})",
+                "wrote {} (genesis hash {}, {} validators, {} notes, {} blocks/epoch, programs up to {} words, proofs up to {} bytes, blocks up to {} bytes, call envelopes up to {} bytes, program public input up to {} words, faucet {}, confidential {}, fri {}, hc_bundle {}, hc_auth {}{})",
                 out.display(),
                 state.hash(),
                 state.validators.len(),
@@ -2800,6 +2861,9 @@ async fn main() -> Result<()> {
                 state.fri_profile,
                 gen.hc_bundle,
                 gen.hc_auth.as_deref().unwrap_or("none"),
+                // Private multisig's pin, only when set: a summary without it reads as before (and
+                // says nothing of "multisig" on a chain that has none).
+                gen.hc_auth_multisig.as_deref().map(|h| format!(", hc_auth_multisig {h}")).unwrap_or_default(),
             );
             println!("{}", gas_summary(state.ledger.gas()));
             if let Some(p) = state.ledger.program_state() {
@@ -2845,11 +2909,16 @@ async fn main() -> Result<()> {
             println!("initialised {} at genesis {} (chain id {})", datadir.display(), gs.hash(), gs.chain_id);
             println!("{}", gas_summary(gs.ledger.gas()));
         }
-        Cmd::Verify { datadir, mode, repair } => {
+        Cmd::Verify { datadir, mode, repair, msauth_vk } => {
             let mode: VerifyMode = mode.parse().map_err(|e: String| anyhow::anyhow!(e))?;
             let (gs, executor) = node::load_genesis(&datadir)?;
             refuse_test_fri_profile(&gs.fri_profile, test_profile_allowed)?;
-            node::refuse_chains_this_build_cannot_run(&gs)?;
+            // What `run` checks first (it includes `refuse_chains_this_build_cannot_run`): a
+            // genesis naming another build's guest is refused here, before any block is read, so
+            // it is never reported CORRUPT and `--repair` never truncates on it.
+            node::check_build_runs_genesis(&gs, &ZkExecutor::known_hc_bundles()).map_err(|e| anyhow::anyhow!("{e:#}; refusing to verify"))?;
+            // The pinned msauth key, loaded as `run` loads it: a replay must never build it.
+            randprotocol_node::msauth_key::verify_startup(&gs, msauth_vk, executor.as_ref()).map_err(|e| anyhow::anyhow!("{e:#}; refusing to verify"))?;
             let storage = Storage::open(&datadir)?;
             let check = node::verify_store(&storage, &gs, mode, executor.as_ref())?;
             match &check.problem {
@@ -2882,6 +2951,8 @@ async fn main() -> Result<()> {
             }
         }
         Cmd::Run {
+            msauth_vk,
+            build_msauth_key,
             datadir,
             key,
             listen,
@@ -2909,6 +2980,7 @@ async fn main() -> Result<()> {
             prover_cpu,
             prover_threads,
             verify_workers,
+            apply_proposals_inline,
             prover_skip_memory_check,
             prover_allow_origin,
             prover_fee,
@@ -2975,8 +3047,10 @@ async fn main() -> Result<()> {
                 keep_raw_proofs,
                 min_free_disk_bytes: min_free_disk_mb << 20,
                 verify_workers,
+                apply_inline: apply_proposals_inline,
                 prune_history,
                 gas_policy: randprotocol_core::gas::GasPolicy::from_prices(gas_price, byte_price),
+                msauth: randprotocol_node::msauth_key::MsauthKeyOptions { path: msauth_vk, build: build_msauth_key },
             }, rpc_options, node::NetOptions { reserved_peers: reserved_peer, strict_gossip })
             .await?;
             // The prover is served once the node's RPC is up and stops with the node; a prover
@@ -3653,6 +3727,20 @@ fn tree_cover_count(available: usize, tree: &randprotocol_core::ledger::aggregat
         .find(|n| *n <= available && *n > 0)
 }
 
+/// The aggregator's cover assembly: each work row's raw bundle proof decoded, and refused if it
+/// declares a modq table (constraint set 9, circuits Task 9b: the recursion verifier is chip-free,
+/// `agg_executor::check_inner_chip_free`) — before any rVM work, flat or tree.
+fn decode_inner_proofs(raw_proofs: &[Vec<u8>]) -> Result<Vec<randprotocol_zkvm::machine::Proof>> {
+    raw_proofs
+        .iter()
+        .map(|b| {
+            let p = postcard::from_bytes::<randprotocol_zkvm::machine::Proof>(b).map_err(|_| anyhow::anyhow!("a work row's proof does not decode"))?;
+            randprotocol_node::agg_executor::check_inner_chip_free(&p).map_err(|e| anyhow::anyhow!("a work row's proof: {e}"))?;
+            Ok(p)
+        })
+        .collect()
+}
+
 /// The tree's root over the raw bundle proofs (`--layout tree`): the section's leaf and per-level
 /// step shapes rebuilt from its pinned heights (`TreeShapes::build`, what admission rebuilds), then
 /// `aggregate_tree` on this one machine — `2^d` `rv32n` leaves of `L` proofs, then `d` levels of
@@ -3666,10 +3754,7 @@ fn prove_tree_aggregate(
     tree: &randprotocol_core::ledger::aggregation::TreeConfig,
 ) -> Result<Vec<u8>> {
     use randprotocol_node::agg_executor::rvm_heights;
-    let proofs = raw_proofs
-        .iter()
-        .map(|b| postcard::from_bytes::<randprotocol_zkvm::machine::Proof>(b).map_err(|_| anyhow::anyhow!("a work row's proof does not decode")))
-        .collect::<Result<Vec<_>>>()?;
+    let proofs = decode_inner_proofs(raw_proofs)?;
     let first = proofs.first().context("nothing to aggregate")?;
     let shape = randprotocol_rvm::shape::InnerShape::of(
         profile,
@@ -3699,10 +3784,7 @@ fn prove_tree_aggregate(
 /// only expensive step (~26 min at the test profile), a function of its own so the pass around
 /// it can be driven without the rVM.
 fn prove_aggregate(profile: FriProfile, raw_proofs: &[Vec<u8>], binding: &[u32; 8]) -> Result<Vec<u8>> {
-    let proofs = raw_proofs
-        .iter()
-        .map(|b| postcard::from_bytes::<randprotocol_zkvm::machine::Proof>(b).map_err(|_| anyhow::anyhow!("a work row's proof does not decode")))
-        .collect::<Result<Vec<_>>>()?;
+    let proofs = decode_inner_proofs(raw_proofs)?;
     // The shape is the first proof's; every proof in the set must share it (the chain's
     // admission checks it again).
     let first = proofs.first().context("nothing to aggregate")?;
@@ -4722,7 +4804,7 @@ mod tests {
                 .expect_err(&format!("this build must refuse chain {chain} at run"))
                 .to_string();
             assert!(refused.contains(why) && refused.contains(&format!("chain {chain}")), "{refused}");
-            assert!(refused.contains("constraint set 8"), "names this build's set: {refused}");
+            assert!(refused.contains("constraint set 9"), "names this build's set: {refused}");
             let at_verify = node::refuse_chains_this_build_cannot_run(&state)
                 .expect_err(&format!("this build must refuse chain {chain} at verify"))
                 .to_string();
@@ -4736,7 +4818,7 @@ mod tests {
     /// blocks), chain 16's 26 validators, its bridge state (set 1, burn sequence 7, the replay
     /// floors at the snapshot's next sequences) and its zUSD, plus the RAND the operator's wallets
     /// held. `deploy/genesis-chain17.json` is committed and its hash is pinned in
-    /// `node::CHAINS_THIS_BUILD_CANNOT_RUN`: this build is constraint set 8 (the gas meter) and
+    /// `node::CHAINS_THIS_BUILD_CANNOT_RUN`: this build is constraint set 9 (the MODQ chip) and
     /// refuses to run chain 17 — it verifies none of its cs7 proofs — but still names its exact
     /// genesis hash there, so the hash assertion below reads it from that one place (chain 16's
     /// test, the same way since v0.6.3).
@@ -4767,17 +4849,17 @@ mod tests {
         assert_eq!(state.ledger.hc_auth(), Some(ZkExecutor::hc_auth()), "the ledger enforces split authorisation");
         assert!(state.ledger.gas().is_none(), "chain 17 has no gas section");
         let refused = node::check_build_runs_genesis(&state, &ZkExecutor::known_hc_bundles())
-            .expect_err("a constraint-set-8 build must refuse chain 17")
+            .expect_err("a constraint-set-9 build must refuse chain 17")
             .to_string();
-        assert!(refused.contains("chain 17") && refused.contains("constraint set 7") && refused.contains("constraint set 8"), "{refused}");
+        assert!(refused.contains("chain 17") && refused.contains("constraint set 7") && refused.contains("constraint set 9"), "{refused}");
     }
 
     /// The committed chain-18 genesis (LIVE 2026-09-29 04:56 UTC, cut by `deploy/cut-chain18-genesis.sh`
     /// from chain 17 at height 5 604 on the v0.6.7-rc1 build) builds chain 18: the hash the fleet runs,
     /// the gas section (Phase 1 prices 100/800, the bundle pin, the Phase 2 controller), the memo on,
-    /// and this build accepts it — the counterpart of the chain-17 test above.
+    /// and — since constraint set 9 (the MODQ chip) — this build refuses it, by its listed hash.
     #[test]
-    fn chain_18s_genesis_file_builds_chain_18() {
+    fn chain_18s_genesis_file_is_refused_by_this_build() {
         let chain_18_hash = "a7cb020cc99a33c83fc38cfa0ec1db357f67fbf8b6dab13ab1d9812280b4da76";
         let committed = concat!(env!("CARGO_MANIFEST_DIR"), "/../../deploy/genesis-chain18.json");
         let gen = Genesis::from_json(&std::fs::read_to_string(committed).unwrap()).unwrap();
@@ -4808,17 +4890,22 @@ mod tests {
         assert_eq!(state.hash().to_hex(), chain_18_hash, "chain 18's live genesis");
         assert!(state.ledger.gas().is_some(), "the ledger prices calls and pins the bundle limit");
         assert_eq!(state.ledger.envelope_bytes(), Some(1860));
-        node::check_build_runs_genesis(&state, &ZkExecutor::known_hc_bundles()).expect("this build runs chain 18");
+        let (_, hash, _) = node::CHAINS_THIS_BUILD_CANNOT_RUN.iter().find(|(c, _, _)| *c == 18).expect("listed");
+        assert_eq!(state.hash().to_hex(), *hash, "the listed hash is the committed file's");
+        let e = node::refuse_chains_this_build_cannot_run(&state).unwrap_err().to_string();
+        assert!(e.contains("constraint set 8"), "{e}");
+        let at_run = node::check_build_runs_genesis(&state, &ZkExecutor::known_hc_bundles()).expect_err("this build refuses chain 18 at run").to_string();
+        assert_eq!(at_run, e, "run and verify give the same reason");
     }
 
     /// Chain 19, live 2026-10-01 03:43 UTC: a pure re-genesis of chain 18 on v0.6.7 (the
-    /// redeployed bridge endpoints as its emitters). This build must still compute its hash and
-    /// run it: none of the audit-v6 genesis fields (`testnet`, `binding_domain`, `bridge.rotation`,
+    /// redeployed bridge endpoints as its emitters). This build must still compute its hash, and
+    /// refuses it (constraint set 8's proofs; this build is set 9): none of the audit-v6 genesis fields (`testnet`, `binding_domain`, `bridge.rotation`,
     /// `proof_window_blocks`, the staking and vesting additions) is in its file, and it carries a
     /// faucet beside a bridge without the `testnet` marker, so its id is grandfathered
     /// (`FAUCET_BESIDE_BRIDGE_CHAIN_IDS`).
     #[test]
-    fn chain_19s_genesis_file_builds_chain_19() {
+    fn chain_19s_genesis_file_is_refused_by_this_build() {
         let chain_19_hash = "a3defc937d561d4beb1df9a08c9cb87a3dc32dadbfc2d1814ab6f627b0a2228a";
         let committed = concat!(env!("CARGO_MANIFEST_DIR"), "/../../deploy/genesis-chain19.json");
         let gen = Genesis::from_json(&std::fs::read_to_string(committed).unwrap()).unwrap();
@@ -4830,13 +4917,19 @@ mod tests {
         let executor = node::executor_for_profile(&gen.fri_profile).unwrap();
         let state = gen.build(executor.as_ref()).unwrap();
         assert_eq!(state.hash().to_hex(), chain_19_hash, "chain 19's live genesis");
-        node::check_build_runs_genesis(&state, &ZkExecutor::known_hc_bundles()).expect("this build runs chain 19");
+        let (_, hash, _) = node::CHAINS_THIS_BUILD_CANNOT_RUN.iter().find(|(c, _, _)| *c == 19).expect("listed");
+        assert_eq!(state.hash().to_hex(), *hash, "the listed hash is the committed file's");
+        let e = node::refuse_chains_this_build_cannot_run(&state).unwrap_err().to_string();
+        assert!(e.contains("constraint set 8"), "{e}");
+        let at_run = node::check_build_runs_genesis(&state, &ZkExecutor::known_hc_bundles()).expect_err("this build refuses chain 19 at run").to_string();
+        assert_eq!(at_run, e, "run and verify give the same reason");
     }
 
     /// Chain 20, live 2026-10-01 06:17 UTC on v0.6.8: chain 19's shape plus every audit-v6 genesis
-    /// field at its recommended value, RPL-2's `program_state` and the zUSD bridge fees.
+    /// field at its recommended value, RPL-2's `program_state` and the zUSD bridge fees. Refused by
+    /// this build (constraint set 9), by its listed hash.
     #[test]
-    fn chain_20s_genesis_file_builds_chain_20() {
+    fn chain_20s_genesis_file_is_refused_by_this_build() {
         let chain_20_hash = "6210cf071a390d7ac61d8cbea5dd9d139d1a493a862b54a45a498f36af2d5135";
         let committed = concat!(env!("CARGO_MANIFEST_DIR"), "/../../deploy/genesis-chain20.json");
         let gen = Genesis::from_json(&std::fs::read_to_string(committed).unwrap()).unwrap();
@@ -4849,10 +4942,15 @@ mod tests {
         let executor = node::executor_for_profile(&gen.fri_profile).unwrap();
         let state = gen.build(executor.as_ref()).unwrap();
         assert_eq!(state.hash().to_hex(), chain_20_hash, "chain 20's live genesis");
-        node::check_build_runs_genesis(&state, &ZkExecutor::known_hc_bundles()).expect("this build runs chain 20");
+        let (_, hash, _) = node::CHAINS_THIS_BUILD_CANNOT_RUN.iter().find(|(c, _, _)| *c == 20).expect("listed");
+        assert_eq!(state.hash().to_hex(), *hash, "the listed hash is the committed file's");
+        let e = node::refuse_chains_this_build_cannot_run(&state).unwrap_err().to_string();
+        assert!(e.contains("constraint set 8"), "{e}");
+        let at_run = node::check_build_runs_genesis(&state, &ZkExecutor::known_hc_bundles()).expect_err("this build refuses chain 20 at run").to_string();
+        assert_eq!(at_run, e, "run and verify give the same reason");
     }
 
-    /// This build is constraint set 8 (the gas meter, chain 18): every verifier key moved again, so
+    /// This build is constraint set 9 (the MODQ chip; set 8, the gas meter, ran chains 18-20): every verifier key moved again, so
     /// no proof chain 16 (constraint set 7, v0.6.1) committed verifies here. Chain 16 pins the v2
     /// guest, which this build still carries, so the `hc_bundle` check alone would let this binary
     /// start on chain 16 — and its startup replay (or a `verify --repair`) would then refuse, and
@@ -4865,10 +4963,10 @@ mod tests {
         let state = gen.build(executor.as_ref()).unwrap();
         assert_eq!(state.hash().to_hex(), "20925ae63cfa6e6c96f3ff369486ead8ea04821fec026a55df9e2893f3d53005");
         let refused = node::check_build_runs_genesis(&state, &ZkExecutor::known_hc_bundles())
-            .expect_err("a constraint-set-8 build must refuse chain 16")
+            .expect_err("a constraint-set-9 build must refuse chain 16")
             .to_string();
         assert!(
-            refused.contains("chain 16") && refused.contains("constraint set 7") && refused.contains("constraint set 8"),
+            refused.contains("chain 16") && refused.contains("constraint set 7") && refused.contains("constraint set 9"),
             "{refused}"
         );
         assert!(refused.contains("archive"), "the message names the archive risk: {refused}");
@@ -5312,6 +5410,7 @@ mod tests {
             fees: None,
             incremental_nullifier_root: None,
             perps: None,
+            hc_auth_multisig: None,
         }
     }
 
@@ -5547,6 +5646,24 @@ mod tests {
                 TreeStepPin { heights: h(17), program_digest: d.steps[1].0, key: d.steps[1].1 },
             ],
         }
+    }
+
+    /// Constraint set 9 / circuits Task 9b: the aggregator's cover assembly refuses a work row
+    /// whose bundle proof declares a modq table, before any rVM work (`prove_aggregate` and
+    /// `prove_tree_aggregate` both decode through `decode_inner_proofs`), and still decodes a
+    /// chip-free one.
+    #[test]
+    fn the_aggregators_cover_assembly_refuses_a_modq_bearing_inner_proof() {
+        use randprotocol_zkvm::machine::{Machine, ProveOptions, Tier};
+        let program = randprotocol_zkvm::executor::fixtures::one_modq_ntt_program();
+        let (modq, _) = Machine::new(FriProfile::Test).prove_with_options(&program, &[], &[], Some(Tier(10)), ProveOptions::default()).unwrap();
+        assert_eq!(modq.modq_log_height, 10);
+        let err = decode_inner_proofs(&[modq.to_bytes()]).err().expect("refused").to_string();
+        assert!(err.contains(randprotocol_node::agg_executor::INNER_MODQ_REFUSAL), "{err}");
+        let err = prove_aggregate(FriProfile::Test, &[modq.to_bytes()], &[0; 8]).unwrap_err().to_string();
+        assert!(err.contains(randprotocol_node::agg_executor::INNER_MODQ_REFUSAL), "flat: {err}");
+        let (plain, _) = Machine::new(FriProfile::Test).prove(&randprotocol_zkvm::guests::fib(10), &[], &[], None).unwrap();
+        assert_eq!(decode_inner_proofs(&[plain.to_bytes()]).unwrap().len(), 1);
     }
 
     /// `--layout tree`'s selection (spec §2's layout rule): the largest whole tree, `L·2^d` for

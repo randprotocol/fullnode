@@ -14,11 +14,16 @@ pub const ECALL_MEM_REG: u32 = REG_A1;
 pub struct MemAccess { pub space: u32, pub addr: u32, pub slot: u32, pub value: u32, pub is_write: bool }
 impl MemAccess { pub fn ts(&self, clk: u32) -> u32 { 4 * clk + self.slot } }
 
+/// One `MODQ` call: the decoded inputs and every RAM access (all reads at slot 0, then all writes
+/// at slot 1), kept apart from `CycleEvent::accesses` as the keccak and sha256 lists are.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ModqCall { pub clk: u32, pub base: u32, pub a1: u32, pub inputs: Vec<crate::modq::Poly>, pub accesses: Vec<MemAccess> }
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AluEvent { pub op: AluOp, pub a: u32, pub b: u32, pub c: u32 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Syscall { Halt, WriteOutput { slot: u32, word: u32 }, ReadInput { idx: u32, word: u32 }, ReadPublic { idx: u32, word: u32 }, Poseidon2 { ptr: u32, n: u32 }, Keccak { ptr: u32 }, Sha256 { ptr: u32 },
+pub enum Syscall { Halt, WriteOutput { slot: u32, word: u32 }, ReadInput { idx: u32, word: u32 }, ReadPublic { idx: u32, word: u32 }, Poseidon2 { ptr: u32, n: u32 }, Keccak { ptr: u32 }, Sha256 { ptr: u32 }, Modq { base: u32, a1: u32 },
     /// HCS-4 (the next constraint set): `POSEIDON2_LEN` — `Poseidon2`'s row group over the
     /// length-seeded sponge (`hash::sponge_hash_len`).
     Poseidon2Len { ptr: u32, n: u32 } }
@@ -104,6 +109,8 @@ pub struct CycleEvent {
     /// are wired up with the chip itself (M4.4 Tasks 3-4); this list is the emulator's record of
     /// what they must agree on.
     pub sha256_accesses: Vec<MemAccess>,
+    /// Private multisig phase 3: `Some` exactly on a `MODQ` row.
+    pub modq: Option<Box<ModqCall>>,
 }
 
 #[derive(Clone, Debug)]
@@ -137,7 +144,19 @@ pub enum ExecError {
     /// `ptr < 0x3000_0000`, and the emulator refuses at least those pointers so that every
     /// execution it admits has an honest trace the AIR can prove.
     Sha256PtrOutOfRange(u32),
+    /// `MODQ`: `a1` has a reserved bit set, or a transform names `A` / `B`.
+    ModqArgs(u32),
+    /// `MODQ`: the operands overlap (`modq::Args::aliasing_ok`); carries `a1`.
+    ModqAlias(u32),
+    /// `MODQ`: `BASE` past `MODQ_PTR_LIMIT`.
+    ModqPtrOutOfRange(u32),
+    /// `MODQ`: an input word `>= 2^24`.
+    ModqCoefficient { addr: u32, value: u32 },
 }
+
+/// The largest `BASE` a `MODQ` call may name: the arena spans `MODQ_SPAN_WORDS`, so this keeps
+/// every word it can touch below `0x3000_0000`.
+pub const MODQ_PTR_LIMIT: u32 = 0x3000_0000 - crate::isa::MODQ_SPAN_WORDS;
 
 /// The largest word address a `KECCAK` syscall may name: the state occupies `ptr ..
 /// ptr + KECCAK_WORDS`, so this limit keeps the *whole* state below `0x3000_0000`.
@@ -158,6 +177,19 @@ pub const KECCAK_PTR_LIMIT: u32 = 0x3000_0000 - KECCAK_WORDS;
 pub const SHA256_PTR_LIMIT: u32 = 0x3000_0000 - SHA256_WORDS;
 
 pub fn execute(program: &Program, inputs: &[u32], public: &[u32], max_cycles: usize) -> Result<Execution, ExecError> {
+    execute_inner(program, inputs, public, max_cycles, false)
+}
+
+/// Cheating-suite hook (spec §5; `cheating` feature only): `execute` with `SYS_MODQ` through `modq::call_unchecked` — no
+/// `ModqArgs`/`ModqAlias` refusal — so a test can hand the chip a reserved `a1` bit, a transform
+/// naming `A`, or overlapping operands. Every other refusal stands.
+#[cfg(feature = "cheating")]
+#[doc(hidden)]
+pub fn execute_unchecked_modq(program: &Program, inputs: &[u32], public: &[u32], max_cycles: usize) -> Result<Execution, ExecError> {
+    execute_inner(program, inputs, public, max_cycles, true)
+}
+
+fn execute_inner(program: &Program, inputs: &[u32], public: &[u32], max_cycles: usize, unchecked_modq: bool) -> Result<Execution, ExecError> {
     let mut regs = [0u32; 32];
     let mut ram: HashMap<u32, u32> = HashMap::new(); // word address -> value; unwritten reads are 0
     let mut outputs = [0u32; NUM_OUTPUTS];
@@ -257,7 +289,7 @@ pub fn execute(program: &Program, inputs: &[u32], public: &[u32], max_cycles: us
                         sys: Some(if len_bound { Syscall::Poseidon2Len { ptr, n } } else { Syscall::Poseidon2 { ptr, n } }),
                         accesses: acc.clone(), alu: alu.clone(),
                         hash_row: Some(HashRow::Ecall { ptr, n }), keccak_row: None, keccak_accesses: Vec::new(),
-                        sha256_row: None, sha256_accesses: Vec::new(),
+                        sha256_row: None, sha256_accesses: Vec::new(), modq: None,
                     });
                     clk += 1;
 
@@ -291,7 +323,7 @@ pub fn execute(program: &Program, inputs: &[u32], public: &[u32], max_cycles: us
                             alu_out: 0, tgt: 0, mem_addr: 0, mem_val: 0, sys: None, accesses: racc, alu: Vec::new(),
                             hash_row: Some(HashRow::Absorb { idx, left_before: left, words, active, state_in, state_out }),
                             keccak_row: None, keccak_accesses: Vec::new(),
-                            sha256_row: None, sha256_accesses: Vec::new(),
+                            sha256_row: None, sha256_accesses: Vec::new(), modq: None,
                         });
                         state = state_out;
                         left -= cnt;
@@ -318,7 +350,7 @@ pub fn execute(program: &Program, inputs: &[u32], public: &[u32], max_cycles: us
                             clk, pc, next_pc: row_next_pc, instr, dec: Decoded::default(), a: 0, b: 0, c: 0,
                             alu_out: 0, tgt: 0, mem_addr: 0, mem_val: 0, sys: None, accesses: wacc, alu: Vec::new(),
                             hash_row: Some(HashRow::WriteOut { fin, words, state }), keccak_row: None, keccak_accesses: Vec::new(),
-                            sha256_row: None, sha256_accesses: Vec::new(),
+                            sha256_row: None, sha256_accesses: Vec::new(), modq: None,
                         });
                         clk += 1;
                     }
@@ -364,7 +396,7 @@ pub fn execute(program: &Program, inputs: &[u32], public: &[u32], max_cycles: us
                         sys: Some(Syscall::Keccak { ptr }), accesses: std::mem::take(&mut acc), alu: std::mem::take(&mut alu),
                         hash_row: None,
                         keccak_row: Some(KeccakRow { ptr, input, output }), keccak_accesses: kacc,
-                        sha256_row: None, sha256_accesses: Vec::new(),
+                        sha256_row: None, sha256_accesses: Vec::new(), modq: None,
                     });
                     clk += 1;
                     regs[0] = 0;
@@ -406,7 +438,34 @@ pub fn execute(program: &Program, inputs: &[u32], public: &[u32], max_cycles: us
                         clk, pc, next_pc: pc.wrapping_add(4), instr, dec, a, b, c: 0, alu_out, tgt, mem_addr, mem_val,
                         sys: Some(Syscall::Sha256 { ptr }), accesses: std::mem::take(&mut acc), alu: std::mem::take(&mut alu),
                         hash_row: None, keccak_row: None, keccak_accesses: Vec::new(),
-                        sha256_row: Some(Sha256Row { clk, ptr, block, h_in, h_out }), sha256_accesses: sacc,
+                        sha256_row: Some(Sha256Row { clk, ptr, block, h_in, h_out }), sha256_accesses: sacc, modq: None,
+                    });
+                    clk += 1;
+                    regs[0] = 0;
+                    pc = pc.wrapping_add(4);
+                    pushed_own_rows = true;
+                } else if num == SYS_MODQ {
+                    let (base, a1) = (arg0, arg1);
+                    if base > MODQ_PTR_LIMIT { return Err(ExecError::ModqPtrOutOfRange(base)); }
+                    let read = |w: u32| *ram.get(&w).unwrap_or(&0);
+                    let io = if unchecked_modq { crate::modq::call_args(base, crate::modq::Args::decode_fields(a1), read) } else { crate::modq::call(base, a1, read) };
+                    let io = io.map_err(|e| match e {
+                        crate::modq::ModqError::Args(w) => ExecError::ModqArgs(w),
+                        crate::modq::ModqError::Alias(w) => ExecError::ModqAlias(w),
+                        crate::modq::ModqError::Coefficient { addr, value } => ExecError::ModqCoefficient { addr, value },
+                    })?;
+                    let mut macc = Vec::with_capacity(io.reads.len() + io.writes.len());
+                    for &(addr, value) in &io.reads { macc.push(MemAccess { space: SPACE_RAM, addr, slot: 0, value, is_write: false }); }
+                    for &(addr, value) in &io.writes {
+                        ram.insert(addr, value);
+                        macc.push(MemAccess { space: SPACE_RAM, addr, slot: 1, value, is_write: true });
+                    }
+                    events.push(CycleEvent {
+                        clk, pc, next_pc: pc.wrapping_add(4), instr, dec, a, b, c: 0, alu_out, tgt, mem_addr, mem_val,
+                        sys: Some(Syscall::Modq { base, a1 }), accesses: std::mem::take(&mut acc), alu: std::mem::take(&mut alu),
+                        hash_row: None, keccak_row: None, keccak_accesses: Vec::new(),
+                        sha256_row: None, sha256_accesses: Vec::new(),
+                        modq: Some(Box::new(ModqCall { clk, base, a1, inputs: io.inputs, accesses: macc })),
                     });
                     clk += 1;
                     regs[0] = 0;
@@ -451,7 +510,7 @@ pub fn execute(program: &Program, inputs: &[u32], public: &[u32], max_cycles: us
         }
         regs[0] = 0;
         let halted = matches!(sys, Some(Syscall::Halt));
-        events.push(CycleEvent { clk, pc, next_pc, instr, dec, a, b, c, alu_out, tgt, mem_addr, mem_val, sys, accesses: acc, alu, hash_row: None, keccak_row: None, keccak_accesses: Vec::new(), sha256_row: None, sha256_accesses: Vec::new() });
+        events.push(CycleEvent { clk, pc, next_pc, instr, dec, a, b, c, alu_out, tgt, mem_addr, mem_val, sys, accesses: acc, alu, hash_row: None, keccak_row: None, keccak_accesses: Vec::new(), sha256_row: None, sha256_accesses: Vec::new(), modq: None });
         clk += 1;
         if halted { return Ok(Execution { events, outputs, halted: true }); }
         pc = next_pc;

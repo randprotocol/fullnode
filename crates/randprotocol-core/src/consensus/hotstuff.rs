@@ -66,6 +66,22 @@ struct Entry {
     qc: Option<QuorumCertificate>,
 }
 
+/// A proposal's apply, computed off the consensus loop (spec 2026-10-11 off-loop apply, §3):
+/// `apply_block_for_sync`'s outcome on a clone of [`HotStuff::ledger_after`] the block's parent,
+/// with [`HotStuff::covered_sidecar`]'s records and the replica's own executor and verified set.
+/// [`HotStuff::on_proposal_with`] takes it in place of applying on the loop, and only when
+/// `parent` is the block's parent and that parent is still in the tree; otherwise it is dropped
+/// and the block is applied as [`HotStuff::on_proposal`] applies it. Apply is deterministic and a
+/// tree entry's post-state never changes while it is held, so the two are the same result.
+/// An apply that ran across a commit can carry a `SharedSet` delta that the shared base has since
+/// absorbed, until the entry's next absorb: logically equal, costing only memory.
+pub struct PreApplied {
+    /// The hash of the block whose `ledger_after` was cloned.
+    pub parent: Hash,
+    /// The apply's post-state and receipts, or its refusal.
+    pub result: Result<(Ledger, Vec<crate::program::CallReceipt>), BlockError>,
+}
+
 /// Chained HotStuff replica. Validators hold a `signer`; observing full nodes do not.
 /// What the covered-carrying apply path asks of the node (block aggregation, spec §3.2): the
 /// covered bundles' records for an aggregate's cover set, or `None` when any of them is
@@ -411,7 +427,7 @@ impl HotStuff {
                 tracing::info!("pending block {hash:?} (height {}) does not extend a block this replica holds; dropped", block.height());
                 continue;
             }
-            match self.execute_and_insert(&block) {
+            match self.execute_and_insert(&block, None) {
                 Ok(()) => restored += 1,
                 Err(e) => tracing::warn!("pending block {hash:?} (height {}) did not re-execute: {e}; dropped", block.height()),
             }
@@ -508,8 +524,9 @@ impl HotStuff {
     /// The covered-bundle records a block's `Aggregate` transactions need, keyed by their
     /// index in it — empty for a block that carries none, so a chain that never aggregates
     /// never consults the source. An aggregate the source cannot cover is the covered-carrying
-    /// admission's refusal, at its index.
-    fn covered_sidecar(&self, block: &Block) -> Result<BTreeMap<usize, Vec<CoveredBundle>>, ConsensusError> {
+    /// admission's refusal, at its index. Public for the node's off-loop apply ([`PreApplied`]),
+    /// which must hand `apply_block_for_sync` exactly the sidecar the on-loop apply would.
+    pub fn covered_sidecar(&self, block: &Block) -> Result<BTreeMap<usize, Vec<CoveredBundle>>, ConsensusError> {
         let mut sidecar = BTreeMap::new();
         for (index, tx) in block.transactions.iter().enumerate() {
             if let crate::types::Action::Aggregate { covers, .. } = &tx.action {
@@ -696,6 +713,17 @@ impl HotStuff {
     }
     pub fn block(&self, hash: &Hash) -> Option<&Block> {
         self.tree.get(hash).map(|e| &e.block)
+    }
+    /// The post-state of a block in the tree: what a child's off-loop apply ([`PreApplied`])
+    /// clones. `None` when the block is not held — an orphan's parent, or one pruned — and the
+    /// child is then delivered plainly.
+    pub fn ledger_after(&self, hash: &Hash) -> Option<&Ledger> {
+        self.tree.get(hash).map(|e| &e.ledger_after)
+    }
+    /// The receipts a block in the tree was applied with.
+    #[cfg(test)]
+    pub(crate) fn receipts(&self, hash: &Hash) -> Option<&[crate::program::CallReceipt]> {
+        self.tree.get(hash).map(|e| e.receipts.as_slice())
     }
     /// Ledger state on top of the block the next proposal would extend.
     pub fn tip_ledger(&self) -> &Ledger {
@@ -937,94 +965,61 @@ impl HotStuff {
     }
 
     pub fn on_proposal(&mut self, block: Block, now_ms: u64) -> Result<Vec<Action>, ConsensusError> {
+        self.on_proposal_with(block, now_ms, None)
+    }
+
+    /// [`Self::on_proposal`], with the apply step possibly done already, off the loop
+    /// ([`PreApplied`]). Every check before the apply runs here, unchanged and in the same order,
+    /// and everything after it too: only the clone, sidecar and apply of the parent's post-state
+    /// are replaced, and only when `pre` was computed on this block's parent and that parent is
+    /// still in the tree. A `pre` that is not used is dropped; the block is applied as always.
+    pub fn on_proposal_with(&mut self, block: Block, now_ms: u64, pre: Option<PreApplied>) -> Result<Vec<Action>, ConsensusError> {
         let mut out = Vec::new();
         let hash = block.hash();
         if self.tree.contains_key(&hash) {
             return Ok(out);
         }
-        if block.view() > self.view.saturating_add(MAX_VIEW_AHEAD) {
-            return Err(ConsensusError::ViewOutOfRange { view: block.view() });
-        }
-        // The proposal window (audit v4, CON-3): a block for a view far past this replica's is
-        // refused before its signature is even checked, and is not kept as an orphan either —
-        // the view moves on QCs and NewViews, and a far-behind replica catches up through sync.
-        if block.view() > self.view.saturating_add(PROPOSAL_VIEW_WINDOW) {
-            return Err(ConsensusError::ViewTooFarAhead { view: block.view(), current: self.view });
-        }
-        if block.height() <= self.committed_height {
-            return Err(ConsensusError::Stale(block.height()));
-        }
-        if !block.verify_signature(&self.cfg.domain) {
-            return Err(ConsensusError::BadSignature);
-        }
+        self.check_before_parent(&block)?;
         // The set of a block's epoch is derived from its branch, so the parent comes first.
         let parent_hash = block.parent();
-        let Some(parent) = self.tree.get(&parent_hash) else {
+        if !self.tree.contains_key(&parent_hash) {
             let bytes = self.check_orphan(&block)?;
             self.add_orphan(block, bytes);
             return Err(ConsensusError::UnknownParent(parent_hash));
-        };
-        let parent_height = parent.block.height();
-        let parent_view = parent.block.view();
-        let grandparent = parent.block.parent();
-        // Pin the block to its parent before deriving anything from its height: the epoch of an
-        // unchecked height is attacker-chosen, and each distinct one would be a fresh register
-        // walk and a fresh cache entry keyed on a parent that never leaves the tree.
-        if block.view() <= parent_view {
-            return Err(ConsensusError::ViewNotIncreasing { block: block.view(), parent: parent_view });
         }
-        if block.height() != parent_height + 1 {
-            return Err(ConsensusError::BadHeight { block: block.height(), parent: parent_height });
-        }
-        let Some(set) = self.shared_set_for_height(block.height(), &parent_hash) else {
-            return Err(ConsensusError::UnknownEpochSet(self.epoch(block.height())));
-        };
-        if block.proposer() != set.leader(block.view()) {
-            return Err(ConsensusError::WrongLeader(block.view()));
-        }
+        self.check_against_parent(&block)?;
         // One block per (view, leader) (audit v4, CON-3). Checked once the signature and the
         // leader are known, so the first block is the leader's own evidence: a second, different
         // one for the same view is an equivocation, refused and logged with both hashes.
-        let proposed_key = (block.view(), block.proposer());
-        if let Some(first) = self.proposed.get(&proposed_key) {
-            if *first != hash {
-                tracing::warn!(
-                    view = block.view(),
-                    proposer = %block.proposer(),
-                    first = ?first,
-                    second = ?hash,
-                    "leader equivocated: a second block for a view it already proposed in"
-                );
-                // Audit v6, STAKE-1: keep both signed headers as evidence — the first block's,
-                // still in the tree, and this one's, whose signature was verified above — for
-                // the node to turn into a `SlashEquivocation`. Only on a chain that slashes
-                // (elsewhere the pair would be held for nothing), only while the first block is
-                // still held (its header and signature are what the tree keeps), bounded.
-                let slashes = self.committed_ledger.staking().is_some_and(|s| s.slashing.is_some());
-                if slashes && self.evidence.len() < MAX_EVIDENCE_HELD {
-                    if let Some(entry) = self.tree.get(first) {
-                        let held = crate::types::actions::SignedHeader { header: entry.block.header.clone(), signature: entry.block.signature.clone() };
-                        let refused = crate::types::actions::SignedHeader { header: block.header.clone(), signature: block.signature.clone() };
-                        let (first, second) = crate::types::actions::SignedHeader::ordered(held, refused);
-                        self.evidence.push(Action::Equivocation { first, second });
-                    }
+        if let Some(first) = self.equivocated(&block, &hash) {
+            tracing::warn!(
+                view = block.view(),
+                proposer = %block.proposer(),
+                first = ?first,
+                second = ?hash,
+                "leader equivocated: a second block for a view it already proposed in"
+            );
+            // Audit v6, STAKE-1: keep both signed headers as evidence — the first block's,
+            // still in the tree, and this one's, whose signature was verified above — for
+            // the node to turn into a `SlashEquivocation`. Only on a chain that slashes
+            // (elsewhere the pair would be held for nothing), only while the first block is
+            // still held (its header and signature are what the tree keeps), bounded.
+            let slashes = self.committed_ledger.staking().is_some_and(|s| s.slashing.is_some());
+            if slashes && self.evidence.len() < MAX_EVIDENCE_HELD {
+                if let Some(entry) = self.tree.get(&first) {
+                    let held = crate::types::actions::SignedHeader { header: entry.block.header.clone(), signature: entry.block.signature.clone() };
+                    let refused = crate::types::actions::SignedHeader { header: block.header.clone(), signature: block.signature.clone() };
+                    let (first, second) = crate::types::actions::SignedHeader::ordered(held, refused);
+                    self.evidence.push(Action::Equivocation { first, second });
                 }
-                return Err(ConsensusError::Equivocation { view: block.view(), first: *first, second: hash });
             }
+            return Err(ConsensusError::Equivocation { view: block.view(), first, second: hash });
         }
-        if block.header.justify.block_hash != parent_hash {
-            return Err(ConsensusError::JustifyParentMismatch);
-        }
-        // `justify` certifies the parent, so it is the parent's own epoch that voted for it.
-        let Some(parent_set) = self.shared_set_for_height(parent_height, &grandparent) else {
-            return Err(ConsensusError::UnknownEpochSet(self.epoch(parent_height)));
-        };
+        let parent_set = self.check_justify_parent(&block)?;
         if !self.verified_qcs.check(&self.cfg.domain, &block.header.justify, &parent_set) {
             return Err(ConsensusError::BadJustify);
         }
-        if block.header.justify.view != parent_view && !block.header.justify.is_genesis() {
-            return Err(ConsensusError::BadJustify);
-        }
+        self.check_justify_view(&block)?;
         let parent = &self.tree[&parent_hash];
         // The shielded chain reads no clock: `time` is bounded in block heights (spec §7
         // item 5), so a block's timestamp constrains nothing a replica must agree on. A
@@ -1046,8 +1041,9 @@ impl HotStuff {
         if self.tree.len() >= self.cfg.max_tree_blocks {
             return Err(ConsensusError::TreeFull);
         }
-        // `evict_for_room` never removes the certified chain, so the parent is still there.
-        self.execute_and_insert(&block)?;
+        // `execute_and_insert` looks the parent up again and refuses with `UnknownParent` if it
+        // is gone; that re-lookup, not `evict_for_room`'s choice, is what keeps the apply safe.
+        self.execute_and_insert(&block, pre)?;
         self.refresh_current_set();
 
         // A valid proposal for view v moves us into view v.
@@ -1094,17 +1090,144 @@ impl HotStuff {
         Ok(out)
     }
 
+    /// `on_proposal`'s refusals that need neither the parent nor any state but the view and the
+    /// committed height, in its order: the view range and window, a stale height, the signature.
+    fn check_before_parent(&self, block: &Block) -> Result<(), ConsensusError> {
+        if block.view() > self.view.saturating_add(MAX_VIEW_AHEAD) {
+            return Err(ConsensusError::ViewOutOfRange { view: block.view() });
+        }
+        // The proposal window (audit v4, CON-3): a block for a view far past this replica's is
+        // refused before its signature is even checked, and is not kept as an orphan either —
+        // the view moves on QCs and NewViews, and a far-behind replica catches up through sync.
+        if block.view() > self.view.saturating_add(PROPOSAL_VIEW_WINDOW) {
+            return Err(ConsensusError::ViewTooFarAhead { view: block.view(), current: self.view });
+        }
+        if block.height() <= self.committed_height {
+            return Err(ConsensusError::Stale(block.height()));
+        }
+        if !block.verify_signature(&self.cfg.domain) {
+            return Err(ConsensusError::BadSignature);
+        }
+        Ok(())
+    }
+
+    /// `on_proposal`'s refusals against the held parent, in its order: the view increases, the
+    /// height is the parent's plus one, and the proposer leads the view in the block's epoch.
+    /// The parent must be in the tree.
+    fn check_against_parent(&self, block: &Block) -> Result<(), ConsensusError> {
+        let parent_hash = block.parent();
+        let parent = &self.tree[&parent_hash];
+        let (parent_height, parent_view) = (parent.block.height(), parent.block.view());
+        // Pin the block to its parent before deriving anything from its height: the epoch of an
+        // unchecked height is attacker-chosen, and each distinct one would be a fresh register
+        // walk and a fresh cache entry keyed on a parent that never leaves the tree.
+        if block.view() <= parent_view {
+            return Err(ConsensusError::ViewNotIncreasing { block: block.view(), parent: parent_view });
+        }
+        if block.height() != parent_height + 1 {
+            return Err(ConsensusError::BadHeight { block: block.height(), parent: parent_height });
+        }
+        let Some(set) = self.shared_set_for_height(block.height(), &parent_hash) else {
+            return Err(ConsensusError::UnknownEpochSet(self.epoch(block.height())));
+        };
+        if block.proposer() != set.leader(block.view()) {
+            return Err(ConsensusError::WrongLeader(block.view()));
+        }
+        Ok(())
+    }
+
+    /// The block this replica already holds from `block`'s leader for `block`'s view, when it is
+    /// not `block` (`hash`): an equivocation. Reads only.
+    fn equivocated(&self, block: &Block, hash: &Hash) -> Option<Hash> {
+        self.proposed.get(&(block.view(), block.proposer())).copied().filter(|first| first != hash)
+    }
+
+    /// `on_proposal`'s justify refusals before the certificate's signatures: it names the
+    /// parent, and the parent's epoch set is known — returned, for the certificate check. The
+    /// parent must be in the tree.
+    fn check_justify_parent(&self, block: &Block) -> Result<Arc<ValidatorSet>, ConsensusError> {
+        let parent_hash = block.parent();
+        if block.header.justify.block_hash != parent_hash {
+            return Err(ConsensusError::JustifyParentMismatch);
+        }
+        let parent = &self.tree[&parent_hash];
+        let (parent_height, grandparent) = (parent.block.height(), parent.block.parent());
+        // `justify` certifies the parent, so it is the parent's own epoch that voted for it.
+        self.shared_set_for_height(parent_height, &grandparent).ok_or_else(|| ConsensusError::UnknownEpochSet(self.epoch(parent_height)))
+    }
+
+    /// `on_proposal`'s last justify refusal, after the certificate's signatures: it is for the
+    /// parent's view. The parent must be in the tree.
+    fn check_justify_view(&self, block: &Block) -> Result<(), ConsensusError> {
+        let parent_view = self.tree[&block.parent()].block.view();
+        if block.header.justify.view != parent_view && !block.header.justify.is_genesis() {
+            return Err(ConsensusError::BadJustify);
+        }
+        Ok(())
+    }
+
+    /// Whether [`Self::on_proposal`] would get as far as the apply with `block`, for the node's
+    /// off-loop apply ([`PreApplied`]): a block refused here is delivered on the loop instead,
+    /// so a proposal a cheap check refuses never costs a worker's apply, and a copy of an
+    /// honest block's hash that is not that block (a forged signature; GOSSIP-2's repeated tail)
+    /// never takes its place. Runs `on_proposal`'s pre-execute refusals through the same code,
+    /// reading only — the view range and window, a stale height, the signature, the parent
+    /// (`UnknownParent` when it is not held and the block passes `check_orphan`, whose refusal
+    /// is returned otherwise; nothing is orphaned), its view and height, the
+    /// leader, an equivocation (no evidence kept), the justify's parent and set and view — plus
+    /// [`Block::transaction_list_fault`], in place of the apply that would refuse it. Two checks
+    /// are left to `on_proposal`: the certificate's signatures (verified there once, through
+    /// the verified-QC cache, which this read-only path does not fill) and the tree's room.
+    pub fn precheck_proposal(&self, block: &Block) -> Result<(), ConsensusError> {
+        self.check_before_parent(block)?;
+        // Before the parent, so a block that waits for its parent is screened for it too.
+        match block.transaction_list_fault() {
+            None => {}
+            Some(_) if block.verify_tx_root() => return Err(BlockError::RepeatedTransaction.into()),
+            Some(_) => return Err(BlockError::TxRootMismatch.into()),
+        }
+        let parent_hash = block.parent();
+        if !self.tree.contains_key(&parent_hash) {
+            // The orphan checks `on_proposal` runs on such a block (final review I1): a block that
+            // waits for its parent must be one the replica would keep as an orphan — a proposer
+            // that leads its view in the current or next set, a height and view that can link,
+            // the transaction count and byte cap, a justify no larger than a set. Without them a
+            // key that leads no view, signing its own header, could take every waiting place.
+            self.check_orphan(block)?;
+            return Err(ConsensusError::UnknownParent(parent_hash));
+        }
+        self.check_against_parent(block)?;
+        let hash = block.hash();
+        if let Some(first) = self.equivocated(block, &hash) {
+            return Err(ConsensusError::Equivocation { view: block.view(), first, second: hash });
+        }
+        self.check_justify_parent(block)?;
+        self.check_justify_view(block)
+    }
+
     /// Execute `block` on its parent's state and put it in the tree: the one insertion path,
     /// shared by `on_proposal` and the locked block's restore. The parent must be in the tree.
-    fn execute_and_insert(&mut self, block: &Block) -> Result<(), ConsensusError> {
+    /// A `pre` computed on that same parent ([`PreApplied`]) stands in for the clone, sidecar and
+    /// apply; any other `pre` is dropped and the block is applied here.
+    fn execute_and_insert(&mut self, block: &Block, pre: Option<PreApplied>) -> Result<(), ConsensusError> {
         let hash = block.hash();
         let parent_hash = block.parent();
         let parent = self.tree.get(&parent_hash).ok_or(ConsensusError::UnknownParent(parent_hash))?;
-        let mut ledger = parent.ledger_after.clone();
-        let sidecar = self.covered_sidecar(block)?;
-        // B5: the admission cache comes along — a transaction this node verified at the pool is
-        // decoded here, not re-verified. Everything stateful is re-checked either way.
-        let receipts = ledger.apply_block_for_sync(block, &sidecar, &[], self.executor.as_ref(), self.verified.as_ref())?;
+        // `parent` was found just above, so a `pre` on the same hash is a result on this very
+        // post-state; any other is dropped.
+        let applied = match pre {
+            Some(pre) if pre.parent == parent_hash => pre.result,
+            _ => {
+                let mut ledger = parent.ledger_after.clone();
+                let sidecar = self.covered_sidecar(block)?;
+                // B5: the admission cache comes along — a transaction this node verified at the
+                // pool is decoded here, not re-verified. Everything stateful is re-checked either way.
+                ledger
+                    .apply_block_for_sync(block, &sidecar, &[], self.executor.as_ref(), self.verified.as_ref())
+                    .map(|receipts| (ledger, receipts))
+            }
+        };
+        let (ledger, receipts) = applied.map_err(Self::apply_error)?;
         self.tree.insert(hash, Entry { block: block.clone(), ledger_after: ledger, receipts, qc: None });
         self.proposed.insert((block.view(), block.proposer()), hash);
         while self.proposed.len() > MAX_PROPOSED_KEYS {
@@ -1116,6 +1239,12 @@ impl HotStuff {
         self.not_held.remove(&hash);
         self.unobtainable.remove(&hash);
         Ok(())
+    }
+
+    /// How an apply's refusal reaches `on_proposal`'s caller — the one mapping, whether the
+    /// apply ran here or off the loop ([`PreApplied`]).
+    fn apply_error(e: BlockError) -> ConsensusError {
+        ConsensusError::Execution(e)
     }
 
     pub fn on_vote(&mut self, vote: Vote) -> Result<Vec<Action>, ConsensusError> {

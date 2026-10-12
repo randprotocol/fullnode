@@ -109,7 +109,7 @@ fn the_manifest_covers_every_vendored_file_and_nothing_else() {
 #[test]
 fn each_circuits_pin_names_the_manifest_digest() {
     let manifest = manifest();
-    for guest in ["fib", "keccak256", "evm", "sbpf"] {
+    for guest in ["fib", "keccak256", "evm", "sbpf", "dilithium-verify", "msauth"] {
         let bin = format!("bin/{guest}.bin");
         let want = &manifest.iter().find(|(_, p)| *p == bin).unwrap_or_else(|| panic!("{bin} not in SHA256SUMS")).0;
         let pin = std::fs::read_to_string(dir().join(format!("{bin}.sha256"))).unwrap();
@@ -194,6 +194,19 @@ fn the_auth_guest_is_pinned() {
         !ZkExecutor::known_hc_bundles().map(|h| word8_to_hex(&h)).contains(&auth.to_string()),
         "the auth guest's digest must not be a bundle guest's"
     );
+}
+
+/// The docs name the pinned multisig auth guest and its tier, as they do hc_auth.
+#[test]
+fn the_docs_name_the_multisig_auth_guest() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let hc = word8_to_hex(&ZkExecutor::hc_auth_multisig());
+    for doc in ["docs/shielded.md", "docs/prover.md", "docs/rpc.md"] {
+        let text = std::fs::read_to_string(root.join(doc)).unwrap();
+        assert!(text.contains("hc_auth_multisig"), "{doc} does not mention hc_auth_multisig");
+    }
+    let shielded = std::fs::read_to_string(root.join("docs/shielded.md")).unwrap();
+    assert!(shielded.contains(&hc) && shielded.contains("tier 18"), "docs/shielded.md names the guest's digest and tier");
 }
 
 /// ZKG-2: the pin above, for every genesis file the repository carries — chain 15 included, which
@@ -322,4 +335,74 @@ fn the_cuda_backend_is_one_git_revision_in_both_manifests() {
     assert!(zkvm.contains("git = \"https://github.com/randprotocol/zkp-circuits\""), "{zkvm}");
     assert!(zkvm.contains("optional = true"), "{zkvm}");
     assert!(!zkvm.contains("path ="), "a path dependency outside the repository again: {zkvm}");
+}
+
+/// Private multisig phase 4: the re-vendor brought the MODQ chip (syscall 8, `MODQ_GAS`), the
+/// `msauth` host model and the compiled `msauth` guest, and the guest is in the manifest.
+#[test]
+fn the_msauth_guest_and_the_modq_chip_are_vendored() {
+    let manifest = manifest();
+    for path in ["bin/msauth.bin", "bin/msauth.bin.sha256", "bin/dilithium-verify.bin", "bin/dilithium-verify.bin.sha256"] {
+        assert!(manifest.iter().any(|(_, p)| p == path), "{path} is not in SHA256SUMS");
+    }
+    assert_eq!(randprotocol_zkvm::isa::SYS_MODQ, 8);
+    assert_eq!(randprotocol_zkvm::gas::MODQ_GAS, 168);
+    assert_eq!(randprotocol_zkvm::msauth::MSAUTH_WORDS, 17 + randprotocol_zkvm::msauth::M_MAX * 967);
+    assert!(!randprotocol_zkvm::guests::compiled::msauth().words.is_empty());
+    // Its tags are node-local and sit beside auth.rs's: AUTH is the same 65.
+    assert_eq!(randprotocol_zkvm::msauth::AUTH, randprotocol_zkvm::auth::AUTH_DOMAIN);
+}
+
+/// No guest program moved: every digest pin above is unchanged by the MODQ re-vendor (only
+/// verifier keys moved), and the msauth guest is none of them.
+#[test]
+fn the_modq_re_vendor_moved_no_guest_program() {
+    let msauth = randprotocol_zkvm::guests::compiled::msauth().digest();
+    assert_eq!(word8_to_hex(&ZkExecutor::hc_auth()), "1e4e347f44cf86750b30a9a4bdf9ec9256efe353d4ff8017451eca7d195639c1");
+    assert_eq!(word8_to_hex(&ZkExecutor::hc_hidden_bundle_v3()), "60af094acfe65d85fdb18fb3d06cf9085dcf28c96e59e87f1ee527226e6e3fce");
+    assert!(!ZkExecutor::known_hc_bundles().contains(&msauth) && msauth != ZkExecutor::hc_auth());
+}
+
+/// The multisig auth guest (`guests::compiled::msauth()`, private multisig phase 4) is the value a
+/// genesis carries as `hc_auth_multisig`. Its digest is that of circuits Task 8's `msauth.bin`
+/// (c55cfa1; the vendored file's sha256 is the manifest's), pinned so a re-vendor that moves it
+/// fails here, not at a chain's first block.
+const MSAUTH_HC: &str = "9705f8e2f1bc8561848b29cb8efd57c37e3e39788fa58a5f03304d8019668247";
+
+#[test]
+fn the_multisig_auth_guest_is_pinned() {
+    assert_eq!(MSAUTH_HC.len(), 64, "write circuits Task 8's msauth hc into MSAUTH_HC (Task 2 Step 3)");
+    assert_eq!(word8_to_hex(&ZkExecutor::hc_auth_multisig()), MSAUTH_HC);
+    assert_eq!(randprotocol_zkvm::executor::MSAUTH_TIER, 18, "the MODQ ruling: tier 18 only");
+    assert_ne!(ZkExecutor::hc_auth_multisig(), ZkExecutor::hc_auth());
+    assert!(!ZkExecutor::known_hc_bundles().contains(&ZkExecutor::hc_auth_multisig()));
+}
+
+/// The precomputed msauth verifier key (plan Task 2b, spec §3.6) is consensus-critical: a wrong
+/// commitment could let a forged multisig proof verify. Both profiles' blobs are pinned by the
+/// SHA-256 of their file bytes. Both are committed (`keys/msauth-vk-{test,production}.bin`) and
+/// must hash to their pins; `$MSAUTH_VK_PRODUCTION_BLOB`, if set, is checked as well (a release
+/// asset about to ship), and `docs/deploy.md` must name the production pin so an operator can
+/// compare by hand.
+#[test]
+fn the_msauth_verifier_key_blobs_are_pinned() {
+    use randprotocol_zkvm::executor::msauth_vk::{digest, MSAUTH_VK_SHA256_PRODUCTION, MSAUTH_VK_SHA256_TEST, PIN_PENDING};
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    for (profile, pin) in [("test", MSAUTH_VK_SHA256_TEST), ("production", MSAUTH_VK_SHA256_PRODUCTION)] {
+        assert_eq!(pin.len(), 64, "{profile}: a SHA-256 pin is 64 hex characters");
+        assert!(pin.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()), "{profile}: lowercase hex");
+        assert_ne!(pin, PIN_PENDING, "{profile}: the pin is still the placeholder");
+    }
+    let test = root.join("keys/msauth-vk-test.bin");
+    let bytes = std::fs::read(&test).unwrap_or_else(|e| panic!("{}: {e}; run `rand-node keygen-msauth-vk --profile test --out {}`", test.display(), test.display()));
+    assert_eq!(digest(&bytes), MSAUTH_VK_SHA256_TEST, "test msauth key blob {} ({} bytes): write the computed digest (left) into MSAUTH_VK_SHA256_TEST", test.display(), bytes.len());
+    let committed = root.join("keys/msauth-vk-production.bin");
+    let bytes = std::fs::read(&committed).unwrap_or_else(|e| panic!("{}: {e}; run `rand-node keygen-msauth-vk --profile production --out {}`", committed.display(), committed.display()));
+    assert_eq!(digest(&bytes), MSAUTH_VK_SHA256_PRODUCTION, "production msauth key blob {} ({} bytes): write the computed digest (left) into MSAUTH_VK_SHA256_PRODUCTION", committed.display(), bytes.len());
+    if let Some(extra) = std::env::var_os("MSAUTH_VK_PRODUCTION_BLOB").map(PathBuf::from) {
+        let bytes = std::fs::read(&extra).unwrap_or_else(|e| panic!("{}: {e}", extra.display()));
+        assert_eq!(digest(&bytes), MSAUTH_VK_SHA256_PRODUCTION, "MSAUTH_VK_PRODUCTION_BLOB {} is not the pinned production blob", extra.display());
+    }
+    let deploy = std::fs::read_to_string(root.join("../../docs/deploy.md")).unwrap();
+    assert!(deploy.contains(MSAUTH_VK_SHA256_PRODUCTION), "docs/deploy.md names the production msauth key pin");
 }

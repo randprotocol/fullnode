@@ -719,14 +719,14 @@ fn the_genesis_command_writes_an_aggregation_tree_section_it_checks_first() {
             "leaf_size": 1,
             "max_depth": 2,
             "leaf": { "tier": 18, "reg_log_height": 19, "ram_log_height": 19, "poseidon2_log_height": 14, "reduce_log_height": 16 },
-            "vk_leaf": [1769152780461762224u64, 4754121159208375271u64, 16285051620565002471u64, 12356170513791122891u64],
+            "vk_leaf": [8319022251449045440u64, 6921460171031583545u64, 12120586048388560564u64, 2237657693139026209u64],
             "steps": [
-                { "heights": { "tier": 19, "reg_log_height": 20, "ram_log_height": 20, "poseidon2_log_height": 15, "reduce_log_height": 16 },
-                  "program_digest": limbs("2c586636c4c0f94cdf13b410154679d995eefad11e27371e0786e89e206ccd34"),
-                  "key": [7711328338169539612u64, 5984874271003933741u64, 17134834717916042633u64, 2542356665053237370u64] },
-                { "heights": { "tier": 19, "reg_log_height": 20, "ram_log_height": 20, "poseidon2_log_height": 15, "reduce_log_height": 17 },
-                  "program_digest": limbs("04b1677122526e51c0d278375b0c30ebd37f94ba8a2afed3cd3e019ecdc3c226"),
-                  "key": [12189568167191873679u64, 7035563939045772652u64, 12535684755110529647u64, 4848701472125205360u64] }
+                { "heights": { "tier": 18, "reg_log_height": 19, "ram_log_height": 20, "poseidon2_log_height": 15, "reduce_log_height": 17 },
+                  "program_digest": limbs("d8d558eecb8fbdaaba7eaa93d7d04bae0a47808f31978ecea804f04f7e6e5d93"),
+                  "key": [149934054759036529u64, 11853972217771236064u64, 7974370166788545537u64, 4681341164698736412u64] },
+                { "heights": { "tier": 18, "reg_log_height": 19, "ram_log_height": 20, "poseidon2_log_height": 15, "reduce_log_height": 17 },
+                  "program_digest": limbs("a222637e1eb9333b16b820bbacceaac9ea0e5d4cebfc5379d170796a2ac6dc62"),
+                  "key": [17974589521606301101u64, 12194447673073698417u64, 12600030651550503010u64, 948039196462741351u64] }
             ]
         });
         edit(&mut v);
@@ -750,7 +750,9 @@ fn the_genesis_command_writes_an_aggregation_tree_section_it_checks_first() {
         (&(|v: &mut serde_json::Value| v["leaf_size"] = 6.into()) as &dyn Fn(&mut serde_json::Value), "leaf_size"),
         (&|v: &mut serde_json::Value| v["steps"][1]["key"][0] = 1.into(), "tree level 3"),
         (&|v: &mut serde_json::Value| v["steps"][0]["program_digest"][0] = 1.into(), "aggregate program"),
-        (&|v: &mut serde_json::Value| v["max_depth"] = 3.into(), "fixed point"),
+        // rVM phase 4 (circuits docs/09 §7): level 2 is a fixed point, so a deeper max_depth over
+        // both levels is servable; level 1 alone is not one.
+        (&|v: &mut serde_json::Value| { v["steps"].as_array_mut().unwrap().truncate(1) }, "fixed point"),
     ] {
         let refused = dir.path().join("refused.json");
         let run = run(&refused, &section(edit));
@@ -764,4 +766,43 @@ fn the_genesis_command_writes_an_aggregation_tree_section_it_checks_first() {
 /// A distinct file name per section variant.
 fn rand_suffix(v: &serde_json::Value) -> String {
     blake3::hash(v.to_string().as_bytes()).to_hex()[..12].to_string()
+}
+
+/// Private multisig phase 4: `--auth-multisig-guest` pins this build's msauth guest as
+/// `hc_auth_multisig` (from `ZkExecutor::hc_auth_multisig()`, never retyped) and prints it; it
+/// requires `--auth-guest`, and without it the command is refused, with the reason, before any
+/// file is written. (The plan's `run_genesis` is this file's `genesis` runner.)
+#[test]
+fn genesis_auth_multisig_guest_writes_this_builds_msauth_hc_and_needs_auth_guest() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("g.json");
+    let ok = genesis(
+        &out,
+        &["--bundle-guest", "v3", "--auth-guest", "--auth-multisig-guest", "--max-proof-bytes", "4194304", "--max-block-bytes", "20971520"],
+    );
+    assert!(ok.status.success(), "{}", String::from_utf8_lossy(&ok.stderr));
+    let gen = read(&out);
+    let want = word8_to_hex(&ZkExecutor::hc_auth_multisig());
+    assert_eq!(gen.hc_auth_multisig.as_deref(), Some(want.as_str()));
+    assert_eq!(want, "9705f8e2f1bc8561848b29cb8efd57c37e3e39788fa58a5f03304d8019668247", "this build's msauth guest");
+    let stdout = String::from_utf8_lossy(&ok.stdout);
+    assert!(stdout.contains(&format!("hc_auth_multisig {want}")), "the operator is told: {stdout}");
+    let executor = randprotocol_node::node::executor_for_profile(&gen.fri_profile).unwrap();
+    let state = gen.build(executor.as_ref()).unwrap();
+    assert_eq!(state.ledger.hc_auth_multisig(), Some(ZkExecutor::hc_auth_multisig()));
+    randprotocol_node::node::check_build_runs_genesis(&state, &ZkExecutor::known_hc_bundles()).unwrap();
+    assert_eq!(printed_hash(&ok, "genesis hash "), state.hash().to_hex());
+
+    let bare_out = dir.path().join("h.json");
+    let bare = genesis(&bare_out, &["--auth-multisig-guest"]);
+    assert!(!bare.status.success(), "requires --auth-guest");
+    let stderr = String::from_utf8_lossy(&bare.stderr);
+    assert!(stderr.contains("--auth-guest"), "the reason names the missing flag: {stderr}");
+    assert!(!bare_out.exists(), "and nothing is written");
+
+    // Without the flag the field is absent: the file is the one `--auth-guest` alone writes.
+    let plain_out = dir.path().join("p.json");
+    let plain = genesis(&plain_out, &["--bundle-guest", "v3", "--auth-guest", "--max-proof-bytes", "4194304", "--max-block-bytes", "20971520"]);
+    assert!(plain.status.success(), "{}", String::from_utf8_lossy(&plain.stderr));
+    assert!(!std::fs::read_to_string(&plain_out).unwrap().contains("hc_auth_multisig"));
 }

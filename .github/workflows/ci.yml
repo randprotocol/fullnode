@@ -70,7 +70,7 @@ env:
   # 56b7061 is circuits branch feat/scan-compact: main c83b1c7 (tree aggregation, 4a244b6) plus
   # viewing.rs's ScanKey and EnvelopeHead; recursion/ is 4a244b6's. The rand-zkvm-cuda revs stay
   # at the pushed 71e1a04, where rand-zkvm-cuda/ is identical to this commit's.
-  CIRCUITS_PIN: 56b70611724930a5848ac5c0fd32ca2de8e61e2e
+  CIRCUITS_PIN: d217252afde318b2ff51976351f449a685b5832f
 
 jobs:
   check-and-test:
@@ -92,6 +92,14 @@ jobs:
       - name: Check every target
         working-directory: fullnode
         run: cargo check --workspace --tests
+      # Private multisig phase 4 (spec §6.5): the signer checks are the pure crate
+      # `randprotocol-msig`, which the clients' wasm and native cores vendor, so it must keep
+      # compiling for the browser — no RPC, filesystem, tokio or prover crept into its cone.
+      - name: The signer checks build for wasm32
+        working-directory: fullnode
+        run: |
+          rustup toolchain install 1.98.1 --profile minimal --target wasm32-unknown-unknown
+          RUSTFLAGS='--cfg getrandom_backend="wasm_js"' cargo +1.98.1 check -p randprotocol-msig --target wasm32-unknown-unknown
       # The node's aggregation tests read the pinned recursion fixtures committed at
       # crates/randprotocol-node/fixtures/recursion (#131). A missing, truncated or edited file
       # fails here, by name, rather than as a panic or a wrong digest in the middle of the suite.
@@ -189,7 +197,7 @@ jobs:
           cd fullnode/vendor/circuits
           sha256sum -c SHA256SUMS
           grep -q "^circuits: $CIRCUITS_PIN$" PROVENANCE.md
-          for crate in evm-core sbpf-core; do
+          for crate in evm-core sbpf-core dilithium-core; do
             diff -r --exclude Cargo.lock --exclude target "$crate" "$GITHUB_WORKSPACE/circuits/guests-compiled/$crate"
           done
       # The CUDA backend is a git dependency at its own revision (`crates/randprotocol-zkvm/Cargo.toml`),
@@ -211,9 +219,10 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: circuits/rand-guest
-      # Builds fib, keccak256, evm and sbpf from source with `rand-guest build` and compares:
-      # evm/sbpf byte for byte, the two legacy flat pins by program (base_pc, words, hc).
-      - name: circuits rebuilds the four guests from source
+      # Builds fib, keccak256, evm, sbpf, dilithium-verify and msauth from source with `rand-guest
+      # build` and compares: the four image containers byte for byte, the two legacy flat pins by
+      # program (base_pc, words, hc). circuits' gate lists all six at the pin (private multisig).
+      - name: circuits rebuilds the six guests from source
         working-directory: circuits/rand-guest
         run: cargo test --release --test build -- --exact build_reproduces_every_committed_image_and_reports_hc
       # Inline rather than circuits' `contracts/build.sh`: that script's `mktemp -t erc20.runtime.hex`
@@ -261,7 +270,7 @@ jobs:
         run: |
           cargo clippy --no-deps \
             -p randprotocol-core -p randprotocol-node -p randprotocol-client \
-            -p randprotocol-prover -p bridge-codec \
+            -p randprotocol-prover -p bridge-codec -p randprotocol-msig \
             --all-targets -- -D warnings
 
   # Audit v6, PROC-6: a dependency and supply-chain gate. `cargo audit` fails on a RUSTSEC

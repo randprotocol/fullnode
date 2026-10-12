@@ -538,6 +538,22 @@ pub struct Genesis {
     /// [`TreeConfig::check`]: crate::ledger::aggregation::TreeConfig::check
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub aggregation_tree: Option<crate::ledger::aggregation::TreeConfig>,
+    /// Private multisig (phase 4, `docs/superpowers/specs/2026-10-11-private-multisig-phase4-design.md`
+    /// §2): the multisig auth guest's program commitment, 64 hex characters. Present, an auth
+    /// proof may also be of this guest's pinned shape — a `t`-of-`M` multisig authorising the
+    /// spend — and is then verified against this digest instead of `hc_auth`; both publish the
+    /// same `c` that bundle guest v3 folds in. It requires `hc_auth`
+    /// ([`GenesisError::HcAuthMultisigWithoutHcAuth`]), must name another guest
+    /// ([`GenesisError::HcAuthMultisigIsHcAuth`], compared as parsed words) and, at Production
+    /// FRI, a proof cap of at least [`gas::MSAUTH_MIN_PROOF_BYTES`]
+    /// ([`GenesisError::ProofCapTooSmallForMsauth`]). The node checks at startup that it is this
+    /// build's msauth guest. The **last** field, so a file that has it lists it last and one without
+    /// it serialises byte for byte as before; bound into the genesis hash last (after
+    /// `aggregation_tree`), tagged, only when present — every genesis without it hashes as before;
+    /// a genesis parameter on the ledger (`Ledger::hc_auth_multisig`, restored by
+    /// `reload_ledger`), never state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hc_auth_multisig: Option<String>,
 }
 
 /// The chains whose committed genesis file (`deploy/genesis-chain<N>.json`) carries both
@@ -688,6 +704,24 @@ pub enum GenesisError {
     BadHcBundle(String),
     #[error("bad hc_auth {0} (64 hex characters)")]
     BadHcAuth(String),
+    /// Private multisig: `hc_auth_multisig` is not 64 hex characters.
+    #[error("bad hc_auth_multisig {0} (64 hex characters)")]
+    BadHcAuthMultisig(String),
+    /// Private multisig: the multisig auth guest publishes the `c` bundle guest v3 folds in, and
+    /// only an `hc_auth` chain runs v3.
+    #[error("hc_auth_multisig needs hc_auth: the multisig auth guest authorises bundle guest v3's spends, which only a split-authorisation (hc_auth) chain runs")]
+    HcAuthMultisigWithoutHcAuth,
+    /// Private multisig: the ledger picks the guest by the proof's shape, and one digest cannot
+    /// have two shapes. Compared as parsed words, so case cannot slip one past.
+    #[error("hc_auth_multisig names the same guest as hc_auth: the multisig auth guest is another program")]
+    HcAuthMultisigIsHcAuth,
+    /// Private multisig, spec §2.3 item 4: at Production FRI a multisig auth proof is about
+    /// 3.6 MB, and the ledger caps every auth proof at `max_proof_bytes`.
+    #[error(
+        "max_proof_bytes {proof} cannot hold a multisig auth proof (about 3.6 MB at production FRI): \
+         a chain with hc_auth_multisig needs max_proof_bytes ≥ {need}"
+    )]
+    ProofCapTooSmallForMsauth { proof: usize, need: usize },
     #[error("bad alloc note {0}")]
     BadNote(String),
     #[error("duplicate alloc note {0}")]
@@ -942,6 +976,27 @@ impl Genesis {
             }
             if block < need {
                 return Err(GenesisError::BlockTooSmallForSplitAuth { block, proof, need });
+            }
+        }
+        // Private multisig (spec §2.3, rules 2–4; rule 1, the parse, is `build`'s with `hc_auth`'s
+        // and is met here first only because rule 3 needs both digests parsed). The block rule
+        // above is unchanged: a transaction still carries at most three proofs (bundle, auth of
+        // either kind, call), each at most `max_proof_bytes`.
+        if let Some(ms) = &self.hc_auth_multisig {
+            let Some(single) = &self.hc_auth else {
+                return Err(GenesisError::HcAuthMultisigWithoutHcAuth);
+            };
+            let ms_word = word8_from_hex(ms).ok_or_else(|| GenesisError::BadHcAuthMultisig(ms.clone()))?;
+            // An unparsable `hc_auth` is `build`'s `BadHcAuth`; it cannot equal anything here.
+            if word8_from_hex(single) == Some(ms_word) {
+                return Err(GenesisError::HcAuthMultisigIsHcAuth);
+            }
+            // At the Test profile proofs are about a quarter of the size: not judged.
+            if self.fri_profile == "production" {
+                let proof = self.max_proof_bytes.map_or(gas::MAX_PROOF_BYTES, |n| n as usize);
+                if proof < gas::MSAUTH_MIN_PROOF_BYTES {
+                    return Err(GenesisError::ProofCapTooSmallForMsauth { proof, need: gas::MSAUTH_MIN_PROOF_BYTES });
+                }
             }
         }
         if let Some(n) = self.max_call_envelope_bytes {
@@ -1321,6 +1376,11 @@ impl Genesis {
             None => None,
         };
         ledger.set_hc_auth(hc_auth);
+        let hc_auth_multisig = match &self.hc_auth_multisig {
+            Some(h) => Some(word8_from_hex(h).ok_or_else(|| GenesisError::BadHcAuthMultisig(h.clone()))?),
+            None => None,
+        };
+        ledger.set_hc_auth_multisig(hc_auth_multisig);
         ledger.set_gas(self.gas.clone());
         ledger.set_testnet(self.testnet == Some(true));
         ledger.set_proof_window_blocks(self.proof_window_blocks);
@@ -1774,6 +1834,15 @@ impl Genesis {
             commit.extend_from_slice(b"aggregation_tree");
             commit.extend_from_slice(&bincode::serialize(t).expect("serializes"));
         }
+        // Private multisig, after `aggregation_tree` — last — tagged, present-only (spec §2.2), so
+        // every genesis cut before it hashes byte-for-byte as before. The parsed words, so the
+        // file's hex case cannot make a second chain of the same guest.
+        if let Some(h) = ledger.hc_auth_multisig() {
+            commit.extend_from_slice(b"hc_auth_multisig");
+            commit.extend_from_slice(&word8_to_bytes(&h));
+        }
+        #[cfg(test)]
+        tests::LAST_GENESIS_COMMIT.with(|c| *c.borrow_mut() = commit.clone());
         let genesis_binding = Hash::digest_domain(b"rand-genesis-2", &commit);
         let header = BlockHeader {
             height: 0,
@@ -2226,7 +2295,18 @@ mod tests {
             perps: None,
             multisig: None,
             aggregation_tree: None,
+            hc_auth_multisig: None,
         }
+    }
+
+    thread_local! {
+        /// The genesis-binding preimage of the last `Genesis::build` on this thread, captured just
+        /// before it is hashed: the tagged-append test reads it (tests only).
+        pub(super) static LAST_GENESIS_COMMIT: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    fn last_genesis_commit() -> Vec<u8> {
+        LAST_GENESIS_COMMIT.with(|c| c.borrow().clone())
     }
 
     /// The name the RPL tokens tests use for [`genesis(1)`] — the same one-validator plain
@@ -5829,4 +5909,134 @@ mod tests {
         assert!(matches!(huge.build(&StubExecutor), Err(GenesisError::SupplyOverflow)));
     }
 
+
+    /// Private multisig phase 4: `hc_auth_multisig` is opt-in, the file's last key, bound into the
+    /// hash last (after `aggregation_tree`) and only when present, set on the ledger, never state.
+    #[test]
+    fn hc_auth_multisig_is_bound_last_and_only_when_present() {
+        let mut plain = genesis(2);
+        plain.max_proof_bytes = Some(4 << 20);
+        plain.max_block_bytes = Some(20 << 20);
+        plain.hc_auth = Some(word8_to_hex(&[21; 8]));
+        assert!(!plain.to_json().contains("hc_auth_multisig"), "absent from the file");
+        let s = build(&plain);
+        assert_eq!(s.ledger.hc_auth_multisig(), None);
+
+        let mut on = plain.clone();
+        on.hc_auth_multisig = Some(word8_to_hex(&[23; 8]));
+        let g = build(&on);
+        assert_eq!(g.ledger.hc_auth_multisig(), Some([23; 8]));
+        assert_ne!(g.hash(), s.hash(), "a different chain");
+        assert_eq!(g.ledger.state_root(), s.ledger.state_root(), "a parameter, not state");
+        let mut other = on.clone();
+        other.hc_auth_multisig = Some(word8_to_hex(&[24; 8]));
+        assert_ne!(build(&other).hash(), g.hash(), "the pin itself is bound");
+        let json = on.to_json();
+        let last_key = json.rfind("\"hc_auth_multisig\"").unwrap();
+        assert!(json[last_key..].matches("\": ").count() == 1, "the file's last key: {json}");
+        assert_eq!(Genesis::from_json(&json).unwrap(), on, "round-trips");
+    }
+
+    #[test]
+    fn hc_auth_multisig_needs_hc_auth_must_differ_from_it_and_must_parse() {
+        let mut g = genesis(2);
+        g.max_proof_bytes = Some(4 << 20);
+        g.max_block_bytes = Some(20 << 20);
+        g.hc_auth_multisig = Some(word8_to_hex(&[23; 8]));
+        assert!(matches!(g.build(&StubExecutor), Err(GenesisError::HcAuthMultisigWithoutHcAuth)));
+        g.hc_auth = Some(word8_to_hex(&[23; 8]));
+        assert!(matches!(g.build(&StubExecutor), Err(GenesisError::HcAuthMultisigIsHcAuth)));
+        // Compared as parsed words, never as text: the same digest in upper case is the same guest.
+        g.hc_auth = Some(word8_to_hex(&[23; 8]).to_uppercase());
+        assert!(matches!(g.build(&StubExecutor), Err(GenesisError::HcAuthMultisigIsHcAuth)), "case cannot slip one past");
+        g.hc_auth = Some(word8_to_hex(&[23; 8]));
+        g.hc_auth_multisig = Some(word8_to_hex(&[23; 8]).to_uppercase());
+        assert!(matches!(g.build(&StubExecutor), Err(GenesisError::HcAuthMultisigIsHcAuth)), "either side");
+        g.hc_auth = Some(word8_to_hex(&[21; 8]));
+        g.hc_auth_multisig = Some("not hex".into());
+        assert!(matches!(g.build(&StubExecutor), Err(GenesisError::BadHcAuthMultisig(_))));
+        g.hc_auth_multisig = Some(word8_to_hex(&[23; 8])[..62].into());
+        assert!(matches!(g.build(&StubExecutor), Err(GenesisError::BadHcAuthMultisig(_))), "31 bytes");
+    }
+
+    /// Spec §2.3 item 4: at Production FRI the proof cap must admit an msauth proof (~3.6 MB); the
+    /// three-proof block rule is unchanged and then covers bundle + msauth + call.
+    #[test]
+    fn a_production_hc_auth_multisig_genesis_needs_a_4_mib_proof_cap() {
+        let caps = |profile: &str, proof: Option<u32>, block: Option<u32>| {
+            let mut g = genesis(2);
+            g.fri_profile = profile.into();
+            g.hc_auth = Some(word8_to_hex(&[21; 8]));
+            g.hc_auth_multisig = Some(word8_to_hex(&[23; 8]));
+            g.max_proof_bytes = proof;
+            g.max_block_bytes = block;
+            g
+        };
+        let need = crate::gas::MSAUTH_MIN_PROOF_BYTES;
+        assert_eq!(need, 4 << 20);
+        match caps("production", Some(need as u32 - 1), Some(20 << 20)).build(&StubExecutor) {
+            Err(e @ GenesisError::ProofCapTooSmallForMsauth { proof, need: n }) => {
+                assert_eq!((proof, n), (need - 1, need));
+                assert!(e.to_string().contains("multisig auth proof"), "{e}");
+            }
+            other => panic!("{:?}", other.map(|s| s.hash())),
+        }
+        assert!(
+            matches!(caps("production", None, Some(20 << 20)).build(&StubExecutor), Err(GenesisError::ProofCapTooSmallForMsauth { .. })),
+            "the 2 MiB default"
+        );
+        assert!(caps("production", Some(need as u32), Some(20 << 20)).build(&StubExecutor).is_ok(), "chain 21's 4 MiB / 20 MiB");
+        assert!(caps("production", Some(6 << 20), Some(20 << 20)).build(&StubExecutor).is_ok(), "a 6 MiB cap clears it too (3·6 + 1 = 19 MiB)");
+        assert!(
+            matches!(caps("production", Some(need as u32), Some(12 << 20)).build(&StubExecutor), Err(GenesisError::BlockTooSmallForSplitAuth { .. })),
+            "3·4 MiB + 1 MiB still rules the block"
+        );
+        assert!(caps("test", None, Some(7 << 20)).build(&StubExecutor).is_ok(), "the Test profile is not judged by it");
+        // Without the field the floor is not a rule: chain 17's shape at 2 MiB is untouched.
+        let mut plain = caps("production", None, Some(7 << 20));
+        plain.hc_auth_multisig = None;
+        assert!(plain.build(&StubExecutor).is_ok(), "no hc_auth_multisig, no msauth floor");
+    }
+
+    /// The hash-binding position, byte for byte: the genesis-binding preimage of a file with
+    /// `hc_auth_multisig` is exactly the same file's preimage without it, then the tag, then the
+    /// digest's 32 bytes — appended after everything, `aggregation_tree` (the last tagged section
+    /// before it) included — and that preimage is what the genesis block's `parent` hashes.
+    #[test]
+    fn hc_auth_multisig_is_a_tagged_append_after_aggregation_tree() {
+        use crate::ledger::aggregation::{RvmHeights, TreeConfig, TreeStepPin};
+        let mut g = aggregating_genesis();
+        g.max_proof_bytes = Some(4 << 20);
+        g.max_block_bytes = Some(20 << 20);
+        g.hc_auth = Some(word8_to_hex(&[21; 8]));
+        let shape = g.aggregation.as_ref().unwrap().admitted_shapes[0].shape;
+        let h = |reduce_log_height| RvmHeights { tier: 19, reg_log_height: 20, ram_log_height: 20, poseidon2_log_height: 15, reduce_log_height };
+        let tree = TreeConfig {
+            shape,
+            leaf_size: 1,
+            max_depth: 3,
+            leaf: h(15),
+            vk_leaf: [1; 4],
+            steps: vec![TreeStepPin { heights: h(16), program_digest: [2; 4], key: [3; 4] }],
+        };
+        g.aggregation_tree = Some(tree.clone());
+        let without = build(&g);
+        let before = last_genesis_commit();
+        let tree_tail = [b"aggregation_tree".as_slice(), &bincode::serialize(&tree).unwrap()].concat();
+        assert!(before.ends_with(&tree_tail), "aggregation_tree is the last tagged section without the field");
+        assert_eq!(without.block.header.parent, Hash::digest_domain(b"rand-genesis-2", &before), "the captured preimage is the hashed one");
+
+        let mut on = g.clone();
+        on.hc_auth_multisig = Some(word8_to_hex(&[23; 8]));
+        let with = build(&on);
+        let after = last_genesis_commit();
+        let want = [before.as_slice(), b"hc_auth_multisig", &word8_to_bytes(&[23; 8])].concat();
+        assert_eq!(after, want, "the field is a tagged append, after aggregation_tree");
+        assert_eq!(with.block.header.parent, Hash::digest_domain(b"rand-genesis-2", &after));
+        // Upper-case hex in the file is the same digest and so the same chain: the hash binds the
+        // parsed words, never the text.
+        let mut upper = g.clone();
+        upper.hc_auth_multisig = Some(word8_to_hex(&[23; 8]).to_uppercase());
+        assert_eq!(build(&upper).hash(), with.hash());
+    }
 }

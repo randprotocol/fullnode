@@ -65,8 +65,8 @@ pub mod col {
     pub const G3LIMB0: usize = 70;
     pub const G3LIMB1: usize = 71;
     pub const G3LIMB2: usize = 72;
-    /// ZKQ-3: the base of SPONGE's source (and COMPRESS's sibling), `B0` (group 2 checks its
-    /// top, `B0 + 3`).
+    /// ZKQ-3: the base of SPONGE's source (and COMPRESS's sibling), `B0` — since phase 4 the
+    /// absolute immediate, bound to `B` by the immediate form (group 2 checks its top, `B0 + 3`).
     pub const G4LIMB0: usize = 73;
     pub const G4LIMB1: usize = 74;
     pub const G4LIMB2: usize = 75;
@@ -118,8 +118,9 @@ impl Sels {
     const EXT_READ_RA: &'static [Op] = &[Op::Eadd, Op::Esub, Op::Emul, Op::Emulf, Op::Einv];
     /// Read the `rb` pair.
     const EXT_READ_RB: &'static [Op] = &[Op::Eadd, Op::Esub, Op::Emul];
-    /// Ops whose fourth word names a register (`rb`), mirroring `Op::b_is_register`.
-    const B_REG: &'static [Op] = &[Op::Fadd, Op::Fsub, Op::Fmul, Op::Eadd, Op::Esub, Op::Emul, Op::Emulf, Op::Sponge, Op::Compress];
+    /// Ops whose fourth word names a register (`rb`), mirroring `Op::b_is_register`. Phase 4:
+    /// SPONGE and COMPRESS left this set — their second address is the immediate `B`.
+    const B_REG: &'static [Op] = &[Op::Fadd, Op::Fsub, Op::Fmul, Op::Eadd, Op::Esub, Op::Emul, Op::Emulf];
     /// Read `rd` (the compared or stored value; `COMPRESS`'s index bit; `FOLD`'s point, low lane).
     const READ_RD: &'static [Op] = &[Op::Jeq, Op::Jne, Op::Store, Op::Storee, Op::Compress, Op::Fold, Op::Pow];
     /// Read `rd + 1`, the high lane of the `rd` pair a STOREE writes to memory (RVM-1). LOADE,
@@ -284,7 +285,9 @@ where
             bus::RANGE8.lookup_key(b, [v(l)], Count::bounded(needs_check.clone(), 1));
         }
         // Group 2 (Task 9, Cut C): the second pointer's own check, `B0 + 3 < 2^24` — SPONGE's
-        // source and COMPRESS's sibling, both four cells at `B0`.
+        // source and COMPRESS's sibling, both four cells at `B0`. Phase 4 B/B′: both are absolute
+        // immediates (not in `B_REG`), so the immediate form pins `B0 = B` and these limbs are
+        // their range check, as group 1's are LOAD/STORE's.
         let is_two_ptr = sel(Op::Sponge) + sel(Op::Compress);
         let subject2 = v(B0) + AB::Expr::from_u32(3);
         let limbs2 = v(G2LIMB0) + v(G2LIMB1) * AB::Expr::from_u32(1 << 8) + v(G2LIMB2) * AB::Expr::from_u32(1 << 16);

@@ -24,11 +24,18 @@ use std::time::{Duration, Instant};
 pub mod contacts;
 pub mod governance;
 pub mod memo_display;
+/// Private multisig phase 4: the policy file, proposals, signing, witness assembly and proving —
+/// the parts that need a node, a file or a prover. The pure signer checks are
+/// [`multisig_private`].
+pub mod msig_private;
 pub mod perps;
 pub mod prover;
 pub mod qr;
 pub mod tree;
 pub mod wallet;
+
+/// The pure private-multisig signer checks (`randprotocol-msig`), as every wallet app runs them.
+pub use randprotocol_msig as multisig_private;
 
 /// A node's JSON-RPC error reply. It prints as it always has, `"<message> (rpc <code>)"`, and
 /// keeps its code, so a caller can tell an older node (no such method, [`METHOD_NOT_FOUND`]) from
@@ -135,7 +142,7 @@ pub fn pruned_floor(e: &anyhow::Error) -> Option<u64> {
 
 /// `rand_getLimits`: the chain's five genesis limits, which a wallet derives its caps from
 /// instead of hard-coding them (spec §6).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize)]
 pub struct ChainLimits {
     pub max_program_words: usize,
     pub max_proof_bytes: usize,
@@ -153,6 +160,10 @@ pub struct ChainLimits {
     /// that predates the field, which is right — such a node runs no chain with the flag.
     #[serde(default)]
     pub hardening_v6: bool,
+    /// The genesis `hc_auth_multisig` (private multisig), hex, `null` where the chain has none:
+    /// whether it admits a multisig spend. `None` from a node that predates the field.
+    #[serde(default)]
+    pub hc_auth_multisig: Option<String>,
     /// Gas units per RAND-unit, under the node's gas policy (spec 2026-09-28 §4.1/§8). `None`
     /// from a node that runs no policy or predates the field — paired with `byte_price` below to
     /// decide [`ChainLimits::gas_policy`]. `gas_metering` is decoded only as
@@ -1844,6 +1855,7 @@ mod tests {
                 envelope_bytes: None,
                 // Nor `hardening_v6`: at `false`, the old call rule.
                 hardening_v6: false,
+                hc_auth_multisig: None,
                 // Nor a gas policy: no `gas_price`/`byte_price` key in this reply either.
                 gas_price: None,
                 byte_price: None,

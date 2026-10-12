@@ -16,7 +16,8 @@ fn every_opcode_round_trips_through_encode_and_decode() {
     assert!(!Op::Hintn.b_is_register(), "HINTN's fourth word is an immediate offset");
     assert_eq!(Op::from_u8(27), Some(Op::Compress));
     assert_eq!(Op::Compress.mnemonic(), "COMPRESS");
-    assert!(Op::Compress.b_is_register(), "COMPRESS's fourth word is the sibling's register");
+    assert!(!Op::Compress.b_is_register(), "COMPRESS's fourth word is now the sibling's absolute address (phase 4 B)");
+    assert!(!Op::Sponge.b_is_register(), "SPONGE's fourth word is now the source block's absolute address (phase 4 B′)");
     assert_eq!(Op::from_u8(28), Some(Op::Fold));
     assert_eq!(Op::Fold.mnemonic(), "FOLD");
     assert!(!Op::Fold.b_is_register());

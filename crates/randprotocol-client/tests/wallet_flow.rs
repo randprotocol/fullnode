@@ -119,6 +119,7 @@ fn genesis_full(
         hardening_v6: None,
         hc_auth: None,
         fees: None,
+        hc_auth_multisig: None,
     }
 }
 
@@ -148,6 +149,12 @@ async fn start(dir: &tempfile::TempDir, key: &Keypair) -> NodeHandle {
 }
 
 async fn start_with(dir: &tempfile::TempDir, key: &Keypair, genesis: Genesis) -> NodeHandle {
+    start_configured(dir, key, genesis, Default::default()).await
+}
+
+/// [`start_with`] with an explicit msauth verifier-key source: a chain naming `hc_auth_multisig`
+/// does not start without the key.
+async fn start_configured(dir: &tempfile::TempDir, key: &Keypair, genesis: Genesis, msauth: randprotocol_node::msauth_key::MsauthKeyOptions) -> NodeHandle {
     std::fs::write(dir.path().join("genesis.json"), genesis.to_json()).unwrap();
     node::start(NodeConfig {
         viewing_open: false,
@@ -167,12 +174,14 @@ async fn start_with(dir: &tempfile::TempDir, key: &Keypair, genesis: Genesis) ->
         keep_raw_proofs: false,
         min_free_disk_bytes: 0,
         verify_workers: None,
+        apply_inline: false,
         prune_history: None,
         // Final review I2: the node runs the default gas policy (what `rand-node run` carries
         // unless told `--gas-price 0 --byte-price 0`), so every real call proof in these flows is
         // priced by the pool's `admission::call_floor` over its decoded header, and the wallet
         // pays the policy floor it reads from `rand_getLimits`.
         gas_policy: Some(randprotocol_core::gas::GasPolicy::DEFAULT),
+        msauth,
     })
     .await
     .expect("node starts")
@@ -1245,5 +1254,168 @@ async fn a_multisig_is_created_funded_paid_and_rotated_end_to_end() {
     assert_eq!(supply_json["multisig_rand_in"], fund.to_string());
     assert_eq!(supply_json["invariant_holds"], true, "{supply_json}");
     eprintln!("multisig flow in {:.1?}", started.elapsed());
+    handle.shutdown().await;
+}
+
+/// The chain the private-multisig end to end runs on: split authorisation plus the multisig auth
+/// guest, chain-21's proof and block caps, a `gas` section (so R-gas is checked on real proofs),
+/// and a `multisig` section seeding one public 2-of-3 account with 20 RAND (for the MultisigPay leg).
+fn genesis_private_multisig(validator: &Keypair, public_signers: &[Keypair]) -> Genesis {
+    use randprotocol_core::ledger::multisig::{MultisigAccountConfig, MultisigConfig};
+    Genesis {
+        hc_auth_multisig: Some(word8_to_hex(&ZkExecutor::hc_auth_multisig())),
+        max_proof_bytes: Some(4 << 20),
+        max_block_bytes: Some(20 << 20),
+        // 3 s blocks × 256 would leave 12.8 minutes for two signatures, a tier-18 Test prove and a bundle prove.
+        proof_window_blocks: Some(1024),
+        gas: Some(gas::GasConfig { gas_price: 100, byte_price: 800, bundle_gas_limit: gas::bundle_gas_limit_pin(), metering: gas::GasMetering::Circuit, dynamic: None }),
+        multisig: Some(MultisigConfig {
+            create_fee: 0,
+            accounts: vec![MultisigAccountConfig { salt: [33; 32], signers: public_signers.iter().map(|k| k.public_key().clone()).collect(), threshold: 2, balance: 20 * UNITS_PER_RAND }],
+        }),
+        ..genesis_v3(validator)
+    }
+}
+
+/// Private multisig phase 4's gate (spec §7.1), with real proofs: a 2-of-3 private address
+/// receives, spends with signers 0 and 2, refuses a 1-signature attempt (in the wallet, and at the
+/// node as AuthMismatch), receives a public MultisigPay, and rotates (sweeps) to a new policy
+/// with signers 1 and 2. About four bundle proofs and three tier-18 msauth proofs on the Test profile.
+///
+/// The node reads the committed Test-profile msauth verifier key from this source tree
+/// (`msauth_key::source_tree_path`): a release test binary gets no dev fallback by default, and a
+/// chain naming `hc_auth_multisig` refuses to start without the key. Each phase prints its
+/// elapsed time (`--nocapture`), so a failed run's log shows where it stopped and what it cost.
+///
+/// Run on a >= 48 GB machine:
+/// `cargo +1.98.1 test --release -p randprotocol-client --test wallet_flow -- --ignored --nocapture a_private_multisig`
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "real proofs, three of them tier 18: run on a >= 48 GB machine"]
+async fn a_private_multisig_receives_spends_rotates_and_refuses_one_signature_end_to_end() {
+    use randprotocol_client::msig_private::{self, Policy, Share};
+    use randprotocol_core::ledger::multisig::account_id;
+    use randprotocol_core::ledger::program_state::Payout;
+    use randprotocol_zkvm::executor::{decode_canonical, prove_msauth};
+
+    init_tracing();
+    let started = Instant::now();
+    let phase = |what: &str| eprintln!("[private-multisig e2e +{:>8.1?}] {what}", started.elapsed());
+    let dir = tempfile::tempdir().unwrap();
+    let key = Keypair::from_seed([121; 32]).unwrap();
+    let public: Vec<Keypair> = [91u8, 92, 93].iter().map(|s| Keypair::from_seed([*s; 32]).unwrap()).collect();
+    let msauth = randprotocol_node::msauth_key::MsauthKeyOptions { path: Some(randprotocol_node::msauth_key::source_tree_path(FriProfile::Test)), build: false };
+    let handle = start_configured(&dir, &key, genesis_private_multisig(&key, &public), msauth).await;
+    let rpc = RpcClient::new(format!("http://{}", handle.rpc_addr));
+    let cpu = Proving::local(Backend::Cpu);
+    assert_eq!(rpc.limits().await.unwrap().unwrap().hc_auth_multisig, Some(word8_to_hex(&ZkExecutor::hc_auth_multisig())));
+    phase("node up on a multisig chain");
+
+    // ---- a 2-of-3 private policy; the faucet pays its address ----
+    let k: Vec<Keypair> = [101u8, 102, 103].iter().map(|s| Keypair::from_seed([*s; 32]).unwrap()).collect();
+    let policy = Policy::new(k.iter().map(|k| k.public_key().clone()).collect(), 2).unwrap();
+    let account = policy.wallet();
+    let mut store = NoteStore::default();
+    let hash = rpc.mint_shielded(&account.address.to_string(), Some(100 * UNITS_PER_RAND)).await.unwrap();
+    rpc.wait_for_transaction(&hash, Duration::from_secs(60)).await.unwrap();
+    wallet::scan(&rpc, &account, &mut store).await.unwrap();
+    assert_eq!(store.balance(), 100 * UNITS_PER_RAND, "the account's own scan finds the mint");
+    phase("receive: the account's scan finds the 100 RAND mint");
+
+    // ---- spend 10 RAND to B with signers 0 and 2 ----
+    let b = Wallet::from_spend_key(SpendKey([77; 8]));
+    let fee = gas::BUNDLE_BASE;
+    let prop = msig_private::prepare(&rpc, &policy, &mut store, &b.address, 10 * UNITS_PER_RAND, "rent", fee, CHAIN_ID).await.unwrap();
+    let shares: Vec<Share> = [0usize, 2].iter().map(|&i| msig_private::sign(&prop, &policy, &k[i], &[randprotocol_client::multisig_private::ExpectedRecipient::address(b.address.clone())]).unwrap().0).collect();
+    phase("spend: prepared and signed by 0 and 2; proving (msauth tier 18 + bundle)");
+    let slot = proving_slot().await;
+    let tx = msig_private::prove(&prop, &policy, &shares, &cpu, FriProfile::Test, gas::MAX_PROOF_BYTES).await.unwrap();
+    drop(slot);
+    phase("spend: proved");
+    let auth = &tx.bundle.as_ref().unwrap().auth_proof;
+    let hdr = decode_canonical(auth).unwrap();
+    let s = ZkExecutor::msauth_heights();
+    // R-hide: every declared height — all eight header fields — is the pinned shape.
+    let declared = randprotocol_zkvm::executor::MsauthShape {
+        tier: hdr.tier.0,
+        program_log_height: hdr.program_log_height,
+        input_log_height: hdr.input_log_height,
+        keccak_log_height: hdr.keccak_log_height,
+        sha256_log_height: hdr.sha256_log_height,
+        modq_log_height: hdr.modq_log_height,
+        public_log_height: hdr.public_log_height,
+        mem_log_height: hdr.mem_log_height,
+    };
+    assert_eq!(declared, s, "R-hide");
+    assert_eq!(hdr.public_values[randprotocol_zkvm::tables::cpu::pv::GAS], gas::msauth_gas_limit_pin(), "R-gas");
+    let h = rpc.send_transaction(&tx).await.expect("a 2-of-3 spend is admitted");
+    rpc.wait_for_transaction(&h, Duration::from_secs(120)).await.expect("and commits");
+    let mut b_store = NoteStore::default();
+    wallet::scan(&rpc, &b, &mut b_store).await.unwrap();
+    assert_eq!(b_store.balance(), 10 * UNITS_PER_RAND, "B finds the payment");
+    wallet::scan(&rpc, &account, &mut store).await.unwrap();
+    assert_eq!(store.balance(), 90 * UNITS_PER_RAND - fee, "and the account its change");
+    phase("spend: committed; B paid, change found; R-hide and R-gas hold");
+
+    // ---- one signature: refused by the wallet, and by the node when forced ----
+    let prop1 = msig_private::prepare(&rpc, &policy, &mut store, &b.address, UNITS_PER_RAND, "", fee, CHAIN_ID).await.unwrap();
+    let one = vec![msig_private::sign(&prop1, &policy, &k[0], &[randprotocol_client::multisig_private::ExpectedRecipient::address(b.address.clone())]).unwrap().0];
+    let e = msig_private::prove(&prop1, &policy, &one, &cpu, FriProfile::Test, gas::MAX_PROOF_BYTES).await.unwrap_err().to_string();
+    assert!(e.contains("1 signature") && e.contains("needs 2"), "{e}");
+    phase("one signature: the wallet refuses; forcing a sentinel proof (msauth tier 18 + bundle)");
+    // Forced: the witness with one active slot, proved anyway, publishes the sentinel.
+    let mut forced = randprotocol_zkvm::msauth::msauth_inputs(&policy.msk, &msig_private::parse_word8(&prop1.salt).unwrap(), 2, &[
+        msig_private::slot_for(&prop1, &policy, &one[0]).unwrap(),
+    ]);
+    forced.truncate(randprotocol_zkvm::msauth::MSAUTH_WORDS);
+    let binding = msig_private::parse_binding(&prop1.binding).unwrap();
+    // The emulator first (seconds), so a witness that would not publish the sentinel fails here,
+    // before the tier-18 prove.
+    let pre = randprotocol_zkvm::executor::run_msauth(&forced, &binding).unwrap_err();
+    assert!(pre.contains("sentinel"), "{pre}");
+    let slot = proving_slot().await;
+    let (sentinel_proof, c, _) = prove_msauth(FriProfile::Test, &forced, &binding).unwrap();
+    let mut tx1 = msig_private::prove_bundle_only(&prop1, &cpu, FriProfile::Test).await.unwrap();
+    drop(slot);
+    phase("one signature: sentinel proof and bundle proved");
+    assert_eq!(c[7], randprotocol_zkvm::executor::MSAUTH_REFUSAL);
+    tx1.bundle.as_mut().unwrap().auth_proof = sentinel_proof;
+    let refused = rpc.send_transaction(&tx1).await.unwrap_err().to_string();
+    assert!(refused.contains("different commitment"), "AuthMismatch: {refused}");
+    phase("one signature: the node refuses it as AuthMismatch");
+
+    // ---- a public MultisigPay from the seeded account into the private address ----
+    let genesis = rpc.genesis_hash().await.unwrap();
+    let id = account_id(CHAIN_ID, &[33; 32], 2, &public.iter().map(|k| k.public_key().clone()).collect::<Vec<_>>());
+    let time = rpc.status().await.unwrap()["height"].as_u64().unwrap() as u32;
+    let format = rpc.envelope_format(CHAIN_ID).await.unwrap();
+    let (note, envelope) = wallet::payout_note_for(&b, &account.address, 5 * UNITS_PER_RAND, 0, time, format).unwrap();
+    let pays = vec![Payout { asset: 0, amount: 5 * UNITS_PER_RAND, recipient: account.address.clone(), r: note.r, envelope }];
+    let pay = multisig_pay_tx(&genesis, id, 0, time, pays, &[(0, &public[0]), (1, &public[1])]);
+    let h = rpc.send_transaction(&pay).await.unwrap();
+    rpc.wait_for_transaction(&h, Duration::from_secs(60)).await.unwrap();
+    wallet::scan(&rpc, &account, &mut store).await.unwrap();
+    let before_rotation = store.balance();
+    assert_eq!(before_rotation, 95 * UNITS_PER_RAND - fee, "the MultisigPay landed in the private account");
+    phase("public MultisigPay: 5 RAND landed in the private account");
+
+    // ---- rotate: sweep everything to a new policy, signed by 1 and 2 ----
+    let k2: Vec<Keypair> = [111u8, 112].iter().map(|s| Keypair::from_seed([*s; 32]).unwrap()).collect();
+    let next = Policy::new(k2.iter().map(|k| k.public_key().clone()).collect(), 2).unwrap();
+    let sweep = msig_private::prepare_sweep(&rpc, &policy, &mut store, &next.wallet().address, fee, CHAIN_ID).await.unwrap();
+    let shares: Vec<Share> = [1usize, 2].iter().map(|&i| msig_private::sign(&sweep, &policy, &k[i], &[randprotocol_client::multisig_private::ExpectedRecipient::address(next.wallet().address.clone())]).unwrap().0).collect();
+    phase("rotate: sweep prepared and signed by 1 and 2; proving (msauth tier 18 + bundle)");
+    let slot = proving_slot().await;
+    let tx = msig_private::prove(&sweep, &policy, &shares, &cpu, FriProfile::Test, gas::MAX_PROOF_BYTES).await.unwrap();
+    drop(slot);
+    phase("rotate: proved");
+    assert_eq!(decode_canonical(&tx.bundle.as_ref().unwrap().auth_proof).unwrap().public_values[randprotocol_zkvm::tables::cpu::pv::GAS], gas::msauth_gas_limit_pin());
+    let h = rpc.send_transaction(&tx).await.unwrap();
+    rpc.wait_for_transaction(&h, Duration::from_secs(120)).await.unwrap();
+    wallet::scan(&rpc, &account, &mut store).await.unwrap();
+    assert_eq!(store.balance(), 0, "the old account is empty");
+    let mut next_store = NoteStore::default();
+    wallet::scan(&rpc, &next.wallet(), &mut next_store).await.unwrap();
+    assert_eq!(next_store.balance(), before_rotation - fee, "the new policy holds the sweep");
+    phase("rotate: committed; the old account is empty, the new policy holds the sweep");
     handle.shutdown().await;
 }

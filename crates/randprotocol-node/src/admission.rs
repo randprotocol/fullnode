@@ -1217,16 +1217,20 @@ pub fn acceptance_for(result: &Result<(), TxError>, hash: Hash, refused: &mut Re
 }
 
 /// The same rule one level up, for a refusal that came from the pool's pre-screen rather than from
-/// a verification: a `Duplicate`, a `Conflict` or a `Full` pool is a statement about *this node*
+/// a verification: a `Duplicate`, a `Conflict`, a `Full` pool or a `Warming` key is a statement about *this node*
 /// and never about the message, so it is an `Ignore` and is not cached. A `TxError` the pre-screen
 /// found — an oversized attestation, a spent nullifier — is judged exactly as a verdict's is.
 pub fn acceptance_for_pool(e: &MempoolError, hash: Hash, refused: &mut RefusedCache) -> Acceptance {
     match e {
         MempoolError::Invalid(t) => acceptance_for(&Err(t.clone()), hash, refused),
+        // `Warming` (private multisig phase 4): a multisig auth proof before this node's key is
+        // ready. "Try again later" — not forwarded, not cached, no peer penalised; the RPC
+        // submitter hears `mempool::MSAUTH_WARMING`.
         MempoolError::Duplicate
         | MempoolError::Conflict(_)
         | MempoolError::AttestationConflict(_)
-        | MempoolError::Full => Acceptance::Ignore,
+        | MempoolError::Full
+        | MempoolError::Warming(_) => Acceptance::Ignore,
     }
 }
 

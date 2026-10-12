@@ -205,6 +205,21 @@
 # `5ff7676` while both manifests' `rand-zkvm-cuda` rev stays `75b7893` — the split CI's provenance
 # job allows, since it checks the backend is the same at both.
 #
+# Constraint set 9 (circuits `57fb9dc`, branch `feat/private-multisig`: rVM phase 4's Merkle spans
+# and the MODQ chip, private multisig phase 4; fullnode spec 2026-10-11-private-multisig-phase4
+# §4–§5): research gains `src/{modq,msauth,dilithium_host}.rs` (named in the hand-maintained
+# `lib.rs`), `src/tables/modq.rs`, the `dilithium-verify` and `msauth` guests (copied by the guest
+# loop) and a third vendored crate, `guests-compiled/dilithium-core` (no dependencies; the workspace
+# excludes it like the other two). The hand mirrors: `asm::ops::call_modq` and
+# `guests::compiled::{dilithium_verify, msauth}`. Upstream's forge hooks sit behind a `cheating`
+# feature this crate declares but the node never enables: `tests/modq_cheating.rs` (its only user)
+# is excluded, `tests/common/modq_harness.rs` is `#[cfg(feature = "cheating")]` in `common/mod.rs`,
+# and `tests/cheating.rs` was split upstream to need no feature; the hooks guard below enforces it.
+# `tests/{dilithium,msauth,modq_reference}.rs` (the Dilithium KAT suite) need the dev-dependencies
+# `crystals-dilithium = "=2.0.0"` and `sha3 = "=0.10.9"`. 57fb9dc was synced unpushed with
+# `CUDA_REV=71e1a0411748cbb7ba74b204acaafe37587e613a` (backend and constants identical). The rVM
+# moved on purpose (the recursion section below), so `crates/randprotocol-rvm` is NOT reverted.
+#
 # Audit v6 PROC-2 (issue #109, 2026-10-01): a clone of this repository alone has to build, so no
 # manifest here may name a path outside the repository — cargo loads every path dependency's
 # manifest, optional or not, and `cargo metadata` failed on the first sibling path a lone clone
@@ -241,7 +256,7 @@ rsync -a --delete --exclude target --exclude .git --exclude Cargo.lock --exclude
 rsync -a --delete --exclude executor.rs --exclude shielded.rs --exclude call_envelope.rs \
       --exclude viewing.rs --exclude bundle.rs --exclude hidden_bundle.rs \
       --exclude hidden_cheating.rs --exclude hidden_trace_forgery.rs --exclude guest_provenance.rs --exclude 'auth*.rs' --exclude evm_rt.rs --exclude sbpf_rt.rs \
-      --exclude perps_vectors.rs \
+      --exclude perps_vectors.rs --exclude modq_cheating.rs \
       "$SRC/tests/" "$DST/tests/"
 [ -f "$DST/src/guests.rs" ] || cp "$SRC/src/guests.rs" "$DST/src/guests.rs"
 # M4.1/M4.2: vendor the compiled guest binaries the vendored `tests/e2e.rs` and the local
@@ -253,7 +268,7 @@ rsync -a --delete --exclude executor.rs --exclude shielded.rs --exclude call_env
 # not inside it, so `$SRC/../guests-compiled` — fail loudly rather than leaving a stale/missing
 # binary that only shows up as a runtime `include_bytes!` compile error far from this script.
 mkdir -p "$DST/guests-compiled/bin" "$DST/guests-compiled/evm/contracts" "$DST/guests-compiled/sbpf/programs"
-for GUEST in fib keccak256 evm sbpf; do
+for GUEST in fib keccak256 evm sbpf dilithium-verify msauth; do
   BIN_SRC="$SRC/../guests-compiled/bin/$GUEST.bin"
   if [ ! -f "$BIN_SRC" ]; then
     echo "sync-zkvm.sh: expected compiled guest binary at $BIN_SRC — not found" >&2
@@ -293,11 +308,11 @@ echo "guests-compiled/SHA256SUMS regenerated; PROVENANCE.md names circuits $CIRC
 # taken verbatim, `[workspace]` table included: the root `Cargo.toml` excludes the two paths from
 # membership, which is what lets a package with its own `[workspace]` sit inside this one.
 VENDOR=vendor/circuits
-if [ -n "$(git -C "$CIRCUITS_ROOT" status --porcelain -- guests-compiled/evm-core guests-compiled/sbpf-core 2>/dev/null)" ]; then
-  echo "sync-zkvm.sh: circuits' guests-compiled/{evm-core,sbpf-core} have uncommitted changes; $VENDOR/PROVENANCE.md would name a commit these files are not from" >&2
+if [ -n "$(git -C "$CIRCUITS_ROOT" status --porcelain -- guests-compiled/evm-core guests-compiled/sbpf-core guests-compiled/dilithium-core 2>/dev/null)" ]; then
+  echo "sync-zkvm.sh: circuits' guests-compiled/{evm-core,sbpf-core,dilithium-core} have uncommitted changes; $VENDOR/PROVENANCE.md would name a commit these files are not from" >&2
   exit 1
 fi
-for CRATE in evm-core sbpf-core; do
+for CRATE in evm-core sbpf-core dilithium-core; do
   if [ ! -f "$CIRCUITS_ROOT/guests-compiled/$CRATE/Cargo.toml" ]; then
     echo "sync-zkvm.sh: expected crate at $CIRCUITS_ROOT/guests-compiled/$CRATE — not found" >&2
     exit 1
@@ -312,7 +327,7 @@ done
 ( cd "$VENDOR" && find . -type f ! -name SHA256SUMS ! -name PROVENANCE.md | sed 's|^\./||' | LC_ALL=C sort \
     | while read -r f; do shasum -a 256 "$f"; done > SHA256SUMS )
 sed -i '' "s|^circuits: .*|circuits: $CIRCUITS_COMMIT|" "$VENDOR/PROVENANCE.md"
-echo "$VENDOR/{evm-core,sbpf-core} re-copied; $VENDOR/SHA256SUMS regenerated; $VENDOR/PROVENANCE.md names circuits $CIRCUITS_COMMIT"
+echo "$VENDOR/{evm-core,sbpf-core,dilithium-core} re-copied; $VENDOR/SHA256SUMS regenerated; $VENDOR/PROVENANCE.md names circuits $CIRCUITS_COMMIT"
 # The CUDA backend's git revision (see the header): the commit being synced unless the caller
 # names one, and it has to be on the public remote or cargo cannot fetch it. The remote-tracking
 # check is against whatever remotes this checkout has; it cannot see a push it has not fetched.
@@ -340,6 +355,14 @@ grep -rl "rand_zkvm" "$DST/src" "$DST/tests" | xargs -I{} sed -i '' \
       -e 's/rand_zkvm_cuda/@@RAND_ZKVM_CUDA@@/g' \
       -e 's/rand_zkvm/randprotocol_zkvm/g' \
       -e 's/@@RAND_ZKVM_CUDA@@/rand_zkvm_cuda/g' {} 2>/dev/null || true
+# Private multisig phase 4 (MODQ chip): circuits gates its forge hooks behind a `cheating` feature
+# the node never enables. Only `tests/modq_cheating.rs` (excluded above) and the feature-gated
+# `tests/common/modq_harness.rs` may call them; `tests/cheating.rs` was split upstream so that it
+# builds without the feature. Comment lines are skipped (`modq_run.rs` names `ModqAirWithout` in prose).
+if grep -nE 'forge_block|build_traces_forged|ModqAirWithout|call_unchecked|execute_unchecked_modq|memory_trace_forged|range_counts_without' "$DST"/tests/*.rs "$DST"/tests/common/*.rs \
+     | grep -vE '^[^:]+:[0-9]+:[[:space:]]*//' | cut -d: -f1 | grep -vE '/common/modq_harness\.rs$' | grep -q .; then
+  echo "sync-zkvm.sh: a vendored test other than tests/common/modq_harness.rs calls a cheating hook; give it its own [[test]] required-features = [\"cheating\"] entry in $DST/Cargo.toml (or exclude it) first" >&2; exit 1
+fi
 # Constraint set 6 (M4.3/M4.4): three vendored files `include!` assets from upstream's
 # `guests-compiled/`, spelled `../../guests-compiled/` (two levels up from `research/src` and
 # `research/tests`). This crate's layout is one level shallower — the copy step above puts the
@@ -399,6 +422,10 @@ s = s.replace(anchor, wrapper + anchor, 1)
 open(p, 'w').write(s)
 PY
 fi
+grep -q 'pub fn verifier_key(&self, tier: Tier, program_log_height: u8, input_log_height: u8, keccak_log_height: u8, sha256_log_height: u8, public_log_height: u8)' "$DST/src/machine.rs" \
+  && grep -q 'pub fn log_ext_degrees_pub' "$DST/src/machine.rs" \
+  && echo "anchors: verifier_key 6-arg ok; log_ext_degrees_pub ok" \
+  || { echo "sync-zkvm.sh: an anchor moved (verifier_key 6-arg or log_ext_degrees_pub)" >&2; exit 1; }
 # M3.4/M4.1: `hash.rs`'s program-digest header and `tables/cpu.rs`'s in-circuit copy of the same
 # constant both read `crate::notes::domain::HC` upstream; M4.1 added a second such pair for the
 # input digest, `crate::notes::domain::IN`. Constraint set 6 added a third: `crate::notes::
@@ -446,6 +473,10 @@ fi
 # `fees_collected`/`burned`/`FeeInForeignAsset`); this side's copy says RAND. Comments only — the
 # file has no SHRUGG identifier — and `notes.rs`'s two SHRUGG comment lines are deliberately left
 # as upstream has them, as they always were.
+grep -q 'pub const HC_DOMAIN: u32 = 8;' "$DST/src/hash.rs" \
+  && ! grep -rq 'crate::notes::domain::\(HC\|IN\|PUB\)\b' "$DST/src/hash.rs" "$DST/src/tables/cpu.rs" \
+  && echo "anchors: notes::domain HC/IN/PUB -> hash::*_DOMAIN ok" \
+  || { echo "sync-zkvm.sh: an anchor moved (HC_DOMAIN in hash.rs)" >&2; exit 1; }
 sed -i '' 's/SHRUGG/RAND/g' "$DST/src/ledger.rs"
 REV=$(git -C "$SRC" rev-parse --short HEAD 2>/dev/null || echo unknown)
 echo "synced zkVM from $SRC at $REV into $DST"
@@ -533,6 +564,9 @@ rsync -a --delete --exclude target --exclude .git --exclude Cargo.lock --exclude
       "$RVM_SRC/src/" "$RVM_DST/src/"
 rsync -a --delete --exclude target "$RVM_SRC/tests/" "$RVM_DST/tests/"
 cp "$RVM_SRC/Cargo.toml" "$RVM_DST/Cargo.toml"
+if grep -q 'features = \["cheating"\]' "$RVM_DST/Cargo.toml"; then
+  echo "sync-zkvm.sh: recursion's Cargo.toml enables rand_zkvm's cheating feature; the node must never link the hooks — strip it upstream or here" >&2; exit 1
+fi
 # The rename, over the vendored tree and the manifest alike: `rand_zkvm` -> `randprotocol_zkvm`, with
 # the external `rand_zkvm_cuda` parked behind the placeholder as above; then the three path
 # adjustments the manifest and the crate name need.
@@ -596,4 +630,4 @@ if "license.workspace = true" not in s:
 PY
 sed -i '' 's|crates/shrugg-zkvm/tests/backend.rs|crates/randprotocol-zkvm/tests/backend.rs|' "$RVM_DST/tests/backend.rs"
 RVM_REV=$(git -C "$RVM_SRC" rev-parse --short HEAD 2>/dev/null || echo unknown)
-echo "synced recursion VM from $RVM_SRC at $RVM_REV (pin 4a244b6, tree aggregation) into $RVM_DST"
+echo "synced recursion VM from $RVM_SRC at $RVM_REV (pin $RVM_REV) into $RVM_DST"

@@ -387,3 +387,52 @@ fn bench_apply_reports_a_verdict_and_exits_nonzero_when_over_budget() {
     assert!(!over.ok, "over the budget is a failure for a script");
     assert!(over.out.contains("OVER the 0 ms budget"), "{}", over.out);
 }
+
+/// `verify` runs `run`'s build check before touching a block: a genesis naming another build's
+/// multisig auth guest is refused, naming the field — not reported CORRUPT — and `--repair`
+/// refuses the same way, so it can never truncate on it.
+#[test]
+fn verify_refuses_a_genesis_naming_another_builds_multisig_guest() {
+    let dir = tempfile::tempdir().unwrap();
+    let genesis = dir.path().join("genesis.json");
+    let r = node(&[
+        "genesis",
+        "--chain-id",
+        "14",
+        "--fri-profile",
+        "test",
+        "--validator",
+        &validator_arg(),
+        "--bundle-guest",
+        "v3",
+        "--auth-guest",
+        "--auth-multisig-guest",
+        "--max-proof-bytes",
+        "4194304",
+        "--max-block-bytes",
+        "20971520",
+        "--out",
+        genesis.to_str().unwrap(),
+    ]);
+    assert!(r.ok, "{}", r.err);
+    let mut g: Value = serde_json::from_str(&std::fs::read_to_string(&genesis).unwrap()).unwrap();
+    let other = "ab".repeat(32);
+    assert_ne!(g["hc_auth_multisig"].as_str(), Some(other.as_str()));
+    g["hc_auth_multisig"] = Value::String(other.clone());
+    std::fs::write(&genesis, serde_json::to_string_pretty(&g).unwrap()).unwrap();
+    let data = dir.path().join("data");
+    let d = data.to_str().unwrap();
+    let init = node(&["init", "--datadir", d, "--genesis", genesis.to_str().unwrap()]);
+    assert!(init.ok, "init builds any well-formed genesis: {}", init.err);
+    for args in [&["verify", "--datadir", d][..], &["verify", "--datadir", d, "--repair"]] {
+        let v = node(args);
+        assert!(!v.ok, "{}", v.out);
+        assert!(
+            v.err.contains(&format!("the genesis hc_auth_multisig ({other}) is not this build's multisig auth guest"))
+                && v.err.contains("refusing to verify"),
+            "{}",
+            v.err
+        );
+        assert!(!v.out.contains("CORRUPT") && !v.out.contains("repaired"), "{}", v.out);
+    }
+}

@@ -24,6 +24,24 @@ use crate::notes::{hash, SpendKey, Word8};
 /// has.
 pub const AUTH_DOMAIN: u32 = 65;
 
+// Private multisig phase 4: the vendored `msauth` guest commits under the same `AUTH` tag (65) and
+// owns 66-69 (`MS_LEAF`, `MS_NODE`, `MS_POLICY`, `NK_MS`). Those must not collide with the
+// hidden-bundle tag (64) or the perps tags (21-23); a re-vendor that moved one fails to compile.
+const _: () = {
+    use crate::msauth::{AUTH, MS_LEAF, MS_NODE, MS_POLICY, NK_MS};
+    assert!(AUTH == AUTH_DOMAIN);
+    let ms = [MS_LEAF, MS_NODE, MS_POLICY, NK_MS];
+    let others = [AUTH_DOMAIN, crate::hidden::HIDDEN_BUNDLE_DOMAIN, crate::perps::PERP_BLOCK, crate::perps::PERP_STATE, crate::perps::PERP_PAYOUTS];
+    let mut i = 0;
+    while i < ms.len() {
+        let mut j = 0;
+        while j < others.len() { assert!(ms[i] != others[j]); j += 1; }
+        let mut k = i + 1;
+        while k < ms.len() { assert!(ms[i] != ms[k]); k += 1; }
+        i += 1;
+    }
+};
+
 /// Private-input layout of `guests::auth()` — 16 words, always all present.
 pub mod auth_input {
     /// The 8-word spend key.

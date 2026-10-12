@@ -162,7 +162,7 @@ becomes `O(block)`, and committing is applying a chain of deltas. No consensus c
 
 ### 3.3 Verification off the loop, cached by digest
 
-**Shipped**: the worker count (`rand-node run --verify-workers`, default the cores minus two, at least four, with the queue and in-flight limits sized from it), and the digest-keyed cache (`verify_cache::CachingExecutor`, every STARK verifier, keyed by a digest of all its inputs, 16 384 entries). Still open: moving an uncached apply-time verify off the consensus loop.
+**Shipped**: the worker count (`rand-node run --verify-workers`, default the cores minus two, at least four, with the queue and in-flight limits sized from it), and the digest-keyed cache (`verify_cache::CachingExecutor`, every STARK verifier, keyed by a digest of all its inputs, 16 384 entries). **Also shipped**: an incoming proposal's apply (`apply_block_for_sync` on a clone of the parent's ledger) runs on a blocking thread, so an uncached verify at apply time no longer blocks the consensus loop (spec 2026-10-11 off-loop apply). Still on the loop: `precheck_proposal` (view, stale, signature, parent, leader, equivocation, justify, transaction list), all of `on_proposal`'s checks including the QC check, and the insert. Still applied on the loop: sync batches, the leader's own block, orphan re-runs, `offer_pending` and `restore_pending`. `--apply-proposals-inline` restores the old path.
 
 The admission workers already verify proofs on `spawn_blocking` threads and the proposal path
 re-checks against a verified set. Generalise it: every proof the node will ever verify — bundle,
@@ -268,7 +268,8 @@ test-profile N = 1 aggregate with margin (measured). Production N = 1 projected 
 and `docs/07-rvm-rate-quarter.md`):** phase 3 moves the reduce chip's descriptor into a
 preprocessed layout and adds FOLD / POW row kinds (production inner proof 893 606 → 585 686 cpu
 rows, still tier 20; the register and RAM tables `2^22` → `2^21`; the aggregate program digest
-`c90b3f0a…74d8` → `dc350ecf…8ba0`). The rVM's own proofs then move from rate ⅛ to rate ¼
+`c90b3f0a…74d8` → `dc350ecf…8ba0`; superseded since 2026-10-11 by rVM phase 4 and constraint
+set 9: `8bc2cecb…d8c7`, with `inner_vk_digest` `1b0c4b00…ddc7`, `docs/aggregation.md`). The rVM's own proofs then move from rate ⅛ to rate ¼
 (`log_blowup 3 → 2`, 92 queries and 24 grinding bits in place of 80 and 20; 86.38 proven bits
 against 86.41, the inner RV32 profile untouched). Measured on the tier-18 test twin: peak live
 heap 33.27 GB (quotient layout) → 26.88 GB (phase 3) → **15.64 GB** (rate ¼), verify 7.07 →

@@ -1950,6 +1950,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "dilithium-core"
+version = "0.1.0"
+
+[[package]]
 name = "displaydoc"
 version = "0.2.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5329,6 +5333,7 @@ dependencies = [
  "libp2p",
  "qrcode",
  "randprotocol-core",
+ "randprotocol-msig",
  "randprotocol-node",
  "randprotocol-prover",
  "randprotocol-zkvm",
@@ -5360,6 +5365,23 @@ dependencies = [
  "thiserror 2.0.20",
  "tracing",
  "zeroize",
+]
+
+[[package]]
+name = "randprotocol-msig"
+version = "0.7.1"
+dependencies = [
+ "chacha20poly1305 0.11.0",
+ "getrandom 0.2.17",
+ "getrandom 0.4.3",
+ "hex",
+ "ml-kem",
+ "rand_chacha 0.3.1",
+ "randprotocol-core",
+ "randprotocol-zkvm",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -5471,6 +5493,8 @@ version = "0.7.1"
 dependencies = [
  "chacha20 0.10.2",
  "chacha20poly1305 0.11.0",
+ "crystals-dilithium",
+ "dilithium-core",
  "evm-core",
  "hex",
  "ml-kem",
@@ -5500,6 +5524,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "sha3 0.10.9",
  "solana-sbpf",
 ]
 

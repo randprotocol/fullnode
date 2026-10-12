@@ -71,6 +71,28 @@ lost quorum frees the slot. `initial_price_micros` is required. Pinned: a no-sec
 state root (identical to base `3119a29a`). Suites: core lib 810, node lib 623 (1 ignored), node bin
 55, rpc_contract 7, genesis_cli 14, client lib 210, clippy clean for the three crates. Recommended values deferred until aggregation is admitted (`docs/deploy.md`).
 
+### Constraint set 9 re-vendored (2026-10-11; branch `feat/private-multisig`, commit `6530861f`, NOT pushed)
+
+The branch's circuits pin is **`d217252`** (`CIRCUITS_PIN` in `.github/workflows/ci.yml`,
+`vendor/circuits/PROVENANCE.md`; synced with `CUDA_REV=71e1a04`). It was first re-vendored at
+`57fb9dc` (this entry), then `c55cfa1` (`emulator_edges` knows syscall 8, `SYS_MODQ`; `074c5141`), then
+`d217252` (`4219d5f5`), which adds over `57fb9dc` the verifier-key blob export/install API
+(`export_verifier_key_with_modq`, `install_verifier_key_pinned`: SHA-256-pinned, lookups recomputed on
+install, installed keys non-evictable) on top of the same constraint set 9; no recursion pin moved
+after `57fb9dc`. Circuits `57fb9dc` (`feat/private-multisig`, unpushed) carries
+**rVM phase 4** (Merkle spans, `recursion/docs/09-phase4-spans.md`) and the **MODQ chip**
+(constraint set 9: every inner verifier key and the proof encoding move, `Proof::modq_log_height`),
+plus the `msauth`/`dilithium-verify` guests and `vendor/circuits/dilithium-core`. **Current pins**
+(every earlier value below is superseded; `tests/no_pre_phase4_recursion_pins.rs` refuses the old
+full literals anywhere in crates/deploy/scripts/vendor and this file): `inner_vk_digest`
+`1b0c4b0043dd5d00d710f10048bfde989a955034d7fd52f1a85595a61339ddc7`; admission interface digest
+`3753f2fd7ba2091910f1a5eb6b722c3b55e71e7661854c058d95ed446cb186b4` (fixtures re-proved);
+`verify_rv32.digest` `79ebe02b…`; production `aggregate_program_digest`
+`8bc2cecbd30b975ec15a5e11354434bd7e1c2814d46dd0acc1d92b3ff944d8c7` (now pinned by a node test).
+Production N=1 is 315 391 rows, **tier 19**, so `admitted_tiers` Production is **{19, 20, 21}**
+(test {18, 19, 20}); the test tree's steps are tier 18 and its fixed point is level 2 (`vk_fix`
+dropped). `BUILD_CONSTRAINT_SET` = 9 refuses chains 14-20 by genesis hash.
+
 ### rVM phase 3 + rate ¼ re-vendored (2026-10-08; branch `feat/rvm-rate-quarter-vendor`, NOT pushed)
 
 Circuits `71e1a04` (main; on the `randprotocol` remote) carries two rVM changes, vendored
@@ -79,7 +101,7 @@ layout, FOLD / POW row kinds; production inner proof 893 606 → 585 686 cpu row
 and **rate ¼** (`docs/07-rvm-rate-quarter.md`: the rVM's own proofs at log_blowup 2, 92 queries,
 24 grinding bits; 86.38 proven bits against 86.41; the inner RV32 profile stays 80/8/20). Phase 3
 moved the aggregate program digest `c90b3f0a…74d8` →
-**`dc350ecf6b60af74f4bb032bdf607c3fa0fbd6317705f0b1077e71b455e38ba0`** (production bundle shape);
+**`dc350ecf…8ba0`** (production bundle shape; superseded, see constraint set 9 above);
 rate ¼ moved only rVM keys and proofs; `inner_vk_digest` `346ee184…` and the admission vectors
 (`3534960f…`) did not move; `admitted_tiers` unchanged ({20, 21, 22} / {18, 19, 20}). Node API
 follow-through in `agg_executor.rs`: `Machine::verifier_key` takes a reduce log-height (was a
@@ -770,7 +792,7 @@ real proofs, not just the structural tests, pass.
 `CIRCUITS_PIN` already names it); `aggregate_program_digest`
 `1831f036a2d3524249df17a66a220457878f8aeed669c77db08d58026461ddd7`; rVM interface digest
 `5e3d7fb2bd1f5342e49577650a281996b656d1fa4e8f3eff7ee82adefe9d1ed6`; `inner_vk_digest`
-`346ee1841980e46a3501f5b04cdf40dd3208e5b1c67360285353cf7a0b735fb9`; `bundle_gas_limit` `20 479`
+`346ee184…5fb9` (superseded by `1b0c4b00…` at constraint set 9); `bundle_gas_limit` `20 479`
 (moved once from `16 383` mid-task — the absorb-term ruling below — every site greps clean for the
 old value now).
 

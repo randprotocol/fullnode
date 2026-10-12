@@ -407,6 +407,7 @@ one the cut announced; a mismatch on one node is almost always an old binary.
 | `--prover-cpu` | off | prove on the CPU even when a GPU is visible to a CUDA build |
 | `--prover-threads <N>` | the cores minus one, at most 8 | CPU threads the hosted prover's proofs use (`RAYON_NUM_THREADS` when set and no flag) |
 | `--verify-workers <N>` | the cores minus two, at least four | the proof-verification workers of admission and the consensus loop's lookups; the queue and in-flight limits follow it (spec 2026-10-05 §6, `docs/compute-optimization.md` §3.3) |
+| `--apply-proposals-inline` | off | restore the inline apply: incoming proposals are applied on the consensus loop, as before v0.8.0's off-loop apply; by default the apply runs on a blocking thread (at most 4 at once, up to 8 waiting behind a parent, at most 2 per proposer), with the prechecks, `on_proposal`'s checks and the insert still on the loop (`docs/compute-optimization.md` §3.3). The by-hash fetch answer binding (an answer that is not the block asked for is dropped) is a separate fix and stays on with this flag |
 | `--prover-skip-memory-check` | off | skip the free-memory gate |
 | `--prover-fee <RAND>` | none | the fee every job sent to the hosted prover must pay, in RAND (display units, up to 9 decimals): one RAND output to `--prover-fee-address` inside the bundle proved; needs `--prover-fee-address`, and only a v3 (split-authorisation) witness can carry it (`docs/prover.md` §3.5) |
 | `--prover-fee-address <ADDRESS>` | none | the `rand1…` address the hosted prover's fee is paid to; needs `--prover-fee` |
@@ -446,10 +447,14 @@ rand-node bench apply --blocks 10000 --report-every 500 --incremental-nullifier-
 | `--datadir <DATADIR>` | required | data directory (node must not be running) |
 | `--mode <MODE>` | `full` | `quick`, `replay` or `full`, as for `--verify-chain` (no checkpoint here: `rand-node verify` always walks) |
 | `--repair` | off | truncate the damaged tail and rewrite the note, nullifier, anchor and validator families from the replayed ledger; safety state is kept |
+| `--msauth-vk <PATH>` | `$RAND_MSAUTH_VK`, else `msauth-vk-<profile>.bin` beside the binary | the pinned msauth verifier key blob, read only on a chain naming `hc_auth_multisig` |
 
 Exit code 0 if the chain is consistent, 2 if a problem was found and `--repair` was not given.
 Replay re-verifies every bundle proof, so a build whose zkVM constraints differ from the one that
-made the chain will stop at the first bundle (`docs/confidential.md`).
+made the chain will stop at the first bundle (`docs/confidential.md`). On a chain naming
+`hc_auth_multisig` it first loads the pinned msauth verifier key as `run` does (fixed path, `--msauth-vk`
+/ `RAND_MSAUTH_VK` override, refused loudly when absent or of the wrong digest, never built;
+`docs/deploy.md`, "The msauth verifier key").
 
 ### `rand-node db drop-perp-inputs`
 
@@ -519,7 +524,7 @@ Global options, accepted before or after the subcommand:
 | command | arguments | behaviour |
 |---|---|---|
 | `keygen` | | write a new spend-key file at `--key`, mode 0600; refuses to overwrite |
-| `address` | `--uri [--amount A] [--asset X] [--memo M]`, `--qr`, `--qr-png <FILE>` | print this wallet's `rand1…` shielded address on stdout — exactly the address and a newline, so `$(rand address)` works in a script — and its `fingerprint XXXX-XXXX-XXXX-XXXX` on stderr (spec 2026-09-26 §2.1 — 16 Crockford base32 characters, a human check of the address, never sent on the wire). `--uri` also prints a `randpay:` link (§2.2: address plus optional `amount`/`asset`/`memo`), round-tripped through the same parser a payee's wallet uses before it is shown. `--qr` renders that link as a QR code in the terminal (Unicode half blocks); `--qr-png <FILE>` writes it as a PNG. A bare address's QR is the link with no parameters — a scanner always lands on `randpay:`, never a raw address |
+| `address` | `--uri [--amount A] [--asset X] [--memo M]`, `--qr`, `--qr-png <FILE>` | print this wallet's `rand1…` shielded address on stdout — exactly the address and a newline, so `$(rand address)` works in a script — and its `fingerprint XXXX-XXXX-XXXX-XXXX` on stderr (spec 2026-09-26 §2.1 — 16 Crockford base32 characters, a human check of the address, never sent on the wire), then its `owner fingerprint <16 hex>` on stderr: what a private multisig's signer sees on the output that pays this address, so a payee can hand it over with the address. `--uri` also prints a `randpay:` link (§2.2: address plus optional `amount`/`asset`/`memo`), round-tripped through the same parser a payee's wallet uses before it is shown. `--qr` renders that link as a QR code in the terminal (Unicode half blocks); `--qr-png <FILE>` writes it as a PNG. A bare address's QR is the link with no parameters — a scanner always lands on `randpay:`, never a raw address |
 | `contacts add <NAME> <TO>` / `list` / `show <NAME> [--qr]` / `remove <NAME>` | `--yes` (`add`) | named addresses this wallet can send to by name (§3.1). `TO` is a `rand1…` address or a `randpay:` link (only its address is kept); `add` prints the fingerprint and asks `add? [y/N]` unless `--yes`; on a stdin that is not a terminal it refuses (`stdin is not a terminal: pass --yes to add without confirmation`) instead of reading an answer nobody gave. `show` prints the address, its fingerprint, and — with `--qr` — a QR of its `randpay:` link. Stored at `<key>.contacts.json`, mode 0600, written atomically (temp file, then rename); a name is 1–64 characters, never starting with `rand1` or `randpay:` (case-insensitive), and unique — an address may be saved under one name only |
 | `prover pair <LINK>` / `show` / `forget` | `--name <NAME>`, `--yes` (`pair`) | pair this wallet with one delegated prover. `pair` takes the `randprover:` link `rand-prover pair` printed, refuses a URL that is not printable ASCII or not `https://` (plain `http://` only to `localhost`, `127.0.0.1` or `[::1]`, and never with a user name or password), then shows the prover's fingerprint and URL and **what it will receive** — `this prover will receive this wallet's viewing key: it can read the wallet's whole history; it cannot spend` — and asks `pair? [y/N]` (`--yes` skips the question; a stdin that is not a terminal is refused without it, as for `send`). Only then does it ask the prover's `prover_info`, refuse unless its key fingerprint is the one the link names, and write `<key>.prover.json`, mode 0600 (the token is a bearer credential), replacing any earlier pairing. `--name` is printed instead of the URL. The link's `own=1` is a label and changes nothing that is sent or shown: no prover is ever sent the spend key, and on a chain whose bundle guest is v1 or v2 every `--prover` use is refused (`docs/prover.md` §2, §5.1). `show` prints name, URL, fingerprint, `own` and the prover's key — never the token; `forget` deletes the file. `prover pair --trusted` takes no link: it pairs with the validators' prover pool, `https://prover.randprotocol.org`, from the link this build carries (`docs/prover.md` §9) — not your own prover: its operators can read this wallet's whole history and cannot spend |
 | `viewing-key` | | print this wallet's viewing key `nk`, 64 hex — the parameter `rand_importViewingKey` takes. It reads every note the wallet has sent or received and spends none; derived from the spend key on each run, never stored |
@@ -642,7 +647,7 @@ header (`docs/fees.md` §1.1), printed as `gas bound …` before the bundle is p
 
 ```bash
 rand keygen                                   # wallet.key.json
-rand address                                  # rand1… on stdout, its fingerprint XXXX-XXXX-XXXX-XXXX on stderr
+rand address                                  # rand1… on stdout, its fingerprint XXXX-XXXX-XXXX-XXXX and owner fingerprint on stderr
 rand faucet                                   # testnet: 100 RAND into a note only you can open
 rand balance                                  # balance: 100 RAND
 rand send rand1q9f… 1.5                     # ~100 s of local proving, then the commit
@@ -746,6 +751,47 @@ new account). Each waits for the commit unless `--no-wait`.
 | `perp state` | | `rand_getPerps` verbatim |
 | `perp account [ID]` | `--trading-key <FILE>` (instead of `ID`) | `rand_getPerpAccount`: key, `nonce_high`, `used`, pending withdrawals |
 | `perp inputs <HEIGHT>` | | `rand_getPerpInputs`: the block's perp input words and digest |
+
+### `rand multisig-private`
+
+Private multisig accounts: a T-of-N policy of Dilithium2 signer keys whose address and spends look
+like any wallet's. The account has a viewing key and no spend key; a spend is a **proposal** that
+T signers check and sign offline, and the signatures are hidden in a proof. Needs a chain whose
+`rand_status` names `hc_auth_multisig`. The **policy file** holds the account's secret `msk` (its
+viewing power over every note) and a **proposal** holds the witness: both are written mode 0600,
+never over an existing file, refused when group or other can read them, and never printed. Signers
+need the policy file (give it to them out of band) and a `rand-node keygen` key of their own. The
+global `--rpc` applies; `--key` matters only to `--prover` (which prover is paired); the account's notes live beside the policy.
+
+| command | flags | does |
+|---|---|---|
+| `multisig-private new-policy` | `--signer <pubkey hex>` (repeat, in order: the order is part of the address), `--threshold <T>`, `--out` (`policy.json`), `--public-account <ID>` (repeat) | make a policy with a fresh `msk`; prints the address and its fingerprint. Refused where the prover could never spend it (T above 3, more than 16 signers, a repeated key). Each `--public-account` is read from the node (`rand_getMultisig`) and a warning is printed for every signer that also signs it: anyone who knows both policies can link the two |
+| `multisig-private address` | `--policy` | the address, the fingerprint (every signer compares it out of band), the owner fingerprint (what a signer of *another* private account paying this one sees on that output) and the policy hash |
+| `multisig-private balance` | `--policy`, `--store` (`<policy>.notes.json`) | scan the chain for the account's notes; prints the balance |
+| `multisig-private prepare` | `--policy`, `--to <rand1…>` with `--amount <RAND>`, or `--sweep-to <rand1…>`; `--memo`, `--fee <RAND>`, `--out` (`proposal.json`), `--store` | write the proposal every signer checks: a payment, or every RAND note of the account (at most two) moved to a new address, less the fee, which is how a policy is rotated. Prints the summary and the height before which it must be proved |
+| `multisig-private check` | `--proposal`, `--policy`, `--expect-to <rand1…[:AMOUNT]>` (repeat) | every check a signer makes, offline, and the summary; compares the expiry with the head when a node answers. With `--expect-to`, as for `sign` |
+| `multisig-private sign` | `--proposal`, `--policy`, `--key`, `--expect-to <rand1…[:AMOUNT]>` (repeat) | one signer, offline: the checks, the summary on stderr, and `<index>:<hex>` on stdout. **Name the payee**: ask them for their address and pass it as `--expect-to`; every output that moves value and is not the account's change must then pay one of the named addresses' owner keys, or nothing is signed (`output N pays <owner fingerprint>, not an expected recipient`); every named address must also be paid (`expected recipient <fp> is not paid`), and `ADDR:AMOUNT` (RAND, read as `--amount` reads it) pins the total paid to it (`expected recipient <fp> is paid <sum>, not <AMOUNT>`). The paying line says `matches <address fingerprint> (<amount>)`. Without `--expect-to` the summary says `WARNING: no expected recipient given: the payee was NOT checked` and the share is still produced: the coordinator holds the policy and could have paid its own key. The summary's first line names the chain id and the genesis hash the binding commits to. Each output line says the owner key is verified and the delivery key is not verifiable from the proposal: even a matching output could be sealed so the payee never finds it (nothing is stolen; confirm receipt with the payee). Warns when the key looks like a validator's (its address is in `rand_getValidators`, or the file is a datadir `node.key.json`). With no node reachable it prints a note that the key could not be checked and carries on; an offline signer waits out the read timeout (15 s) first |
+| `multisig-private prove` | `--proposal`, `--policy`, `--signature <index:hex>` (repeat, at least T), `--out` (`proposal.tx`), `--cuda` | verify the shares and prove: the **auth proof is proved on this machine (tier 18: minutes, at least 48 GB)**, the bundle here or on the paired prover (`--prover`). Refused at or past 16 blocks before the expiry. Prints both proofs' sizes |
+| `multisig-private submit` | `--tx`, `--no-wait` | send the proved transaction and wait for the commit; prints its hash |
+
+A 2-of-3 walk-through:
+
+```sh
+rand multisig-private new-policy --signer $PK0 --signer $PK1 --signer $PK2 --threshold 2 --out policy.json
+rand multisig-private address --policy policy.json            # signers compare the fingerprint
+#   pay the printed address from any wallet, then:
+rand multisig-private balance --policy policy.json
+rand multisig-private prepare --policy policy.json --to rand1… --amount 1.5 --out proposal.json
+#   each signer asks the payee for their address (rand1…), out of band, then:
+rand multisig-private sign --proposal proposal.json --policy policy.json --key signer0.key.json --expect-to rand1…   # 0:…
+rand multisig-private sign --proposal proposal.json --policy policy.json --key signer2.key.json --expect-to rand1…   # 2:…
+rand multisig-private prove --proposal proposal.json --policy policy.json --signature 0:… --signature 2:…
+rand multisig-private submit --tx proposal.tx
+```
+
+A proposal expires `proof_window_blocks` after it is prepared (256 unless the genesis sets it): the
+shares must be gathered and the transaction proved before then, or `prepare` again. Preparing
+reserves nothing; a note named by two live proposals is spent by whichever commits first.
 
 ### Key file formats
 

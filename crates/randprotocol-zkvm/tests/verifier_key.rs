@@ -47,6 +47,13 @@
 //! same shape as the constraint-set-7 RANGE8 widening above. The constraint-set-7 `common` pins
 //! this replaces were `fab9945e…`, `c207625a…`, `7a3a38e4…`, `8e6cd439…` (same order as the shapes
 //! below); their `commitment` halves are unchanged and still pinned.
+//!
+//! MODQ (private multisig phase 3): cpu `SYS_MODQ` column, every key moved. The appended cpu column
+//! and its `MODQ` lookup move every shape's packed lookups, so every `common` moved and no
+//! `commitment` did (the cpu commits no preprocessed column). A fifth shape, "tier 10, one modq
+//! block", pins the modq chip's 16 periodic columns. The key tuple is now 7 wide (`mlh`). The
+//! constraint-set-8 `common` pins this replaces were `fd2f4f49…`, `99eed72b…`, `8792f659…`,
+//! `9690b474…`.
 use p3_batch_stark::CommonData;
 use randprotocol_zkvm::machine::{Config, FriProfile, Machine, Tier};
 use randprotocol_zkvm::tables::{input, keccak, program, public, sha256};
@@ -92,6 +99,7 @@ struct Shape {
     ilh: u8,
     klh: u8,
     slh: u8,
+    mlh: u8,
     publh: u8,
     want: (&'static str, &'static str),
 }
@@ -112,10 +120,11 @@ fn shapes() -> Vec<Shape> {
             ilh: input::input_log_height(0),
             klh: 0,
             slh: 0,
+            mlh: 0,
             publh: public::MIN_LOG_HEIGHT,
             want: (
                 "1442e70e1ddc7e9c6eabf1a6e29bd9ea37d1996d81f89768af967b77ddc3fd41",
-                "fd2f4f49d948aa8744340b5374fc85163be8520a2a7e6d25f2d6dd29c8a98ea9",
+                "d945789bc249eda9b3667e1cb6b4ee38c44bd1ce498acb20afa663a5d65b5146",
             ),
         },
         Shape {
@@ -125,10 +134,11 @@ fn shapes() -> Vec<Shape> {
             ilh: bundle_ilh,
             klh: 0,
             slh: 0,
+            mlh: 0,
             publh: binding_publh,
             want: (
                 "54991bdde2fdf6112181fde865e25cf94fae6084cb31ef33d9f58cb4645a6cc4",
-                "99eed72b1d1c904a39f9f5b2c209bfb169a8e3ea79e1c8c337a3c6d6a6811f36",
+                "0adff6278abf635c3f86fd3e3f6751f0b8c690ccdb98a51acb9926b1dfb47b5b",
             ),
         },
         Shape {
@@ -138,10 +148,11 @@ fn shapes() -> Vec<Shape> {
             ilh: input::input_log_height(0),
             klh: keccak::keccak_log_height(1),
             slh: 0,
+            mlh: 0,
             publh: public::MIN_LOG_HEIGHT,
             want: (
                 "0337aeaecbd7d601ac4b502153c29589ae290f179e277b2f66e1f4c29d3c48cb",
-                "8792f659dd527a6909ba962216caa889082aed4d8983646a9c6b0847a2aaa764",
+                "eed808f70e50bf81e1b788f643dc28be4cf494d376983fc7faf63df634c2e2c6",
             ),
         },
         Shape {
@@ -151,10 +162,25 @@ fn shapes() -> Vec<Shape> {
             ilh: input::input_log_height(0),
             klh: 0,
             slh: sha256::sha256_log_height(1),
+            mlh: 0,
             publh: public::MIN_LOG_HEIGHT,
             want: (
                 "c277ab160af3160092c4a33220724276fabc2cd26e6229c5dae535eb16ba3760",
-                "9690b474c215b7b38683e341cfe25a4fd12dc19bb46fb87e7cb3c21e2f831042",
+                "52b999fcf7f4f94dc89095853729e74914d5f90d46db1fd00e1ae56e0ff68cc9",
+            ),
+        },
+        Shape {
+            name: "tier 10, one modq block",
+            tier: Tier(10),
+            plh: program::MIN_LOG_HEIGHT,
+            ilh: input::input_log_height(0),
+            klh: 0,
+            slh: 0,
+            mlh: randprotocol_zkvm::tables::modq::modq_log_height(1),
+            publh: public::MIN_LOG_HEIGHT,
+            want: (
+                "91bffa9b1cb59d4dc85ff092b7c6180355a8680b3f559d70eabd323a1fad5448",
+                "aa129c0dcbb26432ed5609e130a9a3c3de1f3a7f49028f96cb0c6e868e7e9cdb",
             ),
         },
     ]
@@ -166,11 +192,11 @@ fn the_verifier_keys_answer_their_known_digests() {
     for profile in [FriProfile::Test, FriProfile::Production] {
         let m = Machine::new(profile);
         for s in shapes() {
-            let common = m.verifier_key(s.tier, s.plh, s.ilh, s.klh, s.slh, s.publh);
+            let common = m.verifier_key_with_modq(s.tier, s.plh, s.ilh, s.klh, s.slh, s.mlh, s.publh);
             let (commitment, all) = digests(&common);
             eprintln!(
-                "{profile:?} | {} (tier {}, plh {}, ilh {}, klh {}, slh {}, publh {}): (\"{commitment}\", \"{all}\")",
-                s.name, s.tier.0, s.plh, s.ilh, s.klh, s.slh, s.publh
+                "{profile:?} | {} (tier {}, plh {}, ilh {}, klh {}, slh {}, mlh {}, publh {}): (\"{commitment}\", \"{all}\")",
+                s.name, s.tier.0, s.plh, s.ilh, s.klh, s.slh, s.mlh, s.publh
             );
             if (commitment.as_str(), all.as_str()) != s.want {
                 failures.push(format!("{profile:?} | {}: got (\"{commitment}\", \"{all}\"), pinned {:?}", s.name, s.want));

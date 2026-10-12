@@ -39,6 +39,16 @@ pub const MAX_PROOF_BYTES: usize = 2 << 20;
 pub const MAX_PROOF_BYTES_MIN: usize = 1 << 20;
 /// The largest `max_proof_bytes` a genesis file may set: 32 MiB.
 pub const MAX_PROOF_BYTES_LIMIT: usize = 32 << 20;
+/// The smallest `max_proof_bytes` a Production-FRI genesis naming `hc_auth_multisig` may run
+/// (private multisig phase 4, spec §3.3; `Genesis::validate`'s `ProofCapTooSmallForMsauth`): the
+/// ledger caps every auth proof at `max_proof_bytes`, and a multisig auth proof is estimated at
+/// ≈ 3.6 MB (3.5–3.8 MB; at least 3.4 MB): a v3 bundle proof's 1.49 MB, +4 × 30 KB from tier 14
+/// to 18, +1.91 MB for the keccak table's width, +75 KB for the modq table. The rule keeps it at
+/// most 95 % of the cap (3 984 588 bytes at 4 MiB); a measured proof above that moves this to
+/// `6 << 20`. It is a floor, not the chain's cap: a genesis may set more (chain 21's cut chooses
+/// its own `max_proof_bytes`), and the block rule ([`min_block_bytes`], three proofs) still
+/// applies on top. The Test profile is not judged by it.
+pub const MSAUTH_MIN_PROOF_BYTES: usize = 4 << 20;
 /// Largest bridge attestation accepted in a `BridgeAttest` transaction.
 ///
 /// A real attestation is tiny: 6 envelope bytes, 66 per signature, a
@@ -146,6 +156,9 @@ pub const KECCAK_GAS: u64 = 192;
 /// Its sha256 twin: one row plus 64 rows of 466 columns, ≈ 66 cycle-equivalents, rounded down
 /// to the block size.
 pub const SHA256_GAS: u64 = 64;
+/// What one `MODQ` ecall row costs (constraint set 9; circuits `gas::MODQ_GAS`): 1 024 × (59 + 16)
+/// committed cells at ≈ 460 cells per gas.
+pub const MODQ_GAS: u64 = 168;
 /// Spec §3.3: the default price of one gas, 10⁻⁷ RAND.
 pub const GAS_PRICE_DEFAULT: u64 = 100;
 /// Spec §3.3: the default price of one KiB of call proof and envelope, from byte 0 — a bare
@@ -179,6 +192,14 @@ pub fn gas_max(tier: u8, keccak_log_height: u8, sha256_log_height: u8) -> u64 {
         .saturating_add(blocks(sha256_log_height, 64).saturating_mul(SHA256_GAS - 1))
 }
 
+/// `gas_max` with the modq table's declared height: `MODQ_GAS − 1` per 1 024-row block
+/// (constraint set 9; mirrors circuits `gas::gas_max_with_modq`). At `modq_log_height = 0` it is
+/// `gas_max` exactly.
+pub fn gas_max_with_modq(tier: u8, keccak_log_height: u8, sha256_log_height: u8, modq_log_height: u8) -> u64 {
+    let blocks = if modq_log_height == 0 { 0 } else { (1u64 << modq_log_height.min(40)) / 1024 };
+    gas_max(tier, keccak_log_height, sha256_log_height).saturating_add(blocks.saturating_mul(MODQ_GAS - 1))
+}
+
 /// The one `bundle_gas_limit` a genesis `gas` section may name (final-review I3): the bundle
 /// guest's header ceiling `gas_max(BUNDLE_PROOF_TIER, 0, 0)` = 20 479 — what every hidden-asset
 /// bundle proof declares, since a bundle is pinned to tier 14 with no hash tables.
@@ -192,6 +213,13 @@ pub fn bundle_gas_limit_pin() -> u64 {
 /// (the machine's default). A fixed rule, not a genesis field: there is exactly one honest value.
 pub fn auth_gas_limit_pin() -> u64 {
     gas_max(crate::types::AUTH_PROOF_TIER, 0, 0)
+}
+
+/// The `GAS_LIMIT` every multisig auth proof must declare on a chain with a `gas` section: its
+/// pinned header's ceiling `gas_max_with_modq(18, 14, 0, 16)` = 436 159 (R-gas: a function of
+/// public header words only, the same for every M).
+pub fn msauth_gas_limit_pin() -> u64 {
+    gas_max_with_modq(crate::types::MSAUTH_PROOF_TIER, crate::types::MSAUTH_KECCAK_LOG_HEIGHT, 0, crate::types::MSAUTH_MODQ_LOG_HEIGHT)
 }
 
 /// A node's gas prices (spec §4.1, Phase 0): admission policy, not a ledger rule.
@@ -957,5 +985,18 @@ mod gas_config_tests {
         assert_eq!(next_price(1_000, 800, 2 * t + 1, t, 5000), 1_500, "just over twice the target at 50 %: +50 %, no more");
         assert_eq!(next_price(u64::MAX, 800, 2 * t, t, 5000), u64::MAX, "saturates");
         assert_eq!(next_price(100, 100, 0, 1 << 18, 1250), 100, "gas: floor holds");
+    }
+
+    /// MODQ re-vendor: `gas_max_with_modq` is `gas_max` plus `MODQ_GAS − 1` per declared 1 024-row
+    /// modq block; at 0 it is `gas_max` exactly, at every tier.
+    #[test]
+    fn gas_max_with_modq_adds_167_per_modq_block() {
+        assert_eq!(MODQ_GAS, 168);
+        for t in MIN_TIER..=MAX_TIER {
+            assert_eq!(gas_max_with_modq(t, 0, 0, 0), gas_max(t, 0, 0));
+            assert_eq!(gas_max_with_modq(t, 14, 0, 0), gas_max(t, 14, 0));
+        }
+        assert_eq!(gas_max_with_modq(18, 14, 0, 16) - gas_max(18, 14, 0), (1u64 << 16) / 1024 * 167);
+        assert_eq!(gas_max_with_modq(18, 14, 0, 10) - gas_max(18, 14, 0), 167);
     }
 }

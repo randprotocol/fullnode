@@ -77,6 +77,17 @@ rand-zkvm-cuda = { git = "https://github.com/randprotocol/zkp-circuits", rev = "
 # `tests/guest_provenance.rs` (PROC-2, #109; they were sibling path dependencies before).
 evm-core = { path = "../../vendor/circuits/evm-core" }
 sbpf-core = { path = "../../vendor/circuits/sbpf-core" }
+# Private multisig phase 4 (the MODQ re-vendor): the no_std Dilithium2 verifier core the `msauth`
+# guest is compiled from, run natively by the vendored `src/dilithium_host.rs` (host-side Keccak).
+# Like evm-core/sbpf-core it has no dependencies of its own; vendored by `deploy/sync-zkvm.sh`.
+# Not on wasm32 (below).
+
+# `dilithium-core`'s packing barrier is an empty `asm!`, which is unstable on wasm32, and only the
+# host-side `dilithium_host` (tests and witnesses, never a wallet path) reads the crate: so the
+# browser build of this crate — the clients' core, `randprotocol-msig`'s wasm32 check — leaves both
+# out (`lib.rs` gates the module the same way).
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+dilithium-core = { path = "../../vendor/circuits/dilithium-core" }
 
 [dev-dependencies]
 # The same `evm-core` with its `ffi` feature, for tests only (upstream's dev-dependency, taken with
@@ -97,9 +108,19 @@ num-bigint = "0.4"
 revm = { version = "=43.0.2", default-features = false, features = ["std"] }
 sha2 = { version = "=0.10.9", features = ["compress"] }
 solana-sbpf = { version = "=0.11.1", default-features = false }
+# Private multisig phase 4, upstream's exact pins, host tests only: `crystals-dilithium` is the
+# oracle (keygen, signing, reference verify) for `dilithium-core` in the vendored
+# `tests/{dilithium,msauth,modq_reference}.rs`; `sha3` the independent SHAKE oracle for its sponge.
+crystals-dilithium = "=2.0.0"
+sha3 = "=0.10.9"
 
 [features]
 default = []
+# The vendored MODQ cheating hooks (`tables::modq::forge_block`, `ModqAirWithout`, ...) sit behind
+# this feature upstream; only upstream's `tests/modq_cheating.rs` uses them, and that file is not
+# vendored. Declared so the vendored `#[cfg(feature = "cheating")]` items are known cfgs.
+# Never a node feature: `cargo tree -p randprotocol-node -e features` must not show it.
+cheating = []
 # The GPU backend's CPU-twin engines: the same Merkle/NTT code paths, no device needed.
 reference-backend = ["dep:rand-zkvm-cuda"]
 # `cuda` and `mock-cuda` are mutually exclusive: enabling both is a hard `compile_error!` in

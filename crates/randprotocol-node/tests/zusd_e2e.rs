@@ -145,6 +145,7 @@ fn zusd_genesis(validators: &[randprotocol_core::Keypair]) -> Genesis {
         fees: None,
         incremental_nullifier_root: None,
         perps: None,
+        hc_auth_multisig: None,
     }
 }
 

@@ -427,6 +427,9 @@ impl InnerShape {
             && proof.sha256_log_height == self.sha256_log_height
             && proof.public_log_height == self.public_log_height
             && proof.mem_log_height == self.mem_log_height
+            // The shape is chip-free of MODQ (nine instances): a proof that declares a modq table is
+            // refused by name here, not only indirectly through its ten-entry `degree_bits`.
+            && proof.modq_log_height == 0
             && proof.batch.degree_bits == self.degree_bits
             && proof.public_values.len() == self.num_public_values[PV_INSTANCE]
             // `Machine::verify` insists on the canonical representative, so a proof it refuses is

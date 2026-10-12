@@ -447,11 +447,16 @@ fn every_value_the_cpu_row_writes_is_bound_on_every_opcode() {
 /// not read from `rd` the prover would choose the child order. Here every operand column a
 /// dispatch carries on an opcode's rows must be carried by a `REG` read sent on those rows. `CLK`
 /// and `PUB_IDX` are the row chain's own, constrained by transitions, not operands.
+///
+/// Phase 4 B/B′: `SPONGE`'s source and `COMPRESS`'s sibling are absolute immediates, so their
+/// `B0` is no longer a `REG` read. It is bound instead by the immediate form `B0 = B` (`B` being
+/// the fetched word): on an opcode whose fourth word is not a register, a carried `B0` passes
+/// only if moving it off `B` breaks a row constraint — checked here, not assumed.
 #[test]
 fn every_operand_a_dispatch_carries_is_read_from_a_register() {
-    use cpu::col::{B, CLK, PUB_IDX};
+    use cpu::col::{B, B0, CLK, PUB_IDX};
     let mut rng = <rand::rngs::StdRng as rand::SeedableRng>::seed_from_u64(0x43_5554_43);
-    let (interactions, _) = common::symbolic_air(&cpu::CpuAir);
+    let (interactions, constraints) = common::symbolic_air(&cpu::CpuAir);
     let (msgs, _) = cpu_messages_and_constraints();
     let dispatches = [bus::POSEIDON2.name(), bus::SPONGE.name(), bus::REDUCE.name(), bus::PUBLIC.name(), bus::COMPRESS.name(), bus::FOLD.name(), bus::POW.name()];
     let mut failures = Vec::new();
@@ -466,6 +471,13 @@ fn every_operand_a_dispatch_carries_is_read_from_a_register() {
             .filter(|m| m.bus == "REG" && !m.is_write && eval_at(&m.count, &cur, &next) != F::ZERO)
             .map(|m| m.value)
             .collect();
+        // The immediate form's binding of `B0` to the fetched word, on this opcode's row.
+        let b0_is_immediate = !op.b_is_register() && {
+            let (mut on, mut off) = (cur.clone(), cur.clone());
+            on[B0] = on[B];
+            off[B0] = off[B] + F::ONE;
+            constraints.iter().any(|c| eval_at(c, &on, &next) == F::ZERO && eval_at(c, &off, &next) != F::ZERO)
+        };
         for i in interactions.iter().filter(|i| dispatches.contains(&i.bus_name.as_str())) {
             if eval_at(&i.count, &cur, &next) == F::ZERO {
                 continue;
@@ -477,7 +489,8 @@ fn every_operand_a_dispatch_carries_is_read_from_a_register() {
                 let col = as_column(f).unwrap_or_else(|| panic!("a {} field is one column", i.bus_name));
                 // B is the fetched instruction word (bound by the PROGRAM lookup): REDUCE's entry id (Cut D),
                 // FOLD's arity (Cut E2), POW's `off + 256·L` (Cut F).
-                if col != CLK && col != PUB_IDX && col != B && !reg_reads.contains(&col) {
+                let bound_imm = col == B0 && b0_is_immediate;
+                if col != CLK && col != PUB_IDX && col != B && !bound_imm && !reg_reads.contains(&col) {
                     failures.push(format!("{}: {} carries {} and no REG read binds it", op.mnemonic(), i.bus_name, col_name(col)));
                 }
             }
@@ -510,10 +523,10 @@ fn multi_cell_program() -> Program {
         i(Op::Faddi, 7, 0, 64),    // 4: a state pointer
         i(Op::Poseidon2, 0, 7, 0), // 5
         i(Op::Faddi, 8, 0, 96),    // 6: a source pointer
-        ir(Op::Sponge, 0, 7, 8),   // 7
+        i(Op::Sponge, 0, 7, 96),   // 7: source at 96 (phase 4 B′: an immediate)
         i(Op::Hintn, 0, 8, 0),     // 8: mem[96..104] = the eight tape words (Cut B)
         i(Op::Faddi, 9, 0, 1),     // 9: an index bit
-        ir(Op::Compress, 9, 7, 8), // 10: state at 64, sibling at 96 (Cut C)
+        i(Op::Compress, 9, 7, 96), // 10: state at 64, sibling at 96 (Cut C; phase 4 B: an immediate)
         i(Op::Public, 0, 0, 0),
         i(Op::Public, 0, 0, 0),
         i(Op::Public, 0, 0, 0),
@@ -549,6 +562,12 @@ fn a_multi_cell_access_whose_base_wraps_below_zero_is_refused() {
         let (mut cur, next) = (row(k), row(k + 1));
         assert!(common::admits_byte_limbs(&constraints, &cur, &next, &limbs).is_ok(), "the honest row {k} is admitted");
         cur[col] = value;
+        // Phase 4 B/B′: SPONGE's source and COMPRESS's sibling are the immediate, `B0 = B`. The
+        // single-row harness does not see the PROGRAM lookup that fixes `B`, so move `B` with
+        // `B0` — the row a malicious *program* word would give — and let the limbs answer.
+        if col == B0 {
+            cur[B] = value;
+        }
         let diff = cur[D0] - cur[A0];
         (cur[EQ_AUX], cur[EQ_INV]) = if diff == F::ZERO { (F::ONE, F::ZERO) } else { (F::ZERO, diff.inverse()) };
         if common::admits_byte_limbs(&constraints, &cur, &next, &limbs).is_ok() {
@@ -572,8 +591,25 @@ fn a_multi_cell_access_whose_base_wraps_below_zero_is_refused() {
     for (col, what) in [(A0, "state"), (B0, "sibling")] {
         let (mut cur, next) = (row(10), row(11));
         cur[col] = F::from_u64((1 << 24) - 3);
+        if col == B0 {
+            cur[B] = cur[B0]; // the immediate form holds, so only group 2 can refuse (see above)
+        }
         let diff = cur[D0] - cur[A0];
         (cur[EQ_AUX], cur[EQ_INV]) = if diff == F::ZERO { (F::ONE, F::ZERO) } else { (F::ZERO, diff.inverse()) };
         assert!(common::admits_byte_limbs(&constraints, &cur, &next, &limbs).is_err(), "a COMPRESS whose {what}'s top cell is 2^24 is refused");
+    }
+}
+
+/// Phase 4 B/B′: the second address is an immediate, so neither row reads `rb` (`TS_RB` = 2).
+#[test]
+fn sponge_and_compress_rows_send_no_rb_register_read() {
+    let p = multi_cell_program();
+    let tape: Vec<F> = (1..=8).map(F::from_u64).collect();
+    let exec = randprotocol_rvm::emulator::execute(&p, &tape, 1000).unwrap();
+    let regs = randprotocol_rvm::tables::cpu::register_accesses(&exec.events);
+    // Row 7 is the SPONGE, row 10 the COMPRESS: their clk·16 + TS_RB slot (= 2) carries no read.
+    for row in [7u32, 10] {
+        let clk = exec.events[row as usize].clk;
+        assert!(regs.iter().all(|a| a.ts != clk * 16 + 2), "row {row} still reads rb");
     }
 }
