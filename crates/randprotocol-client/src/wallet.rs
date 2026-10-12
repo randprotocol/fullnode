@@ -2067,7 +2067,7 @@ impl Prepared {
     /// already been placed in — as the public input segment. The chain recomputes the binding from
     /// the transaction it receives and refuses a proof made for any other. The auth proof, on a
     /// v3 chain, is [`prove_auth_locally`]'s and not made here.
-    fn prove(&self, binding: &[u32; TX_BINDING_WORDS], profile: FriProfile, backend: Backend) -> Result<Proved> {
+    pub(crate) fn prove(&self, binding: &[u32; TX_BINDING_WORDS], profile: FriProfile, backend: Backend) -> Result<Proved> {
         eprintln!("proving the bundle (tier 14; about a minute and a half on a laptop)…");
         let started = Instant::now();
         let (proof, digest, tier) = prove_bundle_for(&self.guest, profile, &self.words, binding, backend)

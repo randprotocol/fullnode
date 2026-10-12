@@ -319,6 +319,16 @@ pub fn assemble_witness(proposal: &Proposal, policy: &Policy, shares: &[Share]) 
     Ok(msauth::msauth_inputs(&policy.msk, &parse_word8(&proposal.salt)?, policy.threshold, &slots))
 }
 
+/// One share's `msauth` slot over `proposal` — its key, signature and signer-tree path, the
+/// signature verified natively first: one iteration of [`assemble_witness`]'s slot loop, with no
+/// threshold applied.
+pub fn slot_for(proposal: &Proposal, policy: &Policy, share: &Share) -> Result<Slot> {
+    let msg = msauth::signing_message(&parse_binding(&proposal.binding)?);
+    let pks = policy.pks();
+    let (_, paths) = msauth::signer_tree(&pks);
+    slot(policy, &pks, &paths, share, &msg)
+}
+
 /// The bundle as [`prepare`] built it, rebuilt from the proposal: its witness, digest, salt and
 /// `auth_commit`, bundle guest v3.
 fn prepared_of(proposal: &Proposal, tx: &Transaction) -> Result<Prepared> {
@@ -352,6 +362,27 @@ pub async fn prove(proposal: &Proposal, policy: &Policy, shares: &[Share], provi
     let prepared = prepared_of(proposal, &tx)?;
     let (p, w) = (&prepared, &words[..]);
     wallet::prove_transaction_by(&mut tx, &domain, |b| async move { proving.prove(p, AuthWitness::Multisig(w), &b, profile, gas::MAX_PROOF_BYTES).await }).await?;
+    if tx.binding(&domain) != binding {
+        return Err(anyhow!("the proved transaction no longer hashes to the proposal's binding (wallet bug)"));
+    }
+    Ok(tx)
+}
+
+/// Test-only (`tests/wallet_flow.rs`, the node-side `AuthMismatch` refusal): [`prove`] without the
+/// auth half — the bundle proof alone, over the proposal's binding, on this machine, with
+/// `auth_proof` left empty for the caller to fill. No share, no threshold and no §6.5 check is
+/// applied. Never a wallet path: a transaction without its `msauth` proof is refused by every node.
+#[doc(hidden)]
+pub async fn prove_bundle_only(proposal: &Proposal, proving: &Proving, profile: FriProfile) -> Result<Transaction> {
+    let Proving::Local(backend) = proving else {
+        return Err(anyhow!("prove_bundle_only proves on this machine only"));
+    };
+    let mut tx = Transaction::decode(&hex::decode(&proposal.tx)?)?;
+    let binding = parse_binding(&proposal.binding)?;
+    let domain = BindingDomain::for_version(proposal.binding_domain, Hash::from_hex(&proposal.genesis)?);
+    let prepared = prepared_of(proposal, &tx)?;
+    let (p, backend) = (&prepared, *backend);
+    wallet::prove_transaction_by(&mut tx, &domain, |b| async move { p.prove(&b, profile, backend) }).await?;
     if tx.binding(&domain) != binding {
         return Err(anyhow!("the proved transaction no longer hashes to the proposal's binding (wallet bug)"));
     }
