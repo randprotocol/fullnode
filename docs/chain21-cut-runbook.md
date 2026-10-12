@@ -109,8 +109,11 @@ only if that run ends green; otherwise a new run's id replaces it in the annotat
    `OLD_VERSION` 0.7.0, `OLD_GIT_SHA` 806ed349…), read for preflight, the stop gate, the
    `*.pre-c21` backups and the rollback. **Confirm before the cut** with
    `deploy/cutover-fleet-chain21.sh status` (every host: version 0.7.0, git_sha 806ed349…) — and
-   read the relayer's own `rand --version` on `rand-relayer-1` (its build is not recorded; see
-   `deploy/chain21-bridge-steps.md`); if anything else answers, set `OLD_VERSION`/`OLD_GIT_SHA` and
+   the relayer's own `rand`: on 2026-10-12 `rand-relayer-1` (167.172.65.45) ran rand 0.6.8, sha256
+   155dfe66…ee2d — re-read it (`ssh -i ~/.ssh/rand_guardian_ed25519 root@167.172.65.45 'rand
+   --version; sha256sum /usr/local/bin/rand'`; the alias `rand-relayer-1` is not in
+   `~/.ssh/config`; on the first connect check the host key is ED25519
+   SHA256:emiVrQXryU8L12wv4PWsmkap04SAh8bfqss2bpR0pyI); see `deploy/chain21-bridge-steps.md`; if anything else answers, set `OLD_VERSION`/`OLD_GIT_SHA` and
    that release's sums instead:
 
    ```bash
@@ -161,7 +164,7 @@ the snapshot and the balances scan, with chain 20 still committing.
 
 1. **Bridge stop** (the bridge session owns the daemons; `deploy/chain21-bridge-steps.md` is a
    DRAFT from chain 20's for it to review, step 1): relayer on
-   `rand-relayer-1` and the six guardian daemons stopped, nothing in flight (each endpoint's
+   `rand-relayer-1` (`ssh -i ~/.ssh/rand_guardian_ed25519 root@167.172.65.45`) and the six guardian daemons stopped, nothing in flight (each endpoint's
    `sequence()` = the relayer's `next_sequence`; chain 20's `burn_sequence` = the relayer's cursor).
    `cutover-fleet-chain21.sh switch` refuses a guardian host whose `rand-guardian` is still active.
 
@@ -249,7 +252,7 @@ echo $?
 | `EXPECT_ENGINE_HC`, `EXPECT_HC_AUTH_MULTISIG` | f286a611…, 9705f8e2…8247 | the script's decided defaults; any other value is refused |
 | `CHAIN20_GENESIS` / `_HASH` / `_SHA256`, `EMITTER_2..5`, `BONDED`, `GENESIS_NAMES`, `STAKE_RAND` | the script's defaults (chain 20's) | local-known; leave them |
 | `MIN_INBOUND_*` | `auto` (from the snapshot) | default; explicit floors only if a lock was in flight at the snapshot |
-| `RELAYER_DONE_DIR` | a copy of `rand-relayer-1`'s `done/` | optional cross-check; **needs the user** (ssh to the relayer host) |
+| `RELAYER_DONE_DIR` | a copy of `rand-relayer-1`'s `done/` | optional cross-check; **needs the user** (`scp -r -i ~/.ssh/rand_guardian_ed25519 root@167.172.65.45:<relayer data>/done …`) |
 | `REWARDS_DROPPED_OK`, `PENDING_OK`, `UNCOVERED_ALLOCS_OK`, `NODE_VERSION_OK` | unset | set one only knowingly, after the cut refuses and says why; whatever it drops goes in `drops:` |
 
 The cut prints the genesis file (`deploy/genesis-chain21.json`), its **genesis hash**, `TREASURY
@@ -385,7 +388,7 @@ unit or drop-in that already names another chain-21 genesis.
    zUSD deposit, open, close and withdraw on durian.market once the prover keeps up.
 
 4. **The bridge** (the chain-21 bridge steps): guardians' `chain_id = 21` and `rand.json` cursor at
-   the snapshot's `burn_sequence`, the relayer's v0.8.0 `rand`, start, `rand-bridge-audit`, one
+   the snapshot's `burn_sequence`, the relayer's 0.6.8 → v0.8.0 `rand` swap (rand.pre-c21 kept; the bridge session confirms the relayer works with v0.8.0 before the cut), start, `rand-bridge-audit`, one
    1 USDT round trip.
 
 5. **Clients** — the apps' **default RPC host still points at chain 20**:
@@ -412,7 +415,7 @@ constraint set 9, so rollback is "chain 20 again from where it stopped", never "
 In this order (each line alone, `echo $?`):
 
 1. **The bridge stops FIRST** (`deploy/chain21-bridge-steps.md`, rollback step 1): the relayer on
-   `rand-relayer-1` and all eight guardians. The fleet's `rollback` refuses a guardian host whose
+   `rand-relayer-1` (`ssh -i ~/.ssh/rand_guardian_ed25519 root@167.172.65.45`) and all eight guardians. The fleet's `rollback` refuses a guardian host whose
    `rand-guardian` is still active.
 2. **Nothing happened on chain 21?** With chain 21 still up (read-only):
 
@@ -443,8 +446,8 @@ In this order (each line alone, `echo $?`):
    `wait20` ends with "CHAIN 20 COMMITTING AGAIN" only when every host serves chain 20's genesis
    `6210cf07…` and C's height rises between two polls; `status` alone does not show that.
 4. **The bridge back on chain 20** (`deploy/chain21-bridge-steps.md`, rollback step 4): the
-   guardians' and the relayer's chain-20 config and cursors, the relayer's v0.7.0 `rand` from
-   `rand.pre-c21` (sha-checked), then the daemons started; the cut record gets a line saying why.
+   guardians' and the relayer's chain-20 config and cursors, the relayer's 0.6.8 `rand` from
+   `rand.pre-c21` (sha-checked against 155dfe66…ee2d), then the daemons started; the cut record gets a line saying why.
 
 Chain 20 resumes at the height it stopped at; its data dirs were never touched. The msauth blob
 stays in `/usr/local/bin` (v0.7.0 ignores it). By hand, if `rollback` itself cannot run: the
