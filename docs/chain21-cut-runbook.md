@@ -1,6 +1,6 @@
 # Chain 21: the cut and the fleet cutover (runbook)
 
-Written 2026-10-12 on `feat/chain21-cutover` (fullnode main 5e17030e merged in). **Nothing in this
+Written 2026-10-12 on `feat/chain21-cutover` (fullnode main c0878c3f merged in). **Nothing in this
 runbook has run against a server.** Every step that touches a host, the public RPC, GitHub or a key
 runs only on the user's go, typed in the executing session, one step at a time; each fleet phase
 runs **alone**, never piped or chained, and its `echo $?` is read before the next (the chain-16
@@ -14,8 +14,18 @@ issuance), and **`hc_auth_multisig`** (private multisig, guest `9705f8e2…8247`
 host can be created, so there is no spare, no fresh archive and no big prover host to add).
 
 The tools: `deploy/cut-chain21-genesis.sh` (snapshot, balances, the cut, check-limits),
-`deploy/cutover-fleet-chain21.sh` (preflight, stage, stop, push, switch, start, wait, status,
-rollback; `DRY_RUN=1` and `SELFTEST=1`), `deploy/cut-records/chain21.record` (the draft cut record).
+`deploy/cutover-fleet-chain21.sh` (preflight, stage, push, stop, switch, start, wait, status; for
+a rollback quiet, halt, rollback, wait20; `DRY_RUN=1` and `SELFTEST=1`),
+`deploy/cut-records/chain21.record` (the draft cut record), `deploy/chain21-bridge-steps.md` (DRAFT,
+the bridge session's to review).
+
+**The order, end to end.** Chain 20 keeps running until everything chain 21 needs is on every host:
+preflight → stage → bridge stop → snapshot → balances → the cut → the second operator's hash →
+`push` → **the user's go** → `stop <genesis>` (refuses unless all 26 hosts hold the staged build,
+the verified key and the pushed genesis) → `switch` → `start` → `wait` → check-limits → bridge
+restart. A refused cut or an absent second operator therefore never leaves the fleet down. The
+cut stamps the genesis time, so the second operator stands by before the cut runs, and the go
+follows `push` within minutes.
 
 ## Known risk, stated plainly
 
@@ -43,20 +53,23 @@ the genesis is `testnet: true`.
 
 ## a. Pre-flight: the tag, the release, the signature, the local copies
 
-Inputs: fullnode **5e17030e** (origin/main = a1785c95 + version 0.8.0, doc memory corrections, a
-dated CHANGELOG). Tag **v0.8.0** from it once CI run **38207185162** is green.
+Inputs: fullnode **c0878c3f** (origin/main = a1785c95 + version 0.8.0, doc memory corrections, a
+dated CHANGELOG, and the CHANGELOG assets line naming msauth-vk-production.bin). Tag **v0.8.0** from
+it once its push CI run is green (`<CI RUN FOR c0878c3f>` below: read it with `gh run list -R
+randprotocol/fullnode -w ci.yml -c c0878c3f…`).
 
 1. **Tag** (the user; `docs/deploy.md` "Release rule": an annotated tag naming the green run):
 
    ```bash
    cd ~/Github/randprotocol/fullnode && git fetch origin
-   gh run view 38207185162 -R randprotocol/fullnode --json conclusion,headSha   # success, 5e17030e…
-   git tag -a v0.8.0 5e17030e -m "v0.8.0 — chain 21 onward (constraint set 9, private multisig)
-   ci: run 38207185162 (success) at 5e17030e"
+   gh run list -R randprotocol/fullnode -w ci.yml --commit c0878c3f --json databaseId,conclusion,headSha   # success
+   gh run view <CI RUN FOR c0878c3f> -R randprotocol/fullnode --json conclusion,headSha
+   git tag -a v0.8.0 c0878c3f -m "v0.8.0 — chain 21 onward (constraint set 9, private multisig)
+   ci: run <CI RUN FOR c0878c3f> (success) at c0878c3f"
    git push origin v0.8.0
    ```
 
-2. **release.yml** runs on the tag: it refuses unless CI was green at 5e17030e, builds on
+2. **release.yml** runs on the tag: it refuses unless CI was green at c0878c3f, builds on
    ubuntu-24.04, self-checks `keygen-msauth-vk --check` against `--print-pinned production`, attests
    provenance, and publishes **rand-node, rand, rand-prover, msauth-vk-production.bin, SHA256SUMS**.
    Watch it: `gh run watch -R randprotocol/fullnode $(gh run list -R randprotocol/fullnode -w release.yml -L1 --json databaseId -q '.[0].databaseId')`.
@@ -135,9 +148,8 @@ dated CHANGELOG). Tag **v0.8.0** from it once CI run **38207185162** is green.
 As chain 20's cut did from chain 19 (`AGENTS.md`, "Chain 20 — LIVE"): the bridge stops first, then
 the snapshot and the balances scan, with chain 20 still committing.
 
-1. **Bridge stop** (the bridge session owns the daemons; there is no
-   `deploy/chain21-bridge-steps.md` yet — derive it from `deploy/chain20-bridge-steps.md`, chain 20 →
-   chain 21, `rand.pre-c20` → `rand.pre-c21`, the relayer's `rand` → the v0.8.0 one): relayer on
+1. **Bridge stop** (the bridge session owns the daemons; `deploy/chain21-bridge-steps.md` is a
+   DRAFT from chain 20's for it to review, step 1): relayer on
    `rand-relayer-1` and the six guardian daemons stopped, nothing in flight (each endpoint's
    `sequence()` = the relayer's `next_sequence`; chain 20's `burn_sequence` = the relayer's cursor).
    `cutover-fleet-chain21.sh switch` refuses a guardian host whose `rand-guardian` is still active.
@@ -180,8 +192,9 @@ the snapshot and the balances scan, with chain 20 still committing.
 
 ## c. The cut (the real invocation)
 
-**The user's go comes first**, then `deploy/cutover-fleet-chain21.sh stop` (section e, step 4),
-then this, then section d. The cut stamps the genesis: launch within minutes of it.
+Chain 20 is **still running**: the cut reads only the snapshot directory and contacts nothing.
+Then section d, then `push`, then the user's go and `stop`. The cut stamps the genesis time, so
+have the second operator standing by first, and keep the gap from the cut to `start` to minutes.
 
 ```bash
 cd ~/rand-worktrees/fullnode-chain21-cutover
@@ -234,6 +247,12 @@ Copy the three values into the record's `genesis-hash:`, `treasury-id:` and `per
 
 ## d. The second operator's hash check
 
+**Getting the file to them.** The author sends `deploy/genesis-chain21.json` over a channel the
+second operator already trusts for the author (an scp to their machine, a USB stick handed over,
+or an attachment to a signed message), and reads the cut's printed sha256 to them over a second,
+separate channel (a call, a chat) — the file and its hash never travel together. Nothing is
+committed or pushed for this.
+
 The second operator, on **their own machine**, with the v0.8.0 release `rand-node` (verified as in
 a.4; a Linux host can use the release binary directly):
 
@@ -243,9 +262,11 @@ rand-node --version                                # rand-node 0.8.0
 rand-node init --datadir "$(mktemp -d)/p" --genesis genesis-chain21.json | grep -o 'genesis [0-9a-f]*'
 ```
 
-They write the hash they got as `second-hash: <hash>` into `deploy/cut-records/chain21.record`
-(and their name/machine in `second-operator:`). `cutover-fleet-chain21.sh push` compares it with
-the author's (`require_second_rebuild`) and refuses on a blank or a mismatch. Chain 20 waived this
+They send the hash they got back; it goes into `deploy/cut-records/chain21.record` as
+`second-hash: <hash>` (with their name/machine in `second-operator:`), and **the record is
+published again** with that line (it was first published before the cut, without it).
+`cutover-fleet-chain21.sh push`, `stop` and `switch` each compare it with the hash this machine
+derives (`require_second_rebuild`) and refuse on a blank or a mismatch. Chain 20 waived this
 (one operator holds every key and host); `SECOND_REBUILD_WAIVED=1` still exists for that, prints
 what it leaves unchecked and appends `second-rebuild-waived: …` to the record — **a user decision,
 not a default**. Note what the check proves here: that the file's hash is what an independent build
@@ -266,8 +287,9 @@ quorum 18):
 matches `configuration/fleet/guardian-hosts.txt`. Re-check against the live fleet in `preflight`
 (the snapshot is from 2026-10-06; the fleet has run v0.7.1 since 2026-10-07).
 
-**Order.** A cut is all-stop, all-start: every host stops, the genesis goes everywhere, every host
-switches, then C and D start first and the other 24 after them. The compact-blocks rule "observers
+**Order.** The genesis goes to every host while chain 20 runs (`push`); then a cut is all-stop,
+all-start: every host stops (only once all 26 pass the gate), every host switches, then C and D
+start first and the other 24 after them. The compact-blocks rule "observers
 and archives before validators" is for a same-chain flag-day roll; it does not apply here — there
 is no observer-only node (obs1 and archive2 are validators too), nothing runs mixed, and v0.8.0
 (which carries compact blocks) refuses chain 20 anyway. The compact-blocks flag day is therefore
@@ -291,24 +313,33 @@ OLD_RELEASE_SUMS=$OLDREL/SHA256SUMS deploy/cutover-fleet-chain21.sh preflight
 #    checks all three against the SIGNED sums, and its staged rand-node verifies the staged key
 RELEASE_SUMS=$REL/SHA256SUMS deploy/cutover-fleet-chain21.sh stage
 # 3. section b: bridge stop, snapshot, balances; fill the record; publish it
-# ── the user's go ──
-# 4.
-deploy/cutover-fleet-chain21.sh stop
-# 5. section c: the cut;  6. section d: second-hash into the record
-# 7.
+# 4. section c: the cut (chain 20 still running);  5. section d: second-hash, record republished
+# 6. chain 20 STILL RUNNING: the genesis to every host, checked by each staged v0.8.0 binary
 LOCAL_NODE=$LN RELEASE_SUMS=$REL/SHA256SUMS deploy/cutover-fleet-chain21.sh push $G
+# ── the user's go ──
+# 7. gated: refuses (NOTHING STOPPED) unless every host holds the staged files, the verified key and
+#    the pushed genesis and the record's second-hash matches; then stops all 26 (rc 1 if one stays up)
+LOCAL_NODE=$LN RELEASE_SUMS=$REL/SHA256SUMS deploy/cutover-fleet-chain21.sh stop $G
 # 8. key verified by the staged binary, then binaries + key installed, key re-verified, datadirs, units
 LOCAL_NODE=$LN RELEASE_SUMS=$REL/SHA256SUMS OLD_RELEASE_SUMS=$OLDREL/SHA256SUMS deploy/cutover-fleet-chain21.sh switch $G
-# 9. every host's installed key re-verified (refuses the whole start otherwise); C, D, then 24
+# 9. every host's installed key re-verified (refuses the whole start otherwise); C, D, then 24;
+#    a host that does not come up is named, rc 1, and the marker is kept so start can be re-run
 deploy/cutover-fleet-chain21.sh start
 # 10. until 26/26 serve chain 21, healthy, msauth_key loaded, and C commits past height 2
 LOCAL_NODE=$LN deploy/cutover-fleet-chain21.sh wait $G
 deploy/cutover-fleet-chain21.sh status
 ```
 
-The script refuses `stage`/`push`/`switch` without the signed sums, a genesis that is not chain
-21's with `hc_auth_multisig` 9705f8e2… and 6/19 MiB, a `push` without `second-hash`, a `switch` on a
-running node or an active `rand-guardian`, and a `start` without the marker a full `switch` writes.
+The script refuses `stage`/`push`/`stop`/`switch` without the signed sums, a genesis that is not
+chain 21's with `hc_auth_multisig` 9705f8e2… and 6/19 MiB, a `push`/`stop`/`switch` without the
+matching `second-hash`, a `stop` before every host passes its gate, a `switch` on a running node or
+an active `rand-guardian`, and a `start` without the marker a full `switch` writes.
+
+**A failed switch** names the hosts; fix them and re-run `switch`, or roll the fleet back: `stop`
+(already stopped), then `rollback`, which restores the hosts that switched and leaves the rest
+alone. **A re-cut after a switch** (a second genesis) needs the rollback first — `halt`,
+`rollback`, `start`, `wait20` — and then `push`, `stop`, `switch` of the new file; `switch` refuses a
+unit or drop-in that already names another chain-21 genesis.
 
 ## f. After launch
 
@@ -365,19 +396,40 @@ running node or an active `rand-guardian`, and a `start` without the marker a fu
 Possible only **before** anything is minted, released or paid out on chain 21 — after that, going
 back loses it. v0.8.0 cannot run chain 20 and a chain-21 database cannot be rolled back across
 constraint set 9, so rollback is "chain 20 again from where it stopped", never "chain 21 on v0.7.1".
+In this order (each line alone, `echo $?`):
 
-```bash
-deploy/cutover-fleet-chain21.sh stop                                      # alone; echo $?
-OLD_RELEASE_SUMS=$OLDREL/SHA256SUMS deploy/cutover-fleet-chain21.sh rollback   # units/drop-ins + v0.7.1 binaries, sha-checked
-deploy/cutover-fleet-chain21.sh start                                     # the rollback marker licenses it; no key check
-deploy/cutover-fleet-chain21.sh status
-```
+1. **The bridge stops FIRST** (`deploy/chain21-bridge-steps.md`, rollback step 1): the relayer on
+   `rand-relayer-1` and all eight guardians. The fleet's `rollback` refuses a guardian host whose
+   `rand-guardian` is still active.
+2. **Nothing happened on chain 21?** With chain 21 still up (read-only):
 
-Then the bridge session restores the guardians' and the relayer's chain-20 config and cursors and
-the relayer's v0.7.1 `rand` (`rand.pre-c21`), and the cut record gets a line saying why. Chain 20
-resumes at the height it stopped at; its data dirs were never touched. The msauth blob stays in
-`/usr/local/bin` (v0.7.1 ignores it). By hand, if `rollback` itself cannot run: the script's header
-lists the files per host shape.
+   ```bash
+   deploy/cutover-fleet-chain21.sh quiet deploy/genesis-chain21.json
+   ```
+
+   It reads `rand_getBridgeState` on C and D and refuses unless `burn_sequence` and Σ `locked` over
+   every backing are still the genesis values (no burn emitted, no deposit minted). Also check the
+   relayer's `done/` holds nothing newer than the snapshot, and the treasury: `rand_getMultisig
+   <TREASURY ID>` still 100 000 RAND and no zUSD deposited. If anything moved, the rollback loses it
+   — the user decides.
+3. **The fleet:**
+
+   ```bash
+   deploy/cutover-fleet-chain21.sh halt                                       # stops chain 21 (refuses a host running chain 20)
+   OLD_RELEASE_SUMS=$OLDREL/SHA256SUMS deploy/cutover-fleet-chain21.sh rollback    # units/drop-ins + v0.7.1 binaries, sha-checked
+   deploy/cutover-fleet-chain21.sh start                                      # the rollback marker licenses it; no key check
+   deploy/cutover-fleet-chain21.sh wait20                                     # all 26 serve chain 20, healthy, C's height MOVING
+   ```
+
+   `wait20` ends with "CHAIN 20 COMMITTING AGAIN" only when every host serves chain 20's genesis
+   `6210cf07…` and C's height rises between two polls; `status` alone does not show that.
+4. **The bridge back on chain 20** (`deploy/chain21-bridge-steps.md`, rollback step 4): the
+   guardians' and the relayer's chain-20 config and cursors, the relayer's v0.7.1 `rand` from
+   `rand.pre-c21` (sha-checked), then the daemons started; the cut record gets a line saying why.
+
+Chain 20 resumes at the height it stopped at; its data dirs were never touched. The msauth blob
+stays in `/usr/local/bin` (v0.7.1 ignores it). By hand, if `rollback` itself cannot run: the
+script's header lists the files per host shape.
 
 ## What did not carry over cleanly from the chain-20 tooling
 
@@ -387,9 +439,15 @@ lists the files per host shape.
   `SHA256SUMS`; they come from v0.7.1's signed file (a.5).
 - Chain 20's cutover had no SELFTEST and no DRY_RUN; its rehearsal was a separate script. Chain 21's
   has `DRY_RUN=1` built in and `SELFTEST=1` runs `deploy/rehearse-cutover-fleet-chain21.sh`.
-- There is no `deploy/chain21-bridge-steps.md`; the bridge session derives it from chain 20's.
+- **The phase order changed.** Chain 20 stopped the fleet, then cut, then waited for the second
+  hash and pushed, all during the downtime, and its `stop` checked nothing and ignored a host that
+  failed to stop. Chain 21 cuts and pushes with chain 20 running, and `stop <genesis>` is gated.
+  `halt` (an ungated stop that refuses a host running chain 20), `quiet` and `wait20` are new, for
+  the rollback; `start` now fails and keeps its marker when a host does not come up; chain 20's
+  `wait` exits silently on the first node that does not answer (left as is there; fixed here).
+- `deploy/chain21-bridge-steps.md` is a DRAFT written here from chain 20's; the bridge session
+  owns it and must review it.
 - The cut script's default `CUT_RECORD` is `~/.rand-chain21/cut-record.txt`; the cutover's is the
   committed `deploy/cut-records/chain21.record`. Pass the same path to both (this runbook does).
-- `CHANGELOG.md`'s v0.8.0 "Assets" line omits `msauth-vk-production.bin`, which release.yml ships.
 - `deploy/roll-all.sh` and `configuration/scripts/respawn-*.sh` still describe chain 20 / v0.7.0
   hosts; a respawn after the cut needs the v0.8.0 pins and the blob.
