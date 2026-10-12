@@ -24,8 +24,11 @@ use randprotocol_core::notes::{BundleDigestInput, Word8};
 use randprotocol_core::program::{CallOutcome, ProgramRecord};
 use randprotocol_core::types::{CoveredBundle, DeclaredShape, TX_BINDING_WORDS};
 
-/// Twice the pool's 8192-entry verified set, to cover both proofs of a split-auth transaction.
-pub const VERIFY_CACHE_ENTRIES: usize = 16_384;
+/// Three entries per transaction (bundle, auth, one call / invoke / perp) for the 8192
+/// transactions the retired verified set held, rounded up to a power of two (spec
+/// `docs/superpowers/specs/2026-10-12-verified-fold-design.md` §1). A verdict is a few hundred
+/// bytes at most.
+pub const VERIFY_CACHE_ENTRIES: usize = 32_768;
 
 /// The domain every cache key is hashed under. A change to the key layout changes it.
 const KEY_DOMAIN: &[u8] = b"rand-verify-cache-1";
@@ -1229,8 +1232,7 @@ mod tests {
         (l, tx)
     }
 
-    /// Admission (`validate`) then apply (`apply_tx`, which passes `NoVerified` and so verifies
-    /// the proof again) through one cache: the bundle verifier runs once. The control, the same
+    /// Admission (`validate`) then apply (`apply_tx`, which verifies the proof again) through one cache: the bundle verifier runs once. The control, the same
     /// two calls on the bare executor, shows apply does verify: there it runs twice.
     #[test]
     fn a_ledger_apply_after_validate_reuses_the_bundle_verdict() {
@@ -1249,6 +1251,48 @@ mod tests {
         l.clone().apply_tx(&tx, &proposer, &cx).unwrap();
         assert_eq!(inner.count(Kind::Bundle), 1, "apply reused admission's verdict");
         assert_eq!((cx.cache().hits(), cx.cache().misses()), (1, 1));
+    }
+
+    /// The verified-set fold (spec `docs/superpowers/specs/2026-10-12-verified-fold-design.md`
+    /// §2), on the node's real admission path: on the RPL-2 fixture chain (split authorisation,
+    /// `hardening_v6`), `validate_for_pool` — what `pump_verify` runs — admits a split-auth
+    /// transfer and a hardened call through one `CachingExecutor`, then a block holding both
+    /// applies on the same ledger through it. Each inner verifier runs exactly once per proof:
+    /// apply's verify of each is answered from admission's verdict.
+    #[test]
+    fn admission_then_apply_verifies_each_proof_once() {
+        use crate::storage::fixtures::{make_block, rpl2_chain, rpl2_program, v3_bundle, v3_tx};
+        const FEE: u64 = randprotocol_core::UNITS_PER_RAND;
+        let (_dir, storage, _gs, ledger, b1) = rpl2_chain(7);
+        let transfer = v3_tx(&ledger, 40, FEE, Action::None);
+        let (program, _) = rpl2_program();
+        let mut call = Transaction::shielded(
+            ledger.chain_id(),
+            v3_bundle(&ledger, 50, FEE, (0, 0, 0)),
+            Action::Call { program, proof: Vec::new(), input_envelope: None },
+        );
+        let record = ledger.program(&program).expect("the fixture program is deployed");
+        let segment = ledger.hardened_call_segment(record, &call.call_binding(ledger.binding_domain()));
+        let proof = StubExecutor::make_proof_with_public(&program, 10, [1; 8], &segment);
+        let Action::Call { proof: p, .. } = &mut call.action else { unreachable!() };
+        *p = proof;
+        let call = StubExecutor::bound(call);
+
+        let inner = Arc::new(Counting::plain());
+        let cx = CachingExecutor::new(inner.clone());
+        for tx in [&transfer, &call] {
+            assert_eq!(crate::node::validate_for_pool(tx, &ledger, &storage, FriProfile::Test, &cx), Ok(()));
+        }
+        let admitted = (inner.count(Kind::Bundle), inner.count(Kind::Auth), inner.count(Kind::CallHardened));
+        assert_eq!(admitted, (2, 2, 1), "admission verified each proof");
+
+        let block = make_block(&b1, &mut ledger.clone(), vec![transfer, call], &key(1));
+        let receipts = ledger.clone().apply_block(&block.block, &cx).expect("the block applies");
+        assert_eq!(receipts.len(), 1, "the call's receipt");
+        let applied = (inner.count(Kind::Bundle), inner.count(Kind::Auth), inner.count(Kind::CallHardened));
+        assert_eq!(applied, (2, 2, 1), "apply verified nothing again");
+        assert_eq!(inner.count(Kind::Call) + inner.count(Kind::Invoke) + inner.count(Kind::Perp), 0);
+        assert_eq!((cx.cache().hits(), cx.cache().misses()), (5, 5));
     }
 
     /// A ledger under an aggregation section that admits the stub bundle's shape, with `kp`

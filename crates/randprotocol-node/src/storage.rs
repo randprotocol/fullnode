@@ -3824,7 +3824,7 @@ impl Storage {
                 }
                 let mut next = ledger.clone();
                 let receipts = next
-                    .apply_block_for_sync(&block, &sidecar, &pruned, executor, &randprotocol_core::NoVerified)
+                    .apply_block_for_sync(&block, &sidecar, &pruned, executor)
                     .map_err(|e| format!("block {h} does not apply: {e}"))?;
                 for r in &receipts {
                     match self.receipt(&r.tx) {
@@ -10096,7 +10096,7 @@ mod seal_tests {
         // Sync's own acceptance: the ledger applies the sealed form to the raw block's root.
         let mut synced = gs.ledger.clone();
         synced
-            .apply_block_for_sync(&served.block, &BTreeMap::new(), &served.pruned, &StubExecutor, &randprotocol_core::ledger::NoVerified)
+            .apply_block_for_sync(&served.block, &BTreeMap::new(), &served.pruned, &StubExecutor)
             .unwrap();
         assert_eq!(synced.state_root(), ledger.state_root());
         storage.commit(std::slice::from_ref(&served), &synced, &[], &StubExecutor).unwrap();
@@ -10215,7 +10215,7 @@ mod seal_tests {
                 }
             }
             let receipts = ledger
-                .apply_block_for_sync(&served.block, &sidecar, &served.pruned, &StubExecutor, &randprotocol_core::ledger::NoVerified)
+                .apply_block_for_sync(&served.block, &sidecar, &served.pruned, &StubExecutor)
                 .unwrap_or_else(|e| panic!("the sealed block {h} applies: {e}"));
             let cb = CommittedBlock { receipts, deposits: ledger.take_deposits(), aggregates: ledger.take_paid_aggregates(), ..served };
             synced.commit(std::slice::from_ref(&cb), &ledger, &[], &StubExecutor).unwrap();

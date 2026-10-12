@@ -854,7 +854,7 @@ impl<'a> PerpAction<'a> {
 }
 
 /// The refusal for an action this module's rules do not cover — unreachable through
-/// `validate_inner` and `apply_tx_with`, which route only the six here.
+/// `validate_inner` and `apply_tx`, which route only the six here.
 const NOT_PERP: TxError = TxError::UnsupportedAction("not a perp action");
 
 /// Every rule of a perp action but its signature, in `validate`'s order, against this ledger's
@@ -1086,27 +1086,22 @@ pub fn state_proof_segment_on(
 
 /// Step 10 of admission for a `PerpStateProof`, after every cheap check: the STARK against the
 /// engine commitment and the tier cap of the genesis section, over `segment` ([`validate`]'s);
-/// `admitted` (the verified set vouches for these bytes, B5) decodes instead of verifying, the
-/// segment's digest still compared. Then the engine's own two words: the version it ran and the
+/// always verified, never decoded — at apply a node's verify cache (`randprotocol-node`'s
+/// `CachingExecutor`, keyed on the segment too) answers what admission verified on the same tip
+/// (spec `docs/superpowers/specs/2026-10-12-verified-fold-design.md`). Then the engine's own two words: the version it ran and the
 /// number of blocks it ran over. A tier refusal keeps its name; any other is `ProofRefused`.
 pub(super) fn verify_state_proof(
     ledger: &Ledger,
     action: &Action,
     segment: &[u32],
     executor: &dyn ConfidentialExecutor,
-    admitted: bool,
 ) -> Result<(), TxError> {
     let p = ledger.perps().ok_or(PerpError::Disabled)?;
     let Action::PerpStateProof { from_height, to_height, proof, .. } = action else {
         return Err(NOT_PERP);
     };
     let c = &p.config;
-    let outcome = if admitted {
-        executor.decode_perp(&c.engine_hc, c.max_tier, segment, proof)
-    } else {
-        executor.verify_perp(&c.engine_hc, c.max_tier, segment, proof)
-    }
-    .map_err(|e| match e {
+    let outcome = executor.verify_perp(&c.engine_hc, c.max_tier, segment, proof).map_err(|e| match e {
         ConfidentialError::CallTierTooHigh { tier, max } => PerpError::TierTooHigh { tier, max },
         e => PerpError::ProofRefused(e.to_string()),
     })?;

@@ -387,7 +387,7 @@ pub struct RegistryExt {
     pub windows: Option<MintWindows>,
     /// Audit v5 (TOK-2): the genesis `tokens.burn_registration_fee` — `true` exactly when the
     /// ledger burns a registration's `registration_fee` instead of paying it to the proposer
-    /// (`Ledger::apply_tx_with`'s fee split). `false` is chain 14's rule. Appended to the v0.5.4
+    /// (`Ledger::apply_tx`'s fee split). `false` is chain 14's rule. Appended to the v0.5.4
     /// layout: a `tokens_v2` blob written before this field existed no longer decodes, which no
     /// chain has — chain 14's store never writes the key at all.
     pub burn_registration_fee: bool,
@@ -746,7 +746,7 @@ impl TokenRegistry {
         self
     }
 
-    /// TOK-2: whether `Ledger::apply_tx_with` burns a registration's `registration_fee` instead
+    /// TOK-2: whether `Ledger::apply_tx` burns a registration's `registration_fee` instead
     /// of paying it to the proposer. `false` without the genesis flag (chain 14).
     pub fn burns_registration_fee(&self) -> bool {
         self.ext.burn_registration_fee

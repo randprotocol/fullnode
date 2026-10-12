@@ -4,7 +4,7 @@ use super::{
 };
 use crate::confidential::ConfidentialExecutor;
 use crate::crypto::{Address, Hash, Keypair};
-use crate::ledger::{BlockError, Ledger, NoVerified, TxError, VerifiedProofs};
+use crate::ledger::{BlockError, Ledger, TxError};
 use crate::types::{Block, BlockHeader, CoveredBundle, QuorumCertificate, Transaction, ValidatorSet, Vote};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
@@ -68,7 +68,7 @@ struct Entry {
 
 /// A proposal's apply, computed off the consensus loop (spec 2026-10-11 off-loop apply, §3):
 /// `apply_block_for_sync`'s outcome on a clone of [`HotStuff::ledger_after`] the block's parent,
-/// with [`HotStuff::covered_sidecar`]'s records and the replica's own executor and verified set.
+/// with [`HotStuff::covered_sidecar`]'s records and the replica's own executor.
 /// [`HotStuff::on_proposal_with`] takes it in place of applying on the loop, and only when
 /// `parent` is the block's parent and that parent is still in the tree; otherwise it is dropped
 /// and the block is applied as [`HotStuff::on_proposal`] applies it. Apply is deterministic and a
@@ -150,11 +150,6 @@ pub struct HotStuff {
     /// sets one (tests, and any chain that never aggregates): an `Aggregate` then takes the T4
     /// signpost error, exactly as before.
     covered: Option<Arc<dyn CoveredSource>>,
-    /// The node's admission cache of already-verified proofs (audit v3, B5): consulted at
-    /// propose (the trial apply) and at a proposal's apply, where a hit skips only the STARK
-    /// verification. [`NoVerified`] until the node sets its shared set — tests, and any replay
-    /// path, verify every proof, exactly as before.
-    verified: Arc<dyn VerifiedProofs>,
     /// Certificates already verified, keyed by their bytes and the set they passed under, so a QC
     /// seen as a proposal's justify and again as a NewView's high QC is checked once (spec
     /// 2026-10-05 §7.2).
@@ -348,7 +343,6 @@ impl HotStuff {
             signer,
             executor,
             covered: None,
-            verified: Arc::new(NoVerified),
             verified_qcs: VerifiedQcs::new(VERIFIED_QCS_KEPT),
             view,
             high_qc,
@@ -512,13 +506,6 @@ impl HotStuff {
     /// `Aggregate`. Called once at startup; everything before it keeps the T4 behavior.
     pub fn set_covered_source(&mut self, source: Arc<dyn CoveredSource>) {
         self.covered = Some(source);
-    }
-
-    /// Register the node's admission cache of verified proofs (audit v3, B5). Like
-    /// [`Self::set_covered_source`], it does not ride a `resume`: the node re-sets it on every
-    /// replica it builds. Called once at startup; everything before it verifies every proof.
-    pub fn set_verified_proofs(&mut self, verified: Arc<dyn VerifiedProofs>) {
-        self.verified = verified;
     }
 
     /// The covered-bundle records a block's `Aggregate` transactions need, keyed by their
@@ -1220,11 +1207,9 @@ impl HotStuff {
             _ => {
                 let mut ledger = parent.ledger_after.clone();
                 let sidecar = self.covered_sidecar(block)?;
-                // B5: the admission cache comes along — a transaction this node verified at the
-                // pool is decoded here, not re-verified. Everything stateful is re-checked either way.
-                ledger
-                    .apply_block_for_sync(block, &sidecar, &[], self.executor.as_ref(), self.verified.as_ref())
-                    .map(|receipts| (ledger, receipts))
+                // Every proof is verified here; on a node the executor is its verify cache, which
+                // answers a proof the pool already verified (the verified-fold spec, §2).
+                ledger.apply_block_for_sync(block, &sidecar, &[], self.executor.as_ref()).map(|receipts| (ledger, receipts))
             }
         };
         let (ledger, receipts) = applied.map_err(Self::apply_error)?;
@@ -1530,13 +1515,13 @@ impl HotStuff {
         // after the bundle was written) is undone by rebuilding from the pre-loop ledger and
         // replaying the accepted ones in order. Deterministic, so the replay cannot fail; if it
         // ever did, the block closes with no ordinary transactions rather than a wrong root.
-        // B5: with the admission cache along, a candidate's proofs are not verified a second
-        // time here. Only half-applies count against MAX_PROPOSE_REPLAYS; past it the block
+        // On a node the executor is its verify cache, so a candidate's proofs, verified at the
+        // pool, are answered from it here rather than verified a second time. Only half-applies count against MAX_PROPOSE_REPLAYS; past it the block
         // closes with what it has.
         let base = ledger.clone();
         let mut replays = 0usize;
         for tx in ordinary {
-            match ledger.apply_tx_checked(&tx, &me, self.executor.as_ref(), self.verified.as_ref()) {
+            match ledger.apply_tx_checked(&tx, &me, self.executor.as_ref()) {
                 Ok(receipt) => {
                     call_gas = call_gas.saturating_add(receipt.map_or(0, |r| r.gas_used));
                     txs.push(tx);
@@ -1548,7 +1533,7 @@ impl HotStuff {
                     call_gas = 0;
                     let mut replayed = true;
                     for t in &txs {
-                        match ledger.apply_tx_with(t, &me, self.executor.as_ref(), self.verified.as_ref()) {
+                        match ledger.apply_tx(t, &me, self.executor.as_ref()) {
                             Ok(r) => call_gas = call_gas.saturating_add(r.map_or(0, |r| r.gas_used)),
                             Err(_) => {
                                 replayed = false;

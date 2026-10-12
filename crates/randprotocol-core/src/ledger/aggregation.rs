@@ -3379,7 +3379,7 @@ mod payment_tests {
     use crate::crypto::{Hash, Keypair};
     use crate::gas;
     use crate::ledger::staking::ValidatorEntry;
-    use crate::ledger::{Ledger, NoVerified, TxError};
+    use crate::ledger::{Ledger, TxError};
     use crate::types::{Block, BlockHeader, QuorumCertificate};
     use crate::notes::{word8_from_bytes, Bundle, Envelope, ShieldedAddress, Word8};
     use crate::types::actions::{aggregate_signing_hash, aggregator_register_message, AggregatorRegistration};
@@ -4644,7 +4644,7 @@ mod payment_tests {
             &a,
         );
         let mut after = l.clone();
-        match after.apply_block_for_sync(&block, &BTreeMap::new(), std::slice::from_ref(&side), &StubExecutor, &NoVerified) {
+        match after.apply_block_for_sync(&block, &BTreeMap::new(), std::slice::from_ref(&side), &StubExecutor) {
             Err(crate::ledger::BlockError::TxRootMismatch) => {}
             other => panic!("expected the substituted envelope refused by the tx root, got {other:?}"),
         }
@@ -4705,7 +4705,7 @@ mod payment_tests {
             let mut after = l.clone();
             after.set_height(1);
             after.set_timestamp_ms(1);
-            after.apply_transactions_for_sync(&[pruned_tx.clone()], &p, &BTreeMap::new(), std::slice::from_ref(&side), &StubExecutor, &NoVerified).unwrap();
+            after.apply_transactions_for_sync(&[pruned_tx.clone()], &p, &BTreeMap::new(), std::slice::from_ref(&side), &StubExecutor).unwrap();
             after.sweep_expired_excesses(1, &p);
             after.record_anchor(1);
             after.state_root()
@@ -4715,7 +4715,7 @@ mod payment_tests {
         let block = Block::sign(&crate::types::SigningDomain::v0(Hash::ZERO), header, vec![pruned_tx.clone()], &a);
 
         let mut m = l.clone();
-        m.apply_block_for_sync(&block, &BTreeMap::new(), std::slice::from_ref(&side), &StubExecutor, &NoVerified)
+        m.apply_block_for_sync(&block, &BTreeMap::new(), std::slice::from_ref(&side), &StubExecutor)
             .expect("the pruned bundle applies on the table's attestation");
         assert!(m.is_spent(&[1; 8]) && m.has_commitment(&[3; 8]), "the public-field effects land");
         // And the fee split treats it like any bundle.
@@ -4751,7 +4751,7 @@ mod payment_tests {
         let mut m2 = l.clone();
         m2.set_height(1);
         m2.set_timestamp_ms(1);
-        m2.apply_transactions_for_sync(&[rich_tx], &p, &BTreeMap::new(), std::slice::from_ref(&rich_side), &StubExecutor, &NoVerified)
+        m2.apply_transactions_for_sync(&[rich_tx], &p, &BTreeMap::new(), std::slice::from_ref(&rich_side), &StubExecutor)
             .unwrap();
         assert!(
             m2.unsealed_fees().contains_key(&rich_side.tx_hash),
@@ -4761,7 +4761,7 @@ mod payment_tests {
 
         // Without any side table the root still holds (the marker form hashes to the raw
         // hash), but the marker has no entry: the malformed-marker refusal, at its index.
-        match l.clone().apply_block_for_sync(&block, &BTreeMap::new(), &[], &StubExecutor, &NoVerified) {
+        match l.clone().apply_block_for_sync(&block, &BTreeMap::new(), &[], &StubExecutor) {
             Err(crate::ledger::BlockError::InvalidTx { index: 0, error: TxError::InvalidBundleProof(_) }) => {}
             other => panic!("expected the unattested-marker refusal, got {other:?}"),
         }
@@ -4773,14 +4773,14 @@ mod payment_tests {
             public_values: pv.to_vec(),
             shape: shape(),
         };
-        match l.clone().apply_block_for_sync(&block, &BTreeMap::new(), std::slice::from_ref(&other_side), &StubExecutor, &NoVerified) {
+        match l.clone().apply_block_for_sync(&block, &BTreeMap::new(), std::slice::from_ref(&other_side), &StubExecutor) {
             Err(crate::ledger::BlockError::InvalidTx { index: 0, error: TxError::InvalidBundleProof(_) }) => {}
             other => panic!("expected the unattested-marker refusal, got {other:?}"),
         }
         // A table whose pv does not match the bundle's own fields: the binding refuses it.
         let mut forged = side.clone();
         forged.public_values[pv::OUT0] += 1;
-        match l.clone().apply_block_for_sync(&block, &BTreeMap::new(), std::slice::from_ref(&forged), &StubExecutor, &NoVerified) {
+        match l.clone().apply_block_for_sync(&block, &BTreeMap::new(), std::slice::from_ref(&forged), &StubExecutor) {
             Err(crate::ledger::BlockError::InvalidTx { index: 0, error: TxError::BadDigest }) => {}
             other => panic!("expected the binding's BadDigest, got {other:?}"),
         }
@@ -4857,7 +4857,7 @@ mod payment_tests {
         from_raw.apply_block(&raw_block, &StubExecutor).expect("the raw block applies");
         let mut from_marker = l.clone();
         from_marker
-            .apply_block_for_sync(&marker_block, &BTreeMap::new(), &sides, &StubExecutor, &NoVerified)
+            .apply_block_for_sync(&marker_block, &BTreeMap::new(), &sides, &StubExecutor)
             .expect("the marker block applies on the side table at the raw block's root");
 
         let floors = gas::BUNDLE_BASE + deploy_floor + call_floor;

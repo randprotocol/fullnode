@@ -10,7 +10,7 @@ use randprotocol_core::consensus::{Action, ConsensusConfig, ConsensusMessage, Ho
 use randprotocol_core::crypto::{Hash, Keypair};
 use randprotocol_core::gas;
 use randprotocol_core::genesis::{Genesis, GenesisState, GenesisValidator};
-use randprotocol_core::ledger::{Ledger, NoVerified};
+use randprotocol_core::ledger::Ledger;
 use randprotocol_core::notes::{word8_from_bytes, word8_to_hex, Bundle, Envelope, ShieldedAddress, Word8, KEM_EK_BYTES};
 use randprotocol_core::types::{Action as TxAction, Block, Transaction};
 use std::sync::Arc;
@@ -278,7 +278,7 @@ pub fn run(args: &BenchArgs) -> anyhow::Result<Verdict> {
         }
         let t = Instant::now();
         replica
-            .apply_block_for_sync(block, &Default::default(), &[], &StubExecutor, &NoVerified)
+            .apply_block_for_sync(block, &Default::default(), &[], &StubExecutor)
             .map_err(|e| anyhow::anyhow!("replica apply at {height}: {e:?}"))?;
         let apply_ms = ms(t);
         drop(replica);

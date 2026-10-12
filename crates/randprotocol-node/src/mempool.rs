@@ -28,7 +28,7 @@
 //! state an earlier one left (`HotStuff::propose`'s packing loop), and after the block the
 //! loser's read no longer matches — [`Mempool::applies`] asks `program_state::still_applies` —
 //! so it is pruned at that tip, not re-offered. The cost of a loser is one trial apply on a
-//! clone, with both proofs already in the verified set.
+//! clone, with both proofs' verdicts already in the verify cache.
 
 use randprotocol_core::bridge::BridgeError;
 use randprotocol_core::confidential::ConfidentialExecutor;

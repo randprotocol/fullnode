@@ -518,54 +518,6 @@ struct Verified {
     attestation: Option<CheckedAttestation>,
 }
 
-/// The set of transactions whose proofs this node has already verified (audit v3, B5).
-///
-/// The key is the transaction hash, which binds the proof: `rand-txid-3` hashes the bundle
-/// proof (and the split-authorisation auth proof) by digest, and the transaction binding the
-/// proof itself is verified against covers the rest of the transaction. So "this hash verified" is a stateless fact — a hit vouches for
-/// these exact bytes, never for some other transaction, however the entry came to be held. The
-/// ledger consults the set at block application ([`Ledger::apply_block_with`]) and skips exactly
-/// one thing on a hit: the STARK verification (`verify_bundle`, `verify_auth`, `verify_call`).
-/// Everything else `validate_inner` does still runs — the digest compares, the bundle's structural checks, and
-/// the whole state-dependent half (anchors, nullifiers, nonces, fee floors) — so two validators
-/// holding different sets still reach byte-identical verdicts, and an entry whose transaction
-/// was evicted from the pool (or never pooled: a proof verified, then lost to a conflict) costs
-/// nothing but the re-verification it was meant to save.
-pub trait VerifiedProofs: Send + Sync {
-    fn contains(&self, tx: &Hash) -> bool;
-    /// `true` when the set holds nothing and a caller can skip computing hashes to query it
-    /// with. Provided, so an implementor that does not care about the hashing cost changes
-    /// nothing; [`NoVerified`] takes it.
-    fn is_empty(&self) -> bool {
-        false
-    }
-}
-
-/// The empty [`VerifiedProofs`]: what every path without an admission cache behind it passes —
-/// sync, replay, `verify_chain`, tests. On those paths every proof is verified at apply, exactly
-/// as before.
-pub struct NoVerified;
-
-impl VerifiedProofs for NoVerified {
-    fn contains(&self, _: &Hash) -> bool {
-        false
-    }
-    fn is_empty(&self) -> bool {
-        true
-    }
-}
-
-/// A locked set answers through the lock, and a poisoned one answers `false`: the cost of a
-/// wrong `false` is a re-verification, where a wrong `true` does not exist (see the trait).
-impl<T: VerifiedProofs + ?Sized> VerifiedProofs for std::sync::RwLock<T> {
-    fn contains(&self, tx: &Hash) -> bool {
-        self.read().map(|g| g.contains(tx)).unwrap_or(false)
-    }
-    fn is_empty(&self) -> bool {
-        self.read().map(|g| g.is_empty()).unwrap_or(true)
-    }
-}
-
 /// The commitment of the note a faucet mint creates: owner `pk`, no sender, `amount` of the
 /// native asset, the action's `time` and blinding `r`. Admission refuses a `Mint` whose `cm` is
 /// anything else; the wallet-side builder ([`Transaction::mint`]) computes it the same way.
@@ -1298,9 +1250,9 @@ impl Ledger {
     /// call_fee(tier, bytes)`, and an invoke's cell fee on top.
     ///
     /// One function for the check and the burn: `validate_inner` holds a call's fee to it after
-    /// decoding, and under `fees.burn_floor` `apply_tx_with` burns `min(fee, settled_floor)` — so
+    /// verifying, and under `fees.burn_floor` `apply_tx` burns `min(fee, settled_floor)` — so
     /// the burned amount can never be a figure the fee was not checked against. `call` is the
-    /// decoded outcome (`Verified::call`); a call passed `None` gets its pre-verify `fee_floor`,
+    /// verified outcome (`Verified::call`); a call passed `None` gets its pre-verify `fee_floor`,
     /// which is not its settled floor. A registration's `registration_fee` is not part of this
     /// floor (`fee_floor` is the plain base for `RegisterToken` and `RegisterBridgedToken`): it is
     /// checked by `tokens::validate` / `bridge_gov::validate` and, under TOK-2, burned separately
@@ -2359,17 +2311,18 @@ impl Ledger {
     /// proofs byte for byte and change the rest (a burn's destination, a bond's validator, an
     /// envelope), and whichever copy committed first would spend the notes.
     ///
-    /// `admitted` is the [`VerifiedProofs`] verdict for the transaction the bundle rides in
-    /// (audit v3, B5): on a hit the STARK verification is skipped — admission already ran it over
-    /// these exact bytes — and the digest compare above still stands, so what is left of this
-    /// function is the cheap, deterministic half of it.
+    /// Both proofs are verified every time this runs, at admission and at apply alike (spec
+    /// `docs/superpowers/specs/2026-10-12-verified-fold-design.md`, which retired audit v3's B5
+    /// verified set): what spares a node the second verify is its verify cache
+    /// (`randprotocol-node`'s `CachingExecutor`), which answers apply's verify of the same
+    /// arguments from admission's verdict.
     ///
     /// Split authorisation (genesis `hc_auth`, delegated proving Phase 2, spec
     /// `docs/superpowers/specs/2026-09-28-delegated-proving-design.md` §4.1) adds four checks, each
     /// necessary (`randprotocol-zkvm/tests/hidden_cheating.rs`'s `ledger_rule` shows a cheat that
     /// only it refuses), cheap before expensive: the auth proof is present and the `c` it
     /// publishes (read without verifying) is the bundle's `auth_commit`; the bundle digest
-    /// recomputed is the v3 one, over `auth_commit`; then, unless `admitted`, the bundle proof
+    /// recomputed is the v3 one, over `auth_commit`; then the bundle proof
     /// verifies against the binding and the auth proof verifies against the *same* binding, its
     /// verified `c` again `auth_commit`. On a chain without `hc_auth` both auth fields must be
     /// empty and the digest is the v1 one — today's rule, byte for byte. A pruned bundle keeps its
@@ -2380,7 +2333,6 @@ impl Ledger {
         b: &Bundle,
         binding: &[u32; crate::types::TX_BINDING_WORDS],
         executor: &dyn ConfidentialExecutor,
-        admitted: bool,
     ) -> Result<(), TxError> {
         let shape = self.check_auth_fields(b, executor)?;
         // A pruned bundle (spec §6.2's marker form) carries no proof to check: the covering
@@ -2425,9 +2377,7 @@ impl Ledger {
                 return Err(TxError::PrunedRecordMismatch("the record's H_PUB is not this transaction's binding"));
             }
             // The auth proof is not covered by the aggregate: verified here, as admission does.
-            if !admitted {
-                self.verify_auth_proof(b, shape, binding, executor)?;
-            }
+            self.verify_auth_proof(b, shape, binding, executor)?;
             return Ok(());
         }
         let published = executor.bundle_proof_digest(&self.hc_bundle, &b.proof).map_err(TxError::InvalidBundleProof)?;
@@ -2435,23 +2385,18 @@ impl Ledger {
             return Err(TxError::BadDigest);
         }
         // Spec §4.3: under the `gas` section every bundle proof declares exactly the genesis
-        // `bundle_gas_limit`. A decode, before the verify — a wrong limit must not buy one — and
-        // on the verified-set path too, since the value is a statement about these bytes. The
-        // verify that follows (or admission's, on a hit) is what makes the decoded value binding.
+        // `bundle_gas_limit`. A decode, before the verify — a wrong limit must not buy one. The
+        // verify that follows is what makes the decoded value binding.
         if let Some(g) = &self.gas {
             let got = executor.bundle_gas_limit(&b.proof).map_err(TxError::InvalidBundleProof)?;
             if got != Some(g.bundle_gas_limit) {
                 return Err(TxError::BundleGasLimit { want: g.bundle_gas_limit, got });
             }
         }
-        // B5: the one step a hit on the verified set skips. Everything else about this bundle —
-        // the digest just compared, and every structural and stateful check `validate_inner` ran
-        // before this function — is checked at apply exactly as at admission. The transaction id
-        // binds the auth proof by digest (`rand-txid-3`), so a hit vouches for it too.
-        if !admitted {
-            executor.verify_bundle(&self.hc_bundle, &b.proof, binding).map_err(TxError::InvalidBundleProof)?;
-            self.verify_auth_proof(b, shape, binding, executor)?;
-        }
+        // The expensive half, at apply exactly as at admission; on a node the verify cache
+        // answers apply's call from admission's verdict (the verified-fold spec, §2).
+        executor.verify_bundle(&self.hc_bundle, &b.proof, binding).map_err(TxError::InvalidBundleProof)?;
+        self.verify_auth_proof(b, shape, binding, executor)?;
         Ok(())
     }
 
@@ -2472,7 +2417,7 @@ impl Ledger {
     /// `auth_gas_limit_pin` single-key, `msauth_gas_limit_pin` multisig (`AuthGasLimit`, spec
     /// 2026-09-28 §4.3, private multisig phase 4 §3.2). A multisig-shaped proof on a chain whose
     /// genesis does not name `hc_auth_multisig` is a permanent `InvalidAuthProof`. Every path runs
-    /// this — admission, apply, a verified-set hit, a pruned bundle — before either proof's verify,
+    /// this — admission, apply, a pruned bundle — before either proof's verify,
     /// so a wrong limit buys none. Returns the shape on a `hc_auth` chain, for
     /// [`Self::verify_auth_proof`] to pick its guest by.
     fn check_auth_fields(&self, b: &Bundle, executor: &dyn ConfidentialExecutor) -> Result<Option<AuthShape>, TxError> {
@@ -2537,24 +2482,20 @@ impl Ledger {
     }
 
     /// Check a transaction against the current state without applying it. This is admission's
-    /// full check — every proof verifies — so it passes [`NoVerified`]: the cache an admission
-    /// verification feeds is never what admission itself reads.
+    /// full check — every proof verifies, as it does at apply.
     pub fn validate(&self, tx: &Transaction, executor: &dyn ConfidentialExecutor) -> Result<(), TxError> {
-        self.validate_inner(tx, executor, &NoVerified).map(|_| ())
+        self.validate_inner(tx, executor).map(|_| ())
     }
 
     /// Spec §7, in order: cheap before expensive. Returns what it verified so `apply_tx`
     /// verifies each proof and each guardian quorum exactly once.
     ///
-    /// `verified_proofs` is the [`VerifiedProofs`] set block application carries (audit v3, B5): a
-    /// transaction whose hash it holds skips the STARK verifications — nothing else. `validate`
-    /// passes [`NoVerified`]; the apply paths pass what their caller was handed.
-    fn validate_inner(
-        &self,
-        tx: &Transaction,
-        executor: &dyn ConfidentialExecutor,
-        verified_proofs: &dyn VerifiedProofs,
-    ) -> Result<Verified, TxError> {
+    /// Every STARK is verified here — the ledger never decodes a proof in place of verifying it
+    /// (spec `docs/superpowers/specs/2026-10-12-verified-fold-design.md`, which retired audit v3's
+    /// B5 verified set). A proof admission already verified costs a node no second verify at
+    /// apply: its executor is `randprotocol-node`'s `CachingExecutor`, which answers the same
+    /// arguments from admission's verdict.
+    fn validate_inner(&self, tx: &Transaction, executor: &dyn ConfidentialExecutor) -> Result<Verified, TxError> {
         // RPL-3: the `perps` gate comes before any other check of a state proof — every size cap
         // included — so a chain without the section refuses each one as `Disabled`, whatever it
         // carries. (Its other rules are `perps::validate`'s, at step 7.)
@@ -2915,8 +2856,7 @@ impl Ledger {
         // 7b. under genesis `hardening_v6`, the canonical-proof rules (INT-5, VERIFIER-1/-2): a
         // header or transcript field the honest prover would not write — one the verifier accepts
         // at any value, so a relayer can re-encode the proof into a second transaction id — is
-        // refused before either proof is looked at. A decode and a few compares, so it runs on
-        // the verified-set path too. Without the flag it is the node's pool policy only
+        // refused before either proof is looked at. A decode and a few compares. Without the flag it is the node's pool policy only
         // (`admission::non_canonical_proofs`) and a block carrying such a proof applies.
         if self.hardening_v6 {
             if let Some(e) = non_canonical_proofs(tx, &|p| executor.non_canonical_proof(p)) {
@@ -2924,21 +2864,17 @@ impl Ledger {
             }
         }
         // 8-9. the bundle's digest, then its proof, against this transaction's binding. Every
-        // cheap check (a burn's in step 7's arm for its action) has run by now. B5: one query of
-        // the verified set covers both this and the call's proof below, and is skipped entirely
-        // on the `NoVerified` paths — an empty set is not worth hashing the transaction for.
-        let admitted = !verified_proofs.is_empty() && verified_proofs.contains(&tx.hash());
+        // cheap check (a burn's in step 7's arm for its action) has run by now.
         if let Some(b) = bundle {
             let binding = tx.binding(&self.binding_domain);
-            self.check_bundle_proof(tx, b, &binding, executor, admitted)?;
+            self.check_bundle_proof(tx, b, &binding, executor)?;
         }
         // 10. the call's own proof, then its fee: the tier's, and the byte term for proof and
         // envelope bytes past the free allowance (spec §7)
         if let (Some(record), Action::Call { proof, .. } | Action::Invoke { proof, .. }) = (call_record, &tx.action)
         {
-            // B5: on a verified-set hit the proof is decoded, not verified — admission's
-            // `verify_call` over these same bytes already ran, and the outcome the tier's fee
-            // floor and the receipt are read from is the one it computed.
+            // Verified, never decoded (the verified-fold spec): the outcome the tier's fee floor
+            // and the receipt are read from is the verifier's own, cached on a node.
             //
             // INT-4, under genesis `hardening_v6`: the proof must carry this transaction's
             // `call_binding` as its public segment when the program has none of its own, so a copy
@@ -2951,22 +2887,17 @@ impl Ledger {
             // proof verified under any fee bundle.
             //
             // RPL-2: an `Invoke`'s segment is `public ‖ call_binding ‖ context` (`invoke_segment`),
-            // built from the transaction alone, so the verified set's verdict stands for it as it
-            // does for a call: what depends on this ledger's state — the cells read — was compared
-            // in step 7 and is never inside the proof's verdict.
+            // built from the transaction alone, so admission's verify and apply's take the same
+            // arguments and a node's verify cache answers the second: what depends on this
+            // ledger's state — the cells read — was compared in step 7 and is never inside the
+            // proof's verdict.
             let outcome = match self.invoke_segment(record, tx) {
-                Some(segment) if admitted => executor.decode_invoke(record, proof, &segment),
                 Some(segment) => executor.verify_invoke(record, proof, &segment),
-                None => {
-                    let segment =
-                        if self.hardening_v6 { self.hardened_call_segment(record, &tx.call_binding(&self.binding_domain)) } else { Vec::new() };
-                    match (self.hardening_v6, admitted) {
-                        (true, true) => executor.decode_call_hardened(record, proof, &segment),
-                        (true, false) => executor.verify_call_hardened(record, proof, &segment),
-                        (false, true) => executor.decode_call(record, proof),
-                        (false, false) => executor.verify_call(record, proof),
-                    }
+                None if self.hardening_v6 => {
+                    let segment = self.hardened_call_segment(record, &tx.call_binding(&self.binding_domain));
+                    executor.verify_call_hardened(record, proof, &segment)
                 }
+                None => executor.verify_call(record, proof),
             }
             .map_err(TxError::InvalidProof)?;
             // The tier-exact floor (`settled_floor`: the gas rule at the declared limit, or the
@@ -2979,38 +2910,25 @@ impl Ledger {
             }
             verified.call = Some(outcome);
         }
-        // RPL-3: a state proof's STARK, last — decoded on a verified-set hit, as a call's is. Its
-        // segment holds this ledger's proved root and digests, and the decode path still compares
-        // the proof's `H_PUB` with it, so the verdict stands only for the state it is applied on.
+        // RPL-3: a state proof's STARK, last — verified, as a call's is. Its segment holds this
+        // ledger's proved root and digests, so the verdict (and a node's cached one, keyed on the
+        // segment) stands only for the state it is applied on.
         if let Some(segment) = &perp_segment {
-            perps::verify_state_proof(self, &tx.action, segment, executor, admitted)?;
+            perps::verify_state_proof(self, &tx.action, segment, executor)?;
         }
         Ok(verified)
     }
 
     /// Validate and apply one transaction; for calls, return the receipt data. The bundle fee
-    /// is credited to `proposer`'s validator entry.
+    /// is credited to `proposer`'s validator entry. The same path as
+    /// [`Ledger::apply_tx_checked`], with the refused / half-applied distinction dropped.
     pub fn apply_tx(
         &mut self,
         tx: &Transaction,
         proposer: &Address,
         executor: &dyn ConfidentialExecutor,
     ) -> Result<Option<CallReceiptData>, TxError> {
-        self.apply_tx_with(tx, proposer, executor, &NoVerified)
-    }
-
-    /// `apply_tx` against a [`VerifiedProofs`] set (audit v3, B5): the proposer's trial apply
-    /// and the consensus apply path carry the node's admission cache; everything else takes
-    /// `apply_tx` and verifies every proof, exactly as before. The same path as
-    /// [`Ledger::apply_tx_checked`], with the refused / half-applied distinction dropped.
-    pub fn apply_tx_with(
-        &mut self,
-        tx: &Transaction,
-        proposer: &Address,
-        executor: &dyn ConfidentialExecutor,
-        verified_proofs: &dyn VerifiedProofs,
-    ) -> Result<Option<CallReceiptData>, TxError> {
-        self.apply_tx_checked(tx, proposer, executor, verified_proofs).map_err(ApplyFailure::into_inner)
+        self.apply_tx_checked(tx, proposer, executor).map_err(ApplyFailure::into_inner)
     }
 
     /// The one apply path, telling the proposer how a candidate failed (final review F1).
@@ -3024,9 +2942,8 @@ impl Ledger {
         tx: &Transaction,
         proposer: &Address,
         executor: &dyn ConfidentialExecutor,
-        verified_proofs: &dyn VerifiedProofs,
     ) -> Result<Option<CallReceiptData>, ApplyFailure> {
-        let verified = self.validate_inner(tx, executor, verified_proofs).map_err(ApplyFailure::Refused)?;
+        let verified = self.validate_inner(tx, executor).map_err(ApplyFailure::Refused)?;
         let split = match &tx.bundle {
             Some(b) => Some(self.bundle_fee_split(tx, b, proposer, verified.call.as_ref()).map_err(ApplyFailure::Refused)?),
             None => None,
@@ -3320,7 +3237,7 @@ impl Ledger {
         proposer: &Address,
         executor: &dyn ConfidentialExecutor,
     ) -> Result<Vec<(usize, CallReceiptData)>, BlockError> {
-        self.apply_transactions_for_sync(txs, proposer, &BTreeMap::new(), &[], executor, &NoVerified)
+        self.apply_transactions_for_sync(txs, proposer, &BTreeMap::new(), &[], executor)
     }
 
     /// `apply_transactions` with the covered-bundle records any `Aggregate` among the
@@ -3334,14 +3251,13 @@ impl Ledger {
         covered: &BTreeMap<usize, Vec<crate::types::CoveredBundle>>,
         executor: &dyn ConfidentialExecutor,
     ) -> Result<Vec<(usize, CallReceiptData)>, BlockError> {
-        self.apply_transactions_for_sync(txs, proposer, covered, &[], executor, &NoVerified)
+        self.apply_transactions_for_sync(txs, proposer, covered, &[], executor)
     }
 
     /// `apply_transactions_with_covered` with the sealed form's side table (spec §7): the
     /// pruned bundles the block carries in marker form, keyed by proof hash for
     /// `check_bundle_proof`'s membership and binding checks. Empty on every path but
-    /// sealed-form sync. `verified_proofs` is the [`VerifiedProofs`] set the apply paths carry
-    /// (audit v3, B5) — [`NoVerified`] everywhere but the consensus loop's.
+    /// sealed-form sync.
     pub fn apply_transactions_for_sync(
         &mut self,
         txs: &[Transaction],
@@ -3349,7 +3265,6 @@ impl Ledger {
         covered: &BTreeMap<usize, Vec<crate::types::CoveredBundle>>,
         pruned: &[crate::consensus::PrunedBundle],
         executor: &dyn ConfidentialExecutor,
-        verified_proofs: &dyn VerifiedProofs,
     ) -> Result<Vec<(usize, CallReceiptData)>, BlockError> {
         let mut scratch = self.clone();
         // The deposits reported after a block are exactly that block's (see `Deposit`).
@@ -3399,9 +3314,7 @@ impl Ledger {
                     .get(&index)
                     .ok_or(BlockError::InvalidTx { index, error: TxError::AggregateNeedsCovered })?;
                 scratch.apply_aggregate(tx, c, executor).map_err(|error| BlockError::InvalidTx { index, error })?;
-            } else if let Some(r) =
-                scratch.apply_tx_with(tx, proposer, executor, verified_proofs).map_err(|error| BlockError::InvalidTx { index, error })?
-            {
+            } else if let Some(r) = scratch.apply_tx(tx, proposer, executor).map_err(|error| BlockError::InvalidTx { index, error })? {
                 receipts.push((index, r));
             }
         }
@@ -3417,21 +3330,7 @@ impl Ledger {
     /// the resulting state root must match the header. Ledger unchanged on error. Returns the
     /// receipts of the block's calls.
     pub fn apply_block(&mut self, block: &Block, executor: &dyn ConfidentialExecutor) -> Result<Vec<CallReceipt>, BlockError> {
-        self.apply_block_for_sync(block, &BTreeMap::new(), &[], executor, &NoVerified)
-    }
-
-    /// `apply_block` against a [`VerifiedProofs`] set (audit v3, B5): a transaction whose hash
-    /// the set holds has its proofs decoded rather than re-verified — admission already verified
-    /// them over these exact bytes — while every other check runs as usual. The consensus
-    /// loop's apply path carries the node's admission cache; sync, replay and `verify_chain`
-    /// take `apply_block` and verify everything.
-    pub fn apply_block_with(
-        &mut self,
-        block: &Block,
-        executor: &dyn ConfidentialExecutor,
-        verified: &dyn VerifiedProofs,
-    ) -> Result<Vec<CallReceipt>, BlockError> {
-        self.apply_block_for_sync(block, &BTreeMap::new(), &[], executor, verified)
+        self.apply_block_for_sync(block, &BTreeMap::new(), &[], executor)
     }
 
     /// `apply_block` with the covered-bundle records any `Aggregate` in the block needs (spec
@@ -3445,7 +3344,7 @@ impl Ledger {
         covered: &BTreeMap<usize, Vec<crate::types::CoveredBundle>>,
         executor: &dyn ConfidentialExecutor,
     ) -> Result<Vec<CallReceipt>, BlockError> {
-        self.apply_block_for_sync(block, covered, &[], executor, &NoVerified)
+        self.apply_block_for_sync(block, covered, &[], executor)
     }
 
     /// `apply_block_with_covered` with the sealed form's side table (spec §7): the tx root is
@@ -3453,15 +3352,12 @@ impl Ledger {
     /// hash (`Transaction::hash` takes the proof by digest), so the certified root binds every
     /// byte of it but the proof — the table's attested raw hash must agree with that, and
     /// `check_bundle_proof` runs its membership and digest-binding checks against the table.
-    /// `verified_proofs` is the [`VerifiedProofs`] set the consensus loop's apply path carries
-    /// (audit v3, B5); sync and replay pass [`NoVerified`].
     pub fn apply_block_for_sync(
         &mut self,
         block: &Block,
         covered: &BTreeMap<usize, Vec<crate::types::CoveredBundle>>,
         pruned: &[crate::consensus::PrunedBundle],
         executor: &dyn ConfidentialExecutor,
-        verified_proofs: &dyn VerifiedProofs,
     ) -> Result<Vec<CallReceipt>, BlockError> {
         // Size limits are a consensus rule, not only proposer policy: without them a Byzantine
         // leader can stuff a block up to the gossip transport cap and force every replica to
@@ -3526,7 +3422,7 @@ impl Ledger {
         let mut scratch = self.clone();
         scratch.set_height(block.height());
         scratch.set_timestamp_ms(block.header.timestamp_ms);
-        let data = scratch.apply_transactions_for_sync(&block.transactions, &proposer, covered, pruned, executor, verified_proofs)?;
+        let data = scratch.apply_transactions_for_sync(&block.transactions, &proposer, covered, pruned, executor)?;
         let call_gas = data.iter().fold(0u64, |a, (_, r)| a.saturating_add(r.gas_used));
         let (bytes_used, gas_used) = scratch.block_usage(&block.transactions, call_gas);
         scratch.close_block(block.height(), &proposer, bytes_used, gas_used, executor);
@@ -4523,11 +4419,6 @@ pub(crate) mod tests {
             self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             StubExecutor.verify_call(program, proof)
         }
-        // The whole point of the test: the decode path the ledger takes on a verified-set hit
-        // is not the verify path. Delegated to the stub's own, uncounted.
-        fn decode_call(&self, program: &ProgramRecord, proof: &[u8]) -> Result<CallOutcome, ConfidentialError> {
-            StubExecutor.decode_call(program, proof)
-        }
         fn public_digest(&self, words: &[u32]) -> Word8 {
             StubExecutor.public_digest(words)
         }
@@ -4581,63 +4472,144 @@ pub(crate) mod tests {
         }
     }
 
-    /// The set a node hands the ledger at apply, in miniature: the transaction hashes whose
-    /// proofs admission verified.
-    struct Admitted(std::collections::BTreeSet<Hash>);
+    /// An executor whose `decode_*` panic: everything else is the stub's. The ledger never reads
+    /// a proof through a decoder (spec `docs/superpowers/specs/2026-10-12-verified-fold-design.md`
+    /// §1) — the `decode_*` mirrors are admission pricing's alone — so every apply path runs on it.
+    struct NoDecode;
 
-    impl Admitted {
-        fn of(txs: &[&Transaction]) -> Admitted {
-            Admitted(txs.iter().map(|t| t.hash()).collect())
+    impl ConfidentialExecutor for NoDecode {
+        fn auth_header(&self, proof: &[u8]) -> Result<(crate::confidential::AuthShape, crate::notes::Word8, Option<u64>), crate::confidential::ConfidentialError> {
+            StubExecutor.auth_header(proof)
+        }
+        fn warm_auth_multisig(&self) {}
+        fn auth_multisig_key_ready(&self) -> bool {
+            true
+        }
+        fn install_msauth_vk(&self, blob: &[u8]) -> Result<(), String> {
+            StubExecutor.install_msauth_vk(blob)
+        }
+        fn enable_auth_multisig(&self) {
+            StubExecutor.enable_auth_multisig()
+        }
+        fn build_msauth_key(&self) -> Result<(), String> {
+            StubExecutor.build_msauth_key()
+        }
+        fn check_program(&self, base_pc: u32, words: &[u32]) -> Result<Vec<u8>, ConfidentialError> {
+            StubExecutor.check_program(base_pc, words)
+        }
+        fn max_callable_program_words(&self, public_segment_words: usize) -> Option<usize> {
+            StubExecutor.max_callable_program_words(public_segment_words)
+        }
+        fn verify_call(&self, program: &ProgramRecord, proof: &[u8]) -> Result<CallOutcome, ConfidentialError> {
+            StubExecutor.verify_call(program, proof)
+        }
+        fn decode_call(&self, _: &ProgramRecord, _: &[u8]) -> Result<CallOutcome, ConfidentialError> {
+            panic!("the ledger decoded a proof")
+        }
+        fn verify_call_hardened(&self, program: &ProgramRecord, proof: &[u8], segment: &[u32]) -> Result<CallOutcome, ConfidentialError> {
+            StubExecutor.verify_call_hardened(program, proof, segment)
+        }
+        fn decode_call_hardened(&self, _: &ProgramRecord, _: &[u8], _: &[u32]) -> Result<CallOutcome, ConfidentialError> {
+            panic!("the ledger decoded a proof")
+        }
+        fn verify_invoke(&self, program: &ProgramRecord, proof: &[u8], segment: &[u32]) -> Result<CallOutcome, ConfidentialError> {
+            StubExecutor.verify_invoke(program, proof, segment)
+        }
+        fn decode_invoke(&self, _: &ProgramRecord, _: &[u8], _: &[u32]) -> Result<CallOutcome, ConfidentialError> {
+            panic!("the ledger decoded a proof")
+        }
+        fn verify_perp(&self, engine_hc: &Word8, max_tier: u8, segment: &[u32], proof: &[u8]) -> Result<CallOutcome, ConfidentialError> {
+            StubExecutor.verify_perp(engine_hc, max_tier, segment, proof)
+        }
+        fn decode_perp(&self, _: &Word8, _: u8, _: &[u32], _: &[u8]) -> Result<CallOutcome, ConfidentialError> {
+            panic!("the ledger decoded a proof")
+        }
+        fn public_digest(&self, words: &[u32]) -> Word8 {
+            StubExecutor.public_digest(words)
+        }
+        fn node_hash(&self, left: &Word8, right: &Word8) -> Word8 {
+            StubExecutor.node_hash(left, right)
+        }
+        fn hash_domain(&self, domain: u32, msg: &[u32]) -> Word8 {
+            StubExecutor.hash_domain(domain, msg)
+        }
+        fn note_commitment(&self, pk: &Word8, from: &Word8, amount: u64, asset: u32, time: u32, r: &Word8) -> Word8 {
+            StubExecutor.note_commitment(pk, from, amount, asset, time, r)
+        }
+        fn bundle_digest(&self, input: &crate::notes::BundleDigestInput) -> Word8 {
+            StubExecutor.bundle_digest(input)
+        }
+        fn bundle_digest_v3(&self, input: &crate::notes::BundleDigestInput) -> Word8 {
+            StubExecutor.bundle_digest_v3(input)
+        }
+        fn bundle_proof_digest(&self, hc_bundle: &Word8, proof: &[u8]) -> Result<Word8, ConfidentialError> {
+            StubExecutor.bundle_proof_digest(hc_bundle, proof)
+        }
+        fn auth_proof_digest(&self, proof: &[u8]) -> Result<Word8, ConfidentialError> {
+            StubExecutor.auth_proof_digest(proof)
+        }
+        fn verify_auth(&self, hc_auth: &Word8, proof: &[u8], binding: &[u32; 8]) -> Result<Word8, ConfidentialError> {
+            StubExecutor.verify_auth(hc_auth, proof, binding)
+        }
+        fn bundle_gas_limit(&self, proof: &[u8]) -> Result<Option<u64>, ConfidentialError> {
+            StubExecutor.bundle_gas_limit(proof)
+        }
+        fn auth_gas_limit(&self, proof: &[u8]) -> Result<Option<u64>, ConfidentialError> {
+            StubExecutor.auth_gas_limit(proof)
+        }
+        fn verify_bundle(&self, hc_bundle: &Word8, proof: &[u8], binding: &[u32; 8]) -> Result<(), ConfidentialError> {
+            StubExecutor.verify_bundle(hc_bundle, proof, binding)
+        }
+        fn aggregate_program_digest(&self, shape: &crate::types::DeclaredShape) -> Result<[u64; 4], ConfidentialError> {
+            StubExecutor.aggregate_program_digest(shape)
+        }
+        fn verify_aggregate(
+            &self,
+            shape: &crate::types::DeclaredShape,
+            covered: &[crate::types::CoveredBundle],
+            proof: &[u8],
+            binding: &[u32; 8],
+        ) -> Result<Vec<[u32; 8]>, ConfidentialError> {
+            StubExecutor.verify_aggregate(shape, covered, proof, binding)
         }
     }
 
-    impl VerifiedProofs for Admitted {
-        fn contains(&self, tx: &Hash) -> bool {
-            self.0.contains(tx)
-        }
-        fn is_empty(&self) -> bool {
-            self.0.is_empty()
-        }
-    }
-
-    /// Audit v3, B5: a proof verified at admission is not verified again when the transaction's
-    /// block applies. Admission's verdict is keyed on the transaction hash, which binds the
-    /// proof; everything stateful — anchors, nullifiers, nonces, digests — is re-checked either
-    /// way. A transaction admission never saw is verified at apply as it always was.
+    /// The verified-set fold (spec `docs/superpowers/specs/2026-10-12-verified-fold-design.md`):
+    /// the ledger verifies every proof at apply and never decodes one — a node's `CachingExecutor`
+    /// is what spares the re-verification of a proof admission already verified. Through an
+    /// executor whose `decode_*` panic: a block of a bundle transaction and a call applies through
+    /// `apply_block` and through `apply_block_for_sync`, and a call — plain and under
+    /// `hardening_v6` — validates.
     #[test]
-    fn apply_skips_the_proof_of_an_admitted_transaction() {
-        let mut l = ledger();
+    fn apply_never_decodes_a_proof() {
         let (a, _) = keys();
-        let exec = CountingExecutor::default();
-        // Admission verifies the bundle's proof once.
-        let t = tx(&l, [[1; 8], [2; 8]], [[3; 8], [4; 8]]);
-        l.validate(&t, &exec).unwrap();
-        assert_eq!(exec.bundles(), 1, "admission verified the proof");
-        let root = root_after(&l, std::slice::from_ref(&t), &a.address(), 1);
-        let block = signed_block(vec![t.clone()], &a, 1, root);
-        l.apply_block_with(&block, &exec, &Admitted::of(&[&t])).unwrap();
-        assert_eq!(exec.bundles(), 1, "an admitted transaction's proof is not verified again at apply");
-        // A transaction that was never admitted is still verified at apply.
-        let t = tx(&l, [[5; 8], [6; 8]], [[7; 8], [8; 8]]);
-        let root = root_after(&l, std::slice::from_ref(&t), &a.address(), 2);
-        let block = signed_block(vec![t], &a, 2, root);
-        l.apply_block_with(&block, &exec, &Admitted::of(&[])).unwrap();
-        assert_eq!(exec.bundles(), 2, "a transaction admission never saw is verified at apply");
+        let (l, id) = ledger_with_program(|_| {});
+        let transfer = tx(&l, [[40; 8], [41; 8]], [[42; 8], [43; 8]]);
+        let call = call_tx(&l, 20, id, StubExecutor::make_proof(&id, 12, [9; 8]), fee_for(0));
+        assert_eq!(l.validate(&call, &NoDecode), Ok(()));
+        let txs = vec![transfer, call];
+        let height = l.height() + 1;
+        let root = root_after(&l, &txs, &a.address(), height);
+        let block = signed_block(txs, &a, height, root);
+        let receipts = l.clone().apply_block(&block, &NoDecode).unwrap();
+        assert_eq!(receipts.len(), 1, "the call's receipt");
+        let synced = l.clone().apply_block_for_sync(&block, &BTreeMap::new(), &[], &NoDecode).unwrap();
+        assert_eq!(synced, receipts);
 
-        // The same for a call's proof: decoded for its outcome at apply, not verified.
-        let (mut l, id) = ledger_with_program(|_| {});
-        let t = call_tx(&l, 20, id, StubExecutor::make_proof(&id, 12, [9; 8]), fee_for(0));
-        l.validate(&t, &exec).unwrap();
-        assert_eq!(exec.calls(), 1, "admission verified the call's proof");
-        let root = root_after(&l, std::slice::from_ref(&t), &a.address(), 1);
-        let block = signed_block(vec![t.clone()], &a, 1, root);
-        l.apply_block_with(&block, &exec, &Admitted::of(&[&t])).unwrap();
-        assert_eq!(exec.calls(), 1, "an admitted call's proof is decoded, not verified, at apply");
-        let t = call_tx(&l, 30, id, StubExecutor::make_proof(&id, 12, [9; 8]), fee_for(0));
-        let root = root_after(&l, std::slice::from_ref(&t), &a.address(), 2);
-        let block = signed_block(vec![t], &a, 2, root);
-        l.apply_block_with(&block, &exec, &Admitted::of(&[])).unwrap();
-        assert_eq!(exec.calls(), 2, "a call admission never saw is verified at apply");
+        // Under `hardening_v6` the call is bound to its transaction and verified as such.
+        let mut gated = l.clone();
+        gated.set_hardening_v6(true);
+        let mut bound = StubExecutor::bound(Transaction::shielded(
+            7,
+            bundle(&gated, [[50; 8], [51; 8]], [[52; 8], [53; 8]], fee_for(0)),
+            Action::Call { program: id, proof: vec![], input_envelope: None },
+        ));
+        let proof = StubExecutor::make_proof_with_public(&id, 12, [5; 8], &bound.call_binding(&crate::types::BindingDomain::ChainId));
+        let Action::Call { proof: p, .. } = &mut bound.action else { unreachable!() };
+        *p = proof;
+        let bound = StubExecutor::bound(bound);
+        assert_eq!(gated.validate(&bound, &NoDecode), Ok(()));
+        assert!(gated.clone().apply_tx(&bound, &a.address(), &NoDecode).is_ok());
     }
 
     #[test]
@@ -5914,10 +5886,10 @@ pub(crate) mod tests {
 
         let (mut default, _) = ledger_with_program(|_| {});
         assert_eq!(
-            default.apply_block_for_sync(&block, &BTreeMap::new(), &[], &PaddedStub, &NoVerified),
+            default.apply_block_for_sync(&block, &BTreeMap::new(), &[], &PaddedStub),
             Err(BlockError::TooLarge)
         );
-        let receipts = raised.apply_block_for_sync(&block, &BTreeMap::new(), &[], &PaddedStub, &NoVerified).unwrap();
+        let receipts = raised.apply_block_for_sync(&block, &BTreeMap::new(), &[], &PaddedStub).unwrap();
         assert_eq!(receipts.len(), 1);
         assert_eq!(receipts[0].tx, t.hash());
         assert_eq!(receipts[0].outputs, [9; 8]);
@@ -5927,13 +5899,13 @@ pub(crate) mod tests {
             limits(l);
             l.set_max_block_bytes(t.encoded_len() - 1);
         });
-        assert_eq!(tight.apply_block_for_sync(&block, &BTreeMap::new(), &[], &PaddedStub, &NoVerified), Err(BlockError::TooLarge));
+        assert_eq!(tight.apply_block_for_sync(&block, &BTreeMap::new(), &[], &PaddedStub), Err(BlockError::TooLarge));
         // Exactly at the block's size, it is applied: the block cap is `bytes > max`, not `>=`.
         let (mut exact, _) = ledger_with_program(|l| {
             limits(l);
             l.set_max_block_bytes(t.encoded_len());
         });
-        let receipts = exact.apply_block_for_sync(&block, &BTreeMap::new(), &[], &PaddedStub, &NoVerified).unwrap();
+        let receipts = exact.apply_block_for_sync(&block, &BTreeMap::new(), &[], &PaddedStub).unwrap();
         assert_eq!(receipts.len(), 1, "a block exactly at the cap");
     }
 
@@ -6398,7 +6370,7 @@ pub(crate) mod tests {
             shape: crate::types::DeclaredShape { profile: crate::types::FriProfile::Test, tier: 14, program_log_height: 12, input_log_height: 10, keccak_log_height: 0, sha256_log_height: 0, public_log_height: 2, mem_log_height: 16 },
         };
         let err = l
-            .apply_transactions_for_sync(&[], &proposer, &BTreeMap::new(), &[bad], &StubExecutor, &NoVerified)
+            .apply_transactions_for_sync(&[], &proposer, &BTreeMap::new(), &[bad], &StubExecutor)
             .expect_err("a 33-word side table is refused");
         assert!(matches!(err, BlockError::MalformedPrunedRecord { words: 33, .. }), "{err:?}");
         // The digest check itself, fed a short record (a store written by a build that let one in):
@@ -6413,7 +6385,7 @@ pub(crate) mod tests {
         l.pruned_side.insert(ph, (raw.hash(), Vec::new()));
         let binding = [0u32; crate::types::TX_BINDING_WORDS];
         assert_eq!(
-            l.check_bundle_proof(&marker, marker.bundle.as_ref().unwrap(), &binding, &StubExecutor, false),
+            l.check_bundle_proof(&marker, marker.bundle.as_ref().unwrap(), &binding, &StubExecutor),
             Err(TxError::BadDigest)
         );
     }
@@ -6448,18 +6420,18 @@ pub(crate) mod tests {
         };
         let honest = record(StubExecutor.public_digest(&binding));
         l.pruned_side.insert(ph, (raw.hash(), honest.clone()));
-        assert_eq!(l.check_bundle_proof(&marker, b, &binding, &StubExecutor, false), Ok(()), "the record of this transaction");
+        assert_eq!(l.check_bundle_proof(&marker, b, &binding, &StubExecutor), Ok(()), "the record of this transaction");
         // The same bundle, the same OUT digest — but the covered proof was bound to another
         // transaction (another action, another envelope): refused.
         l.pruned_side.insert(ph, (raw.hash(), record(StubExecutor.public_digest(&[9; 8]))));
         assert_eq!(
-            l.check_bundle_proof(&marker, b, &binding, &StubExecutor, false),
+            l.check_bundle_proof(&marker, b, &binding, &StubExecutor),
             Err(TxError::PrunedRecordMismatch("the record's H_PUB is not this transaction's binding"))
         );
         // And a record naming another transaction id.
         l.pruned_side.insert(ph, (Hash([5; 32]), honest));
         assert_eq!(
-            l.check_bundle_proof(&marker, b, &binding, &StubExecutor, false),
+            l.check_bundle_proof(&marker, b, &binding, &StubExecutor),
             Err(TxError::PrunedRecordMismatch("the record names another transaction"))
         );
     }
@@ -6479,10 +6451,10 @@ pub(crate) mod tests {
             shape: crate::types::DeclaredShape { profile: crate::types::FriProfile::Test, tier: 14, program_log_height: 12, input_log_height: 10, keccak_log_height: 0, sha256_log_height: 0, public_log_height: 2, mem_log_height: 16 },
         };
         let err = l
-            .apply_transactions_for_sync(&[], &proposer, &BTreeMap::new(), &[record(1), record(3)], &StubExecutor, &NoVerified)
+            .apply_transactions_for_sync(&[], &proposer, &BTreeMap::new(), &[record(1), record(3)], &StubExecutor)
             .expect_err("two records under one proof hash");
         assert_eq!(err, BlockError::DuplicatePrunedRecord { proof_hash: Hash([2; 32]) });
-        assert!(l.apply_transactions_for_sync(&[], &proposer, &BTreeMap::new(), &[record(1)], &StubExecutor, &NoVerified).is_ok());
+        assert!(l.apply_transactions_for_sync(&[], &proposer, &BTreeMap::new(), &[record(1)], &StubExecutor).is_ok());
     }
 
     /// HB-3 (zkVM/ISA review, info): the commitment tree's 2^32-leaf capacity was enforced by an
@@ -6531,7 +6503,7 @@ pub(crate) mod tests {
             shape: crate::types::DeclaredShape { profile: crate::types::FriProfile::Test, tier: 14, program_log_height: 12, input_log_height: 10, keccak_log_height: 0, sha256_log_height: 0, public_log_height: 4, mem_log_height: 16 },
         };
         let err = l
-            .apply_transactions_for_sync(&[], &proposer, &BTreeMap::new(), &[bad], &StubExecutor, &NoVerified)
+            .apply_transactions_for_sync(&[], &proposer, &BTreeMap::new(), &[bad], &StubExecutor)
             .expect_err("a record with a word at or past p is refused");
         assert!(matches!(err, BlockError::NonCanonicalPrunedRecord { index: 0, .. }), "{err:?}");
     }
@@ -6789,7 +6761,7 @@ pub(crate) mod tests {
         let t = v3_tx_with(&l, C, [0xc1; 8], HCA);
         assert_eq!(l.validate(&t, &StubExecutor), Err(TxError::AuthMismatch));
         let b = t.bundle.as_ref().unwrap();
-        assert_eq!(l.check_bundle_proof(&t, b, &t.binding(&crate::types::BindingDomain::ChainId), &StubExecutor, true), Err(TxError::AuthMismatch), "the cheap half runs on a verified-set hit too");
+        assert_eq!(l.check_bundle_proof(&t, b, &t.binding(&crate::types::BindingDomain::ChainId), &StubExecutor), Err(TxError::AuthMismatch), "the cheap half, at apply's check too");
 
         /// An executor whose cheap read reports the bundle's own `c` while the verified proof
         /// publishes another — the verify's answer is compared as well.
@@ -6876,8 +6848,11 @@ pub(crate) mod tests {
             l.validate(&t, &StubExecutor),
             Err(TxError::InvalidAuthProof(ConfidentialError::InvalidProof("PublicValues".into())))
         );
-        // B5: admission verified it, so a verified-set hit skips the verify, as for the bundle.
-        assert_eq!(l.check_bundle_proof(&t, b, &t.binding(&crate::types::BindingDomain::ChainId), &StubExecutor, true), Ok(()));
+        // Apply's check verifies it too (the verified-fold spec: no verified-set skip).
+        assert_eq!(
+            l.check_bundle_proof(&t, b, &t.binding(&crate::types::BindingDomain::ChainId), &StubExecutor),
+            Err(TxError::InvalidAuthProof(ConfidentialError::InvalidProof("PublicValues".into())))
+        );
         let other_guest = v3_tx_with(&l, C, C, [22; 8]);
         assert_eq!(l.validate(&other_guest, &StubExecutor), Err(TxError::InvalidAuthProof(ConfidentialError::WrongProgram)));
         let mut junk = v3_tx(&l);
@@ -6940,18 +6915,18 @@ pub(crate) mod tests {
         };
         let b = marker.bundle.clone().unwrap();
         l.pruned_side.insert(ph, (raw.hash(), record(StubExecutor.bundle_digest_v3(&b.digest_input()))));
-        assert_eq!(l.check_bundle_proof(&marker, &b, &binding, &StubExecutor, false), Ok(()));
+        assert_eq!(l.check_bundle_proof(&marker, &b, &binding, &StubExecutor), Ok(()));
         let mut replayed = b.clone();
         replayed.auth_proof = StubExecutor::make_auth_proof(&HCA, &C, &[9; 8]);
         assert_eq!(
-            l.check_bundle_proof(&marker, &replayed, &binding, &StubExecutor, false),
+            l.check_bundle_proof(&marker, &replayed, &binding, &StubExecutor),
             Err(TxError::InvalidAuthProof(ConfidentialError::InvalidProof("PublicValues".into())))
         );
         let mut missing = b.clone();
         missing.auth_proof = Vec::new();
-        assert_eq!(l.check_bundle_proof(&marker, &missing, &binding, &StubExecutor, false), Err(TxError::AuthMissing));
+        assert_eq!(l.check_bundle_proof(&marker, &missing, &binding, &StubExecutor), Err(TxError::AuthMissing));
         l.pruned_side.insert(ph, (raw.hash(), record(StubExecutor.bundle_digest(&b.digest_input()))));
-        assert_eq!(l.check_bundle_proof(&marker, &b, &binding, &StubExecutor, false), Err(TxError::BadDigest), "a v1 record");
+        assert_eq!(l.check_bundle_proof(&marker, &b, &binding, &StubExecutor), Err(TxError::BadDigest), "a v1 record");
     }
 
     /// Phase 2's controller parameters for the tests below: prices 100 / 800 at their floors.
@@ -7344,7 +7319,7 @@ pub(crate) mod tests {
     }
 
     /// Review focus 4 (spec §4.3): every bundle proof declares exactly `bundle_gas_limit`, checked
-    /// before the STARK verify and on the verified-set (B5) path too.
+    /// before the STARK verify, at admission and at apply.
     #[test]
     fn a_bundle_declaring_any_other_gas_limit_is_refused() {
         let (a, _) = keys();
@@ -7360,12 +7335,9 @@ pub(crate) mod tests {
             let exec = CountingExecutor::default();
             assert_eq!(l.validate(&t, &exec), Err(TxError::BundleGasLimit { want: 20_479, got: Some(other) }));
             assert_eq!(exec.bundles(), 0, "refused before the verify");
-            // And the verified-set hit, which skips the verify, still checks the limit.
+            // And apply checks the limit as admission does.
             let mut applied = l.clone();
-            assert_eq!(
-                applied.apply_tx_with(&t, &a.address(), &StubExecutor, &Admitted::of(&[&t])),
-                Err(TxError::BundleGasLimit { want: 20_479, got: Some(other) })
-            );
+            assert_eq!(applied.apply_tx(&t, &a.address(), &StubExecutor), Err(TxError::BundleGasLimit { want: 20_479, got: Some(other) }));
         }
         // An executor whose proofs carry no limit declares none, and is refused under the section.
         struct NoGas;
@@ -7446,8 +7418,8 @@ pub(crate) mod tests {
 
     /// Spec §4.3 for the second proof a v3 (split-authorisation) transaction carries: under the gas
     /// section the auth proof declares exactly the auth guest's tier-10, hash-free ceiling
-    /// (`gas::auth_gas_limit_pin`, 1 279) — checked before either proof's verify, and on the
-    /// verified-set (B5) path too, exactly like the bundle proof's `bundle_gas_limit`. A chain with
+    /// (`gas::auth_gas_limit_pin`, 1 279) — checked before either proof's verify, at admission and at
+    /// apply, exactly like the bundle proof's `bundle_gas_limit`. A chain with
     /// `hc_auth` but no gas section (chain 17) reads no limit at all.
     #[test]
     fn an_auth_proof_declaring_any_other_gas_limit_is_refused() {
@@ -7474,9 +7446,9 @@ pub(crate) mod tests {
             let exec = CountingExecutor::default();
             assert_eq!(l.validate(&t, &exec), want);
             assert_eq!((exec.bundles(), exec.auths()), (0, 0), "refused before either verify");
-            // And the verified-set hit, which skips both verifies, still checks the limit.
+            // And apply checks the limit as admission does.
             let mut applied = l.clone();
-            assert_eq!(applied.apply_tx_with(&t, &a.address(), &StubExecutor, &Admitted::of(&[&t])).map(|_| ()), want);
+            assert_eq!(applied.apply_tx(&t, &a.address(), &StubExecutor).map(|_| ()), want);
         }
         // Without the gas section (chain 17's rules) the auth proof's limit is not read.
         let plain = v3_ledger();
@@ -7565,7 +7537,7 @@ pub(crate) mod tests {
         let t = msig_tx_with(&l, C, [0xc1; 8], HCM);
         assert_eq!(l.validate(&t, &StubExecutor), Err(TxError::AuthMismatch));
         let b = t.bundle.as_ref().unwrap();
-        assert_eq!(l.check_bundle_proof(&t, b, &t.binding(&crate::types::BindingDomain::ChainId), &StubExecutor, true), Err(TxError::AuthMismatch), "on a verified-set hit too");
+        assert_eq!(l.check_bundle_proof(&t, b, &t.binding(&crate::types::BindingDomain::ChainId), &StubExecutor), Err(TxError::AuthMismatch), "at apply's check too");
     }
 
     /// R-gas: under the section a multisig proof must declare its header's ceiling, the msauth pin —
@@ -7588,7 +7560,7 @@ pub(crate) mod tests {
             assert_eq!(l.validate(&t, &exec), want, "{other}");
             assert_eq!((exec.bundles(), exec.auths()), (0, 0), "refused before either verify");
             let mut applied = l.clone();
-            assert_eq!(applied.apply_tx_with(&t, &a.address(), &StubExecutor, &Admitted::of(&[&t])).map(|_| ()), want);
+            assert_eq!(applied.apply_tx(&t, &a.address(), &StubExecutor).map(|_| ()), want);
         }
     }
 
@@ -8143,7 +8115,7 @@ pub(crate) mod tests {
     /// ask and refuses it on every odd one. A `Deploy` asks twice, once in `validate_inner` and once
     /// in the action step after `apply_bundle_notes` has written the bundle, so every such deploy
     /// passes validation and then fails mid-application: the half-applied case
-    /// ([`ApplyFailure::HalfApplied`]) that `apply_tx_with`'s comment names, which the double spend
+    /// ([`ApplyFailure::HalfApplied`]) that `apply_tx_checked`'s comment names, which the double spend
     /// (refused before any write, [`ApplyFailure::Refused`]) is not. Shared with the consensus
     /// tests, whose proposer replays exactly on this case.
     pub(crate) struct FlakyDeploy {
@@ -8229,7 +8201,7 @@ pub(crate) mod tests {
     /// The proposer's split (final review F1): a candidate refused by validation leaves the
     /// ledger byte-identical, so `HotStuff::propose` skips it without a replay; one that passed
     /// validation and failed in the action step has written its bundle, so the proposer must
-    /// rebuild. `apply_tx_checked` names which, and `apply_tx_with` is the same path with the
+    /// rebuild. `apply_tx_checked` names which, and `apply_tx` is the same path with the
     /// distinction dropped.
     #[test]
     fn apply_tx_checked_names_a_refusal_apart_from_a_half_apply() {
@@ -8243,13 +8215,13 @@ pub(crate) mod tests {
         l.apply_tx(&first, &a.address(), &StubExecutor).unwrap();
         let before = l.clone();
         // The double spend: refused before any write.
-        let err = l.apply_tx_checked(&dup, &a.address(), &StubExecutor, &NoVerified).unwrap_err();
+        let err = l.apply_tx_checked(&dup, &a.address(), &StubExecutor).unwrap_err();
         assert_eq!(err, ApplyFailure::Refused(TxError::Spent([1; 8])));
         assert!(l == before, "a refusal leaves the ledger equal to its pre-call clone");
-        assert_eq!(l.apply_tx_with(&dup, &a.address(), &StubExecutor, &NoVerified), Err(TxError::Spent([1; 8])), "the same error through apply_tx_with");
+        assert_eq!(l.apply_tx(&dup, &a.address(), &StubExecutor), Err(TxError::Spent([1; 8])), "the same error through apply_tx");
         // The half-apply: validation passes, the action step refuses after the bundle was written.
         let flaky = FlakyDeploy { asked: Default::default() };
-        let err = l.apply_tx_checked(&t, &a.address(), &flaky, &NoVerified).unwrap_err();
+        let err = l.apply_tx_checked(&t, &a.address(), &flaky).unwrap_err();
         assert!(matches!(err, ApplyFailure::HalfApplied(TxError::BadProgram(_))), "{err:?}");
         assert!(l.is_spent(&[20; 8]) && l.is_spent(&[21; 8]), "the bundle's nullifiers were written before the refusal");
         assert!(l != before, "a half-apply leaves the ledger dirty");
