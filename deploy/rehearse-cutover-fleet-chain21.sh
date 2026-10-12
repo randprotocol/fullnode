@@ -121,7 +121,7 @@ st=$FAKE_ROOT/state; mkdir -p $st
 case "$1" in
   is-active) q=0; [ "$2" = --quiet ] && { q=1; shift; }; s=$(cat $st/$2 2>/dev/null || echo inactive); [ $q = 1 ] || echo $s; [ "$s" = active ];;
   stop) echo inactive > $st/$2;;
-  start) echo active > $st/$2;;
+  start) [ -e $st/refuse-start ] || echo active > $st/$2;;   # refuse-start: the rehearsal's host that will not come up
   daemon-reload) :;;
   cat) cat $FAKE_ROOT/etc/systemd/system/$2.service $FAKE_ROOT/etc/systemd/system/$2.service.d/*.conf 2>/dev/null;;
   *) echo "fake systemctl: $*" >&2; exit 1;;
@@ -166,10 +166,20 @@ case "$body" in
     esac
     echo "{\"id\":1,\"jsonrpc\":\"2.0\",\"result\":\"$h\"}";;
   *rand_getHealth*) echo '{"id":1,"jsonrpc":"2.0","result":{"status":"ok"}}';;
+  *rand_getBridgeState*)
+    python3 - "$FAKE_ROOT/root/genesis-chain21.json" "${REHEARSE_MINTED:-0}" <<'PY'
+import json, sys
+g = json.load(open(sys.argv[1])); b = g["bridge"]
+assets = [{"locked": str(k.get("locked", 0))} for t in g["tokens"]["tokens"] for k in t["backings"]]
+assets[0]["locked"] = str(int(assets[0]["locked"]) + int(sys.argv[2]))
+print(json.dumps({"id": 1, "jsonrpc": "2.0", "result": {"enabled": True, "burn_sequence": b["burn_sequence"], "assets": assets}}))
+PY
+    ;;
   *rand_status*)
+    n=$(( $(cat $FAKE_ROOT/state/height 2>/dev/null || echo 4) + 1 )); echo $n > $FAKE_ROOT/state/height
     k=absent; g=$($B/rand-node keygen-msauth-vk --check $B/msauth-vk-production.bin 2>/dev/null); p=$($B/rand-node keygen-msauth-vk --print-pinned production 2>/dev/null)
     [ -n "$g" ] && [ "$g" = "$p" ] && k=loaded
-    echo "{\"id\":1,\"jsonrpc\":\"2.0\",\"result\":{\"height\":5,\"view\":6,\"msauth_key\":\"$k\"}}";;
+    echo "{\"id\":1,\"jsonrpc\":\"2.0\",\"result\":{\"height\":$n,\"view\":6,\"msauth_key\":\"$k\"}}";;
   *rand_getVersion*) echo '{"id":1,"jsonrpc":"2.0","result":{"chain_id":0,"git_sha":"fake","version":"fake"}}';;
 esac
 FAKE_CURL
@@ -239,15 +249,25 @@ U0=$(units)
 
 # ── DRY_RUN: prints, touches nothing ──
 TR0=$(tree)
-for ph in preflight stage stop status; do
+for ph in preflight stage status halt; do
   t "DRY_RUN=1 $ph with no inputs prints and touches nothing" 0 "[dry-run]" env DRY_RUN=1 $F $ph
 done
 t "DRY_RUN=1 push with every input prints the push" 0 "[dry-run] scp" env DRY_RUN=1 "${NEWENV[@]}" "${LN[@]}" $F push $G21
+t "DRY_RUN=1 stop prints its gate" 0 "stop gate" env DRY_RUN=1 "${NEWENV[@]}" "${LN[@]}" $F stop $G21
 t "DRY_RUN=1 switch prints the msauth key check" 0 "keygen-msauth-vk --check" env DRY_RUN=1 "${NEWENV[@]}" "${OLDENV[@]}" "${LN[@]}" $F switch $G21
 t "DRY_RUN=1 start prints the key gate" 0 "msauth key on every host" env DRY_RUN=1 $F start
+t "DRY_RUN=1 quiet" 0 "rand_getBridgeState" env DRY_RUN=1 $F quiet $G21
 t "DRY_RUN=1 rollback" 0 "[dry-run]" env DRY_RUN=1 "${OLDENV[@]}" $F rollback
 t "DRY_RUN=1 wait" 0 "msauth_key loaded" env DRY_RUN=1 "${LN[@]}" $F wait $G21
+t "DRY_RUN=1 wait20" 0 "serves genesis 6210cf07" env DRY_RUN=1 $F wait20
 chk "…the dry runs changed no host, wrote no marker, no record" '[ "$(tree)" = "$TR0" ] && [ "$(active)" = 26 ] && [ "$(nmark)" = 0 ] && [ ! -e $CUT_RECORD ]'
+# ── input hygiene (M1, M4) ──
+cp "$GUARDIAN_HOSTS" "$T/gh.keep"; sed -i '' 's/^3 .*/3 192.0.2.103;touch/' "$GUARDIAN_HOSTS"
+t "a guardian host that is not an IPv4 address is refused" 1 "is not an IPv4 address" $F status
+cp "$T/gh.keep" "$GUARDIAN_HOSTS"
+t "a WANT_VERSION with a quote and ';' is refused" 1 "shell metacharacter" env "WANT_VERSION=0.8.0'; touch /tmp/x" $F status
+t "a STAGE_URL with a space is refused" 1 "shell metacharacter" env "STAGE_URL=https://rehearsal.invalid/a b" $F status
+t "NEED_FLAGS with a non-flag word is refused" 1 "is not a --flag" env "NEED_FLAGS=--fees ;id" $F status
 
 # ── preflight ──
 t "preflight without v0.7.1's pins" 1 "OLD_SHA / OLD_SHA_WALLET" $F preflight
@@ -263,6 +283,8 @@ rmdir "$T/hosts/192.0.2.103/var/lib/randnode/data-21"
 touch "$T/hosts/192.0.2.9/root/rand.pre-c21"
 t "preflight with a leftover *.pre-c21" 1 "not every host is ready" env "${OLDENV[@]}" $F preflight
 rm "$T/hosts/192.0.2.9/root/rand.pre-c21"
+t "halt while chain 20 runs is refused (only stop <genesis> takes chain 20 down)" 1 "RUNS CHAIN 20" $F halt
+chk "…nothing halted" '[ "$(active)" = 26 ]'
 # ── stage ──
 t "stage without RELEASE_SUMS" 1 "RELEASE_SUMS is unset" $F stage
 t "stage with an unsigned SHA256SUMS" 1 "signature does not verify" env RELEASE_SUMS=$T/SUMS-unsigned $F stage
@@ -286,12 +308,7 @@ chk "26 hosts hold rand-node.c21 / rand.c21 / the blob at the pins; installed st
 t "stage again from a private url (token kept out of the log)" 0 "STAGED" env "${NEWENV[@]}" STAGE_FROM=url "STAGE_URL=https://rehearsal.invalid/private/v080?token=SECRET123" $F stage
 ! grep -q SECRET123 "$T/out.log" && { echo "ok   — …the url's token is not in the output"; pass=$((pass+1)); } || { echo "FAIL — the token was printed"; fail=$((fail+1)); }
 t "stage again from a local path (STAGE_ALLOW_NON_ELF=1: the rehearsal's wrappers are scripts)" 0 "STAGED" env "${NEWENV[@]}" STAGE_FROM=path STAGE_DIR=$BIN/new STAGE_ALLOW_NON_ELF=1 $F stage
-# ── the cut ──
-t "start with no marker" 1 "no $MARKER_GLOB<prefix> marker" $F start
-t "switch while the fleet still runs" 1 "some hosts are not ready" env "${NEWENV[@]}" "${OLDENV[@]}" "${LN[@]}" $F switch $G21
-chk "…switched nothing, installed nothing, no marker" '[ "$(units)" = "$U0" ] && [ "$(installed rand-node)" = "26:$OLD_SHA " ] && [ "$(installed msauth-vk-production.bin)" = "26:none " ] && [ "$(nmark)" = 0 ]'
-t "stop" 0 "STOPPED" $F stop
-chk "all 26 inactive" '[ "$(active)" = 0 ]'
+# ── push, with chain 20 still running ──
 t "push without LOCAL_NODE" 1 "LOCAL_NODE is unset" env "${NEWENV[@]}" $F push $G21
 t "push with chain 20's v0.7.1 as LOCAL_NODE" 1 "nothing done" env "${NEWENV[@]}" LOCAL_NODE=$BIN/old/rand-node $F push $G21
 t "push without RELEASE_SUMS" 1 "RELEASE_SUMS is unset" env "${LN[@]}" $F push $G21
@@ -304,15 +321,39 @@ record "$H21B"
 t "push with the second operator's hash differing" 1 "differ" env "${NEWENV[@]}" "${LN[@]}" $F push $G21
 chk "…nothing copied" '! ls $T/hosts/*/root/genesis-chain21.json >/dev/null 2>&1'
 record "$H21"
-t "switch before push" 1 "some hosts are not ready" env "${NEWENV[@]}" "${OLDENV[@]}" "${LN[@]}" $F switch $G21
-chk "…no marker, units, binaries and key untouched" '[ "$(units)" = "$U0" ] && [ "$(nmark)" = 0 ] && [ "$(installed rand-node)" = "26:$OLD_SHA " ] && [ "$(installed msauth-vk-production.bin)" = "26:none " ]'
-t "push of the chain-21 genesis" 0 "PUSHED" env "${NEWENV[@]}" "${LN[@]}" $F push $G21
-chk "26 hosts hold the genesis, byte-identical" '[ "$(shasum $T/hosts/*/root/genesis-chain21.json | cut -d" " -f1 | sort -u | wc -l | tr -d " ")" = 1 ] && [ "$(ls $T/hosts/*/root/genesis-chain21.json | wc -l | tr -d " ")" = 26 ]'
+t "start with no marker" 1 "no $MARKER_GLOB<prefix> marker" $F start
+t "stop with no genesis argument" 1 "stop <genesis file>" $F stop
+t "stop before push: refused, nothing stopped" 1 "NOTHING STOPPED" env "${NEWENV[@]}" "${LN[@]}" $F stop $G21
+chk "…all 26 still active on chain 20" '[ "$(active)" = 26 ] && [ "$(units)" = "$U0" ]'
+t "push of the chain-21 genesis while chain 20 runs" 0 "PUSHED — chain 20 still runs" env "${NEWENV[@]}" "${LN[@]}" $F push $G21
+chk "26 hosts hold the genesis, byte-identical; all 26 still active" '[ "$(shasum $T/hosts/*/root/genesis-chain21.json | cut -d" " -f1 | sort -u | wc -l | tr -d " ")" = 1 ] && [ "$(ls $T/hosts/*/root/genesis-chain21.json | wc -l | tr -d " ")" = 26 ] && [ "$(active)" = 26 ]'
+t "switch while the fleet still runs" 1 "some hosts are not ready" env "${NEWENV[@]}" "${OLDENV[@]}" "${LN[@]}" $F switch $G21
+chk "…switched nothing, installed nothing, no marker" '[ "$(units)" = "$U0" ] && [ "$(installed rand-node)" = "26:$OLD_SHA " ] && [ "$(installed msauth-vk-production.bin)" = "26:none " ] && [ "$(nmark)" = 0 ]'
+# ── the gated stop ──
+mv "$T/hosts/192.0.2.14/root/genesis-chain21.json" "$T/g.aside"
+t "stop when one host lacks the pushed genesis" 1 "NOTHING STOPPED" env "${NEWENV[@]}" "${LN[@]}" $F stop $G21
+has "…that host says the genesis is not pushed" "the chain-21 genesis is not pushed here"
+chk "…all 26 still active" '[ "$(active)" = 26 ]'
+mv "$T/g.aside" "$T/hosts/192.0.2.14/root/genesis-chain21.json"
+cp "$TESTBLOB" "$T/hosts/192.0.2.16/root/msauth-vk-production.bin.c21"
+t "stop when one host's staged blob changed since stage" 1 "NOTHING STOPPED" env "${NEWENV[@]}" "${LN[@]}" $F stop $G21
+chk "…all 26 still active" '[ "$(active)" = 26 ]'
+cp "$BLOB" "$T/hosts/192.0.2.16/root/msauth-vk-production.bin.c21"
+record "$H21B"
+t "stop when the record's second-hash is another genesis's" 1 "differ" env "${NEWENV[@]}" "${LN[@]}" $F stop $G21
+chk "…all 26 still active" '[ "$(active)" = 26 ]'
+record "$H21"
+t "stop (gated: all 26 ready)" 0 "STOPPED" env "${NEWENV[@]}" "${LN[@]}" $F stop $G21
+chk "all 26 inactive" '[ "$(active)" = 0 ]'
+# ── switch ──
+record ""
+t "switch with the record's second-hash blanked after push (M3)" 1 "no 'second-hash:' line" env "${NEWENV[@]}" "${OLDENV[@]}" "${LN[@]}" $F switch $G21
+record "$H21"
 t "switch without v0.7.1's pins" 1 "OLD_SHA / OLD_SHA_WALLET" env "${NEWENV[@]}" "${LN[@]}" $F switch $G21
 # the first switch attempt: every other host switches in it — a failed switch is re-run, never undone
 cp "$TESTBLOB" "$T/hosts/192.0.2.5/root/msauth-vk-production.bin.c21"
 cp "$BIN/badrel/rand-node" "$T/hosts/192.0.2.12/usr/local/bin/rand-node"
-t "switch with host 5's staged blob replaced after staging and host 12 not on v0.7.1" 1 "some hosts are not ready" env "${NEWENV[@]}" "${OLDENV[@]}" "${LN[@]}" $F switch $G21
+t "switch with host 5's staged blob replaced and host 12 not on v0.7.1" 1 "Or roll the fleet back: stop (already stopped), then rollback" env "${NEWENV[@]}" "${OLDENV[@]}" "${LN[@]}" $F switch $G21
 has "…host 5 says its staged blob is not the pinned one (sha256, before the key check)" "files are not staged"
 has "…host 12 made no backup" "no backup made"
 chk "…host 5 installed nothing: still v0.7.1, no key, unit on chain 20; no marker" '[ "$(sha $T/hosts/192.0.2.5/usr/local/bin/rand-node)" = "$OLD_SHA" ] && [ ! -e $T/hosts/192.0.2.5/usr/local/bin/msauth-vk-production.bin ] && grep -q -- "-6210cf07 " $T/hosts/192.0.2.5/etc/systemd/system/rand-node.service && [ "$(nmark)" = 0 ]'
@@ -336,35 +377,55 @@ chk "20 node units name -$P, none -6210cf07; each new datadir initialised" '[ "$
 chk "the two symlinked (archive) hosts got their chain-21 datadir on the volume" '[ -L $T/hosts/192.0.2.19/root/data-n19-$P ] && [ -d $T/hosts/192.0.2.19/mnt/volume/data-n19-$P/db ] && [ -d $T/hosts/192.0.2.20/mnt/volume/data-n20-$P/db ]'
 chk "every node host kept a chain-20 unit backup; chain-20 datadirs untouched" '[ "$(ls $T/hosts/192.0.2.{1..20}/root/rand-node.service.6210cf07.bak | wc -l | tr -d " ")" = 20 ] && [ "$(ls -d $T/hosts/192.0.2.{1..18}/root/data-n*-6210cf07/db | wc -l | tr -d " ")" = 18 ]'
 chk "6 guardian hosts: chain21.conf on data-21, chain20.conf moved aside, stamp = the genesis" '[ "$(grep -l -- "/data-21 " $T/hosts/192.0.2.10{1..6}/etc/systemd/system/rand-node.service.d/chain21.conf | wc -l | tr -d " ")" = 6 ] && ! ls $T/hosts/192.0.2.10{1..6}/etc/systemd/system/rand-node.service.d/chain20.conf >/dev/null 2>&1 && [ "$(ls $T/hosts/192.0.2.10{1..6}/root/chain20.conf.c20 | wc -l | tr -d " ")" = 6 ] && [ "$(cat $T/hosts/192.0.2.10{1..6}/var/lib/randnode/data-21.genesis | sort -u)" = "$NEW" ] && [ -d $T/hosts/192.0.2.106/var/lib/randnode/data-20/db ]'
-# the start gate: one host's installed key goes bad after the switch
+# ── start ──
 cp "$TESTBLOB" "$T/hosts/192.0.2.15/usr/local/bin/msauth-vk-production.bin"
 t "start with one host's installed key not verified" 1 "nothing started" $F start
 chk "…no node started anywhere, the marker kept" '[ "$(active)" = 0 ] && [ "$(nmark)" = 1 ]'
 cp "$BLOB" "$T/hosts/192.0.2.15/usr/local/bin/msauth-vk-production.bin"
-t "start" 0 "START-DONE" $F start
+touch "$T/hosts/192.0.2.11/state/refuse-start"
+t "start with one host that does not come up (I3)" 1 "NOT STARTED on: 192.0.2.11" $F start
+chk "…25 active, the marker KEPT" '[ "$(active)" = 25 ] && [ "$(nmark)" = 1 ]'
+rm "$T/hosts/192.0.2.11/state/refuse-start"
+t "start again once that host is fixed" 0 "START-DONE" $F start
 has "…every host's key verified before the start" "msauth key ${VK_SHA:0:12}… verified"
 chk "26 active, marker consumed" '[ "$(active)" = 26 ] && [ "$(nmark)" = 0 ]'
 t "a second start" 1 "refusing" $F start
 t "wait" 0 "CUTOVER DONE: all 26 on $NEW" env "${LN[@]}" $F wait $G21
+echo inactive > "$T/hosts/192.0.2.17/state/rand-node"
+t "wait with one node that does not answer yet (I1: a laggard, not a silent exit)" 1 "25/26 on chain 21" env "${LN[@]}" bash -c "$F wait $G21 | head -1; exit 1"
+has "…and names it" "not yet: 192.0.2.17"
+echo active > "$T/hosts/192.0.2.17/state/rand-node"
 mv "$T/hosts/192.0.2.8/usr/local/bin/msauth-vk-production.bin" "$T/vk.aside"
 t "wait with one node's key gone (msauth_key absent)" 1 "25/26 on chain 21" env "${LN[@]}" bash -c "$F wait $G21 | head -1; exit 1"
 mv "$T/vk.aside" "$T/hosts/192.0.2.8/usr/local/bin/msauth-vk-production.bin"
-# ── rollback ──
-t "rollback while running" 1 "not back on chain 20" env "${OLDENV[@]}" $F rollback
-chk "…no rollback marker; still v0.8.0" '[ "$(nmark)" = 0 ] && [ "$(installed rand-node)" = "26:$NEW_SHA " ]'
-t "stop (for the rollback)" 0 "STOPPED" $F stop
+echo inactive > "$T/hosts/192.0.2.18/state/rand-node"
+t "status with one node not answering prints its line" 0 "no answer" $F status
+echo active > "$T/hosts/192.0.2.18/state/rand-node"
+# ── before a rollback, with chain 21 up: has anything bridge-side happened? ──
+t "quiet: nothing burned or minted on chain 21" 0 "QUIET" $F quiet $G21
+t "quiet when a deposit was minted on chain 21" 1 "NOT the genesis values" env REHEARSE_MINTED=5 $F quiet $G21
+# ── a re-cut over a switched fleet, without a rollback, is refused (M2) ──
+t "halt the chain-21 fleet" 0 "HALTED" $F halt
+record "$H21B"
+t "push of a re-cut while chain 21 is down" 0 "PUSHED" env "${NEWENV[@]}" "${LN[@]}" $F push $G21B
+UB=$(units)
+t "switch to a re-cut over the switched fleet (no rollback)" 1 "needs rollback first" env "${NEWENV[@]}" "${OLDENV[@]}" "${LN[@]}" $F switch $G21B
+chk "…no host changed its unit, no marker" '[ "$(units)" = "$UB" ] && [ "$(nmark)" = 0 ]'
+# ── rollback (bridge stopped first, in the runbook) ──
 t "rollback" 0 "ROLLED BACK" env "${OLDENV[@]}" $F rollback
 chk "every unit / drop-in is byte-for-byte chain 20's again, and every binary is v0.7.1" '[ "$(units)" = "$U0" ] && [ "$(installed rand-node)" = "26:$OLD_SHA " ] && [ "$(installed rand)" = "26:$OLD_SHA_WALLET " ]'
 t "start after rollback (v0.7.1: no msauth key check)" 0 "START-DONE" $F start
 ! grep -q "msauth key on every host" "$T/out.log" && { echo "ok   — …the key gate was skipped for the rollback"; pass=$((pass+1)); } || { echo "FAIL — the key gate ran on a rollback start"; fail=$((fail+1)); }
+t "wait20: chain 20 serves on all 26 and C's height moves" 0 "CHAIN 20 COMMITTING AGAIN" $F wait20
+t "rollback while running" 1 "not back on chain 20" env "${OLDENV[@]}" $F rollback
 t "wait for chain 21 after a rollback never completes (the fleet serves chain 20)" 1 "0/26 on chain 21" env "${LN[@]}" bash -c "$F wait $G21 | head -1; exit 1"
 t "preflight after the rollback flags the leftovers (*.pre-c21, data-21)" 1 "not every host is ready" env "${OLDENV[@]}" $F preflight
-# ── a re-cut ──
-t "stop again" 0 "STOPPED" $F stop
+# ── the re-cut, in the right order: push (chain 20 running), stop, switch ──
 record "$H21"   # the second-hash names the FIRST cut
 t "push of a re-cut genesis whose second-hash is another cut's, no waiver" 1 "differ" env "${NEWENV[@]}" "${LN[@]}" $F push $G21B
 record "$H21B"
-t "push of the re-cut with the second operator's hash for it" 0 "PUSHED" env "${NEWENV[@]}" "${LN[@]}" $F push $G21B
+t "push of the re-cut while chain 20 runs" 0 "PUSHED" env "${NEWENV[@]}" "${LN[@]}" $F push $G21B
+t "stop for the re-cut (gated)" 0 "STOPPED" env "${NEWENV[@]}" "${LN[@]}" $F stop $G21B
 t "switch to the re-cut genesis (guardian hosts still hold the first cut's data-21)" 0 "SWITCHED" env "${NEWENV[@]}" "${OLDENV[@]}" "${LN[@]}" $F switch $G21B
 NEWB=$(cut -d' ' -f1 "$T"/markers/*)
 chk "each guardian host moved the first cut's data-21 aside (kept) and initialised a fresh one" '[ "$(ls -d $T/hosts/192.0.2.10{1..6}/var/lib/randnode/data-21.stale-$P/db | wc -l | tr -d " ")" = 6 ] && [ "$(ls -d $T/hosts/192.0.2.10{1..6}/var/lib/randnode/data-21/db | wc -l | tr -d " ")" = 6 ] && [ "$(cat $T/hosts/192.0.2.10{1..6}/var/lib/randnode/data-21.genesis | sort -u)" = "$NEWB" ] && [ "$NEWB" != "$NEW" ]'
@@ -372,9 +433,10 @@ chk "…and the re-cut installed v0.8.0 again over the restored v0.7.1, keeping 
 t "start on the re-cut" 0 "START-DONE" $F start
 t "wait on the re-cut" 0 "CUTOVER DONE" env "${LN[@]}" $F wait $G21B
 # ── the waiver (kept from chain 20) ──
-t "stop for the waiver case" 0 "STOPPED" $F stop
 record ""
 t "push with SECOND_REBUILD_WAIVED=1 prints why and records it" 0 "PUSHED" env "${NEWENV[@]}" "${LN[@]}" SECOND_REBUILD_WAIVED=1 $F push $G21B
 chk "…the waiver is recorded once" '[ "$(grep -c "^second-rebuild-waived: .*genesis $H21B" $CUT_RECORD)" = 1 ]'
+t "switch accepts the recorded waiver for that genesis (re-run over switched hosts)" 1 "STILL RUNNING" env "${NEWENV[@]}" "${OLDENV[@]}" "${LN[@]}" $F switch $G21B
+has "…after reading the waiver" "second-rebuild WAIVER for genesis $H21B"
 echo "fleet rehearsal (chain 21): $pass passed, $fail failed"
 [ $fail = 0 ]

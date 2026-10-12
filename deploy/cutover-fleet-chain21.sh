@@ -72,22 +72,32 @@
 #                                                      # chain 20 running, READ-ONLY
 #   RELEASE_SUMS=rel/SHA256SUMS deploy/cutover-fleet-chain21.sh stage
 #                                                      # chain 20 running: v0.8.0 + the msauth blob to /root/*.c21, checked
-#   (bridge: the chain-21 bridge steps "stop" — relayer + guardians down, BEFORE the snapshot)
+#   (bridge: deploy/chain21-bridge-steps.md "stop" — relayer + guardians down, BEFORE the snapshot)
 #   deploy/cut-chain21-genesis.sh snapshot <dir>       # chain 20 still up
 #   WALLET=<v0.7.1 rand> deploy/cut-chain21-genesis.sh balances <dir>
-#   ── the user's go, typed in the executing session, before anything below ──
-#   deploy/cutover-fleet-chain21.sh stop               # stop every chain-20 node (26)
 #   (cut: CUT_RECORD=… CHAIN20_SNAPSHOT=<dir> NODE=<v0.8.0 rand-node> WALLET=<v0.8.0 rand> …
-#         deploy/cut-chain21-genesis.sh; the second operator writes second-hash into the record)
+#         deploy/cut-chain21-genesis.sh — reads only the snapshot; chain 20 still up)
+#   (the second operator re-derives the hash and writes second-hash into the record)
 #   LOCAL_NODE=<v0.8.0 rand-node> RELEASE_SUMS=… deploy/cutover-fleet-chain21.sh push <genesis>
+#                                                      # chain 20 STILL RUNNING: genesis beside the staged build, checked
+#   ── the user's go, typed in the executing session, before anything below ──
+#   LOCAL_NODE=… RELEASE_SUMS=… deploy/cutover-fleet-chain21.sh stop <genesis>
+#                                                      # GATED: refuses unless all 26 hold the staged files, the
+#                                                      # verified key and the pushed genesis; then stops all 26
 #   LOCAL_NODE=… RELEASE_SUMS=… OLD_RELEASE_SUMS=… deploy/cutover-fleet-chain21.sh switch <genesis>
 #                                                      # key checked, install, init, rewrite — no start; writes the marker
-#   deploy/cutover-fleet-chain21.sh start              # every key re-checked; C, D first, then the other 24
+#   deploy/cutover-fleet-chain21.sh start              # every key re-checked; C, D first, then the other 24; a
+#                                                      # host that fails is named, rc 1, the marker kept
 #   LOCAL_NODE=… deploy/cutover-fleet-chain21.sh wait <genesis>     # until all 26 serve chain 21, key loaded
 #   (then: NODE=<v0.8.0 rand-node> deploy/cut-chain21-genesis.sh check-limits <a node's RPC> <genesis>)
 #   deploy/cutover-fleet-chain21.sh status             # read-only: version, chain id, height per host
-#   OLD_RELEASE_SUMS=… deploy/cutover-fleet-chain21.sh rollback     # ONLY after `stop`: chain 20's units / drop-ins and
-#                                                      # v0.7.1 binaries on every host; then `start`
+# Rollback (bridge stopped first — deploy/chain21-bridge-steps.md):
+#   deploy/cutover-fleet-chain21.sh quiet <genesis>    # read-only: nothing burned or minted on chain 21?
+#   deploy/cutover-fleet-chain21.sh halt               # stop a fleet that does not run chain 20 (refuses one that does)
+#   OLD_RELEASE_SUMS=… deploy/cutover-fleet-chain21.sh rollback     # chain 20's units / drop-ins and v0.7.1 binaries
+#   deploy/cutover-fleet-chain21.sh start              # the rollback marker licenses it (no key check)
+#   deploy/cutover-fleet-chain21.sh wait20             # until all 26 serve chain 20 and C's height moves
+# A re-cut after a switch: halt, rollback, start, wait20, then push / stop / switch the new genesis.
 #
 # THE TRAP FROM CHAIN 16 (kept by every script since): `push … | tail && switch … | tail && start`
 # ran `start` after `push` had FAILED — a pipeline's exit status is its last command's. So:
@@ -96,7 +106,11 @@
 #     this machine — the macOS build of the same tag: it re-derives the genesis hash, which every
 #     host's staged binary must then re-derive identically);
 #   * `start` refuses unless a successful `switch` (or `rollback`) left /tmp/chain21-switched-<tag>
-#     (exactly one such marker); `stop`, `push`, `stage` and `switch` delete any marker first.
+#     (exactly one such marker); `stop`, `halt`, `push`, `stage` and `switch` delete any marker first.
+#   * THE ORDER IS NOT CHAIN 20'S: chain 20 stopped before the cut, and the second operator's hash and
+#     push came during the downtime. Here chain 20 keeps running through the cut, the second hash
+#     and push; `stop <genesis>` is gated on push having reached every host, so a refused cut or an
+#     absent second operator never leaves the fleet down.
 #
 # Env: TAG (v0.8.0), STAGE_FROM (release|url|path) / RELEASE_URL / STAGE_URL / STAGE_DIR (as chain
 # 20's: a path holds rand-node, rand and msauth-vk-production.bin), RELEASE_SUMS / RELEASE_SUMS_SIG
@@ -125,7 +139,7 @@ if [ "${SELFTEST:-}" = 1 ]; then exec bash deploy/rehearse-cutover-fleet-chain21
 # shellcheck disable=SC1091
 . deploy/lib/verify-release.sh
 
-PHASE=${1:?preflight|stage|stop|push|switch|start|wait|status|rollback}
+PHASE=${1:?preflight|stage|push|stop|switch|start|wait|status|halt|quiet|rollback|wait20}
 DRY=${DRY_RUN:-0}
 TAG=${TAG:-v0.8.0}
 STAGE_FROM=${STAGE_FROM:-release}
@@ -159,8 +173,15 @@ OLD=${OLD:-6210cf07}
 CUT_RECORD=${CUT_RECORD:-deploy/cut-records/chain21.record}
 GUARDIAN_HOSTS=${GUARDIAN_HOSTS:-$HOME/.rand-bridge/mainnet-set1/hosts.txt}
 MARKER_GLOB=${MARKER_GLOB:-/tmp/chain21-switched-}
-OPTS="-o StrictHostKeyChecking=accept-new -o ConnectTimeout=20 -o BatchMode=yes"
-GOPTS="-i $HOME/.ssh/rand_guardian_ed25519 -o IdentitiesOnly=yes -o UserKnownHostsFile=$HOME/.ssh/rand_guardian_known_hosts -o StrictHostKeyChecking=yes -o ConnectTimeout=20 -o BatchMode=yes"
+OPTS=(-o StrictHostKeyChecking=accept-new -o ConnectTimeout=20 -o BatchMode=yes)
+GOPTS=(-i "$HOME/.ssh/rand_guardian_ed25519" -o IdentitiesOnly=yes -o "UserKnownHostsFile=$HOME/.ssh/rand_guardian_known_hosts" -o StrictHostKeyChecking=yes -o ConnectTimeout=20 -o BatchMode=yes)
+# What goes into a single-quoted remote string must not be able to leave it (M4): no quote,
+# semicolon, space or shell metacharacter in the URLs and the version; NEED_FLAGS is a
+# space-separated list of --flags and nothing else.
+for v in RELEASE_URL STAGE_URL WANT_VERSION; do
+  case "${!v}" in *[\'\;\ \"\`\$\\\|\<\>\(\)\{\}]*) echo "$v contains a quote, ';', a space or a shell metacharacter — refused" >&2; exit 1;; esac
+done
+for f in $NEED_FLAGS; do [[ "$f" =~ ^--[a-z0-9-]+$ ]] || { echo "NEED_FLAGS: '$f' is not a --flag — refused" >&2; exit 1; }; done
 BOOTS=${BOOTS:-164.90.239.200 165.245.173.74}   # C, D — started first, as in every cut
 # shellcheck disable=SC2046,SC2005  # word-split on purpose: one space-separated list
 IPS=$(echo $(grep -oE '/ip4/[0-9.]+' deploy/nodes.env | cut -d/ -f3 | sort -u))   # 20: A–F, 12 regional, obs1, archive-2
@@ -170,6 +191,7 @@ NIPS=$(wc -w <<<"$IPS" | tr -d ' ')
 # shellcheck disable=SC2046,SC2005
 GUARDS=$(echo $(awk '$1 ~ /^[1-6]$/ {print $2}' "$GUARDIAN_HOSTS"))
 NG=$(wc -w <<<"$GUARDS" | tr -d ' ')
+for ip in $GUARDS; do [[ "$ip" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || { echo "$GUARDIAN_HOSTS: '$ip' is not an IPv4 address" >&2; exit 1; }; done
 [ "$NG" -eq 6 ] || { echo "$GUARDIAN_HOSTS names $NG guardian hosts, expected 6" >&2; exit 1; }
 ALL="$IPS $GUARDS"
 for ip in $BOOTS; do case " $IPS " in *" $ip "*) ;; *) echo "bootstrap $ip is not in deploy/nodes.env" >&2; exit 1;; esac; done
@@ -186,14 +208,12 @@ is_guard() { case " $GUARDS " in *" $1 "*) return 0;; esac; return 1; }
 on() {
   local ip=$1; shift
   if dry; then echo "[dry-run] ssh root@$ip $*"; return 0; fi
-  # shellcheck disable=SC2086  # OPTS / GOPTS are option lists
-  if is_guard "$ip"; then ssh -n $GOPTS "root@$ip" "$@"; else ssh -n $OPTS "root@$ip" "$@"; fi
+  if is_guard "$ip"; then ssh -n "${GOPTS[@]}" "root@$ip" "$@"; else ssh -n "${OPTS[@]}" "root@$ip" "$@"; fi
 }
 cp_to() {
   local ip=$1 dst=$2; shift 2
   if dry; then echo "[dry-run] scp $* root@$ip:$dst"; return 0; fi
-  # shellcheck disable=SC2086
-  if is_guard "$ip"; then scp -q $GOPTS "$@" "root@$ip:$dst"; else scp -q $OPTS "$@" "root@$ip:$dst"; fi
+  if is_guard "$ip"; then scp -q "${GOPTS[@]}" "$@" "root@$ip:$dst"; else scp -q "${OPTS[@]}" "$@" "root@$ip:$dst"; fi
 }
 each() {  # run a remote script on every host in parallel, the last line of output each; fail if any failed
   if dry; then
@@ -309,6 +329,43 @@ staged_self() {
     $(vk_check ./rand-node.c21 ./$VK.c21)"
 }
 
+# The genesis a phase was given, checked once: chain 21's, the hash this machine's v0.8.0 derives
+# (NEW, prefix P), its sha256 (SHA). Every phase that acts on a genesis calls it.
+need_genesis() {
+  GENESIS=$1
+  need_chain21_genesis "$GENESIS"
+  SHA=$(file_sha "$GENESIS")
+  NEW=$(genesis_hash "$GENESIS")
+  if [ ${#NEW} -eq 64 ]; then P=${NEW:0:8}
+  elif dry; then P="<8-hex genesis prefix>"
+  else echo "$PHASE: $LOCAL_NODE derived no genesis hash from $GENESIS — nothing done" >&2; exit 1; fi
+  [ "$P" != "$OLD" ] || { echo "$PHASE: $GENESIS is chain 20's genesis ($NEW) — nothing done" >&2; exit 1; }
+}
+# OPS-7: the second operator rebuilt this hash (`second-hash:`), or push recorded a waiver for it.
+# push writes the waiver; stop and switch only read it (defence in depth: each re-checks).
+second_rebuild_ok() {
+  if dry && [ ${#NEW} -ne 64 ]; then
+    echo "[dry-run] local: require_second_rebuild $CUT_RECORD <genesis hash> — the record's second-hash: must equal it"; return 0; fi
+  if grep -q "^second-rebuild-waived: .*genesis $NEW" "$CUT_RECORD" 2>/dev/null; then
+    echo "== ⚠ the cut record carries a second-rebuild WAIVER for genesis $NEW (no second operator's hash)"; return 0; fi
+  if require_second_rebuild "$CUT_RECORD" "$NEW"; then return 0; fi
+  if dry; then echo "== DRY RUN: the real $PHASE REFUSES here (above); the dry run goes on to show the rest"; return 0; fi
+  echo "$PHASE: nothing done" >&2; exit 1
+}
+# The remote check that a host holds the pushed genesis and the staged build re-derives its hash
+# (run from /root).
+pushed_ok() {
+  echo "[ \"\$(sha256sum /root/genesis-chain21.json 2>/dev/null | cut -d' ' -f1)\" = '$SHA' ] || { echo 'the chain-21 genesis is not pushed here (sha256 differs or no file)'; exit 1; }
+    rm -rf /root/probe-c21
+    H=\$(/root/rand-node.c21 init --datadir /root/probe-c21 --genesis /root/genesis-chain21.json | grep -o 'genesis [0-9a-f]*' | cut -d' ' -f2); rm -rf /root/probe-c21
+    [ \"\$H\" = '$NEW' ] || { echo \"genesis hash \$H, expected $NEW\"; exit 1; }"
+}
+# Stop every host's rand-node and fail (non-zero) when one is still active.
+stop_all() {
+  each 'systemctl stop rand-node; if systemctl is-active --quiet rand-node; then echo "$(hostname) STILL ACTIVE"; exit 1; fi; echo "$(hostname) stopped"' \
+    || { echo "$PHASE: some hosts did not stop (above) — stop them by hand; switch and rollback refuse a running node" >&2; exit 1; }
+}
+
 case "$PHASE" in
 preflight)
   need_old_shas
@@ -403,25 +460,45 @@ stage)
   echo "STAGED $(date -u +%T) — nothing was installed; the fleet still runs chain 20 on v$OLD_VERSION"
   ;;
 stop)
-  clear_markers
-  echo "== stop all 26 $(date -u +%T)"
-  H0=$(rpc "$BOOT1" rand_status | grep -oE '"height":[0-9]+' | head -1 | cut -d: -f2 || true)
-  echo "   chain 20 head at C: ${H0:-?}"
-  each 'systemctl stop rand-node; echo "$(hostname) $(systemctl is-active rand-node || true)"' || true
-  echo "STOPPED $(date -u +%T) — cut the genesis now (deploy/cut-chain21-genesis.sh), then push (run it alone, check \$?)"
-  ;;
-push)
-  GENESIS=${2:?push <genesis file>}
+  # Chain 20 keeps running through stage, the cut, the second operator's hash and push; stop is the
+  # first phase that takes it down, and it refuses unless every host is ready to switch at once.
+  GENESIS=${2:?stop <genesis file> — stop is gated on push: every host must hold the staged v0.8.0 files and the pushed genesis (halt stops a fleet that does not run chain 20)}
   clear_markers
   need_local_node
   need_new_shas
-  need_chain21_genesis "$GENESIS"
-  SHA=$(file_sha "$GENESIS")
-  NEW=$(genesis_hash "$GENESIS")
-  if ! dry || [ -n "${LOCAL_NODE:-}" ]; then
-    [ ${#NEW} -eq 64 ] || { echo "push: $LOCAL_NODE derived no genesis hash from $GENESIS — nothing pushed" >&2; exit 1; }
-    [ "${NEW:0:8}" != "$OLD" ] || { echo "push: $GENESIS is chain 20's genesis ($NEW) — nothing pushed" >&2; exit 1; }
-  fi
+  need_genesis "$GENESIS"
+  second_rebuild_ok
+  echo "== stop gate on $(wc -w <<<"$ALL" | tr -d ' ') hosts: the staged v$WANT_VERSION files at their pins, the staged key verified, the pushed genesis $NEW $(date -u +%T)"
+  each "set -e; cd /root
+    $(staged_ok)
+    $(staged_self)
+    $(pushed_ok)
+    echo \"\$(hostname) ready: staged v$WANT_VERSION, msauth key \${vk_pin:0:12}… verified, genesis $NEW pushed\"" \
+    || { echo "stop: not every host is ready (above) — NOTHING STOPPED; chain 20 keeps running. Re-run stage / push for those hosts" >&2; exit 1; }
+  echo "== stop all 26 $(date -u +%T)"
+  H0=$(rpc "$BOOT1" rand_status | grep -oE '"height":[0-9]+' | head -1 | cut -d: -f2 || true)
+  echo "   chain 20 head at C: ${H0:-?}"
+  stop_all
+  echo "STOPPED $(date -u +%T) — next: switch $GENESIS (alone; check \$?)"
+  ;;
+halt)
+  # Stop a fleet that does NOT run chain 20: chain 21 before a rollback, or before a re-cut's push.
+  # A host still running chain 20 is refused here — taking chain 20 down is `stop <genesis>`'s, gated.
+  clear_markers
+  echo "== halt: no host may be running chain 20 (its datadir -$OLD / data-20) $(date -u +%T)"
+  each "D=\$(systemctl cat rand-node 2>/dev/null | grep -o -- '--datadir [^ ]*' | tail -1 | cut -d' ' -f2)
+    if systemctl is-active --quiet rand-node; then case \"\$D\" in *-$OLD|*/data-20) echo \"\$(hostname) RUNS CHAIN 20 (\$D) — use stop <genesis>\"; exit 1;; esac; fi
+    echo \"\$(hostname) may halt (\$(systemctl is-active rand-node || true), \$D)\"" \
+    || { echo "halt: a host runs chain 20 — nothing halted; chain 20 is stopped only by \`stop <genesis>\`" >&2; exit 1; }
+  stop_all
+  echo "HALTED $(date -u +%T) — next: rollback (or push + switch for a re-cut)"
+  ;;
+push)
+  # Chain 20 is still RUNNING here: push only copies the genesis beside the staged build and checks it.
+  need_local_node
+  need_new_shas
+  need_genesis "${2:?push <genesis file>}"
+  clear_markers
   # OPS-7: the second operator rebuilt this hash on another machine before anything is published.
   if [ "${SECOND_REBUILD_WAIVED:-}" = 1 ]; then
     require_cut_record "$CUT_RECORD" || { echo "push: a waiver is recorded in the cut record, and $CUT_RECORD is not a filled one — nothing pushed" >&2; exit 1; }
@@ -439,39 +516,25 @@ EOF
       LINE=$(printf 'second-rebuild-waived: %s genesis %s by %s@%s: %s' "$(date -u +%FT%TZ)" "$NEW" "$(id -un)" "$(hostname -s)" "$WHY")
       local_write "append to $CUT_RECORD: $LINE" bash -c 'printf "%s\n" "$1" >> "$2"' _ "$LINE" "$CUT_RECORD"
     fi
-  elif dry && [ ${#NEW} -ne 64 ]; then
-    echo "[dry-run] local: require_second_rebuild $CUT_RECORD <genesis hash> — the record's second-hash: must equal it, or nothing is pushed"
-  elif dry; then
-    if require_second_rebuild "$CUT_RECORD" "$NEW"; then echo "[dry-run] local: $CUT_RECORD carries second-hash: $NEW"
-    else echo "== DRY RUN: the real push REFUSES here (above) — nothing would be pushed; the dry run goes on to show the rest"; fi
   else
-    require_second_rebuild "$CUT_RECORD" "$NEW" || { echo "push: nothing pushed" >&2; exit 1; }
+    second_rebuild_ok
   fi
   echo "== push $GENESIS (sha256 $SHA, genesis $NEW) $(date -u +%T)"
   for ip in $ALL; do ( cp_to "$ip" /root/genesis-chain21.json "$GENESIS" ) & done; wait
   each "set -e
-    [ \"\$(sha256sum /root/genesis-chain21.json | cut -d' ' -f1)\" = '$SHA' ] || { echo 'genesis sha mismatch'; exit 1; }
     $(staged_ok)
-    rm -rf /root/probe-c21
-    H=\$(/root/rand-node.c21 init --datadir /root/probe-c21 --genesis /root/genesis-chain21.json | grep -o 'genesis [0-9a-f]*' | cut -d' ' -f2); rm -rf /root/probe-c21
-    [ \"\$H\" = '$NEW' ] || { echo \"genesis hash \$H, expected $NEW\"; exit 1; }
+    $(pushed_ok)
     echo \"\$(hostname) genesis $NEW verified by the staged v$WANT_VERSION binary\"" \
-    || { echo "push: not every host holds the genesis — do NOT switch or start" >&2; exit 1; }
-  echo "PUSHED — next: switch (alone; check \$?)"
+    || { echo "push: not every host holds the genesis — do NOT stop chain 20; re-run push" >&2; exit 1; }
+  echo "PUSHED — chain 20 still runs; next: the user's go, then stop $GENESIS (alone; check \$?)"
   ;;
 switch)
-  GENESIS=${2:?switch <genesis file>}
-  clear_markers
   need_local_node
   need_new_shas
   need_old_shas
-  need_chain21_genesis "$GENESIS"
-  SHA=$(file_sha "$GENESIS")
-  NEW=$(genesis_hash "$GENESIS")
-  if [ ${#NEW} -eq 64 ]; then P=${NEW:0:8}
-  elif dry; then P="<8-hex genesis prefix>"
-  else echo "switch: could not derive the genesis hash — nothing switched" >&2; exit 1; fi
-  [ "$P" != "$OLD" ] || { echo "switch: $GENESIS is chain 20's genesis — nothing switched" >&2; exit 1; }
+  need_genesis "${2:?switch <genesis file>}"
+  clear_markers
+  second_rebuild_ok
   echo "== switch to chain 21, genesis $NEW (datadir suffix -$P), checking the msauth key, installing v$WANT_VERSION $(date -u +%T)"
   # One script for both kinds of host; the guardian branch is chosen by the drop-in's presence.
   # Order on each host: refuse while running; genesis and staged files at their pins; the msauth
@@ -485,6 +548,15 @@ switch)
     D=/etc/systemd/system/rand-node.service.d
     if [ -f \$D/chain20.conf ] || [ -f \$D/chain21.conf ]; then
       systemctl is-active --quiet rand-guardian && { echo 'rand-guardian still active — the bridge steps stop it first'; exit 1; }
+      if [ -f \$D/chain21.conf ]; then
+        [ \"\$(cat /var/lib/randnode/data-21.genesis 2>/dev/null)\" = '$NEW' ] || { echo 'chain21.conf already runs another chain-21 genesis — a re-cut over a switched fleet needs rollback first; nothing switched'; exit 1; }
+      else
+        grep -q -- '--datadir /var/lib/randnode/data-20 ' \$D/chain20.conf || { echo 'chain20.conf has no data-20 datadir — nothing switched'; exit 1; }
+      fi
+    else
+      # The unit must name chain 20's datadir (or already this genesis's) BEFORE anything is installed.
+      grep -q -- '-$P ' /etc/systemd/system/rand-node.service || grep -q -- '-$OLD ' /etc/systemd/system/rand-node.service \
+        || { echo 'unit names neither -$OLD (chain 20) nor -$P (this genesis) — a re-cut over a switched fleet needs rollback first; nothing switched'; exit 1; }
     fi
     chmod 755 /root/rand-node.c21
     $(vk_check /root/rand-node.c21 /root/$VK.c21)
@@ -532,7 +604,7 @@ switch)
       sed -i 's/-$OLD /-$P /' \$U
       systemctl daemon-reload
       echo \"\$(hostname) ready: \$(/usr/local/bin/rand-node --version), msauth key \${vk_pin:0:12}… verified, \$(grep -o -- '--datadir [^ ]*' \$U)\"
-    fi" || { echo "switch: some hosts are not ready — fix them and re-run switch; do NOT start" >&2; exit 1; }
+    fi" || { echo "switch: some hosts are not ready — fix them and re-run switch; do NOT start. Or roll the fleet back: stop (already stopped), then rollback — it restores the hosts that switched and leaves the rest alone" >&2; exit 1; }
   # Only a switch that reached every host licenses `start`.
   local_write "echo '$NEW <UTC>' > $MARKER_GLOB$P" bash -c 'echo "$1 $(date -u +%FT%TZ)" > "$2"' _ "$NEW" "$MARKER_GLOB$P"
   echo "SWITCHED — marker $MARKER_GLOB$P written; next: start (alone; check \$?)"
@@ -605,13 +677,28 @@ start)
     # … and again in the same call as each host's own start.
     GATE="$(vk_check /usr/local/bin/rand-node /usr/local/bin/$VK);"
   fi
+  # Each host's start is one ssh call: the key gate (after a switch), the start, and a check that
+  # the unit is active. Every result is collected; a host that failed is named, the phase exits
+  # non-zero and the marker is KEPT, so `start` can be re-run once those hosts are fixed (a host
+  # already active just starts again as a no-op).
+  ONE="$GATE systemctl start rand-node; sleep 2; systemctl is-active --quiet rand-node || { echo \"\$(hostname) NOT ACTIVE after start\"; exit 1; }; echo \"\$(hostname) active\""
+  RES=$(mktemp -d)
+  start_one() { if on "$1" "$ONE" > "$RES/$1" 2>&1; then echo ok > "$RES/$1.rc"; else echo FAIL > "$RES/$1.rc"; fi; }
   echo "== start bootstraps $(date -u +%T)"
-  for ip in $BOOTS; do on "$ip" "$GATE systemctl start rand-node; sleep 2; echo \"   \$(hostname): \$(systemctl is-active rand-node)\""; done
+  for ip in $BOOTS; do start_one "$ip"; printf '   %-16s %s %s\n' "$ip" "$(cat "$RES/$ip.rc")" "$(tail -1 "$RES/$ip")"; done
   echo "== start the other 24 $(date -u +%T)"
-  for ip in $ALL; do case " $BOOTS " in *" $ip "*) continue;; esac
-    ( on "$ip" "$GATE systemctl start rand-node; sleep 2; echo \"   \$(hostname): \$(systemctl is-active rand-node)\"" ) & done; wait
+  for ip in $ALL; do case " $BOOTS " in *" $ip "*) continue;; esac; start_one "$ip" & done; wait
+  FAILED=""
+  for ip in $ALL; do
+    case " $BOOTS " in *" $ip "*) ;; *) printf '   %-16s %s %s\n' "$ip" "$(cat "$RES/$ip.rc")" "$(tail -1 "$RES/$ip")";; esac
+    [ "$(cat "$RES/$ip.rc")" = ok ] || FAILED="$FAILED $ip"
+  done
+  rm -rf "$RES"
+  if [ -n "$FAILED" ]; then
+    echo "start: NOT STARTED on:$FAILED — the marker $MARK is kept; fix those hosts and re-run start (or stop + rollback)" >&2; exit 1
+  fi
   local_write "rm -f $MARK" rm -f "$MARK"
-  echo "START-DONE $(date -u +%T) — nothing commits until 18 of the 26 validators are up"
+  echo "START-DONE $(date -u +%T) — all 26 active; nothing commits until 18 of the 26 validators are up"
   ;;
 wait)
   GENESIS=${2:?wait <genesis file>}
@@ -623,24 +710,72 @@ wait)
   fi
   [ ${#NEW} -eq 64 ] || { echo "wait: could not derive the genesis hash" >&2; exit 1; }
   for _ in $(seq 1 90); do
-    sleep "${WAIT_SLEEP:-20}"; ok=0
+    sleep "${WAIT_SLEEP:-20}"; ok=0; late=""
     for ip in $ALL; do
-      g=$(rpc "$ip" rand_getGenesisHash | grep -oE '"result":"[0-9a-f]+"' | cut -d'"' -f4)
-      s=$(rpc "$ip" rand_getHealth | grep -oE '"status":"[a-z_]+"' | cut -d'"' -f4)
-      k=$(rpc "$ip" rand_status | grep -oE '"msauth_key":"[a-z]+"' | cut -d'"' -f4)
-      [ "$g" = "$NEW" ] && [ "$s" = ok ] && [ "$k" = loaded ] && ok=$((ok+1))
+      # `|| true` in each: a node that does not answer yet is a laggard, not a failed wait (I1).
+      g=$(rpc "$ip" rand_getGenesisHash | grep -oE '"result":"[0-9a-f]+"' | cut -d'"' -f4 || true)
+      s=$(rpc "$ip" rand_getHealth | grep -oE '"status":"[a-z_]+"' | cut -d'"' -f4 || true)
+      k=$(rpc "$ip" rand_status | grep -oE '"msauth_key":"[a-z]+"' | cut -d'"' -f4 || true)
+      if [ "$g" = "$NEW" ] && [ "$s" = ok ] && [ "$k" = loaded ]; then ok=$((ok+1)); else late="$late $ip"; fi
     done
-    H=$(rpc "$BOOT1" rand_status | grep -oE '"height":[0-9]+' | head -1 | cut -d: -f2)
-    echo "  $(date -u +%T) $ok/26 on chain 21, healthy, msauth key loaded; C height ${H:-?}"
+    H=$(rpc "$BOOT1" rand_status | grep -oE '"height":[0-9]+' | head -1 | cut -d: -f2 || true)
+    echo "  $(date -u +%T) $ok/26 on chain 21, healthy, msauth key loaded; C height ${H:-?}${late:+; not yet:$late}"
     if [ "$ok" = 26 ] && [ -n "$H" ] && [ "$H" -gt 2 ]; then echo "=== $(date -u +%T) CUTOVER DONE: all 26 on $NEW, committing at $H — next: check-limits (deploy/cut-chain21-genesis.sh)"; exit 0; fi
   done
   echo "=== not all 26 healthy after 30 min — check the laggards"; exit 1
   ;;
+wait20)
+  # After a rollback + start: every host serves chain 20 again, healthy, and C's height MOVES.
+  if dry; then
+    echo "[dry-run] every ${WAIT_SLEEP:-20} s, up to 90 times: each of the 26 hosts serves genesis $OLD…, rand_getHealth ok; C's height strictly above the previous poll's"
+    rpc "$BOOT1" rand_status; exit 0
+  fi
+  PREV=""
+  for _ in $(seq 1 90); do
+    sleep "${WAIT_SLEEP:-20}"; ok=0; late=""
+    for ip in $ALL; do
+      g=$(rpc "$ip" rand_getGenesisHash | grep -oE '"result":"[0-9a-f]+"' | cut -d'"' -f4 || true)
+      s=$(rpc "$ip" rand_getHealth | grep -oE '"status":"[a-z_]+"' | cut -d'"' -f4 || true)
+      case "$g" in "$OLD"*) [ "$s" = ok ] && { ok=$((ok+1)); continue; };; esac
+      late="$late $ip"
+    done
+    H=$(rpc "$BOOT1" rand_status | grep -oE '"height":[0-9]+' | head -1 | cut -d: -f2 || true)
+    echo "  $(date -u +%T) $ok/26 on chain 20 and healthy; C height ${H:-?} (previous ${PREV:-?})${late:+; not yet:$late}"
+    if [ "$ok" = 26 ] && [ -n "$H" ] && [ -n "$PREV" ] && [ "$H" -gt "$PREV" ]; then echo "=== $(date -u +%T) CHAIN 20 COMMITTING AGAIN: all 26 on $OLD…, C at $H (was $PREV)"; exit 0; fi
+    PREV=$H
+  done
+  echo "=== chain 20 is not committing on all 26 after 30 min"; exit 1
+  ;;
+quiet)
+  # Before a rollback: has anything bridge-side happened on chain 21? burn_sequence and every
+  # backing's `locked` must still be the genesis values (no burn emitted, no deposit minted). A
+  # rollback after either loses it.
+  GENESIS=${2:?quiet <genesis file>}
+  WANT=$(python3 -c 'import json,sys
+g=json.load(open(sys.argv[1])); b=g["bridge"]
+locked=sum(int(k.get("locked",0)) for t in g["tokens"]["tokens"] for k in t["backings"])
+print(b["burn_sequence"], locked)' "$GENESIS")
+  echo "== genesis: burn_sequence ${WANT% *}, Σ locked ${WANT#* }"
+  if dry; then rpc "$BOOT1" rand_getBridgeState; exit 0; fi
+  bad=0
+  for ip in $BOOTS; do
+    GOT=$(rpc "$ip" rand_getBridgeState | python3 -c 'import json,sys
+try:
+    r=json.load(sys.stdin)["result"]
+    print(r["burn_sequence"], sum(int(a.get("locked") or 0) for a in r.get("assets",[])))
+except Exception as e:
+    print("unreadable", e)' || true)
+    if [ "$GOT" = "$WANT" ]; then echo "   $ip: burn_sequence ${GOT% *}, Σ locked ${GOT#* } — as at genesis"
+    else echo "   $ip: $GOT — NOT the genesis values: something was burned or minted on chain 21"; bad=1; fi
+  done
+  [ $bad = 0 ] || { echo "quiet: chain 21 has bridge activity — a rollback loses it; the user decides" >&2; exit 1; }
+  echo "QUIET — nothing burned or minted on chain 21 (as C and D report)"
+  ;;
 status)
   for ip in $ALL; do (
-    v=$(rpc "$ip" rand_getVersion | grep -oE '"version":"[^"]+"|"git_sha":"[a-z0-9]+"|"chain_id":[0-9]+' | tr '\n' ' ')
-    h=$(rpc "$ip" rand_status | grep -oE '"height":[0-9]+|"msauth_key":"[a-z]+"' | head -2 | tr '\n' ' ')
-    printf '   %-16s %s %s\n' "$ip" "$v" "$h" ) & done; wait
+    v=$(rpc "$ip" rand_getVersion | grep -oE '"version":"[^"]+"|"git_sha":"[a-z0-9]+"|"chain_id":[0-9]+' | tr '\n' ' ' || true)
+    h=$(rpc "$ip" rand_status | grep -oE '"height":[0-9]+|"msauth_key":"[a-z]+"' | head -2 | tr '\n' ' ' || true)
+    printf '   %-16s %s %s\n' "$ip" "$v" "${h:-no answer}" ) & done; wait
   ;;
 *) echo "unknown phase $PHASE" >&2; exit 1 ;;
 esac
