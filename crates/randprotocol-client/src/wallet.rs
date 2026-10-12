@@ -70,9 +70,11 @@ pub struct KeyFile {
 
 pub const KEY_FILE_VERSION: u32 = 2;
 
-/// A spend key and everything derived from it.
+/// A spend key and everything derived from it — or, for a private multisig account (spec
+/// 2026-10-11 phase 4 §6.2), a viewing key alone: `sk` is `None`, scanning and bundle building work
+/// unchanged, and a spend goes through `rand multisig-private` ([`Wallet::spend_key`] says so).
 pub struct Wallet {
-    pub sk: SpendKey,
+    pub sk: Option<SpendKey>,
     pub vk: ViewingKey,
     pub address: ShieldedAddress,
     /// The keys a scan opens envelopes with, derived from `vk` once: re-deriving the ML-KEM
@@ -83,7 +85,18 @@ pub struct Wallet {
 impl Wallet {
     pub fn from_spend_key(sk: SpendKey) -> Wallet {
         let vk = sk.viewing_key();
-        Wallet { sk, vk, address: address_of(&vk), scan_key: vk.scan_key() }
+        Wallet { sk: Some(sk), vk, address: address_of(&vk), scan_key: vk.scan_key() }
+    }
+
+    /// A wallet that can see and never spend: a private multisig account's, whose `nk` is
+    /// `msauth::nk(msk, policy)` and has no spend key above it.
+    pub fn from_viewing_key(vk: ViewingKey) -> Wallet {
+        Wallet { sk: None, vk, address: address_of(&vk), scan_key: vk.scan_key() }
+    }
+
+    /// The spend key, or the refusal a private multisig account answers every single-key spend with.
+    pub fn spend_key(&self) -> Result<&SpendKey> {
+        self.sk.as_ref().ok_or_else(|| anyhow!("this wallet is a private multisig account: spend with `rand multisig-private`"))
     }
 
     pub fn generate() -> Wallet {
@@ -96,19 +109,7 @@ impl Wallet {
     /// is otherwise never noticed. `metadata` follows a symlink, so the mode checked is the key
     /// file's own.
     pub fn load(path: &Path) -> Result<Wallet> {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(path).with_context(|| format!("reading key file {}", path.display()))?.permissions().mode();
-            if mode & 0o077 != 0 {
-                return Err(anyhow!(
-                    "{} is group/world readable (mode {:o}): it holds this wallet's spend key — run `chmod 600 {}`, then try again",
-                    path.display(),
-                    mode & 0o777,
-                    path.display()
-                ));
-            }
-        }
+        refuse_loose_mode(path, "key file", "this wallet's spend key")?;
         let text = std::fs::read_to_string(path).with_context(|| format!("reading key file {}", path.display()))?;
         let kf: KeyFile = serde_json::from_str(&text).with_context(|| format!("{} is not a wallet key file", path.display()))?;
         if kf.version != KEY_FILE_VERSION {
@@ -125,35 +126,63 @@ impl Wallet {
     /// Write the key file, refusing to touch an existing path. There is no second copy of a
     /// spend key: overwriting one destroys every note it could still open.
     pub fn save_new(&self, path: &Path) -> Result<()> {
-        let kf = KeyFile { version: KEY_FILE_VERSION, spend_key: word8_to_hex(&self.sk.0) };
+        let kf = KeyFile { version: KEY_FILE_VERSION, spend_key: word8_to_hex(&self.spend_key()?.0) };
         let text = serde_json::to_string_pretty(&kf)? + "\n";
-        // `create_new` closes the exists-then-write race and `mode(0o600)` makes the file
-        // owner-only from the start: writing first and chmodding afterwards leaves the spend
-        // key world-readable for a window.
-        #[cfg(unix)]
-        {
-            use std::io::Write;
-            use std::os::unix::fs::OpenOptionsExt;
-            let mut f = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(path)
-                .with_context(|| format!("{} already exists or cannot be created; refusing to overwrite", path.display()))?;
-            f.write_all(text.as_bytes())?;
-            // The bytes reach the disk before this returns: a power loss right after a key is
-            // handed out must not leave an empty file where the only copy of a secret should be
-            // (node I1's companion).
-            f.sync_all().with_context(|| format!("flushing {}", path.display()))?;
-            Ok(())
+        write_new_secret(path, &text)
+    }
+}
+
+/// On unix, refuses a secret file (`what`, which `holds` a secret) that group or other can read —
+/// [`Wallet::load`]'s rule, shared with the private multisig policy file. `metadata` follows a
+/// symlink, so the mode checked is the file's own.
+pub(crate) fn refuse_loose_mode(path: &Path, what: &str, holds: &str) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(path).with_context(|| format!("reading {what} {}", path.display()))?.permissions().mode();
+        if mode & 0o077 != 0 {
+            return Err(anyhow!(
+                "{} is group/world readable (mode {:o}): it holds {holds} — run `chmod 600 {}`, then try again",
+                path.display(),
+                mode & 0o777,
+                path.display()
+            ));
         }
-        #[cfg(not(unix))]
-        {
-            if path.exists() {
-                return Err(anyhow!("{} already exists; refusing to overwrite", path.display()));
-            }
-            std::fs::write(path, text).with_context(|| format!("writing {}", path.display()))
+    }
+    #[cfg(not(unix))]
+    let _ = (path, what, holds);
+    Ok(())
+}
+
+/// Writes a secret file that must not exist yet — a key file, a private multisig policy — owner-only
+/// from the start, refusing to touch an existing path.
+pub(crate) fn write_new_secret(path: &Path, text: &str) -> Result<()> {
+    // `create_new` closes the exists-then-write race and `mode(0o600)` makes the file
+    // owner-only from the start: writing first and chmodding afterwards leaves the spend
+    // key world-readable for a window.
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+            .with_context(|| format!("{} already exists or cannot be created; refusing to overwrite", path.display()))?;
+        f.write_all(text.as_bytes())?;
+        // The bytes reach the disk before this returns: a power loss right after a key is
+        // handed out must not leave an empty file where the only copy of a secret should be
+        // (node I1's companion).
+        f.sync_all().with_context(|| format!("flushing {}", path.display()))?;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        if path.exists() {
+            return Err(anyhow!("{} already exists; refusing to overwrite", path.display()));
         }
+        std::fs::write(path, text).with_context(|| format!("writing {}", path.display()))
     }
 }
 
@@ -1899,8 +1928,8 @@ fn select_rand_pair(rand: &[&OwnedNote], need_r: u64, prover_fee: u64) -> Result
     ))
 }
 
-/// A fresh random word: a blinding `r`.
-fn fresh_word() -> Word8 {
+/// A fresh random word: a blinding `r`, a salt, a private multisig policy's `msk`.
+pub(crate) fn fresh_word() -> Word8 {
     SpendKey::random().0
 }
 
@@ -1912,31 +1941,37 @@ fn fresh_word() -> Word8 {
 /// field of the transaction except the proof — the action, the four envelopes, the chain id. So
 /// the wallet builds the transaction from this first, takes its binding, and then proves the
 /// bundle with it ([`Prepared::prove`]).
-struct Prepared {
+pub(crate) struct Prepared {
     /// The bundle, `proof` empty.
-    bundle: Bundle,
+    pub(crate) bundle: Bundle,
     /// The guest's private inputs (`hidden::hidden_bundle_inputs`).
-    words: Vec<u32>,
+    pub(crate) words: Vec<u32>,
     /// The digest this wallet computed from its own plaintext, which the proof must publish.
-    expected: Word8,
+    pub(crate) expected: Word8,
     /// The chain's bundle guest — its genesis `hc_bundle`, as `rand_status` names it — which is
     /// the program this bundle is proved with ([`ZkExecutor::bundle_program_for`]). Chains 14 and
     /// 15 run the v1 hidden guest; a later genesis may name the branch-free v2 (INT-2 / GV-1).
     /// Both read this witness and publish this digest, so only the program differs — and a proof
     /// of the other one would be refused by every validator. v3 (split authorisation) reads its
     /// own witness and publishes its own digest: see `v3`.
-    guest: Word8,
+    pub(crate) guest: Word8,
     /// The chain runs split authorisation (spec 2026-09-28 §4.1): `guest` is bundle guest v3, the
     /// witness carries `nk` and `salt` instead of the spend key, `expected` is the v3 digest, and
     /// the transaction needs a second proof — the auth proof, made by this wallet over its spend
     /// key and `salt`, publishing `auth_commit`. False on every chain without genesis `hc_auth`.
-    v3: bool,
+    pub(crate) v3: bool,
     /// 256 fresh random bits, drawn for this bundle alone: a repeated salt repeats `auth_commit`
     /// and links two transactions to one wallet, and no guest can tell. Zero when not `v3`.
-    salt: Word8,
+    pub(crate) salt: Word8,
     /// `auth::auth_commit(nk, salt)` — the bundle's `auth_commit`, which the auth proof must
     /// publish and the v3 digest folds in. Zero when not `v3`.
-    auth_commit: Word8,
+    pub(crate) auth_commit: Word8,
+    /// What the plan pays — the payee and amount, in `asset` — and the memo sealed with it: what a
+    /// private multisig proposal's informational summary names (`msig_private`). Nothing proves
+    /// or checks them; a signer reads the opened outputs instead.
+    pub(crate) to: Option<(ShieldedAddress, u64)>,
+    pub(crate) asset: u32,
+    pub(crate) memo: String,
 }
 
 /// The witness carries a long-term secret — `nk` on v3, the spend key on v1/v2 — and `salt` is
@@ -1954,7 +1989,7 @@ impl Drop for Prepared {
 
 /// One transaction's proofs, made against its binding: the bundle's, and on a v3 chain the auth
 /// proof (empty elsewhere).
-struct Proved {
+pub(crate) struct Proved {
     proof: Vec<u8>,
     tier: u8,
     proving: Duration,
@@ -1977,12 +2012,35 @@ fn check_published_auth(c: &Word8, auth_commit: &Word8) -> Result<()> {
     Ok(())
 }
 
+/// What authorises a v3 bundle's spend (spec 2026-10-11 phase 4 §6.2): a single-key wallet's
+/// spend key (the auth guest over `sk` and the bundle's salt), or a private multisig account's
+/// assembled `msauth` witness — the full `MSAUTH_WORDS` vector, `msk`, the salt and `T` signatures
+/// (`msig_private::assemble_witness`).
+#[derive(Clone, Copy)]
+pub(crate) enum AuthWitness<'a> {
+    Key(&'a SpendKey),
+    Multisig(&'a [u32]),
+}
+
 /// Makes the auth proof on this machine — always here, never on a prover, because its witness is
-/// the spend key. Tier 10, seconds.
-fn prove_auth_locally(prepared: &Prepared, sk: &SpendKey, binding: &[u32; TX_BINDING_WORDS], profile: FriProfile, backend: Backend) -> Result<(Vec<u8>, Duration)> {
-    eprintln!("proving the spend authorisation on this machine (tier 10; seconds)…");
+/// the spend key, or for a private multisig account `msk` and the signatures. Single-key: the auth
+/// guest, tier 10, seconds. Multisig: the `msauth` guest run in the emulator first (its refusal —
+/// below threshold, a signature over another binding — costs nothing), then proved on the CPU at
+/// tier 18, minutes.
+fn prove_auth_locally(prepared: &Prepared, auth: AuthWitness<'_>, binding: &[u32; TX_BINDING_WORDS], profile: FriProfile, backend: Backend) -> Result<(Vec<u8>, Duration)> {
     let started = Instant::now();
-    let (proof, c, tier) = prove_auth(profile, sk, &prepared.salt, binding, backend).map_err(|e| anyhow!("proving the spend authorisation failed: {e}"))?;
+    let (proof, c, tier) = match auth {
+        AuthWitness::Key(sk) => {
+            eprintln!("proving the spend authorisation on this machine (tier 10; seconds)…");
+            prove_auth(profile, sk, &prepared.salt, binding, backend).map_err(|e| anyhow!("proving the spend authorisation failed: {e}"))?
+        }
+        AuthWitness::Multisig(words) => {
+            let c = randprotocol_zkvm::executor::run_msauth(words, binding).map_err(|e| anyhow!("{e}: refusing to prove"))?;
+            check_published_auth(&c, &prepared.auth_commit)?;
+            eprintln!("proving the multisig authorisation on this machine (tier 18; minutes)…");
+            randprotocol_zkvm::executor::prove_msauth(profile, words, binding).map_err(|e| anyhow!("proving the multisig authorisation failed: {e}"))?
+        }
+    };
     let took = started.elapsed();
     eprintln!("authorisation proved in {took:.1?}: tier {tier}, {} bytes", proof.len());
     check_published_auth(&c, &prepared.auth_commit)?;
@@ -2045,13 +2103,13 @@ pub async fn build_transfer_declaring_bundle_gas(
     let guest = chain_bundle_guest(rpc).await?;
     let plan = Plan::select(store, Spend { asset: 0, to: Some((to, amount)), memo: "", fee, burn_a: 0, burn_r: 0, prover_fee: None })?;
     let format = rpc.envelope_format(chain_id).await?;
-    let (prepared, _) = prepare_bundle(rpc, w, store, &plan, format, &guest).await?;
+    let (prepared, _) = prepare_bundle(rpc, w, store, &plan, format, &guest, DummySender::Throwaway).await?;
     let mut tx = Transaction::shielded(chain_id, prepared.bundle.clone(), Action::None);
     let domain = scanned_binding_domain(rpc, store, chain_id).await?;
     let p = &prepared;
     prove_transaction_by(&mut tx, &domain, |binding| async move {
         // On a v3 chain the auth proof rides beside the bundle, exactly as `send` makes it.
-        let auth = p.v3.then(|| prove_auth_locally(p, &w.sk, &binding, profile, Backend::Cpu)).transpose()?;
+        let auth = p.v3.then(|| prove_auth_locally(p, AuthWitness::Key(w.spend_key()?), &binding, profile, Backend::Cpu)).transpose()?;
         let started = Instant::now();
         let (proof, digest, tier) =
             randprotocol_zkvm::executor::prove_bundle_for_with_limit(&p.guest, profile, &p.words, &binding, bundle_gas_limit)
@@ -2133,13 +2191,16 @@ impl Proving {
     }
 
     /// Proves `prepared` against `binding`: the bundle, and on a v3 chain the auth proof over
-    /// `sk` (first — seconds, so a failure there costs no bundle proof). `proof_cap` is the
-    /// chain's `max_proof_bytes`, which a remote prover's reply is held to before it is used (a
-    /// local proof is this build's own).
-    async fn prove(&self, prepared: &Prepared, sk: &SpendKey, binding: &[u32; TX_BINDING_WORDS], profile: FriProfile, proof_cap: usize) -> Result<Proved> {
+    /// `auth` (first — so a failure there costs no bundle proof). `proof_cap` is the chain's
+    /// `max_proof_bytes`, which a remote prover's reply is held to before it is used (a local
+    /// proof is this build's own).
+    pub(crate) async fn prove(&self, prepared: &Prepared, auth: AuthWitness<'_>, binding: &[u32; TX_BINDING_WORDS], profile: FriProfile, proof_cap: usize) -> Result<Proved> {
+        if matches!(auth, AuthWitness::Multisig(_)) && !prepared.v3 {
+            return Err(anyhow!("a private multisig spend needs bundle guest v3 (split authorisation)"));
+        }
         match self {
             Proving::Local(backend) => {
-                let auth = prepared.v3.then(|| prove_auth_locally(prepared, sk, binding, profile, *backend)).transpose()?;
+                let auth = prepared.v3.then(|| prove_auth_locally(prepared, auth, binding, profile, *backend)).transpose()?;
                 let proved = prepared.prove(binding, profile, *backend)?;
                 Ok(with_auth(proved, auth))
             }
@@ -2149,8 +2210,8 @@ impl Proving {
                 // built; held again here, where the witness would leave, so no later caller can
                 // hand a spend-key witness (`prepared.words` of a v1/v2 bundle) to a prover (VK-4).
                 self.refuse_remote_before_v3(&prepared.guest)?;
-                // The auth proof is made here, on the CPU (tier 10, seconds).
-                let auth = Some(prove_auth_locally(prepared, sk, binding, profile, Backend::Cpu)?);
+                // The auth proof is made here, on the CPU.
+                let auth = Some(prove_auth_locally(prepared, auth, binding, profile, Backend::Cpu)?);
                 eprintln!("proving the bundle on {} (paired prover {})…", remote.paired().label(), remote.paired().fingerprint);
                 let started = Instant::now();
                 let (proof, tier) = remote.prove(&prepared.guest, profile, &prepared.words, binding, &prepared.expected, proof_cap).await?;
@@ -2159,12 +2220,12 @@ impl Proving {
                 Ok(with_auth(Proved { proof, tier, proving, auth_proof: Vec::new(), auth_proving: None }, auth))
             }
             #[cfg(test)]
-            Proving::Emulated => tests::emulated_proof(prepared, sk, binding),
+            Proving::Emulated => tests::emulated_proof(prepared, auth, binding),
             #[cfg(test)]
             Proving::EmulatedFee(to, amount, _) => {
                 let fee = randprotocol_prover::service::Fee { amount: *amount, address: to.clone() };
                 randprotocol_prover::service::check_fee(&prepared.words, &fee).map_err(|e| anyhow!("the prover would refuse this witness: {e:?}"))?;
-                tests::emulated_proof(prepared, sk, binding)
+                tests::emulated_proof(prepared, auth, binding)
             }
         }
     }
@@ -2195,8 +2256,21 @@ fn with_auth(proved: Proved, auth: Option<(Vec<u8>, Duration)>) -> Proved {
 /// authorisation) the bundle draws a fresh salt, carries `auth_commit = H(AUTH, nk, salt)`, and its
 /// witness is the v3 one — `nk` and the salt, never the spend key — with the v3 digest expected;
 /// on every other guest the bundle is exactly what it always was, `auth_commit` zero.
+/// `dummy_sender` is who seals the dummy outputs (`Payee::Nobody`): [`DummySender::Throwaway`] — every
+/// single-key bundle, byte for byte as before — or [`DummySender::Account`], this wallet's own
+/// `vk`, so a private multisig account's signers can open every output as sender
+/// (`multisig_private::check_proposal` refuses one they cannot).
 #[allow(clippy::too_many_arguments)]
-fn build_bundle(w: &Wallet, plan: &Plan, anchor: Word8, paths: &[[Word8; DEPTH]], time: u32, format: EnvelopeFormat, guest: &Word8) -> Result<Prepared> {
+pub(crate) fn build_bundle(
+    w: &Wallet,
+    plan: &Plan,
+    anchor: Word8,
+    paths: &[[Word8; DEPTH]],
+    time: u32,
+    format: EnvelopeFormat,
+    guest: &Word8,
+    dummy_sender: DummySender,
+) -> Result<Prepared> {
     let pk_self = w.vk.pk();
     let asset = plan.asset;
     if paths.len() != plan.inputs().count() {
@@ -2246,7 +2320,13 @@ fn build_bundle(w: &Wallet, plan: &Plan, anchor: Word8, paths: &[[Word8; DEPTH]]
             // The prover's fee is a plain note to its address; the payment's memo is never its.
             (Payee::Prover(dest), _) => seal_note_as(format, &w.vk, dest, &note, &key, ""),
             (Payee::Me, _) => seal_note_as(format, &w.vk, &w.address, &note, &key, ""),
-            (Payee::Nobody, Some(t)) => seal_note_as(format, &t.vk, &t.address, &note, &key, ""),
+            (Payee::Nobody, Some(t)) => {
+                let sender = match dummy_sender {
+                    DummySender::Throwaway => &t.vk,
+                    DummySender::Account => &w.vk,
+                };
+                seal_note_as(format, sender, &t.address, &note, &key, "")
+            }
             (Payee::Nobody, None) => unreachable!("a throwaway key for every dummy"),
         };
         envelopes.push(sealed.map_err(|e| anyhow!("sealing output {k}'s envelope: {e}"))?);
@@ -2284,7 +2364,7 @@ fn build_bundle(w: &Wallet, plan: &Plan, anchor: Word8, paths: &[[Word8; DEPTH]]
         (salt, auth_commit, expected, words)
     } else {
         let expected = hidden::hidden_bundle_digest(&digest_input);
-        let words = hidden::hidden_bundle_inputs(&w.sk, &inputs, &outs, anchor, plan.fee, plan.burn_a, plan.burn_r, asset, time);
+        let words = hidden::hidden_bundle_inputs(w.spend_key()?, &inputs, &outs, anchor, plan.fee, plan.burn_a, plan.burn_r, asset, time);
         ([0; 8], [0; 8], expected, words)
     };
     let envelopes: [Envelope; SLOTS] = envelopes.try_into().map_err(|_| anyhow!("four envelopes"))?;
@@ -2304,13 +2384,35 @@ fn build_bundle(w: &Wallet, plan: &Plan, anchor: Word8, paths: &[[Word8; DEPTH]]
         auth_commit,
         auth_proof: Vec::new(),
     };
-    Ok(Prepared { bundle, words, expected, guest: *guest, v3, salt, auth_commit })
+    Ok(Prepared {
+        bundle,
+        words,
+        expected,
+        guest: *guest,
+        v3,
+        salt,
+        auth_commit,
+        to: plan.to.clone(),
+        asset: plan.asset,
+        memo: plan.memo.clone(),
+    })
+}
+
+/// Who seals a bundle's dummy outputs ([`build_bundle`]). Either way the dummy is owned by a
+/// throwaway key and worth nothing; only who can open it as sender differs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DummySender {
+    /// A throwaway key: the dummy opens to no one, the sender included. Every single-key bundle.
+    Throwaway,
+    /// This wallet's own `vk`: the account opens every output as sender. A private multisig
+    /// proposal's, whose signers refuse an output they cannot open.
+    Account,
 }
 
 /// The chain's bundle guest: `rand_status`'s `hc_bundle` (the genesis pin) — and for v3, its
 /// `hc_auth` too — refused unless this build can prove it — asked before a bundle is built, so a wallet too old for its chain says so
 /// instead of spending a minute and a half on a proof every validator refuses.
-async fn chain_bundle_guest(rpc: &RpcClient) -> Result<Word8> {
+pub(crate) async fn chain_bundle_guest(rpc: &RpcClient) -> Result<Word8> {
     let status = rpc.status().await?;
     let named = status["hc_bundle"].as_str().ok_or_else(|| anyhow!("the node's rand_status names no hc_bundle"))?;
     let hc = randprotocol_core::notes::word8_from_hex(named).ok_or_else(|| anyhow!("the node's hc_bundle {named} is not a 32-byte digest"))?;
@@ -2376,7 +2478,15 @@ pub async fn prover_confirmation(rpc: &RpcClient, proving: &Proving) -> Result<V
 /// however long ago the last leaf landed, which is the case a checkpoint alone cannot cover).
 /// Failing that, the newest checkpoint the node still serves — the local tree is frozen at its
 /// checkpoints, so where the old code looped on "tree moved; retry" this one rescans once.
-async fn prepare_bundle(rpc: &RpcClient, w: &Wallet, store: &mut NoteStore, plan: &Plan, format: EnvelopeFormat, guest: &Word8) -> Result<(Prepared, u32)> {
+pub(crate) async fn prepare_bundle(
+    rpc: &RpcClient,
+    w: &Wallet,
+    store: &mut NoteStore,
+    plan: &Plan,
+    format: EnvelopeFormat,
+    guest: &Word8,
+    dummy_sender: DummySender,
+) -> Result<(Prepared, u32)> {
     let guest = *guest;
     let h = tree_hash();
     for attempt in 0..2 {
@@ -2413,7 +2523,7 @@ async fn prepare_bundle(rpc: &RpcClient, w: &Wallet, store: &mut NoteStore, plan
                     .with_context(|| format!("no local witness for note {}; the store's tree is incomplete", n.index))?;
                 paths.push(path);
             }
-            let prepared = build_bundle(w, plan, root, &paths, time, format, &guest)?;
+            let prepared = build_bundle(w, plan, root, &paths, time, format, &guest, dummy_sender)?;
             return Ok((prepared, time));
         }
         if attempt == 1 {
@@ -2434,13 +2544,22 @@ fn is_anchor_miss(e: &anyhow::Error) -> bool {
     e.downcast_ref::<crate::RpcError>().is_some_and(|r| r.code == -32001)
 }
 
-/// Prove `tx`'s one bundle — and on a v3 chain its auth proof, over `sk` — against `tx`'s own
+/// Prove `tx`'s one bundle — and on a v3 chain its auth proof, over `auth` — against `tx`'s own
 /// binding, in place, with `proving` at `profile`.
 ///
 /// BIND-1: `domain` is the chain's binding domain as this wallet decided it ([`binding_domain`]):
 /// what the binding the proofs are made over carries — the chain id, or the genesis hash too.
-async fn prove_transaction(tx: &mut Transaction, domain: &BindingDomain, prepared: &Prepared, sk: &SpendKey, proving: &Proving, profile: FriProfile, proof_cap: usize) -> Result<Proved> {
-    prove_transaction_by(tx, domain, |binding| async move { proving.prove(prepared, sk, &binding, profile, proof_cap).await }).await
+#[allow(clippy::too_many_arguments)]
+async fn prove_transaction(
+    tx: &mut Transaction,
+    domain: &BindingDomain,
+    prepared: &Prepared,
+    auth: AuthWitness<'_>,
+    proving: &Proving,
+    profile: FriProfile,
+    proof_cap: usize,
+) -> Result<Proved> {
+    prove_transaction_by(tx, domain, |binding| async move { proving.prove(prepared, auth, &binding, profile, proof_cap).await }).await
 }
 
 /// The [`BindingDomain`] of a transaction this wallet builds for `chain_id` (BIND-1, audit v6):
@@ -2454,7 +2573,7 @@ async fn prove_transaction(tx: &mut Transaction, domain: &BindingDomain, prepare
 /// and starts a store bound to another chain over). On a chain outside the list the node's claim
 /// is read once, only to refuse early — before a minute and a half of proving — a chain whose
 /// ledger would refuse the genesis-bound form ([`RpcClient::require_binding_domain`]).
-async fn scanned_binding_domain(rpc: &RpcClient, store: &NoteStore, chain_id: u64) -> Result<BindingDomain> {
+pub(crate) async fn scanned_binding_domain(rpc: &RpcClient, store: &NoteStore, chain_id: u64) -> Result<BindingDomain> {
     if crate::CHAIN_ID_BINDING_CHAIN_IDS.contains(&chain_id) {
         return Ok(BindingDomain::ChainId);
     }
@@ -2480,7 +2599,7 @@ pub async fn binding_domain(rpc: &RpcClient, w: &Wallet, store: &mut NoteStore, 
 /// bundle (and the auth proof, on a v3 chain) proved against it, the proofs filled in; filling
 /// them in cannot move the binding, because the binding blanks both. `prove` is handed the binding — a unit test hands in a stub
 /// prover, which is what lets the ordering be tested without a minute of proving.
-async fn prove_transaction_by<F, Fut>(tx: &mut Transaction, domain: &BindingDomain, prove: F) -> Result<Proved>
+pub(crate) async fn prove_transaction_by<F, Fut>(tx: &mut Transaction, domain: &BindingDomain, prove: F) -> Result<Proved>
 where
     F: FnOnce([u32; TX_BINDING_WORDS]) -> Fut,
     Fut: std::future::Future<Output = Result<Proved>>,
@@ -2860,7 +2979,7 @@ async fn submit_spend_at(
     // refused inside `build_bundle`. Checked against this transaction's own chain id: a node's
     // memo claim on a chain pinned as pre-`envelope_bytes` is not believed (issue #64).
     let format = rpc.envelope_format(chain_id).await?;
-    let (prepared, time) = prepare_bundle(rpc, w, store, &plan, format, &guest).await?;
+    let (prepared, time) = prepare_bundle(rpc, w, store, &plan, format, &guest, DummySender::Throwaway).await?;
     // The action last, once the bundle's `time` is known (an invoke's payout notes carry it);
     // then the whole transaction, its bundle's proof empty; then the proof, bound to it. Nothing
     // is set on the transaction after the proof but the proof itself.
@@ -2877,7 +2996,7 @@ async fn submit_spend_at(
         Proving::Remote(_) => proof_cap(rpc.limits().await?.as_ref()),
         _ => gas::MAX_PROOF_BYTES,
     };
-    let proved = prove_transaction(&mut tx, &domain, &prepared, &w.sk, proving, profile, cap).await?;
+    let proved = prove_transaction(&mut tx, &domain, &prepared, AuthWitness::Key(w.spend_key()?), proving, profile, cap).await?;
     // `submit_refused` labels a JSON-RPC error reply *from this call* as `SubmitRefused`
     // (node I1): it is the only failure here that means nothing was admitted, and `rand token
     // create` deletes a freshly generated authority key on it and on nothing else. Everything
@@ -4582,7 +4701,7 @@ async fn send_asset_with(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use randprotocol_zkvm::notes::SpendKey;
 
@@ -5512,20 +5631,31 @@ mod tests {
 
     /// [`Proving::Emulated`]: the hidden guest run on `p.words` against `binding`, its digest
     /// checked as a real proof's is, and a stub proof carrying it. On a v3 chain the auth guest
-    /// is run too, on `auth_inputs(sk, salt)`, its `c` checked against `auth_commit` as a real
-    /// auth proof's is, and a stub auth proof carrying it.
-    pub(super) fn emulated_proof(p: &Prepared, sk: &SpendKey, binding: &[u32; TX_BINDING_WORDS]) -> Result<Proved> {
+    /// is run too — on `auth_inputs(sk, salt)` for a spend key, or the `msauth` guest
+    /// (`run_msauth`) on a private multisig witness — its `c` checked against `auth_commit` as a
+    /// real auth proof's is, and a stub auth proof (`msau:` for multisig) carrying it.
+    pub(super) fn emulated_proof(p: &Prepared, auth: AuthWitness<'_>, binding: &[u32; TX_BINDING_WORDS]) -> Result<Proved> {
         let program = ZkExecutor::bundle_program_for(&p.guest).expect("prepare_bundle refuses a guest this build lacks");
         let run = randprotocol_zkvm::emulator::execute(program, &p.words, binding, 1 << 20)
             .map_err(|e| anyhow!("the hidden guest did not run: {e:?}"))?;
         let digest: Word8 = run.outputs;
         check_published_digest(&digest, &p.expected)?;
         let (auth_proof, auth_proving) = if p.v3 {
-            let words = randprotocol_zkvm::auth::auth_inputs(sk, &p.salt);
-            let run = randprotocol_zkvm::emulator::execute(ZkExecutor::auth_program(), &words, binding, 1 << 16)
-                .map_err(|e| anyhow!("the auth guest did not run: {e:?}"))?;
-            check_published_auth(&run.outputs, &p.auth_commit)?;
-            (StubExecutor::make_auth_proof(&EMULATED_AUTH_HC, &run.outputs, binding), Some(Duration::ZERO))
+            let proof = match auth {
+                AuthWitness::Key(sk) => {
+                    let words = randprotocol_zkvm::auth::auth_inputs(sk, &p.salt);
+                    let run = randprotocol_zkvm::emulator::execute(ZkExecutor::auth_program(), &words, binding, 1 << 16)
+                        .map_err(|e| anyhow!("the auth guest did not run: {e:?}"))?;
+                    check_published_auth(&run.outputs, &p.auth_commit)?;
+                    StubExecutor::make_auth_proof(&EMULATED_AUTH_HC, &run.outputs, binding)
+                }
+                AuthWitness::Multisig(words) => {
+                    let c = randprotocol_zkvm::executor::run_msauth(words, binding).map_err(|e| anyhow!("{e}"))?;
+                    check_published_auth(&c, &p.auth_commit)?;
+                    StubExecutor::make_msauth_proof(&EMULATED_AUTH_HC, &c, binding)
+                }
+            };
+            (proof, Some(Duration::ZERO))
         } else {
             (Vec::new(), None)
         };
@@ -5598,6 +5728,9 @@ mod tests {
         /// `rand_status`'s `hc_auth`: `None` (served as null) unless a test runs split
         /// authorisation.
         hc_auth: Option<Word8>,
+        /// `rand_status`'s `hc_auth_multisig` (private multisig phase 4): `None`, served as null,
+        /// unless a test runs a multisig account ([`fake_multisig_chain`]).
+        hc_auth_multisig: Option<Word8>,
         /// `rand_getLimits`' `binding_domain` claim (BIND-1): `1` by default — this fake is chain
         /// 7, outside `CHAIN_ID_BINDING_CHAIN_IDS`, so the wallet proves the genesis-bound form
         /// there and a node claiming otherwise only gets a refusal.
@@ -5677,6 +5810,7 @@ mod tests {
                 full_rows_served: 0,
                 hc_bundle: ZkExecutor::hc_bundle(),
                 hc_auth: None,
+                hc_auth_multisig: None,
                 binding_domain: 1,
                 proof_window_blocks: None,
                 raise_floor_at_read: None,
@@ -5847,7 +5981,11 @@ mod tests {
                     self.sent.push(tx);
                     json!(hash)
                 }
-                "rand_status" => json!({ "hc_bundle": word8_to_hex(&self.hc_bundle), "hc_auth": self.hc_auth.as_ref().map(word8_to_hex) }),
+                "rand_status" => json!({
+                    "hc_bundle": word8_to_hex(&self.hc_bundle),
+                    "hc_auth": self.hc_auth.as_ref().map(word8_to_hex),
+                    "hc_auth_multisig": self.hc_auth_multisig.as_ref().map(word8_to_hex),
+                }),
                 "rand_getBridgeState" => self.bridge.clone(),
                 "rand_getAssets" => self.assets.clone(),
                 "rand_getTokens" => self.tokens.clone(),
@@ -5867,6 +6005,56 @@ mod tests {
     async fn serve(chain: &Arc<Mutex<ChainState>>) -> RpcClient {
         let c = chain.clone();
         RpcClient::new(rpc_fn(move |m, p| c.lock().unwrap().answer(m, p)).await)
+    }
+
+    /// Private multisig (`msig_private`'s tests): a chain whose `rand_status` names bundle guest v3,
+    /// this build's `hc_auth` and `hc_auth_multisig`, whose `rand_getLimits` says
+    /// `proof_window_blocks: 1024`, and whose tree holds one note of `amount` RAND owned by `w` —
+    /// with a client for it and a store that has scanned it.
+    pub(crate) async fn fake_multisig_chain(w: &Wallet, amount: u64) -> (RpcClient, NoteStore) {
+        let chain = Arc::new(Mutex::new(ChainState::new()));
+        {
+            let mut c = chain.lock().unwrap();
+            c.hc_bundle = ZkExecutor::hc_hidden_bundle_v3();
+            c.hc_auth = Some(ZkExecutor::hc_auth());
+            c.hc_auth_multisig = Some(ZkExecutor::hc_auth_multisig());
+            c.proof_window_blocks = Some(1024);
+            c.fund(w, amount, 0);
+        }
+        let rpc = serve(&chain).await;
+        let mut store = NoteStore::default();
+        scan(&rpc, w, &mut store).await.expect("the multisig account scans");
+        (rpc, store)
+    }
+
+    /// Private multisig (`msig_private`'s tests): a v3 bundle built offline, as `prepare` builds
+    /// one — one synthetic note of `amount + 2 · BUNDLE_BASE` RAND owned by `w` in a one-leaf tree
+    /// and a store, selected by `Plan::select` (nothing marked pending), paying `amount` to a fresh
+    /// address at fee `BUNDLE_BASE` through [`build_bundle`] with `dummy_sender` — placed in
+    /// `Transaction::shielded(7, …, Action::None)`, its `ChainId` binding taken, and all three handed
+    /// to `f`.
+    pub(crate) fn offline_v3_proposal_for<R>(
+        w: &Wallet,
+        amount: u64,
+        dummy_sender: DummySender,
+        f: impl FnOnce(&Prepared, &Transaction, [u32; TX_BINDING_WORDS]) -> R,
+    ) -> (NoteStore, R) {
+        let mut tree = randprotocol_zkvm::ledger::CommitmentTree::new();
+        let note = Note::new(w.vk.pk(), [1; 8], amount + 2 * gas::BUNDLE_BASE, 0, 1);
+        tree.append(note.commitment());
+        let store = NoteStore {
+            notes: vec![OwnedNote { index: 0, cm: note.commitment(), nf: w.vk.nullifier(&note.commitment()), note, spent: false, pending: None, height: 1, memo: None }],
+            ..NoteStore::default()
+        };
+        let to = Wallet::generate().address;
+        let plan = Plan::select(&store, Spend { asset: 0, to: Some((&to, amount)), memo: "", fee: gas::BUNDLE_BASE, burn_a: 0, burn_r: 0, prover_fee: None })
+            .expect("the synthetic note covers the payment and the fee");
+        let prepared = build_bundle(w, &plan, tree.root(), &[tree.path(0)], 2, EnvelopeFormat::Legacy, &ZkExecutor::hc_hidden_bundle_v3(), dummy_sender)
+            .expect("an offline v3 bundle");
+        let tx = Transaction::shielded(7, prepared.bundle.clone(), Action::None);
+        let binding = tx.binding(&BindingDomain::ChainId);
+        let r = f(&prepared, &tx, binding);
+        (store, r)
     }
 
     /// A whole [`ChainState`] plus a ready client for it, for the memo tests' one-call shape: fund
@@ -6986,7 +7174,7 @@ mod tests {
         // Preparing against the stale store anchors at the freshest checkpoint the node confirms.
         let spend = Spend { asset: 0, to: Some((&you.address, 8_000_000)), memo: "", fee: gas::BUNDLE_BASE, burn_a: 0, burn_r: 0, prover_fee: None };
         let plan = Plan::select(&store, spend).unwrap();
-        let (prepared, time) = prepare_bundle(&rpc, &me, &mut store, &plan, EnvelopeFormat::Legacy, &ZkExecutor::hc_bundle()).await.unwrap();
+        let (prepared, time) = prepare_bundle(&rpc, &me, &mut store, &plan, EnvelopeFormat::Legacy, &ZkExecutor::hc_bundle(), DummySender::Throwaway).await.unwrap();
         assert_eq!(time, 2, "the checkpoint's height, not the moved head's");
         assert_eq!(prepared.bundle.anchor, scanned_root, "frozen at the checkpoint");
         assert_eq!(chain.lock().unwrap().witness_calls, 0);
@@ -8165,7 +8353,7 @@ mod tests {
             ..NoteStore::default()
         };
         let plan = Plan::select(&store, Spend { asset: 0, to: None, memo: "", fee: 50, burn_a: 0, burn_r: 0, prover_fee: None }).unwrap();
-        let build = || build_bundle(&me, &plan, tree.root(), &[tree.path(0)], 2, EnvelopeFormat::Legacy, &ZkExecutor::hc_bundle()).unwrap();
+        let build = || build_bundle(&me, &plan, tree.root(), &[tree.path(0)], 2, EnvelopeFormat::Legacy, &ZkExecutor::hc_bundle(), DummySender::Throwaway).unwrap();
         let (one, two) = (build(), build());
         for k in 0..SLOTS {
             if k != 2 {
@@ -8213,7 +8401,7 @@ mod tests {
         let me = Wallet::from_spend_key(SpendKey([56; 8]));
         let (tree, plan) = one_note_plan(&me);
         let v3 = ZkExecutor::hc_hidden_bundle_v3();
-        let build = || build_bundle(&me, &plan, tree.root(), &[tree.path(0)], 2, EnvelopeFormat::Legacy, &v3).unwrap();
+        let build = || build_bundle(&me, &plan, tree.root(), &[tree.path(0)], 2, EnvelopeFormat::Legacy, &v3, DummySender::Throwaway).unwrap();
         let (one, two) = (build(), build());
         assert!(one.v3 && two.v3);
         assert_ne!(one.salt, [0; 8], "a v3 bundle draws a salt");
@@ -8226,7 +8414,7 @@ mod tests {
             assert_eq!(p.words.len(), COUNT);
             assert_eq!(p.words[SALT..SALT + 8], p.salt, "the witness carries this bundle's salt");
             assert_eq!(p.words[NK..NK + 8], me.vk.nk, "the witness carries nk");
-            assert!(p.words.windows(8).all(|w| w != me.sk.0), "and never the spend key");
+            assert!(p.words.windows(8).all(|w| w != me.spend_key().unwrap().0), "and never the spend key");
         }
         // The v3 witness is one the v3 guest accepts, publishing the v3 digest the wallet built.
         let program = ZkExecutor::bundle_program_for(&v3).unwrap();
@@ -8245,7 +8433,7 @@ mod tests {
         let me = Wallet::from_spend_key(SpendKey([57; 8]));
         let (tree, plan) = one_note_plan(&me);
         let v3 = ZkExecutor::hc_hidden_bundle_v3();
-        let p = build_bundle(&me, &plan, tree.root(), &[tree.path(0)], 2, EnvelopeFormat::Legacy, &v3).unwrap();
+        let p = build_bundle(&me, &plan, tree.root(), &[tree.path(0)], 2, EnvelopeFormat::Legacy, &v3, DummySender::Throwaway).unwrap();
         let tx = Transaction::shielded(7, p.bundle.clone(), Action::None);
         let mut moved = tx.clone();
         moved.bundle.as_mut().unwrap().auth_commit[0] ^= 1;
@@ -8295,7 +8483,7 @@ mod tests {
         let me = Wallet::from_spend_key(SpendKey([59; 8]));
         let (tree, plan) = one_note_plan(&me);
         for hc in [ZkExecutor::hc_hidden_bundle(), ZkExecutor::hc_hidden_bundle_v2()] {
-            let p = build_bundle(&me, &plan, tree.root(), &[tree.path(0)], 2, EnvelopeFormat::Legacy, &hc).unwrap();
+            let p = build_bundle(&me, &plan, tree.root(), &[tree.path(0)], 2, EnvelopeFormat::Legacy, &hc, DummySender::Throwaway).unwrap();
             assert!(!p.v3);
             assert_eq!((p.salt, p.auth_commit, p.bundle.auth_commit), ([0; 8], [0; 8], [0; 8]));
             assert!(p.bundle.auth_proof.is_empty());
@@ -8635,7 +8823,7 @@ mod tests {
             let kem_ek = key.kem_ek().to_vec();
             // (every method asked, whether an opened job carried the spend key)
             let seen: Arc<Mutex<(Vec<String>, bool)>> = Arc::default();
-            let (s, sk) = (seen.clone(), me.sk.0);
+            let (s, sk) = (seen.clone(), me.spend_key().unwrap().0);
             let url = rpc_fn(move |method, params| {
                 let mut g = s.lock().unwrap();
                 g.0.push(method.to_string());
@@ -9316,6 +9504,9 @@ mod tests {
             v3: false,
             salt: [0; 8],
             auth_commit: [0; 8],
+            to: None,
+            asset: 0,
+            memo: String::new(),
         };
         let action = Action::BridgeBurn { asset: 3, amount: 400, relayer_fee: 100, to_chain: 2, token: [7; 32], to: [1; 32] };
         let mut tx = Transaction::shielded(13, prepared.bundle.clone(), action);
@@ -9362,7 +9553,18 @@ mod tests {
             auth_proof: Vec::new(),
         };
         let prepared =
-            Prepared { bundle: bundle(10), words: Vec::new(), expected: [0; 8], guest: ZkExecutor::hc_bundle(), v3: false, salt: [0; 8], auth_commit: [0; 8] };
+            Prepared {
+                bundle: bundle(10),
+                words: Vec::new(),
+                expected: [0; 8],
+                guest: ZkExecutor::hc_bundle(),
+                v3: false,
+                salt: [0; 8],
+                auth_commit: [0; 8],
+                to: None,
+                asset: 0,
+                memo: String::new(),
+            };
         let id = Hash::digest(b"program");
         let record = ProgramRecord { id, base_pc: 0, words: vec![0x13; 4], code_hash: vec![], deployed_at: 0, public_digest: None, public_len: 0 };
         let call = Action::Call { program: id, proof: Vec::new(), input_envelope: None };

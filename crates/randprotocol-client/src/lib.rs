@@ -24,11 +24,18 @@ use std::time::{Duration, Instant};
 pub mod contacts;
 pub mod governance;
 pub mod memo_display;
+/// Private multisig phase 4: the policy file, proposals, signing, witness assembly and proving —
+/// the parts that need a node, a file or a prover. The pure signer checks are
+/// [`multisig_private`].
+pub mod msig_private;
 pub mod perps;
 pub mod prover;
 pub mod qr;
 pub mod tree;
 pub mod wallet;
+
+/// The pure private-multisig signer checks (`randprotocol-msig`), as every wallet app runs them.
+pub use randprotocol_msig as multisig_private;
 
 /// A node's JSON-RPC error reply. It prints as it always has, `"<message> (rpc <code>)"`, and
 /// keeps its code, so a caller can tell an older node (no such method, [`METHOD_NOT_FOUND`]) from

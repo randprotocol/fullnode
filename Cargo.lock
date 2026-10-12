@@ -5333,6 +5333,7 @@ dependencies = [
  "libp2p",
  "qrcode",
  "randprotocol-core",
+ "randprotocol-msig",
  "randprotocol-node",
  "randprotocol-prover",
  "randprotocol-zkvm",
