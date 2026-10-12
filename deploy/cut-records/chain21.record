@@ -1,0 +1,35 @@
+# Cut record — chain 21 (docs/deploy.md, "Cut policy"; audit v6, OPS-7). DRAFT, 2026-10-12.
+#
+# Drafted from deploy/cut-record.template by the cutover-prep session; NOT published, NOT final.
+# Every `TODO(user…)` is a field only the user (or the second operator) can fill. While any of
+# reason/carries/drops/clients/second-operator/rollback starts with TODO, deploy/cut-chain21-genesis.sh
+# refuses the cut (`require_cut_record`), and while `second-hash:` is empty or another hash,
+# deploy/cutover-fleet-chain21.sh push refuses (`require_second_rebuild`). Runbook:
+# docs/chain21-cut-runbook.md. Lines starting with # are ignored; one line per field.
+
+chain-id: 21
+
+reason: v0.8.0 runs chain 21 onward only — constraint set 9 (rVM phase 4's Merkle spans and the MODQ chip) changes every verifier key and the proof encoding, so v0.8.0 refuses chains 18–20 at startup and no rolling update can carry it; and chain 21's genesis-gated rules need a new genesis: the `fees` section (burn_base + burn_floor), the `perps` section (RPL-3, BTC-PERP on zUSD, engine_hc f286a611…1573), the `multisig` section seeding the foundation treasury (2 of 3, new issuance), and private multisig — the genesis field hc_auth_multisig = 9705f8e2f1bc8561848b29cb8efd57c37e3e39788fa58a5f03304d8019668247 with max_proof_bytes 6291456 (6 MiB) and max_block_bytes 19922944 (19 MiB), cut WITH the field although no multisig-private spend has ever been proven (the user's decision, 2026-10-12; see the runbook's known risk).
+
+carries: the 26 validators × 1 000 RAND on chain 20's keys (same peer ids, same hosts — the current droplets); the bridge state from a chain-20 snapshot (guardian set, burn_sequence, per-chain inbound floors, chain 20's emitters unchanged, bridge.rotation, bridge.fees 10/10 bps to fingerprint 89DS-4Q4X-HXSX-MBYW) — TODO(user, after `snapshot`): the snapshot height and the locked/custody figures per backing; zUSD per backing as genesis notes per ZUSD_CARRY — TODO(user, after `snapshot`): holders and amounts; operator RAND as genesis allocs per the `balances` scan — TODO(user, after `balances`): wallet list and amounts; NEW ISSUANCE (not carried): the multisig treasury, 2 of 3 signers (treasury-1, -2, -3 from ~/.rand-chain21/treasury.txt), 100 000 RAND, create_fee 1 RAND; hc_auth_multisig (private multisig) as above; perps genesis_root da0e3a53d93e50ec03fa40c6d2bd3dad8b9c7b4f542175e86a1dea567cbb9846 (the perp-prover dry run; the cut re-derives it).
+
+drops: TODO(user, after the `balances` scan): every chain-20 balance not re-issued, with amounts — the shielded pool's RAND held by wallets the operator does not hold (faucet recipients, payments to users), any zUSD not in ZUSD_CARRY, and any unwithdrawn validator fee rewards (refused by the cut unless REWARDS_DROPPED_OK=1).
+
+clients: rand CLI v0.8.0 (the release asset, signed SHA256SUMS; wallet `rand multisig-private …` for private multisig, the auth proof proved locally at tier 18); bridge relayer: the Linux v0.8.0 `rand` from the same release, installed on rand-relayer-1 at the switch (the bridge steps); clients repo: main at 201757c vendors a pre-private-multisig fullnode and its proofs do not decode on chain 21 (constraint set 9) — the chain-21 wallets are the msauth-signing build (clients feat/msauth-signing, local, vendors fullnode a1785c9) and are NOT released; chain-20 wallets stay on clients release/chain20; the apps' default RPC host is still chain 20's; randscan main 60d5612 and randbridge.org 9b395f8 are v0.8.0-compatible (deploy needs randscan migration 014); website WASM / durian.market: TODO(user): rebuilt against v0.8.0 or not; accepted for this cut: TODO(user).
+
+second-operator: TODO(user): the second operator's name and the machine they rebuild the genesis hash on (not the author, and not a session acting on the author's go) — or the user's explicit decision to waive it again as at chain 20 (cutover-fleet-chain21.sh push with SECOND_REBUILD_WAIVED=1 then records the waiver below).
+
+# Filled by the second operator after their rebuild: `rand-node init --datadir <tmp> --genesis
+# genesis-chain21.json` with the v0.8.0 release rand-node on their own machine; the cutover's push
+# compares it with the author's hash (`require_second_rebuild`) and refuses on a mismatch or a blank.
+second-hash:
+
+rollback: every host keeps chain 20's data dir (-6210cf07…, data-20 on the guardian hosts) and the v0.7.1 binaries as /root/rand-node.pre-c21 and /root/rand.pre-c21 (sha-checked against v0.7.1's signed SHA256SUMS) for at least a day; `deploy/cutover-fleet-chain21.sh stop` then `rollback` restores the units/drop-ins and binaries and licenses one `start` (v0.7.1 ignores /usr/local/bin/msauth-vk-production.bin); the bridge session switches the daemons back to chain 20 and restores the relayer's v0.7.1 `rand`; nothing minted or released on chain 21 may exist by then, or it is lost; retire-chain-dirs.sh is not run until chain 21 has run a day.
+
+# Printed by the cut, copied here before the record is published with the genesis:
+genesis-hash: TODO(cut): the hash `rand-node init` prints on the finished file
+treasury-id: TODO(cut): `TREASURY ID <id>` from the cut's output (a fresh salt per cut)
+perps-genesis-root: TODO(cut): `PERPS GENESIS ROOT <hex>` from the cut's output (expected da0e3a53…9846)
+# Who signed this record off, and when it was published (before the cut):
+signed-off: TODO(user): name, UTC timestamp
+published: TODO(user): where and when (UTC), before the cut
