@@ -5645,15 +5645,15 @@ pub(crate) mod tests {
         assert_eq!(v["gas_metering"], "header");
     }
 
-    /// The RPC's local limits follow a 20 MiB ledger (spec §8): the body limit is the same formula
-    /// over the genesis proof and envelope caps, and `rand_sendTransaction`'s pre-check is the
-    /// chain's block cap — a transaction over 4 MiB reaches the node loop instead of being refused.
     #[test]
     fn the_rpc_body_cap_counts_three_proofs_on_a_multisig_chain() {
         let (p, e) = (4 << 20, 65_536);
         assert_eq!(rpc_max_body_bytes(p, e, true) - rpc_max_body_bytes(p, e, false), 2 * p, "one more hex-encoded proof at the cap");
     }
 
+    /// The RPC's local limits follow a 20 MiB ledger (spec §8): the body limit is the same formula
+    /// over the genesis proof and envelope caps, and `rand_sendTransaction`'s pre-check is the
+    /// chain's block cap — a transaction over 4 MiB reaches the node loop instead of being refused.
     #[tokio::test]
     async fn the_rpc_limits_follow_a_20_mib_ledger() {
         use randprotocol_core::gas::MAX_ATTESTATION_BYTES;
