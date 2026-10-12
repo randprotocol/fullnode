@@ -19,7 +19,7 @@ use crate::RpcClient;
 use anyhow::{anyhow, Context, Result};
 use randprotocol_core::ledger::multisig::Account;
 use randprotocol_core::notes::{word8_from_hex, word8_to_hex, ShieldedAddress, Word8};
-use randprotocol_core::{gas, Action, BindingDomain, Hash, Keypair, PublicKey, Signature, Transaction};
+use randprotocol_core::{Action, BindingDomain, Hash, Keypair, PublicKey, Signature, Transaction};
 use randprotocol_msig::{self as pure, parse_words};
 use randprotocol_zkvm::executor::ZkExecutor;
 use randprotocol_zkvm::machine::FriProfile;
@@ -181,12 +181,33 @@ impl ProposalExt for Proposal {
 /// The chain must run bundle guest v3 and this build's multisig auth guest, or no proposal made
 /// here could ever be proved and admitted.
 async fn require_multisig_chain(rpc: &RpcClient) -> Result<()> {
-    let status = rpc.status().await?;
-    let named = |field: &str| status[field].as_str().and_then(word8_from_hex);
-    if named("hc_bundle") != Some(ZkExecutor::hc_hidden_bundle_v3()) || named("hc_auth_multisig") != Some(ZkExecutor::hc_auth_multisig()) {
-        return Err(anyhow!("this chain has no private multisig (hc_auth_multisig) for this build"));
-    }
+    multisig_chain_refusal(&rpc.status().await?).map_or(Ok(()), |e| Err(anyhow!(e)))?;
     wallet::check_bundle_gas_limit(rpc.limits().await?.and_then(|l| l.bundle_gas_limit))
+}
+
+/// Why `rand_status` rules this chain out for a private multisig spend, naming the condition:
+/// no multisig auth guest at all, another build's guest, or a bundle guest other than v3.
+fn multisig_chain_refusal(status: &serde_json::Value) -> Option<String> {
+    let named = |field: &str| status[field].as_str().and_then(word8_from_hex);
+    let (ours, bundle) = (ZkExecutor::hc_auth_multisig(), ZkExecutor::hc_hidden_bundle_v3());
+    match status["hc_auth_multisig"].as_str() {
+        None => return Some("this chain has no private multisig: rand_status names no hc_auth_multisig (null)".into()),
+        Some(theirs) if named("hc_auth_multisig") != Some(ours) => {
+            return Some(format!(
+                "this chain's hc_auth_multisig is {theirs}, another build's guest; this build's is {}: upgrade (or downgrade) the wallet to the chain's release",
+                word8_to_hex(&ours)
+            ))
+        }
+        Some(_) => {}
+    }
+    if named("hc_bundle") != Some(bundle) {
+        return Some(format!(
+            "this chain's bundle guest (hc_bundle {}) is not this build's v3 ({}): a private multisig spend needs bundle guest v3",
+            status["hc_bundle"].as_str().unwrap_or("null"),
+            word8_to_hex(&bundle)
+        ));
+    }
+    None
 }
 
 /// A proposal paying `amount` RAND to `to` from the account (§6.3 `prepare`): the chain checked,
@@ -323,7 +344,8 @@ pub fn assemble_witness(proposal: &Proposal, policy: &Policy, shares: &[Share]) 
 
 /// One share's `msauth` slot over `proposal` — its key, signature and signer-tree path, the
 /// signature verified natively first: one iteration of [`assemble_witness`]'s slot loop, with no
-/// threshold applied.
+/// threshold applied. Test-only (`tests/wallet_flow.rs`, the forced one-signature witness).
+#[doc(hidden)]
 pub fn slot_for(proposal: &Proposal, policy: &Policy, share: &Share) -> Result<Slot> {
     let msg = msauth::signing_message(&parse_binding(&proposal.binding)?);
     let pks = policy.pks();
@@ -354,8 +376,9 @@ fn prepared_of(proposal: &Proposal, tx: &Transaction) -> Result<Prepared> {
 /// `proving` (here or on a paired prover). The binding is required unchanged after.
 ///
 /// No expiry check: this takes no node. The CLI reads the head and refuses at or past
-/// `expires_at - 16` before calling it.
-pub async fn prove(proposal: &Proposal, policy: &Policy, shares: &[Share], proving: &Proving, profile: FriProfile) -> Result<Transaction> {
+/// `expires_at - 16` before calling it. `proof_cap` holds a paired prover's bundle reply: the
+/// chain's `max_proof_bytes` ([`wallet::proof_cap`] of `rand_getLimits`), as `send` does.
+pub async fn prove(proposal: &Proposal, policy: &Policy, shares: &[Share], proving: &Proving, profile: FriProfile, proof_cap: usize) -> Result<Transaction> {
     pure::check_proposal(&json(proposal), &zeroize::Zeroizing::new(json(&policy.pure())))?;
     let words = zeroize::Zeroizing::new(assemble_witness(proposal, policy, shares)?);
     let mut tx = Transaction::decode(&hex::decode(&proposal.tx)?)?;
@@ -363,7 +386,7 @@ pub async fn prove(proposal: &Proposal, policy: &Policy, shares: &[Share], provi
     let domain = BindingDomain::for_version(proposal.binding_domain, Hash::from_hex(&proposal.genesis)?);
     let prepared = prepared_of(proposal, &tx)?;
     let (p, w) = (&prepared, &words[..]);
-    wallet::prove_transaction_by(&mut tx, &domain, |b| async move { proving.prove(p, AuthWitness::Multisig(w), &b, profile, gas::MAX_PROOF_BYTES).await }).await?;
+    wallet::prove_transaction_by(&mut tx, &domain, |b| async move { proving.prove(p, AuthWitness::Multisig(w), &b, profile, proof_cap).await }).await?;
     if tx.binding(&domain) != binding {
         return Err(anyhow!("the proved transaction no longer hashes to the proposal's binding (wallet bug)"));
     }
@@ -426,7 +449,7 @@ pub fn load_tx(path: &Path) -> Result<Transaction> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use randprotocol_core::Keypair;
+    use randprotocol_core::{gas, Keypair};
 
     fn keys(n: u8) -> Vec<Keypair> {
         (0..n).map(|i| Keypair::from_seed([0x40 + i; 32]).unwrap()).collect()
@@ -512,6 +535,22 @@ mod tests {
         let e = sign(&prop, &p, &k[0], &[stranger]).unwrap_err().to_string();
         assert!(e.contains("not an expected recipient"), "{e}");
         assert!(shown.iter().any(|l| l.contains("the payee was NOT checked")), "{shown:?}");
+    }
+
+    /// `require_multisig_chain` names which condition failed: no multisig guest (null), another
+    /// build's guest, or a bundle guest other than v3.
+    #[test]
+    fn the_multisig_chain_refusal_names_the_condition() {
+        let (ours, v3) = (word8_to_hex(&ZkExecutor::hc_auth_multisig()), word8_to_hex(&ZkExecutor::hc_hidden_bundle_v3()));
+        let other = "11".repeat(32);
+        let status = |msauth: serde_json::Value, bundle: &str| serde_json::json!({ "hc_auth_multisig": msauth, "hc_bundle": bundle });
+        assert_eq!(multisig_chain_refusal(&status(serde_json::json!(ours), &v3)), None);
+        let null = multisig_chain_refusal(&status(serde_json::Value::Null, &v3)).unwrap();
+        assert!(null.contains("names no hc_auth_multisig (null)"), "{null}");
+        let theirs = multisig_chain_refusal(&status(serde_json::json!(other), &v3)).unwrap();
+        assert!(theirs.contains(&format!("hc_auth_multisig is {other}, another build's guest")) && theirs.contains(&ours), "{theirs}");
+        let bundle = multisig_chain_refusal(&status(serde_json::json!(ours), &other)).unwrap();
+        assert!(bundle.contains("needs bundle guest v3") && bundle.contains(&other), "{bundle}");
     }
 
     /// Review finding 4: a single-key wallet seals dummy outputs under a throwaway key, so signers
@@ -624,14 +663,14 @@ mod tests {
         let (p, k) = two_of_three();
         let prop = proposal(&p);
         let shares: Vec<Share> = [2usize, 0].iter().map(|&i| sign(&prop, &p, &k[i], &[]).unwrap().0).collect();
-        let tx = prove(&prop, &p, &shares, &Proving::Emulated, FriProfile::Test).await.unwrap();
+        let tx = prove(&prop, &p, &shares, &Proving::Emulated, FriProfile::Test, gas::MAX_PROOF_BYTES).await.unwrap();
         let b = tx.bundle.as_ref().unwrap();
         assert!(!b.proof.is_empty(), "the bundle proof");
         let binding = parse_binding(&prop.binding).unwrap();
         assert_eq!(tx.binding(&BindingDomain::ChainId), binding, "proved over the proposal's binding");
         let (shape, c, _) = StubExecutor.auth_header(&b.auth_proof).unwrap();
         assert_eq!((shape, c), (AuthShape::Multisig, parse_word8(&prop.auth_commit).unwrap()));
-        let e = prove(&prop, &p, &shares[..1], &Proving::Emulated, FriProfile::Test).await.unwrap_err().to_string();
+        let e = prove(&prop, &p, &shares[..1], &Proving::Emulated, FriProfile::Test, gas::MAX_PROOF_BYTES).await.unwrap_err().to_string();
         assert!(e.contains("needs 2"), "{e}");
     }
 }

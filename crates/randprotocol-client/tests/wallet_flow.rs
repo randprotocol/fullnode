@@ -1328,13 +1328,24 @@ async fn a_private_multisig_receives_spends_rotates_and_refuses_one_signature_en
     let shares: Vec<Share> = [0usize, 2].iter().map(|&i| msig_private::sign(&prop, &policy, &k[i], std::slice::from_ref(&b.address)).unwrap().0).collect();
     phase("spend: prepared and signed by 0 and 2; proving (msauth tier 18 + bundle)");
     let slot = proving_slot().await;
-    let tx = msig_private::prove(&prop, &policy, &shares, &cpu, FriProfile::Test).await.unwrap();
+    let tx = msig_private::prove(&prop, &policy, &shares, &cpu, FriProfile::Test, gas::MAX_PROOF_BYTES).await.unwrap();
     drop(slot);
     phase("spend: proved");
     let auth = &tx.bundle.as_ref().unwrap().auth_proof;
     let hdr = decode_canonical(auth).unwrap();
     let s = ZkExecutor::msauth_heights();
-    assert_eq!((hdr.tier.0, hdr.keccak_log_height, hdr.modq_log_height, hdr.mem_log_height), (s.tier, s.keccak_log_height, s.modq_log_height, s.mem_log_height), "R-hide");
+    // R-hide: every declared height — all eight header fields — is the pinned shape.
+    let declared = randprotocol_zkvm::executor::MsauthShape {
+        tier: hdr.tier.0,
+        program_log_height: hdr.program_log_height,
+        input_log_height: hdr.input_log_height,
+        keccak_log_height: hdr.keccak_log_height,
+        sha256_log_height: hdr.sha256_log_height,
+        modq_log_height: hdr.modq_log_height,
+        public_log_height: hdr.public_log_height,
+        mem_log_height: hdr.mem_log_height,
+    };
+    assert_eq!(declared, s, "R-hide");
     assert_eq!(hdr.public_values[randprotocol_zkvm::tables::cpu::pv::GAS], gas::msauth_gas_limit_pin(), "R-gas");
     let h = rpc.send_transaction(&tx).await.expect("a 2-of-3 spend is admitted");
     rpc.wait_for_transaction(&h, Duration::from_secs(120)).await.expect("and commits");
@@ -1348,7 +1359,7 @@ async fn a_private_multisig_receives_spends_rotates_and_refuses_one_signature_en
     // ---- one signature: refused by the wallet, and by the node when forced ----
     let prop1 = msig_private::prepare(&rpc, &policy, &mut store, &b.address, UNITS_PER_RAND, "", fee, CHAIN_ID).await.unwrap();
     let one = vec![msig_private::sign(&prop1, &policy, &k[0], std::slice::from_ref(&b.address)).unwrap().0];
-    let e = msig_private::prove(&prop1, &policy, &one, &cpu, FriProfile::Test).await.unwrap_err().to_string();
+    let e = msig_private::prove(&prop1, &policy, &one, &cpu, FriProfile::Test, gas::MAX_PROOF_BYTES).await.unwrap_err().to_string();
     assert!(e.contains("1 signature") && e.contains("needs 2"), "{e}");
     phase("one signature: the wallet refuses; forcing a sentinel proof (msauth tier 18 + bundle)");
     // Forced: the witness with one active slot, proved anyway, publishes the sentinel.
@@ -1394,7 +1405,7 @@ async fn a_private_multisig_receives_spends_rotates_and_refuses_one_signature_en
     let shares: Vec<Share> = [1usize, 2].iter().map(|&i| msig_private::sign(&sweep, &policy, &k[i], std::slice::from_ref(&next.wallet().address)).unwrap().0).collect();
     phase("rotate: sweep prepared and signed by 1 and 2; proving (msauth tier 18 + bundle)");
     let slot = proving_slot().await;
-    let tx = msig_private::prove(&sweep, &policy, &shares, &cpu, FriProfile::Test).await.unwrap();
+    let tx = msig_private::prove(&sweep, &policy, &shares, &cpu, FriProfile::Test, gas::MAX_PROOF_BYTES).await.unwrap();
     drop(slot);
     phase("rotate: proved");
     assert_eq!(decode_canonical(&tx.bundle.as_ref().unwrap().auth_proof).unwrap().public_values[randprotocol_zkvm::tables::cpu::pv::GAS], gas::msauth_gas_limit_pin());

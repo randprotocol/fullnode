@@ -1533,7 +1533,12 @@ async fn multisig_private_cmd(prover: bool, cpu: bool, key: &Path, max_prover_fe
             let profile = profile_of(rpc).await?;
             let proving = proving_for(prover, cuda, cpu, key, max_prover_fee)?;
             eprintln!("proving the auth proof on this machine (tier 18: minutes, at least 48 GB), then the bundle");
-            let tx = mp::prove(&proposal, &policy, &shares, &proving, profile).await?;
+            // A paired prover's bundle reply is held to the chain's proof cap, as `send` holds it.
+            let cap = match proving {
+                Proving::Remote(_) => wallet::proof_cap(rpc.limits().await?.as_ref()),
+                _ => randprotocol_core::gas::MAX_PROOF_BYTES,
+            };
+            let tx = mp::prove(&proposal, &policy, &shares, &proving, profile, cap).await?;
             mp::save_tx(&tx, &out)?;
             let bundle = tx.bundle.as_ref().context("the proved transaction carries no bundle")?;
             println!("wrote {}: bundle proof {} bytes, auth proof {} bytes", out.display(), bundle.proof.len(), bundle.auth_proof.len());
