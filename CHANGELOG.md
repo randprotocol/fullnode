@@ -27,9 +27,10 @@ each chain:
   walk (`verified_head` META row, bound to the build sha); `--verify-chain replay` forces it. The
   first start of v0.8.0 itself still runs the full check.
 - **Verify cache** (node-only): `rand-node run` remembers the `Ok` verdict of each STARK verifier
-  under a digest of all its inputs (16 384 entries, FIFO), so an aggregate admission has seen is
+  under a digest of all its inputs (32 768 entries, FIFO), so an aggregate admission has seen is
   verified once per node, not three times on the leader and twice on a follower. CLI tools are
-  unchanged.
+  unchanged. The admission verified set (B5) is folded in: the ledger never decodes a proof at
+  apply, and the cache holds 32 768 verdicts.
 - **Off-loop proposal apply** (node-only): an incoming proposal's apply runs on a blocking thread
   (at most 4 at once, up to 8 waiting behind a parent, at most 2 of them per proposer, each past
   HotStuff's orphan checks) while the prechecks, `on_proposal`'s checks and the insert stay on the
