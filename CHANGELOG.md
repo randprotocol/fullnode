@@ -12,20 +12,17 @@ stopped at v0.4 until 2026-09-30, when the entries v0.5 to v0.6.7 were written f
 
 ## Unreleased
 
-## v0.8.0 — TAG_DATE (draft: chain 20 by a flag-day roll; the gated features at chain 21's cut)
+## v0.8.0 — TAG_DATE (chain 21 onward)
 
-Tag `TAG_SHA` (fullnode `main`, vendoring circuits `56b7061`, `feat/scan-compact`: `4a244b6`'s
-tree aggregation plus the scan heads' `viewing.rs`). A minor bump, not a patch: the release
-carries a node-only wire change (compact blocks) and the consensus rules a new chain needs. What reaches each chain:
+Tag `TAG_SHA` (fullnode `main`, vendoring circuits `d217252`: constraint set 9 — rVM phase 4's
+Merkle spans and the MODQ chip — with tree aggregation and the scan heads' `viewing.rs`; the
+branch pins `d217252`). A minor bump, not a patch: the release carries a new constraint set, a
+node-only wire change (compact blocks) and the consensus rules a new chain needs. What reaches
+each chain:
 
-- **Chain 20, rolled as a flag day:** no consensus rule, genesis or bundle verifier key changes
-  on chain 20 (`inner_vk_digest` `346ee184…` is unchanged and the RV32 wallet machine keeps
-  upstream's quotient layout, so every bundle proof verifies as before). The one wire change is
-  compact blocks: roll observers and archives first, then every validator at once with
-  `deploy/roll-all.sh`; a mixed validator set can stop commits. Chain 20 gets the validator hot
-  path's node-only half (`SharedSet`, propose replay, verify workers, parallel QC verification),
-  the compact-block follow-ups, the aggregate daemon's retry loop and the storage checks. Every
-  gated action below is refused there by name.
+- **Chain 21 onward; not for chain 20.** Constraint set 9 (the MODQ chip) changes every verifier
+  key and the proof encoding: this build refuses chains 18–20 at startup
+  (`CHAINS_THIS_BUILD_CANNOT_RUN`). Chain 20 stays on v0.7.x until chain 21's cut.
 - **Startup checkpoint** (node-only): a restart of the same clean build skips the startup chain
   walk (`verified_head` META row, bound to the build sha); `--verify-chain replay` forces it. The
   first start of v0.8.0 itself still runs the full check.
@@ -48,14 +45,27 @@ carries a node-only wire change (compact blocks) and the consensus rules a new c
   consensus half: block apply 495.0 → 55.5 ms at 2.4 M nullifiers, and 56.1 ms at 80 M,
   `docs/node-hardware.md` §7).
   `deploy/cut-chain21-genesis.sh` sets which of these the cut carries.
+- **Private multisig** (`hc_auth_multisig`): an M-of-N Dilithium2 policy hidden inside a second
+  auth guest (`9705f8e2…8247`, tier 18, the MODQ chip; `M_MAX` 3, `N_MAX` 16). Admission tells
+  the two auth guests apart by the proof's pinned shape, with no wire, txid or binding change;
+  the chain learns only "multisig-authorised". The multisig auth proof's Production size is
+  unmeasured (estimated ≥ 3.4 MB; a genesis naming the guest needs `max_proof_bytes` ≥ 4 MiB,
+  and chain 21 is cut at 6 MiB with 19 MiB blocks: the decided chain-21 values, asserted by the
+  cut script on `feat/chain21-msauth` (`a7379a6c`), which merges after this branch). Wallet:
+  `rand multisig-private new-policy|address|balance|prepare|check|sign|prove|submit`
+  (`docs/cli.md`); the auth proof is proved locally (tier 18, ≥ 48 GB), the bundle proof may go
+  to a paired prover. The signer checks are the pure crate `randprotocol-msig`
+  (`randprotocol_client::multisig_private`, vendored by the clients' core). RPC: `rand_status`
+  and `rand_getLimits` serve `hc_auth_multisig` (hex, `null` without it), `rand_status.msauth_key`
+  where the key came from. Every validator loads the pinned msauth verifier key,
+  `msauth-vk-production.bin` (23 754 B, SHA-256 `68facb06…cd30`), from beside its binary at
+  startup and in `rand-node verify`, and refuses to start without it; `deploy/roll-all.sh`
+  installs it (fifth argument or `MSAUTH_VK`). **Constraint set 9:** every verifier key and the
+  proof encoding change, so this build runs chain 21 on and refuses chains 18–20.
 - **Aggregate wire change, every chain:** `Action::Aggregate` gains `payout_total` and `layout`,
   so its encoding, txid and signing domain move. No chain has carried an aggregate.
-- **Rollback:** a database opened by this build has the `perp_inputs` column family; run
-  `rand-node db drop-perp-inputs --datadir <dir>` before going back to v0.7.1 (refused on a perps
-  chain's database). The startup checkpoint is one `meta` key (`verified_head`), not a column
-  family: v0.7.1 ignores it and needs no step, and the next start of v0.8.0 after a rollback runs
-  the full check once — but a v0.7.1 truncate does not clear the row, so after rolling back,
-  truncating and rolling forward, start v0.8.0 once with `--verify-chain replay`.
+- **Rollback:** going back to v0.7.1 is possible only on a chain v0.7.1 runs (18–20); a chain-21
+  database cannot be rolled back across constraint set 9.
 
 Assets, when signed: `rand-node`, `rand`, `rand-prover`, `SHA256SUMS`, `SHA256SUMS.sig`.
 
