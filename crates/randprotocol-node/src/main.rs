@@ -2913,7 +2913,10 @@ async fn main() -> Result<()> {
             let mode: VerifyMode = mode.parse().map_err(|e: String| anyhow::anyhow!(e))?;
             let (gs, executor) = node::load_genesis(&datadir)?;
             refuse_test_fri_profile(&gs.fri_profile, test_profile_allowed)?;
-            node::refuse_chains_this_build_cannot_run(&gs)?;
+            // What `run` checks first (it includes `refuse_chains_this_build_cannot_run`): a
+            // genesis naming another build's guest is refused here, before any block is read, so
+            // it is never reported CORRUPT and `--repair` never truncates on it.
+            node::check_build_runs_genesis(&gs, &ZkExecutor::known_hc_bundles()).map_err(|e| anyhow::anyhow!("{e:#}; refusing to verify"))?;
             // The pinned msauth key, loaded as `run` loads it: a replay must never build it.
             randprotocol_node::msauth_key::verify_startup(&gs, msauth_vk, executor.as_ref()).map_err(|e| anyhow::anyhow!("{e:#}; refusing to verify"))?;
             let storage = Storage::open(&datadir)?;

@@ -128,6 +128,25 @@ pub fn load_msauth_key(
     Ok(MsauthKeySource::Loaded)
 }
 
+/// What a `--build-msauth-key` build's outcome (`ConfidentialExecutor::build_msauth_key`: the
+/// built key's SHA-256 against this build's pin) means for the node. A match is logged. A
+/// mismatch refuses a **validator** — it would vote with a key the fleet's pinned blob does not
+/// match (a dependency, constraint-set or profile drift) — and `node::start_with` returns the
+/// error before anything starts; a non-validator (a development node) logs it and carries on.
+pub fn built_key_verdict(built: Result<(), String>, validator: bool) -> Result<()> {
+    match built {
+        Ok(()) => {
+            tracing::info!("msauth verifier key built; its sha256 is this build's pin");
+            Ok(())
+        }
+        Err(e) if validator => bail!("--build-msauth-key: {e}; a validator does not vote with an unpinned msauth key: refusing to start"),
+        Err(e) => {
+            tracing::error!("msauth verifier key built, but {e}");
+            Ok(())
+        }
+    }
+}
+
 /// `rand-node keygen-msauth-vk --profile <p> --out <file>`: build the key (a big host: 78.6 s,
 /// ~4 GB at Production), write the blob to a new file (never over an existing one) and return
 /// its sha256 and size.
@@ -459,6 +478,18 @@ mod tests {
         }
     }
 
+    /// `--build-msauth-key`'s outcome: a key matching the pin is fine for anyone; a mismatch
+    /// refuses a validator, naming the digests, and only logs on a non-validator.
+    #[test]
+    fn a_built_key_off_the_pin_refuses_a_validator_and_only_logs_otherwise() {
+        let mismatch = || Err("the msauth key built here has sha256 aa, not this build's pin bb: the pinned blob and this build disagree".to_string());
+        assert!(built_key_verdict(Ok(()), true).is_ok());
+        assert!(built_key_verdict(Ok(()), false).is_ok());
+        assert!(built_key_verdict(mismatch(), false).is_ok(), "a development node carries on");
+        let e = built_key_verdict(mismatch(), true).unwrap_err().to_string();
+        assert!(e.contains("sha256 aa, not this build's pin bb") && e.contains("refusing to start"), "{e}");
+    }
+
     /// `rand-node verify` on a multisig chain loads the pinned blob as `run` does: `Loaded`, and
     /// no key built (neither the machine's nor the single-flight slot's); a missing blob is the
     /// same loud error naming the path and the pin, even though `verify` has no build flag.
@@ -470,6 +501,7 @@ mod tests {
         std::fs::write(dir.path().join("genesis.json"), msauth_genesis(&key, true).to_json()).unwrap();
         let (gs, node_ex) = crate::node::load_genesis(dir.path()).unwrap();
         assert_eq!(verify_startup(&gs, Some(blob.clone()), node_ex.as_ref()).unwrap(), MsauthKeySource::Loaded);
+        assert!(node_ex.auth_multisig_key_ready(), "the load reached the inner executor through the AggExecutor");
         // The same load into a bare executor, to count builds.
         let ex = ZkExecutor::new(FriProfile::Test);
         ex.enable_auth_multisig();

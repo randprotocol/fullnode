@@ -378,7 +378,7 @@ fn zkvm_profile(profile: randprotocol_core::types::FriProfile) -> FriProfile {
 /// 18/19/20. Phase 3 (circuits `recursion/docs/06-phase3-fold-reduce.md`, docs/02 "The
 /// N-economics at the phase-3 tiers") keeps the sets: production N=1 at 20 (585 960 rows), N=2–3
 /// at 21, N=4–5 at 22 — and stops there, at the reduce chip's N ceiling (production N ≤ 5,
-/// `check_n_ceiling`; tier 22 would hold N ≤ 7 by cpu rows); test N=1 at 18, N=2–3 at 19, N=4–6 at
+/// `check_n_ceiling`; (at phase 3) tier 22 would have held N ≤ 7 by cpu rows); test N=1 at 18, N=2–3 at 19, N=4–6 at
 /// 20 (by the row model; not measured). The rate-¼ profile (docs/07) moves no tier.
 ///
 /// rVM phase 4 (Merkle spans, circuits `recursion/docs/09-phase4-spans.md` §5, re-pinned with the

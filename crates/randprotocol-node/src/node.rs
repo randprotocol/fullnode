@@ -2483,6 +2483,15 @@ pub async fn start_with(cfg: NodeConfig, rpc_options: RpcOptions, net_options: N
     let msauth_source = crate::msauth_key::startup(&gs, &cfg.msauth, bare_executor.as_ref())
         .map_err(|e| anyhow!("{e:#}; refusing to start"))?;
     let msauth_builder = bare_executor.clone();
+    // `--build-msauth-key` on a validator: built here, before anything starts, and a key whose
+    // digest is not the pin refuses the start (`msauth_key::built_key_verdict`). A development
+    // (non-validator) node builds it in the warm thread below and logs a mismatch.
+    let build_in_warm_thread = msauth_source == crate::msauth_key::MsauthKeySource::Built && !cfg.validator;
+    if msauth_source == crate::msauth_key::MsauthKeySource::Built && cfg.validator {
+        let b = bare_executor.clone();
+        let built = tokio::task::spawn_blocking(move || b.build_msauth_key()).await.context("the msauth key build panicked")?;
+        crate::msauth_key::built_key_verdict(built, true)?;
+    }
     // Before RocksDB opens its ~1000 table files (issue #41): a node started under the default
     // soft limit of 1024 ran out of descriptors and its RPC refused every connection.
     match crate::rlimit::raise_nofile_limit() {
@@ -2711,14 +2720,11 @@ pub async fn start_with(cfg: NodeConfig, rpc_options: RpcOptions, net_options: N
         let multisig = hs.committed_ledger().hc_auth_multisig().is_some();
         let ex = executor.clone();
         tokio::task::spawn_blocking(move || {
-            // `--build-msauth-key` with no key file (development only): the build, first. A loaded
-            // key needs nothing here; on the bare executor, since the caching wrapper's default
-            // would do nothing.
-            if msauth_source == crate::msauth_key::MsauthKeySource::Built {
-                match msauth_builder.build_msauth_key() {
-                    Ok(()) => tracing::info!("msauth verifier key built; its sha256 is this build's pin"),
-                    Err(e) => tracing::error!("msauth verifier key built, but {e}"),
-                }
+            // `--build-msauth-key` with no key file on a non-validator (development only): the
+            // build, first (a validator built it before starting). A loaded key needs nothing
+            // here; on the bare executor, since the caching wrapper's default would do nothing.
+            if build_in_warm_thread {
+                let _ = crate::msauth_key::built_key_verdict(msauth_builder.build_msauth_key(), false);
             }
             if multisig {
                 ex.warm_auth_multisig();

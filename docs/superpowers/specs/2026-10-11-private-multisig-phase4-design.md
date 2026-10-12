@@ -337,6 +337,13 @@ validator builds this key at startup**. The key is precomputed instead (§3.6).
 
 ### 3.6 The precomputed msauth verifier key (plan Task 2b)
 
+*Superseded in part (as shipped): the blob is the generic `machine::VerifierKeyBlob`
+(`{ format_version, profile, shape: VerifierKeyShape, constraint_set, common: postcard(CommonDataWire) }`),
+not a blake3-pinned `MsauthVkBlob`, and it is pinned by its **SHA-256**
+(`executor::msauth_vk::MSAUTH_VK_SHA256_PRODUCTION` / `_TEST`, checked on the raw bytes before
+anything decodes). The design text below keeps the original terms; the corrected ones are marked
+"as shipped".*
+
 **What the key is.** The vendored type is `p3_batch_stark::CommonData<Config>`, which has two fields:
 
 - `preprocessed: Option<GlobalPreprocessed>`: the global preprocessed **commitment** (a Merkle
@@ -349,19 +356,19 @@ and the 4 GB go. The metadata and the lookups are symbolic functions of the AIRs
 heights, cheap to recompute. All of it is deterministic in the msauth program, the pinned shape
 (`msauth_heights()`) and the FRI profile.
 
-**The blob.** `msauth-vk-<profile>.bin` is `postcard` of
+**The blob.** (Design; as shipped it is `VerifierKeyBlob`, see the note above.) `msauth-vk-<profile>.bin` is `postcard` of
 `MsauthVkBlob { version: 1, profile, shape: MsauthShape, hc: Word8, commitment: Commitment<Config>, instances: Vec<Option<(usize, usize, usize)>>, matrix_to_instance: Vec<usize> }`.
 Its size is a few KB at most: a Merkle cap of a few 32-byte digests plus small vectors. Task 2b
 measures it.
 
 **Trust.** A wrong commitment could let a forged multisig proof verify, so the blob is
 consensus-critical, like `hc`. Its blake3 is pinned in `tests/guest_provenance.rs` for both
-profiles, and `warm_auth_multisig` refuses a blob whose digest is not the pinned one, or whose
+profiles (as shipped: its SHA-256, in `msauth_vk::MSAUTH_VK_SHA256_*`), and `warm_auth_multisig` refuses a blob whose digest is not the pinned one, or whose
 `shape`, `hc` or profile is not this build's.
 
 **Building it.** `rand-node keygen-msauth-vk --profile production --out <file>` runs on a big host
 and does the full build once (78.6 s, about 4 GB). It extracts the commitment and metadata from the
-built `CommonData` and writes the blob, printing its blake3.
+built `CommonData` and writes the blob, printing its blake3 (as shipped: its SHA-256).
 
 **Loading it.** `ZkExecutor::install_msauth_vk(blob)` checks the digest, profile, `hc` and shape.
 It then rebuilds the lookups and per-instance metadata from the AIRs: a `sync-zkvm.sh` patch to
@@ -380,9 +387,10 @@ executable). A developer can override it with `--msauth-vk <path>` or the enviro
 
 **Startup fails loudly.** On a chain with `hc_auth_multisig`, `node::warm` loads the blob before
 any other key. If the blob is missing, undecodable, or its blake3 is not the pin in
-`tests/guest_provenance.rs`, the node **refuses to start**. The error names the path and the
+`tests/guest_provenance.rs` (as shipped: its SHA-256 is not `msauth_vk::pin(profile)`), the node
+**refuses to start**. The error names the path and the
 expected digest: "msauth verifier key: /usr/local/bin/msauth-vk-production.bin missing (expected
-blake3 <hex>); install it from the release, or run with --build-msauth-key on a ≥ 8 GB host".
+blake3 <hex>) (as shipped: `expected sha256 <hex>`); install it from the release, or run with --build-msauth-key on a ≥ 8 GB host".
 There is **no automatic fallback build**. A build happens only behind the explicit
 `--build-msauth-key` flag, for development on a laptop, never by default, because the fleet is
 4 GB.
@@ -400,7 +408,7 @@ randprotocol-d7. The plan sends d7 the copy-and-check snippet; it does not write
 binaries it already handles (copy to `/root/*.new`, sha256 check, install to `/usr/local/bin`):
 
 - copy it to `/root/msauth-vk-production.bin.new`;
-- check its blake3 against the pin;
+- check its blake3 against the pin (as shipped: its SHA-256);
 - install it to `/usr/local/bin/msauth-vk-production.bin`.
 
 v0.8.0 ships `msauth-vk-production.bin` as a signed release asset, listed in `SHA256SUMS`.
