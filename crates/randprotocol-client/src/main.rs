@@ -937,7 +937,8 @@ enum MultisigPrivateCmd {
         store: Option<PathBuf>,
     },
     /// A signer's side, offline: check the proposal, print what it pays on stderr and this key's
-    /// `index:hex` share on stdout.
+    /// `index:hex` share on stdout. Name the payee with `--expect-to`: without it the payee is
+    /// NOT checked (the coordinator could be paying itself), and the output says so.
     Sign {
         #[arg(long)]
         proposal: PathBuf,
@@ -946,6 +947,10 @@ enum MultisigPrivateCmd {
         /// A `rand-node keygen` key file.
         #[arg(long)]
         key: PathBuf,
+        /// The address the payee gave you (`rand1…`), out of band. Repeatable: every output that
+        /// moves value and is not change must pay one of them, or nothing is signed.
+        #[arg(long = "expect-to", value_name = "ADDR")]
+        expect_to: Vec<String>,
     },
     /// Check a proposal against the policy and print what it pays; signs nothing.
     Check {
@@ -953,6 +958,9 @@ enum MultisigPrivateCmd {
         proposal: PathBuf,
         #[arg(long)]
         policy: PathBuf,
+        /// The address the payee gave you (`rand1…`), as for `sign`. Repeatable.
+        #[arg(long = "expect-to", value_name = "ADDR")]
+        expect_to: Vec<String>,
     },
     /// Prove the proposal with at least T signatures: the auth proof on this machine (tier 18),
     /// then the bundle. Writes the transaction.
@@ -1234,6 +1242,11 @@ fn parse_address(s: &str) -> Result<ShieldedAddress> {
     ShieldedAddress::parse(s).map_err(|e| anyhow::anyhow!("{e}")).context("invalid shielded address")
 }
 
+/// `multisig-private check|sign --expect-to ADDR…`: each a `rand1…` address, a bad one named.
+fn parse_expect_to(addrs: &[String]) -> Result<Vec<ShieldedAddress>> {
+    addrs.iter().map(|a| parse_address(a.trim()).with_context(|| format!("--expect-to {a}"))).collect()
+}
+
 /// `rand send`'s TO argument, and `rand contacts add`'s TO: a `rand1…` address first, then a
 /// `randpay:` link, then a saved contact's name — in that order, so a name that happens to
 /// collide with neither shape is still refused with one clear error rather than three swallowed
@@ -1431,11 +1444,22 @@ async fn multisig_private_cmd(prover: bool, cpu: bool, key: &Path, max_prover_fe
             }
             policy.save(&out)?;
             println!("wrote {} (holds the account's secret: keep it private, give it to the signers out of band)", out.display());
-            println!("address: {}\nfingerprint: {}", policy.wallet().address, policy.fingerprint());
+            let address = policy.wallet().address;
+            println!(
+                "address: {address}\nfingerprint: {}\nowner fingerprint: {}",
+                policy.fingerprint(),
+                randprotocol_client::multisig_private::owner_fingerprint_of(&address)
+            );
         }
         MultisigPrivateCmd::Address { policy } => {
             let policy = Policy::load(&policy)?;
-            println!("address: {}\nfingerprint: {}\npolicy: {}", policy.wallet().address, policy.fingerprint(), word8_to_hex(&policy.policy_hash()));
+            let address = policy.wallet().address;
+            println!(
+                "address: {address}\nfingerprint: {}\nowner fingerprint: {}\npolicy: {}",
+                policy.fingerprint(),
+                randprotocol_client::multisig_private::owner_fingerprint_of(&address),
+                word8_to_hex(&policy.policy_hash())
+            );
         }
         MultisigPrivateCmd::Balance { policy, store } => {
             let store_path = store.unwrap_or_else(|| policy_store_path(&policy));
@@ -1456,30 +1480,33 @@ async fn multisig_private_cmd(prover: bool, cpu: bool, key: &Path, max_prover_fe
             };
             let chain_id = rpc.chain_id().await?;
             let mut store = NoteStore::load(&store_path);
-            let made = match (&to, &amount, &sweep_to) {
-                (Some(to), Some(amount), None) => mp::prepare(rpc, &policy, &mut store, &parse_address(to)?, parse_amount(amount)?, &memo, fee, chain_id).await,
-                (None, None, Some(to)) => mp::prepare_sweep(rpc, &policy, &mut store, &parse_address(to)?, fee, chain_id).await,
-                _ => Err(anyhow!("give --to with --amount, or --sweep-to")),
+            let payee = parse_address(to.as_ref().or(sweep_to.as_ref()).context("give --to with --amount, or --sweep-to")?)?;
+            let made = match &amount {
+                Some(amount) => mp::prepare(rpc, &policy, &mut store, &payee, parse_amount(amount)?, &memo, fee, chain_id).await,
+                None => mp::prepare_sweep(rpc, &policy, &mut store, &payee, fee, chain_id).await,
             };
             store.save(&store_path)?;
             let proposal = made?;
             mp::save_proposal(&proposal, &out)?;
-            print_proposal_summary(&mp::check(&proposal, &policy)?);
+            // The coordinator's own check names the payee it was given.
+            print_proposal_summary(&mp::check(&proposal, &policy, std::slice::from_ref(&payee))?);
             println!("wrote {}: gather {} or more signatures and prove before height {}", out.display(), policy.threshold, proposal.expires_at);
         }
-        MultisigPrivateCmd::Check { proposal, policy } => {
+        MultisigPrivateCmd::Check { proposal, policy, expect_to } => {
+            let expect_to = parse_expect_to(&expect_to)?;
             let (proposal, policy) = (mp::load_proposal(&proposal)?, Policy::load(&policy)?);
-            print_proposal_summary(&mp::check(&proposal, &policy)?);
+            print_proposal_summary(&mp::check(&proposal, &policy, &expect_to)?);
             match rpc.head().await.ok().and_then(|h| h["height"].as_u64()) {
                 Some(head) if head + EXPIRY_MARGIN >= proposal.expires_at => println!("expired or about to: the head is {head}, the proposal expires at {} — prepare again", proposal.expires_at),
                 Some(head) => println!("ok: the head is {head}, {} blocks left", proposal.expires_at - head),
                 None => println!("ok (no node answered: expiry not compared with the head)"),
             }
         }
-        MultisigPrivateCmd::Sign { proposal, policy, key } => {
+        MultisigPrivateCmd::Sign { proposal, policy, key, expect_to } => {
+            let expect_to = parse_expect_to(&expect_to)?;
             let (proposal, policy) = (mp::load_proposal(&proposal)?, Policy::load(&policy)?);
             let keypair = wallet::load_authority_key(&key)?;
-            let (share, lines) = mp::sign(&proposal, &policy, &keypair)?;
+            let (share, lines) = mp::sign(&proposal, &policy, &keypair, &expect_to)?;
             for line in lines {
                 eprintln!("{line}");
             }
@@ -2037,6 +2064,8 @@ async fn main() -> Result<()> {
             // works in a script; the fingerprint is for the person reading, on stderr.
             println!("{a}");
             eprintln!("fingerprint {}", a.fingerprint());
+            // What a private multisig's signer compares with the output that pays this address.
+            eprintln!("owner fingerprint {}", randprotocol_client::multisig_private::owner_fingerprint_of(&a));
             let u = PaymentUri { address: a, amount, asset, memo };
             let text = u.format();
             // Round-trips through the same parser a payee's wallet uses, so a bad `--amount` or
@@ -3931,6 +3960,12 @@ mod tests {
         assert!(parse(&["multisig-private", "prepare", "--policy", "p.json", "--to", "rand1x", "--sweep-to", "rand1y"]).is_err(), "one or the other");
         assert!(parse(&["multisig-private", "sign", "--proposal", "x", "--policy", "p", "--key", "k"]).is_ok());
         assert!(parse(&["multisig-private", "check", "--proposal", "x", "--policy", "p"]).is_ok());
+        let Ok(Cmd::MultisigPrivate(MultisigPrivateCmd::Sign { expect_to, .. })) =
+            parse(&["multisig-private", "sign", "--proposal", "x", "--policy", "p", "--key", "k", "--expect-to", "rand1a", "--expect-to", "rand1b"]) else { panic!() };
+        assert_eq!(expect_to, ["rand1a", "rand1b"]);
+        let Ok(Cmd::MultisigPrivate(MultisigPrivateCmd::Check { expect_to, .. })) =
+            parse(&["multisig-private", "check", "--proposal", "x", "--policy", "p", "--expect-to", "rand1a"]) else { panic!() };
+        assert_eq!(expect_to, ["rand1a"]);
         assert!(parse(&["multisig-private", "balance", "--policy", "p"]).is_ok());
         let Ok(Cmd::MultisigPrivate(MultisigPrivateCmd::Prove { signatures, .. })) =
             parse(&["multisig-private", "prove", "--proposal", "x", "--policy", "p", "--signature", "0:aa", "--signature", "2:bb"]) else { panic!() };
@@ -3966,6 +4001,44 @@ mod tests {
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
             assert!(multisig_private_cmd(false, false, Path::new("k"), "1", &rpc, MultisigPrivateCmd::Address { policy: path }).await.is_err(), "a readable policy is refused");
         }
+    }
+
+    /// `check` and `sign --expect-to`, offline, over the signer-check crate's committed vectors:
+    /// the real recipient passes and signs; the coordinator's substituted payee (every §6.5 check
+    /// passing) is refused by both under the expectation; `sign` without one still signs; a bad
+    /// address is named.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn expect_to_refuses_a_substituted_recipient_in_check_and_sign() {
+        use std::os::unix::fs::PermissionsExt;
+        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("../randprotocol-msig/tests/fixtures");
+        let dir = tempfile::tempdir().unwrap();
+        let copy = |name: &str| {
+            let to = dir.path().join(name);
+            std::fs::copy(fixtures.join(name), &to).unwrap();
+            std::fs::set_permissions(&to, std::fs::Permissions::from_mode(0o600)).unwrap();
+            to
+        };
+        let (policy, valid, stolen) = (copy("policy.json"), copy("proposal-valid.json"), copy("proposal-substituted-recipient.json"));
+        let expected: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(fixtures.join("expected.json")).unwrap()).unwrap();
+        let seeds: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(fixtures.join("signer-seeds.json")).unwrap()).unwrap();
+        let seed: [u8; 32] = hex::decode(seeds["members"][0].as_str().unwrap()).unwrap().try_into().unwrap();
+        let key = dir.path().join("signer.key.json");
+        wallet::write_authority_key(&Keypair::from_seed(seed).unwrap(), &key).unwrap();
+        let to = expected["recipient"].as_str().unwrap().to_string();
+        let rpc = RpcClient::new("http://127.0.0.1:1".to_string());
+        let run = |cmd| multisig_private_cmd(false, false, Path::new("k"), "1", &rpc, cmd);
+        let check = |proposal: &PathBuf, expect_to: Vec<String>| MultisigPrivateCmd::Check { proposal: proposal.clone(), policy: policy.clone(), expect_to };
+        let sign = |proposal: &PathBuf, expect_to: Vec<String>| MultisigPrivateCmd::Sign { proposal: proposal.clone(), policy: policy.clone(), key: key.clone(), expect_to };
+        run(check(&valid, vec![to.clone()])).await.unwrap();
+        run(sign(&valid, vec![to.clone()])).await.unwrap();
+        let want = expected["substituted_refusal"].as_str().unwrap();
+        assert_eq!(run(check(&stolen, vec![to.clone()])).await.unwrap_err().to_string(), want);
+        assert_eq!(run(sign(&stolen, vec![to.clone()])).await.unwrap_err().to_string(), want);
+        run(check(&stolen, vec![])).await.unwrap();
+        run(sign(&stolen, vec![])).await.expect("the coordinator-trusting mode still signs (and says the payee was NOT checked)");
+        let e = format!("{:#}", run(check(&valid, vec!["rand1nope".into()])).await.unwrap_err());
+        assert!(e.contains("--expect-to rand1nope"), "{e}");
     }
 
     /// `rand sync` scans from where the store left off; `--rescan` starts the store over first

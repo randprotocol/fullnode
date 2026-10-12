@@ -1,7 +1,9 @@
 //! The signer checks against the committed vectors (`tests/fixtures/*.json`, written by
 //! `fixtures_gen.rs`'s seeded generator and vendored by the clients' core). Loads the files;
 //! nothing inline.
-use randprotocol_msig::{check_proposal, sign, verify_share, ProposalSummary};
+use randprotocol_msig::{
+    check_proposal, check_proposal_expecting, owner_fingerprint_of_text, sign, sign_expecting, verify_share, ProposalSummary, NO_EXPECTATION,
+};
 
 fn fixture(name: &str) -> String {
     std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/").to_owned() + name).unwrap()
@@ -99,6 +101,67 @@ fn the_summary_names_nothing_a_signer_is_shown() {
     v["summary"] = serde_json::json!([format!("pay 10 RAND to {}", other.to_string()), "fee 0.001 RAND"]);
     let lines = check_proposal(&v.to_string(), &pol).unwrap().lines();
     assert_eq!(lines, want);
-    assert!(lines[..4].iter().all(|l| l.contains("(owner key verified; delivery key NOT verifiable from this proposal)")), "{lines:?}");
+    assert!(lines[2..6].iter().all(|l| l.contains("(owner key verified; delivery key NOT verifiable from this proposal)")), "{lines:?}");
     assert!(lines.iter().all(|l| !l.contains("rand1")), "no address is shown: {lines:?}");
+}
+
+/// The chain and genesis head the lines, then the loud payee warning (no expectation given).
+#[test]
+fn the_lines_name_the_chain_and_warn_when_no_payee_is_named() {
+    let s = check_proposal(&fixture("proposal-valid.json"), &fixture("policy.json")).unwrap();
+    assert!(!s.recipients_checked);
+    let lines = s.lines();
+    assert_eq!(serde_json::to_value(&lines).unwrap(), expected()["lines"]);
+    assert_eq!(lines[0], format!("chain 7 · genesis {}", "0".repeat(64)));
+    assert_eq!(lines[1], NO_EXPECTATION);
+    assert!(lines[1].contains("no expected recipient given: the payee was NOT checked"));
+    assert_eq!(lines.iter().filter(|l| l.contains("NOT checked")).count(), 1, "said once");
+}
+
+/// Naming the real recipient: the payment line says which address it matches, the warning goes,
+/// the dummies and the change are not held to it.
+#[test]
+fn naming_the_recipient_marks_the_payment_and_drops_the_warning() {
+    let e = expected();
+    let to = e["recipient"].as_str().unwrap();
+    let s = check_proposal_expecting(&fixture("proposal-valid.json"), &fixture("policy.json"), &[to]).unwrap();
+    assert_eq!(serde_json::to_value(&s).unwrap(), e["summary_expecting_recipient"]);
+    assert!(s.recipients_checked);
+    let fp = randprotocol_core::notes::ShieldedAddress::parse(to).unwrap().fingerprint().to_string();
+    assert_eq!(s.outputs.iter().map(|o| o.matches.clone()).collect::<Vec<_>>(), vec![None, None, Some(fp.clone()), None]);
+    let lines = s.lines();
+    assert_eq!(serde_json::to_value(&lines).unwrap(), e["lines_expecting_recipient"]);
+    assert!(lines[3].contains(&format!("matches {fp}")) && lines[3].contains("delivery key NOT verifiable"), "{lines:?}");
+    assert!(lines.iter().all(|l| !l.contains("NOT checked")), "{lines:?}");
+    assert_eq!(owner_fingerprint_of_text(to).unwrap(), e["recipient_owner_fingerprint"].as_str().unwrap());
+    assert!(lines[3].contains(e["recipient_owner_fingerprint"].as_str().unwrap()));
+}
+
+/// The coordinator's theft: the payment re-made to its own key, every §6.5 check passes — and
+/// naming the recipient the signer meant refuses it, naming the output and the key it pays.
+#[test]
+fn a_substituted_recipient_passes_the_checks_and_is_refused_only_under_an_expectation() {
+    let (prop, pol) = (fixture("proposal-substituted-recipient.json"), fixture("policy.json"));
+    let plain = check_proposal(&prop, &pol).unwrap();
+    assert!(!plain.recipients_checked && plain.lines()[1] == NO_EXPECTATION);
+    let to = expected()["recipient"].as_str().unwrap().to_string();
+    let e = check_proposal_expecting(&prop, &pol, &[&to]).unwrap_err().to_string();
+    let want = format!("output 2 pays {}, not an expected recipient", plain.outputs[2].owner_fingerprint);
+    assert_eq!(e, want);
+    assert_eq!(e, expected()["substituted_refusal"].as_str().unwrap());
+    let (members, _) = seeds();
+    assert_eq!(sign_expecting(&prop, &pol, &members[0], &[&to]).unwrap_err().to_string(), want, "no share for it");
+    assert!(sign(&prop, &pol, &members[0]).is_ok(), "the coordinator-trusting mode still signs");
+}
+
+/// A pasted address that does not parse is refused naming its index; an empty list is no
+/// expectation.
+#[test]
+fn a_malformed_expected_recipient_is_refused_by_index() {
+    let (prop, pol) = (fixture("proposal-valid.json"), fixture("policy.json"));
+    let to = expected()["recipient"].as_str().unwrap().to_string();
+    let e = check_proposal_expecting(&prop, &pol, &[to.as_str(), "rand1nope"]).unwrap_err().to_string();
+    assert!(e.starts_with("expected recipient 1 is not a shielded address"), "{e}");
+    assert!(!check_proposal_expecting::<&str>(&prop, &pol, &[]).unwrap().recipients_checked);
+    assert!(owner_fingerprint_of_text("rand1nope").is_err());
 }

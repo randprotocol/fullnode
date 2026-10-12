@@ -53,7 +53,8 @@ each chain:
   and chain 21 is cut at 6 MiB with 19 MiB blocks: the decided chain-21 values, asserted by the
   cut script on `feat/chain21-msauth` (`a7379a6c`), which merges after this branch). Wallet:
   `rand multisig-private new-policy|address|balance|prepare|check|sign|prove|submit`
-  (`docs/cli.md`); the auth proof is proved locally (tier 18, ≥ 48 GB), the bundle proof may go
+  (`docs/cli.md`), where `check`/`sign --expect-to <address>` refuse a proposal paying anyone but
+  the named payee; the auth proof is proved locally (tier 18, ≥ 48 GB), the bundle proof may go
   to a paired prover. The signer checks are the pure crate `randprotocol-msig`
   (`randprotocol_client::multisig_private`, vendored by the clients' core). RPC: `rand_status`
   and `rand_getLimits` serve `hc_auth_multisig` (hex, `null` without it), `rand_status.msauth_key`

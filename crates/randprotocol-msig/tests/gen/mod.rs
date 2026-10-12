@@ -1,12 +1,14 @@
 //! The seeded generator of `tests/fixtures/*.json`: a 2-of-3 policy and one proposal over a real v3
 //! bundle (no proof), built from `randprotocol-zkvm` primitives only — no client — and six bad
-//! proposals derived from it.
+//! proposals derived from it, plus one that passes every §6.5 check while paying another key
+//! (refused only under an expectation naming the real recipient).
 //!
 //! Every random value comes from one `ChaCha20Rng::seed_from_u64(0x2026_1011)`, drawn in the
 //! order the code below reads: `msk`, the three member seeds, the non-member seed, the recipient's
 //! key, the spent note's `from` and `r`, the three dummy inputs' `r`, then per output slot its
 //! owner (a throwaway key for each dummy), its `r`, its transaction key and its sealing randomness;
 //! then the salt; then the tampered proposal's throwaway sender, transaction key and sealing
+//! randomness; then the substituted recipient's key, and its output's transaction key and sealing
 //! randomness. Nothing reads OS entropy: the envelopes are sealed by [`seal`], the vendored
 //! `viewing::Envelope::seal` with its ML-KEM message and AEAD nonces taken from the stream.
 //!
@@ -19,7 +21,7 @@ use rand_chacha::rand_core::{RngCore, SeedableRng};
 use rand_chacha::ChaCha20Rng;
 use randprotocol_core::notes::{word8_to_hex, Bundle, Envelope, ShieldedAddress, Word8, DEPTH};
 use randprotocol_core::{gas, Action, Hash, Keypair, Transaction, UNITS_PER_RAND};
-use randprotocol_msig::{check_proposal, informational_summary, parse_words, sign, words_hex, Policy, Proposal};
+use randprotocol_msig::{check_proposal, check_proposal_expecting, informational_summary, owner_fingerprint_of, parse_words, sign, words_hex, Policy, Proposal};
 use randprotocol_zkvm::address::{address_of, envelope_from_core, envelope_to_core};
 use randprotocol_zkvm::hidden::{self, hidden_input_v3 as hi, HiddenDigestInput, HiddenDigestInputV3, HiddenOutput, SLOTS};
 use randprotocol_zkvm::notes::{Note, SpendKey, ViewingKey};
@@ -204,15 +206,48 @@ pub fn vectors() -> BTreeMap<&'static str, String> {
     let mut expired = valid.clone();
     expired.expires_at = TIME as u64 + randprotocol_core::ledger::MAX_PROOF_WINDOW_BLOCKS + 1;
 
+    // The payment output re-made to pay a key the coordinator holds, same amount and `r`: the
+    // commitment, the witness, the digest and the binding all re-made, every output sealed as the
+    // account, so every §6.5 check passes; only naming the real recipient refuses it.
+    let thief_vk = SpendKey(word(&mut rng)).viewing_key();
+    let mut thief_outs = outs;
+    thief_outs[2].pk = thief_vk.pk();
+    let thief_note = thief_outs[2].note(2, pk_self, 0, TIME);
+    let mut thief_tx = tx.clone();
+    let thief_commitments: [Word8; SLOTS] = std::array::from_fn(|k| thief_outs[k].note(k, pk_self, 0, TIME).commitment());
+    {
+        let b = thief_tx.bundle.as_mut().unwrap();
+        let tx_key = TxKey(bytes32(&mut rng));
+        b.envelopes[2] = seal(&mut rng, &vk, &address_of(&thief_vk), &thief_vk, &thief_note, &tx_key);
+        b.commitments = thief_commitments;
+    }
+    let thief_words = hidden::hidden_bundle_inputs_v3(&vk, &salt, &inputs, &thief_outs, anchor, fee, 0, 0, 0, TIME);
+    let thief_expected = hidden::hidden_bundle_digest_v3(&HiddenDigestInputV3 {
+        base: HiddenDigestInput { anchor, nullifiers, commitments: thief_commitments, fee, burn_a: 0, burn_r: 0, burn_asset: 0, time: TIME },
+        auth_commit,
+    });
+    let substituted = Proposal::new(&policy, &thief_tx, &Hash::ZERO, 0, &thief_words, &thief_expected, &salt, EXPIRES_AT, valid.summary.clone());
+
     // ---- what the valid proposal checks and signs to ----
     let (valid_json, policy_json) = (pretty(&valid), pretty(&policy));
     let summary = check_proposal(&valid_json, &policy_json).expect("the valid proposal checks");
+    let recipient_text = recipient.to_string();
+    let expecting = check_proposal_expecting(&valid_json, &policy_json, &[&recipient_text]).expect("the valid proposal pays the recipient");
+    let substituted_json = pretty(&substituted);
+    check_proposal(&substituted_json, &policy_json).expect("the substituted proposal passes every §6.5 check");
+    let refusal = check_proposal_expecting(&substituted_json, &policy_json, &[&recipient_text]).expect_err("naming the recipient refuses it");
     let share = |i: usize| {
         let (idx, sig) = sign(&valid_json, &policy_json, &members[i]).expect("a member signs");
         format!("{idx}:{}", hex::encode(sig))
     };
     let expected_json = serde_json::json!({
         "summary": summary,
+        "lines": summary.lines(),
+        "recipient": recipient_text,
+        "recipient_owner_fingerprint": owner_fingerprint_of(&recipient),
+        "summary_expecting_recipient": expecting,
+        "lines_expecting_recipient": expecting.lines(),
+        "substituted_refusal": refusal.to_string(),
         "signing_message": hex::encode(summary.signing_message),
         "share_0": share(0),
         "share_2": share(2),
@@ -230,6 +265,7 @@ pub fn vectors() -> BTreeMap<&'static str, String> {
         ("proposal-unbound.json", pretty(&unbound)),
         ("proposal-wrong-expected.json", pretty(&wrong_expected)),
         ("proposal-tampered-output.json", pretty(&tampered)),
+        ("proposal-substituted-recipient.json", substituted_json),
         ("proposal-valid.json", valid_json),
         ("proposal-value-mismatch.json", pretty(&mismatch)),
         ("signer-seeds.json", pretty(&seeds)),

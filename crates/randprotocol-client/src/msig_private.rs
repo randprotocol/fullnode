@@ -267,15 +267,17 @@ fn json<T: serde::Serialize>(v: &T) -> String {
     serde_json::to_string(v).expect("a proposal and a policy serialise")
 }
 
-/// `key`'s share of `proposal`: [`randprotocol_msig::sign`] over the two files with the key's
-/// seed — every §6.5 check first (the binding recomputed, all four outputs opened as the account,
-/// value conserved against the witness) — and the summary lines it checked, for the signer to
-/// read. Refused for a key outside the policy.
-pub fn sign(proposal: &Proposal, policy: &Policy, key: &Keypair) -> Result<(Share, Vec<String>)> {
+/// `key`'s share of `proposal`: [`randprotocol_msig::sign_expecting_addresses`] over the two
+/// files with the key's seed — every §6.5 check first (the binding recomputed, all four outputs
+/// opened as the account, value conserved against the witness), and, when `expect_to` names the
+/// payees, every value-moving non-change output paying one of them — and the summary lines it
+/// checked, for the signer to read (with no `expect_to`, they say the payee was not checked).
+/// Refused for a key outside the policy.
+pub fn sign(proposal: &Proposal, policy: &Policy, key: &Keypair, expect_to: &[ShieldedAddress]) -> Result<(Share, Vec<String>)> {
     // The policy's JSON carries `msk`: wiped when dropped.
     let (proposal, policy) = (json(proposal), zeroize::Zeroizing::new(json(&policy.pure())));
-    let shown = pure::check_proposal(&proposal, &policy)?.lines();
-    let (index, sig) = pure::sign(&proposal, &policy, key.seed())?;
+    let shown = pure::check_proposal_expecting_addresses(&proposal, &policy, expect_to)?.lines();
+    let (index, sig) = pure::sign_expecting_addresses(&proposal, &policy, key.seed(), expect_to)?;
     Ok((Share { index, signature: Signature::from_bytes(&sig)? }, shown))
 }
 
@@ -402,10 +404,11 @@ pub fn load_proposal(path: &Path) -> Result<Proposal> {
     serde_json::from_str(&text).with_context(|| format!("{} is not a private multisig proposal", path.display()))
 }
 
-/// What a signer reads before signing ([`randprotocol_msig::check_proposal`] over the two typed
-/// files): every §6.5 check, and the summary, which `lines()` renders.
-pub fn check(proposal: &Proposal, policy: &Policy) -> Result<pure::ProposalSummary> {
-    Ok(pure::check_proposal(&json(proposal), &zeroize::Zeroizing::new(json(&policy.pure())))?)
+/// What a signer reads before signing ([`randprotocol_msig::check_proposal_expecting_addresses`]
+/// over the two typed files): every §6.5 check, the payees in `expect_to` when it is not empty,
+/// and the summary, which `lines()` renders.
+pub fn check(proposal: &Proposal, policy: &Policy, expect_to: &[ShieldedAddress]) -> Result<pure::ProposalSummary> {
+    Ok(pure::check_proposal_expecting_addresses(&json(proposal), &zeroize::Zeroizing::new(json(&policy.pure())), expect_to)?)
 }
 
 /// Writes a proved transaction as bincode hex, owner-only and never over an existing file.
@@ -487,23 +490,28 @@ mod tests {
     fn sign_recomputes_the_binding_and_opens_every_output_before_signing() {
         let (p, k) = two_of_three();
         let prop = proposal(&p);
-        let (share, shown) = sign(&prop, &p, &k[2]).unwrap();
+        let (share, shown) = sign(&prop, &p, &k[2], &[]).unwrap();
         assert_eq!(share.index, 2);
         let msg = hex::decode(&prop.signing_message).unwrap();
         assert!(k[2].public_key().verify(&msg, &share.signature));
         assert!(shown.iter().any(|l| l.contains("10 RAND")), "{shown:?}");
         assert_eq!(share.to_string().parse::<Share>().unwrap().index, 2, "index:hex round-trips");
         // A key outside the policy is refused.
-        assert!(sign(&prop, &p, &Keypair::from_seed([9; 32]).unwrap()).is_err());
+        assert!(sign(&prop, &p, &Keypair::from_seed([9; 32]).unwrap(), &[]).is_err());
         // A tampered transaction (its binding moves) is refused.
         let mut bad = prop.clone();
         let mut tx = Transaction::decode(&hex::decode(&bad.tx).unwrap()).unwrap();
         tx.bundle.as_mut().unwrap().fee += 1;
         bad.tx = hex::encode(tx.encode());
-        assert!(sign(&bad, &p, &k[0]).unwrap_err().to_string().contains("binding"));
+        assert!(sign(&bad, &p, &k[0], &[]).unwrap_err().to_string().contains("binding"));
         // A proposal from another policy's account is refused.
         let (other, _) = two_of_three();
-        assert!(sign(&prop, &other, &k[0]).unwrap_err().to_string().contains("auth_commit"));
+        assert!(sign(&prop, &other, &k[0], &[]).unwrap_err().to_string().contains("auth_commit"));
+        // Naming a payee the proposal does not pay refuses it; naming none says so in the lines.
+        let stranger = crate::wallet::Wallet::from_spend_key(randprotocol_zkvm::notes::SpendKey([5; 8])).address;
+        let e = sign(&prop, &p, &k[0], &[stranger]).unwrap_err().to_string();
+        assert!(e.contains("not an expected recipient"), "{e}");
+        assert!(shown.iter().any(|l| l.contains("the payee was NOT checked")), "{shown:?}");
     }
 
     /// Review finding 4: a single-key wallet seals dummy outputs under a throwaway key, so signers
@@ -523,15 +531,15 @@ mod tests {
         // A proposal whose witness spends more than the outputs + fee account for is refused.
         let mut skim = prop.clone();
         skim.bundle_words = tests_support::with_input_amount_raised(&prop.bundle_words, 1);
-        assert!(sign(&skim, &p, &k[0]).unwrap_err().to_string().contains("value"), "conservation");
+        assert!(sign(&skim, &p, &k[0], &[]).unwrap_err().to_string().contains("value"), "conservation");
         // An output sealed to a throwaway sender (the single-key dummy) is refused, not skipped —
         // in a proposal re-bound over the edited envelope, so only "opens as sender" can catch it.
         let mut hidden = prop.clone();
         hidden.tx = tests_support::with_a_throwaway_sealed_output(&prop.tx, &w);
         tests_support::rebind(&mut hidden);
-        assert!(sign(&hidden, &p, &k[0]).unwrap_err().to_string().contains("open"));
+        assert!(sign(&hidden, &p, &k[0], &[]).unwrap_err().to_string().contains("open"));
         // Burns are shown.
-        let (_, shown) = sign(&prop, &p, &k[0]).unwrap();
+        let (_, shown) = sign(&prop, &p, &k[0], &[]).unwrap();
         assert!(shown.iter().any(|l| l.starts_with("burn")), "{shown:?}");
     }
 
@@ -574,7 +582,7 @@ mod tests {
         let k = keys(4);
         let p = Policy::new(k.iter().map(|k| k.public_key().clone()).collect(), 2).unwrap();
         let prop = proposal(&p);
-        let shares: Vec<Share> = [3usize, 1, 0, 2].iter().map(|&i| sign(&prop, &p, &k[i]).unwrap().0).collect();
+        let shares: Vec<Share> = [3usize, 1, 0, 2].iter().map(|&i| sign(&prop, &p, &k[i], &[]).unwrap().0).collect();
         let w = assemble_witness(&prop, &p, &shares).unwrap();
         let active: Vec<(u32, u32)> = (0..M_MAX).map(|s| (w[17 + s * SLOT_WORDS], w[17 + s * SLOT_WORDS + 1])).collect();
         assert_eq!(active, vec![(1, 0), (1, 1), (1, 2)], "the lowest M_MAX = 3 indices, in order");
@@ -593,8 +601,8 @@ mod tests {
     fn assemble_witness_needs_the_threshold_and_runs_like_the_guest() {
         let (p, k) = two_of_three();
         let prop = proposal(&p);
-        let s0 = sign(&prop, &p, &k[0]).unwrap().0;
-        let s2 = sign(&prop, &p, &k[2]).unwrap().0;
+        let s0 = sign(&prop, &p, &k[0], &[]).unwrap().0;
+        let s2 = sign(&prop, &p, &k[2], &[]).unwrap().0;
         let w = assemble_witness(&prop, &p, &[s2.clone(), s0.clone()]).unwrap();
         assert_eq!(w.len(), randprotocol_zkvm::msauth::MSAUTH_WORDS);
         let binding = parse_binding(&prop.binding).unwrap();
@@ -615,7 +623,7 @@ mod tests {
         use randprotocol_core::confidential::{AuthShape, ConfidentialExecutor, StubExecutor};
         let (p, k) = two_of_three();
         let prop = proposal(&p);
-        let shares: Vec<Share> = [2usize, 0].iter().map(|&i| sign(&prop, &p, &k[i]).unwrap().0).collect();
+        let shares: Vec<Share> = [2usize, 0].iter().map(|&i| sign(&prop, &p, &k[i], &[]).unwrap().0).collect();
         let tx = prove(&prop, &p, &shares, &Proving::Emulated, FriProfile::Test).await.unwrap();
         let b = tx.bundle.as_ref().unwrap();
         assert!(!b.proof.is_empty(), "the bundle proof");

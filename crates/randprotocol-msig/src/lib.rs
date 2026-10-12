@@ -24,6 +24,15 @@
 //! upstream (the encapsulation message derived from the transaction key), which would let a
 //! signer re-seal and compare.
 //!
+//! **Who is paid.** The coordinator holds the policy, so it can seal every output as the account
+//! and pass every check above while paying a key of its own: the checks prove the outputs are
+//! *some* owner keys, not the payee the signer meant. A signer closes that by naming the payee —
+//! [`check_proposal_expecting`] / [`sign_expecting`] with the `rand1…` addresses the payees
+//! handed over out of band: every output that moves value and is not change must then pay one
+//! of their owner keys, or the proposal is refused. Without an expectation the summary says, once and loudly,
+//! that the payee was not checked. (A zero-amount output — a bundle's dummy — moves nothing and
+//! is not held to the expectation.)
+//!
 //! **Secrets.** A policy's JSON carries the account's `msk` (viewing power over every note of the
 //! account) and a proposal's JSON carries the witness words (`nk`, the salt, the spent notes'
 //! openings). This crate never logs either; callers must store both as secrets.
@@ -102,8 +111,9 @@ pub struct Proposal {
 }
 
 /// One output as the account opened it: its owner key's [`owner_fingerprint`] (verified; the
-/// delivery key is not — see the module doc), whether that owner is this account (change), and
-/// the amount, asset and memo the note carries.
+/// delivery key is not — see the module doc), whether that owner is this account (change), the
+/// amount, asset and memo the note carries, and — under an expectation — the fingerprint of the
+/// expected address whose owner key it pays.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct OutputSummary {
     pub owner_fingerprint: String,
@@ -111,6 +121,9 @@ pub struct OutputSummary {
     pub amount: u64,
     pub asset: u32,
     pub memo: String,
+    /// The matching expected address's fingerprint (`ShieldedAddress::fingerprint`); `None`
+    /// without an expectation, for change, and for a zero-amount output.
+    pub matches: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -123,6 +136,13 @@ pub struct Burns {
 /// What [`check_proposal`] verified, for a signer to read before signing.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct ProposalSummary {
+    /// The chain the transaction is for and the genesis its binding commits to (hex; all zeros
+    /// under the chain-id-only binding domain), both checked.
+    pub chain_id: u64,
+    pub genesis: String,
+    /// Whether the signer named the payees ([`check_proposal_expecting`]): every value-moving,
+    /// non-change output then pays one of them.
+    pub recipients_checked: bool,
     /// The four output slots, in order.
     pub outputs: Vec<OutputSummary>,
     pub fee: u64,
@@ -139,22 +159,23 @@ fn hex_bytes<S: Serializer>(b: &[u8; 45], s: S) -> Result<S::Ok, S::Error> {
 }
 
 impl ProposalSummary {
-    /// The lines a signer is shown: each output, the fee and the burns.
+    /// The lines a signer is shown: the chain, the payee warning when no payee was named, each
+    /// output, the fee and the burns.
     pub fn lines(&self) -> Vec<String> {
-        let mut lines: Vec<String> = self
-            .outputs
-            .iter()
-            .enumerate()
-            .map(|(n, o)| {
-                format!(
-                    "{n}: → {} to {}{} memo {:?} (owner key verified; delivery key NOT verifiable from this proposal)",
-                    amount_text(o.amount, o.asset),
-                    if o.to_account { "this account " } else { "" },
-                    o.owner_fingerprint,
-                    o.memo
-                )
-            })
-            .collect();
+        let mut lines = vec![format!("chain {} · genesis {}", self.chain_id, self.genesis)];
+        if !self.recipients_checked {
+            lines.push(NO_EXPECTATION.to_string());
+        }
+        lines.extend(self.outputs.iter().enumerate().map(|(n, o)| {
+            format!(
+                "{n}: → {} to {}{}{} memo {:?} (owner key verified; delivery key NOT verifiable from this proposal)",
+                amount_text(o.amount, o.asset),
+                if o.to_account { "this account " } else { "" },
+                o.owner_fingerprint,
+                o.matches.as_ref().map(|f| format!(" matches {f}")).unwrap_or_default(),
+                o.memo
+            )
+        }));
         lines.push(format!("fee {} RAND", format_amount(self.fee)));
         lines.push(format!(
             "burn {} of asset {}, {} RAND",
@@ -165,6 +186,10 @@ impl ProposalSummary {
         lines
     }
 }
+
+/// The line a summary carries when the signer named no payee.
+pub const NO_EXPECTATION: &str =
+    "WARNING: no expected recipient given: the payee was NOT checked (the coordinator could be paying itself; pass the payee's address to check)";
 
 /// `10 RAND`, or a token's raw units (this crate knows no token's decimals).
 fn amount_text(amount: u64, asset: u32) -> String {
@@ -180,6 +205,28 @@ fn amount_text(amount: u64, asset: u32) -> String {
 pub fn owner_fingerprint(pk: &Word8) -> String {
     let bytes: Vec<u8> = pk.iter().flat_map(|w| w.to_le_bytes()).collect();
     Hash::digest_domain(b"rand-msig-owner-1", &bytes).to_hex()[..16].to_string()
+}
+
+/// [`owner_fingerprint`] of an address's owner key: what a payee hands a signer (`rand address`
+/// prints it) to compare with the output line that pays them.
+pub fn owner_fingerprint_of(addr: &ShieldedAddress) -> String {
+    owner_fingerprint(&addr.pk)
+}
+
+/// [`owner_fingerprint_of`] a pasted `rand1…` address, parsed as the wallet parses one.
+pub fn owner_fingerprint_of_text(addr: &str) -> Result<String, MsigError> {
+    let a = ShieldedAddress::parse(addr.trim()).map_err(|e| invalid(format!("not a shielded address: {e}")))?;
+    Ok(owner_fingerprint_of(&a))
+}
+
+/// Pasted `rand1…` addresses, parsed as the wallet parses one (`ShieldedAddress::parse`); a
+/// malformed one is refused naming its index.
+pub fn parse_expected_recipients<S: AsRef<str>>(texts: &[S]) -> Result<Vec<ShieldedAddress>, MsigError> {
+    texts
+        .iter()
+        .enumerate()
+        .map(|(i, t)| ShieldedAddress::parse(t.as_ref().trim()).map_err(|e| invalid(format!("expected recipient {i} is not a shielded address: {e}"))))
+        .collect()
 }
 
 /// The informational `summary` lines a proposal carries (§6.4): the payment, the fee, the memo.
@@ -357,12 +404,28 @@ fn parse_inputs(proposal_json: &str, policy_json: &str) -> Result<(Proposal, Pol
 ///    four nullifiers, and per asset Σ inputs = Σ outputs + fee + `burn_a`/`burn_r`.
 /// 7. Expiry, as far as a pure function can: `time < expires_at ≤ time + MAX_PROOF_WINDOW_BLOCKS`.
 ///    Comparing with the chain head is the caller's.
+///
+/// No payee is checked: [`check_proposal_expecting`] with an empty list, whose summary says so.
 pub fn check_proposal(proposal_json: &str, policy_json: &str) -> Result<ProposalSummary, MsigError> {
-    let (proposal, policy) = parse_inputs(proposal_json, policy_json)?;
-    check(&proposal, &policy)
+    check_proposal_expecting_addresses(proposal_json, policy_json, &[])
 }
 
-fn check(p: &Proposal, policy: &Policy) -> Result<ProposalSummary, MsigError> {
+/// [`check_proposal`], and then, when `expected_recipients` (pasted `rand1…` addresses, parsed by
+/// [`parse_expected_recipients`]) is not empty, 8: every output that moves value (amount > 0) and
+/// is not change pays the owner key of one of those addresses — otherwise refused, naming the
+/// output and its owner fingerprint. The delivery key is still not verified (module doc). An
+/// empty list checks no payee: the summary's `recipients_checked` is false and its lines say so.
+pub fn check_proposal_expecting<S: AsRef<str>>(proposal_json: &str, policy_json: &str, expected_recipients: &[S]) -> Result<ProposalSummary, MsigError> {
+    check_proposal_expecting_addresses(proposal_json, policy_json, &parse_expected_recipients(expected_recipients)?)
+}
+
+/// [`check_proposal_expecting`] over addresses already parsed.
+pub fn check_proposal_expecting_addresses(proposal_json: &str, policy_json: &str, expected_recipients: &[ShieldedAddress]) -> Result<ProposalSummary, MsigError> {
+    let (proposal, policy) = parse_inputs(proposal_json, policy_json)?;
+    check(&proposal, &policy, expected_recipients)
+}
+
+fn check(p: &Proposal, policy: &Policy, expected_recipients: &[ShieldedAddress]) -> Result<ProposalSummary, MsigError> {
     // 2. The policy.
     let policy_hash = word8_to_hex(&policy.policy_hash());
     if p.policy != policy_hash {
@@ -479,17 +542,26 @@ fn check(p: &Proposal, policy: &Policy) -> Result<ProposalSummary, MsigError> {
         )));
     }
 
+    // 8. The payees the signer named, if any.
+    let mut outputs = Vec::with_capacity(opened.len());
+    for (slot, (n, memo)) in opened.iter().enumerate() {
+        let to_account = n.pk == account.pk;
+        let matches = if expected_recipients.is_empty() || to_account || n.amount == 0 {
+            None
+        } else {
+            let addr = expected_recipients.iter().find(|a| a.pk == n.pk).ok_or_else(|| {
+                refused(format!("output {slot} pays {}, not an expected recipient", owner_fingerprint(&n.pk)))
+            })?;
+            Some(addr.fingerprint().to_string())
+        };
+        outputs.push(OutputSummary { owner_fingerprint: owner_fingerprint(&n.pk), to_account, amount: n.amount, asset: n.asset, memo: memo.clone(), matches });
+    }
+
     Ok(ProposalSummary {
-        outputs: opened
-            .iter()
-            .map(|(n, memo)| OutputSummary {
-                owner_fingerprint: owner_fingerprint(&n.pk),
-                to_account: n.pk == account.pk,
-                amount: n.amount,
-                asset: n.asset,
-                memo: memo.clone(),
-            })
-            .collect(),
+        chain_id: p.chain_id,
+        genesis: genesis.to_hex(),
+        recipients_checked: !expected_recipients.is_empty(),
+        outputs,
         fee: bundle.fee,
         burns: Burns { burn_a: bundle.burn_a, burn_asset: bundle.burn_asset, burn_r: bundle.burn_r },
         expires_at: p.expires_at,
@@ -501,10 +573,21 @@ fn check(p: &Proposal, policy: &Policy) -> Result<ProposalSummary, MsigError> {
 /// [`check_proposal`], then the signer's share: the Dilithium2 key derived from `signer_seed`
 /// (`dilithium2::Keypair::generate(Some(seed))`, as `rand-node keygen` files hold it), refused
 /// unless it is one of `policy.signers`, signing `signing_message` deterministically. Returns
-/// `(index, 2 420-byte signature)`.
+/// `(index, 2 420-byte signature)`. Checks no payee: [`sign_expecting`] with an empty list.
 pub fn sign(proposal_json: &str, policy_json: &str, signer_seed: &[u8; 32]) -> Result<(u8, Vec<u8>), MsigError> {
+    sign_expecting_addresses(proposal_json, policy_json, signer_seed, &[])
+}
+
+/// [`sign`] after [`check_proposal_expecting`]: refused unless every value-moving, non-change
+/// output pays one of `expected_recipients` (pasted `rand1…` addresses; when not empty).
+pub fn sign_expecting<S: AsRef<str>>(proposal_json: &str, policy_json: &str, signer_seed: &[u8; 32], expected_recipients: &[S]) -> Result<(u8, Vec<u8>), MsigError> {
+    sign_expecting_addresses(proposal_json, policy_json, signer_seed, &parse_expected_recipients(expected_recipients)?)
+}
+
+/// [`sign_expecting`] over addresses already parsed.
+pub fn sign_expecting_addresses(proposal_json: &str, policy_json: &str, signer_seed: &[u8; 32], expected_recipients: &[ShieldedAddress]) -> Result<(u8, Vec<u8>), MsigError> {
     let (proposal, policy) = parse_inputs(proposal_json, policy_json)?;
-    let summary = check(&proposal, &policy)?;
+    let summary = check(&proposal, &policy, expected_recipients)?;
     let key = Keypair::from_seed(*signer_seed).map_err(|e| invalid(format!("the signer seed: {e}")))?;
     let index = policy
         .pks()?
@@ -530,7 +613,7 @@ pub fn parse_share(share: &str) -> Result<(u8, Vec<u8>), MsigError> {
 /// signature verifies under that key over the proposal's signing message.
 pub fn verify_share(proposal_json: &str, policy_json: &str, share: &str) -> Result<(), MsigError> {
     let (proposal, policy) = parse_inputs(proposal_json, policy_json)?;
-    let summary = check(&proposal, &policy)?;
+    let summary = check(&proposal, &policy, &[])?;
     let (i, sig) = parse_share(share)?;
     let pks = policy.pks()?;
     let pk = pks.get(i as usize).ok_or_else(|| refused(format!("signer {i} is not in this policy (it has {} signers)", pks.len())))?;

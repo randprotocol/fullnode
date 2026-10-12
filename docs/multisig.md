@@ -302,12 +302,34 @@ one signature moving funds of the other kind.
 `rand multisig-private sign` (and `check`) recomputes the binding from the proposal's bundle, opens
 every output as the sender, and shows each output by its **owner-key fingerprint** — the first 16 hex
 digits of `blake3("rand-msig-owner-1" ‖ pk)` (`randprotocol_msig::owner_fingerprint`) — never by an
-address taken from the proposal's summary. Every output line carries the caveat **"owner key
+address taken from the proposal's summary. The summary's first line names the chain id and the
+genesis hash, so a testnet proposal is not mistaken for a mainnet one.
+
+**Who is paid is checked only if the signer names the payee.** The coordinator holds the policy,
+so it can build a proposal that passes every other check while paying a key of its own: the checks
+prove each output is *some* owner key and the value balances, not that the payee is the one the
+signer meant. So the signer flow is:
+
+1. Ask the payee, out of band, for their `rand1…` address (`rand address` prints it, and also its
+   `owner fingerprint`).
+2. Sign with `--expect-to <address>` (repeat it for several payees). Every output that moves value
+   and is not the account's own change must pay one of those addresses' owner keys, or nothing is
+   signed: `output N pays <owner fingerprint>, not an expected recipient`. The paying line then says
+   `matches <address fingerprint>`. (Zero-amount outputs, a bundle's dummies, move nothing and are
+   not held to it.)
+3. If you only have the payee's owner fingerprint, compare it by eye with the output line.
+
+Without `--expect-to` the share is still produced — the coordinator-trusting mode stays possible —
+but the summary says, once, `WARNING: no expected recipient given: the payee was NOT checked`.
+
+What is verified: the owner key, amount, asset and memo of every output; the change returns to this
+account; value balances; the chain, genesis and binding; with `--expect-to`, the payee's owner key.
+What is **not** verified: the delivery key. Every output line carries the caveat **"owner key
 verified; delivery key NOT verifiable from this proposal"**. ML-KEM encapsulation is randomised, so a
 proposal cannot prove which KEM key an output's envelope was sealed to: a dishonest coordinator could
-pay the right owner key with an envelope its recipient cannot open. The mitigation today is that the
-coordinator and the recipient confirm the address out of band; a deterministic seal API, which
-would let a signer re-seal and compare, is a follow-up. The checks are the pure, wasm32-clean crate
+pay the right owner key with an envelope its recipient cannot open (nothing is stolen, but the payee
+does not find the note until the envelope is re-sent). Confirm receipt with the payee; a
+deterministic seal API, which would let a signer re-seal and compare, is a follow-up. The checks are the pure, wasm32-clean crate
 `randprotocol-msig` (re-exported as `randprotocol_client::multisig_private`, vendored by the clients'
 core), so a browser signer runs the same code.
 
