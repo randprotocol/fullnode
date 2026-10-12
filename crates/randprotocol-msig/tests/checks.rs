@@ -128,7 +128,7 @@ fn naming_the_recipient_marks_the_payment_and_drops_the_warning() {
     assert_eq!(serde_json::to_value(&s).unwrap(), e["summary_expecting_recipient"]);
     assert!(s.recipients_checked);
     let fp = randprotocol_core::notes::ShieldedAddress::parse(to).unwrap().fingerprint().to_string();
-    assert_eq!(s.outputs.iter().map(|o| o.matches.clone()).collect::<Vec<_>>(), vec![None, None, Some(fp.clone()), None]);
+    assert_eq!(s.outputs.iter().map(|o| o.matches.clone()).collect::<Vec<_>>(), vec![None, None, Some(format!("{fp} ({} RAND)", randprotocol_core::format_amount(s.outputs[2].amount))), None]);
     let lines = s.lines();
     assert_eq!(serde_json::to_value(&lines).unwrap(), e["lines_expecting_recipient"]);
     assert!(lines[3].contains(&format!("matches {fp}")) && lines[3].contains("delivery key NOT verifiable"), "{lines:?}");
@@ -164,4 +164,41 @@ fn a_malformed_expected_recipient_is_refused_by_index() {
     assert!(e.starts_with("expected recipient 1 is not a shielded address"), "{e}");
     assert!(!check_proposal_expecting::<&str>(&prop, &pol, &[]).unwrap().recipients_checked);
     assert!(owner_fingerprint_of_text("rand1nope").is_err());
+}
+
+/// The unpaid second address: the valid proposal pays only the first; naming a second payee that
+/// no output pays is refused (the coordinator could have dropped a payment), in `sign` too.
+#[test]
+fn an_expected_recipient_nobody_pays_is_refused() {
+    let (prop, pol) = (fixture("proposal-valid.json"), fixture("policy.json"));
+    let to = expected()["recipient"].as_str().unwrap().to_string();
+    // The same address with one owner-key word changed: well-formed, paid by no output.
+    let mut other = randprotocol_core::notes::ShieldedAddress::parse(&to).unwrap();
+    other.pk[0] ^= 1;
+    let other_text = other.to_string();
+    let e = check_proposal_expecting(&prop, &pol, &[to.as_str(), other_text.as_str()]).unwrap_err().to_string();
+    assert_eq!(e, format!("expected recipient {} is not paid", other.fingerprint()));
+    let (members, _) = seeds();
+    assert_eq!(sign_expecting(&prop, &pol, &members[0], &[to.as_str(), other_text.as_str()]).unwrap_err().to_string(), e);
+}
+
+/// `rand1…:AMOUNT`: the right amount is accepted and the paying line carries it; a wrong one,
+/// and a malformed one, are refused.
+#[test]
+fn an_amount_pin_is_met_exactly_or_refused() {
+    let (prop, pol) = (fixture("proposal-valid.json"), fixture("policy.json"));
+    let to = expected()["recipient"].as_str().unwrap().to_string();
+    let plain = check_proposal(&prop, &pol).unwrap();
+    let paid = plain.outputs[2].amount;
+    let rand = randprotocol_core::format_amount(paid);
+    let fp = randprotocol_core::notes::ShieldedAddress::parse(&to).unwrap().fingerprint().to_string();
+    let s = check_proposal_expecting(&prop, &pol, &[format!("{to}:{rand}")]).unwrap();
+    assert_eq!(s.outputs[2].matches.as_deref(), Some(format!("{fp} ({rand} RAND)").as_str()));
+    assert!(s.recipients_checked);
+    assert!(s.lines()[3].contains(&format!("matches {fp} ({rand} RAND)")), "{:?}", s.lines());
+    let wrong = format!("{to}:{}", randprotocol_core::format_amount(paid + 1));
+    let e = check_proposal_expecting(&prop, &pol, &[wrong]).unwrap_err().to_string();
+    assert_eq!(e, format!("expected recipient {fp} is paid {rand} RAND, not {} RAND", randprotocol_core::format_amount(paid + 1)));
+    let e = check_proposal_expecting(&prop, &pol, &[to.clone(), format!("{to}:1.x")]).unwrap_err().to_string();
+    assert!(e.starts_with("expected recipient 1 has a malformed amount"), "{e}");
 }

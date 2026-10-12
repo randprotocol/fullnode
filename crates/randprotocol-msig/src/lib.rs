@@ -39,7 +39,7 @@
 
 use randprotocol_core::ledger::MAX_PROOF_WINDOW_BLOCKS;
 use randprotocol_core::notes::{word8_from_hex, word8_to_hex, ShieldedAddress, Word8};
-use randprotocol_core::{format_amount, Action, BindingDomain, Hash, Keypair, PublicKey, Signature, Transaction};
+use randprotocol_core::{format_amount, parse_amount, Action, BindingDomain, Hash, Keypair, PublicKey, Signature, Transaction};
 use randprotocol_zkvm::address::{address_of, envelope_from_core};
 use randprotocol_zkvm::hidden::{hidden_bundle_digest_v3, hidden_input_v3 as hi, HiddenDigestInput, HiddenDigestInputV3};
 use randprotocol_zkvm::msauth::{self, M_MAX, N_MAX};
@@ -219,13 +219,45 @@ pub fn owner_fingerprint_of_text(addr: &str) -> Result<String, MsigError> {
     Ok(owner_fingerprint_of(&a))
 }
 
-/// Pasted `rand1…` addresses, parsed as the wallet parses one (`ShieldedAddress::parse`); a
-/// malformed one is refused naming its index.
-pub fn parse_expected_recipients<S: AsRef<str>>(texts: &[S]) -> Result<Vec<ShieldedAddress>, MsigError> {
+/// A payee the signer expects: a `rand1…` address and, optionally, the exact RAND amount it must
+/// be paid in total.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExpectedRecipient {
+    pub address: ShieldedAddress,
+    /// Smallest units; `Some` pins the sum of every output paying `address` (RAND only).
+    pub amount: Option<u64>,
+}
+
+impl ExpectedRecipient {
+    /// An address with no amount pin.
+    pub fn address(address: ShieldedAddress) -> Self {
+        ExpectedRecipient { address, amount: None }
+    }
+
+    /// `rand1…` or `rand1…:AMOUNT`, the amount parsed as `rand send --amount` parses one
+    /// (`randprotocol_core::parse_amount`: decimal RAND, up to the token's decimals).
+    pub fn parse(text: &str) -> Result<Self, MsigError> {
+        Self::parse_fragment(text).map_err(|f| invalid(format!("expected recipient {f}")))
+    }
+
+    fn parse_fragment(text: &str) -> Result<Self, String> {
+        let text = text.trim();
+        let (addr, amount) = match text.rsplit_once(':') {
+            Some((a, amt)) => (a.trim(), Some(parse_amount(amt).map_err(|e| format!("has a malformed amount {amt:?}: {e}"))?)),
+            None => (text, None),
+        };
+        let address = ShieldedAddress::parse(addr).map_err(|e| format!("is not a shielded address: {e}"))?;
+        Ok(ExpectedRecipient { address, amount })
+    }
+}
+
+/// Pasted `rand1…[:AMOUNT]` entries (see [`ExpectedRecipient::parse`]); a malformed one is
+/// refused naming its index.
+pub fn parse_expected_recipients<S: AsRef<str>>(texts: &[S]) -> Result<Vec<ExpectedRecipient>, MsigError> {
     texts
         .iter()
         .enumerate()
-        .map(|(i, t)| ShieldedAddress::parse(t.as_ref().trim()).map_err(|e| invalid(format!("expected recipient {i} is not a shielded address: {e}"))))
+        .map(|(i, t)| ExpectedRecipient::parse_fragment(t.as_ref()).map_err(|f| invalid(format!("expected recipient {i} {f}"))))
         .collect()
 }
 
@@ -410,22 +442,25 @@ pub fn check_proposal(proposal_json: &str, policy_json: &str) -> Result<Proposal
     check_proposal_expecting_addresses(proposal_json, policy_json, &[])
 }
 
-/// [`check_proposal`], and then, when `expected_recipients` (pasted `rand1…` addresses, parsed by
-/// [`parse_expected_recipients`]) is not empty, 8: every output that moves value (amount > 0) and
-/// is not change pays the owner key of one of those addresses — otherwise refused, naming the
-/// output and its owner fingerprint. The delivery key is still not verified (module doc). An
+/// [`check_proposal`], and then, when `expected_recipients` (pasted `rand1…[:AMOUNT]` entries,
+/// parsed by [`parse_expected_recipients`]) is not empty, 8: every output that moves value
+/// (amount > 0) and is not change pays the owner key of one of those addresses (otherwise refused,
+/// naming the output and its owner fingerprint); every expected address is paid by at least one
+/// such output (`expected recipient <fp> is not paid`); and an entry with an `:AMOUNT` is paid
+/// exactly that in RAND, summed over its outputs (`… is paid <sum>, not <AMOUNT>`; a non-RAND
+/// output to it is refused). The delivery key is still not verified (module doc). An
 /// empty list checks no payee: the summary's `recipients_checked` is false and its lines say so.
 pub fn check_proposal_expecting<S: AsRef<str>>(proposal_json: &str, policy_json: &str, expected_recipients: &[S]) -> Result<ProposalSummary, MsigError> {
     check_proposal_expecting_addresses(proposal_json, policy_json, &parse_expected_recipients(expected_recipients)?)
 }
 
 /// [`check_proposal_expecting`] over addresses already parsed.
-pub fn check_proposal_expecting_addresses(proposal_json: &str, policy_json: &str, expected_recipients: &[ShieldedAddress]) -> Result<ProposalSummary, MsigError> {
+pub fn check_proposal_expecting_addresses(proposal_json: &str, policy_json: &str, expected_recipients: &[ExpectedRecipient]) -> Result<ProposalSummary, MsigError> {
     let (proposal, policy) = parse_inputs(proposal_json, policy_json)?;
     check(&proposal, &policy, expected_recipients)
 }
 
-fn check(p: &Proposal, policy: &Policy, expected_recipients: &[ShieldedAddress]) -> Result<ProposalSummary, MsigError> {
+fn check(p: &Proposal, policy: &Policy, expected_recipients: &[ExpectedRecipient]) -> Result<ProposalSummary, MsigError> {
     // 2. The policy.
     let policy_hash = word8_to_hex(&policy.policy_hash());
     if p.policy != policy_hash {
@@ -549,12 +584,31 @@ fn check(p: &Proposal, policy: &Policy, expected_recipients: &[ShieldedAddress])
         let matches = if expected_recipients.is_empty() || to_account || n.amount == 0 {
             None
         } else {
-            let addr = expected_recipients.iter().find(|a| a.pk == n.pk).ok_or_else(|| {
+            let e = expected_recipients.iter().find(|e| e.address.pk == n.pk).ok_or_else(|| {
                 refused(format!("output {slot} pays {}, not an expected recipient", owner_fingerprint(&n.pk)))
             })?;
-            Some(addr.fingerprint().to_string())
+            Some(format!("{} ({})", e.address.fingerprint(), amount_text(n.amount, n.asset)))
         };
         outputs.push(OutputSummary { owner_fingerprint: owner_fingerprint(&n.pk), to_account, amount: n.amount, asset: n.asset, memo: memo.clone(), matches });
+    }
+
+    // Every expected recipient is paid, and an amount pin is met exactly (asset 0 only).
+    for e in expected_recipients {
+        let paying: Vec<_> = opened.iter().filter(|(n, _)| n.pk == e.address.pk && n.pk != account.pk && n.amount > 0).map(|(n, _)| n).collect();
+        let fp = e.address.fingerprint();
+        if paying.is_empty() {
+            return Err(refused(format!("expected recipient {fp} is not paid")));
+        }
+        if let Some(want) = e.amount {
+            if paying.iter().any(|n| n.asset != 0) {
+                return Err(refused(format!("expected recipient {fp}: amount pin on a non-RAND output")));
+            }
+            let sum = paying.iter().try_fold(0u64, |a, n| a.checked_add(n.amount));
+            if sum != Some(want) {
+                let got = sum.map(|v| format!("{} RAND", format_amount(v))).unwrap_or_else(|| "more than u64".to_string());
+                return Err(refused(format!("expected recipient {fp} is paid {got}, not {} RAND", format_amount(want))));
+            }
+        }
     }
 
     Ok(ProposalSummary {
@@ -579,13 +633,13 @@ pub fn sign(proposal_json: &str, policy_json: &str, signer_seed: &[u8; 32]) -> R
 }
 
 /// [`sign`] after [`check_proposal_expecting`]: refused unless every value-moving, non-change
-/// output pays one of `expected_recipients` (pasted `rand1…` addresses; when not empty).
+/// output pays one of `expected_recipients` (pasted `rand1…[:AMOUNT]`; when not empty).
 pub fn sign_expecting<S: AsRef<str>>(proposal_json: &str, policy_json: &str, signer_seed: &[u8; 32], expected_recipients: &[S]) -> Result<(u8, Vec<u8>), MsigError> {
     sign_expecting_addresses(proposal_json, policy_json, signer_seed, &parse_expected_recipients(expected_recipients)?)
 }
 
 /// [`sign_expecting`] over addresses already parsed.
-pub fn sign_expecting_addresses(proposal_json: &str, policy_json: &str, signer_seed: &[u8; 32], expected_recipients: &[ShieldedAddress]) -> Result<(u8, Vec<u8>), MsigError> {
+pub fn sign_expecting_addresses(proposal_json: &str, policy_json: &str, signer_seed: &[u8; 32], expected_recipients: &[ExpectedRecipient]) -> Result<(u8, Vec<u8>), MsigError> {
     let (proposal, policy) = parse_inputs(proposal_json, policy_json)?;
     let summary = check(&proposal, &policy, expected_recipients)?;
     let key = Keypair::from_seed(*signer_seed).map_err(|e| invalid(format!("the signer seed: {e}")))?;

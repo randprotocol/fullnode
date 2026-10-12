@@ -294,7 +294,7 @@ fn json<T: serde::Serialize>(v: &T) -> String {
 /// payees, every value-moving non-change output paying one of them — and the summary lines it
 /// checked, for the signer to read (with no `expect_to`, they say the payee was not checked).
 /// Refused for a key outside the policy.
-pub fn sign(proposal: &Proposal, policy: &Policy, key: &Keypair, expect_to: &[ShieldedAddress]) -> Result<(Share, Vec<String>)> {
+pub fn sign(proposal: &Proposal, policy: &Policy, key: &Keypair, expect_to: &[randprotocol_msig::ExpectedRecipient]) -> Result<(Share, Vec<String>)> {
     // The policy's JSON carries `msk`: wiped when dropped.
     let (proposal, policy) = (json(proposal), zeroize::Zeroizing::new(json(&policy.pure())));
     let shown = pure::check_proposal_expecting_addresses(&proposal, &policy, expect_to)?.lines();
@@ -430,7 +430,7 @@ pub fn load_proposal(path: &Path) -> Result<Proposal> {
 /// What a signer reads before signing ([`randprotocol_msig::check_proposal_expecting_addresses`]
 /// over the two typed files): every §6.5 check, the payees in `expect_to` when it is not empty,
 /// and the summary, which `lines()` renders.
-pub fn check(proposal: &Proposal, policy: &Policy, expect_to: &[ShieldedAddress]) -> Result<pure::ProposalSummary> {
+pub fn check(proposal: &Proposal, policy: &Policy, expect_to: &[randprotocol_msig::ExpectedRecipient]) -> Result<pure::ProposalSummary> {
     Ok(pure::check_proposal_expecting_addresses(&json(proposal), &zeroize::Zeroizing::new(json(&policy.pure())), expect_to)?)
 }
 
@@ -532,7 +532,7 @@ mod tests {
         assert!(sign(&prop, &other, &k[0], &[]).unwrap_err().to_string().contains("auth_commit"));
         // Naming a payee the proposal does not pay refuses it; naming none says so in the lines.
         let stranger = crate::wallet::Wallet::from_spend_key(randprotocol_zkvm::notes::SpendKey([5; 8])).address;
-        let e = sign(&prop, &p, &k[0], &[stranger]).unwrap_err().to_string();
+        let e = sign(&prop, &p, &k[0], &[randprotocol_msig::ExpectedRecipient::address(stranger)]).unwrap_err().to_string();
         assert!(e.contains("not an expected recipient"), "{e}");
         assert!(shown.iter().any(|l| l.contains("the payee was NOT checked")), "{shown:?}");
     }

@@ -947,9 +947,11 @@ enum MultisigPrivateCmd {
         /// A `rand-node keygen` key file.
         #[arg(long)]
         key: PathBuf,
-        /// The address the payee gave you (`rand1…`), out of band. Repeatable: every output that
-        /// moves value and is not change must pay one of them, or nothing is signed.
-        #[arg(long = "expect-to", value_name = "ADDR")]
+        /// The address the payee gave you (`rand1…`), out of band, optionally `:AMOUNT` (RAND, as
+        /// `--amount`). Repeatable: every output that moves value and is not change must pay one
+        /// of them, every one of them must be paid, and an AMOUNT must be paid exactly, or
+        /// nothing is signed.
+        #[arg(long = "expect-to", value_name = "ADDR[:AMOUNT]")]
         expect_to: Vec<String>,
     },
     /// Check a proposal against the policy and print what it pays; signs nothing.
@@ -958,8 +960,8 @@ enum MultisigPrivateCmd {
         proposal: PathBuf,
         #[arg(long)]
         policy: PathBuf,
-        /// The address the payee gave you (`rand1…`), as for `sign`. Repeatable.
-        #[arg(long = "expect-to", value_name = "ADDR")]
+        /// The address the payee gave you (`rand1…[:AMOUNT]`), as for `sign`. Repeatable.
+        #[arg(long = "expect-to", value_name = "ADDR[:AMOUNT]")]
         expect_to: Vec<String>,
     },
     /// Prove the proposal with at least T signatures: the auth proof on this machine (tier 18),
@@ -1242,9 +1244,10 @@ fn parse_address(s: &str) -> Result<ShieldedAddress> {
     ShieldedAddress::parse(s).map_err(|e| anyhow::anyhow!("{e}")).context("invalid shielded address")
 }
 
-/// `multisig-private check|sign --expect-to ADDR…`: each a `rand1…` address, a bad one named.
-fn parse_expect_to(addrs: &[String]) -> Result<Vec<ShieldedAddress>> {
-    addrs.iter().map(|a| parse_address(a.trim()).with_context(|| format!("--expect-to {a}"))).collect()
+/// `multisig-private check|sign --expect-to ADDR[:AMOUNT]…`: each a `rand1…` address with an
+/// optional exact amount (as `--amount` reads one), a bad one named.
+fn parse_expect_to(addrs: &[String]) -> Result<Vec<randprotocol_msig::ExpectedRecipient>> {
+    addrs.iter().map(|a| randprotocol_msig::ExpectedRecipient::parse(a).map_err(anyhow::Error::from).with_context(|| format!("--expect-to {a}"))).collect()
 }
 
 /// `rand send`'s TO argument, and `rand contacts add`'s TO: a `rand1…` address first, then a
@@ -1489,7 +1492,7 @@ async fn multisig_private_cmd(prover: bool, cpu: bool, key: &Path, max_prover_fe
             let proposal = made?;
             mp::save_proposal(&proposal, &out)?;
             // The coordinator's own check names the payee it was given.
-            print_proposal_summary(&mp::check(&proposal, &policy, std::slice::from_ref(&payee))?);
+            print_proposal_summary(&mp::check(&proposal, &policy, &[randprotocol_msig::ExpectedRecipient::address(payee.clone())])?);
             println!("wrote {}: gather {} or more signatures and prove before height {}", out.display(), policy.threshold, proposal.expires_at);
         }
         MultisigPrivateCmd::Check { proposal, policy, expect_to } => {

@@ -13,7 +13,7 @@
     "chain 7 · genesis 0000000000000000000000000000000000000000000000000000000000000000",
     "0: → 0 RAND to cb5c9747f9a2ef35 memo \"\" (owner key verified; delivery key NOT verifiable from this proposal)",
     "1: → 0 RAND to 2c94b28813d4ce65 memo \"\" (owner key verified; delivery key NOT verifiable from this proposal)",
-    "2: → 10 RAND to 35bad5bd21a6f0f7 matches A5SR-HRMB-SY4M-5ZYF memo \"\" (owner key verified; delivery key NOT verifiable from this proposal)",
+    "2: → 10 RAND to 35bad5bd21a6f0f7 matches A5SR-HRMB-SY4M-5ZYF (10 RAND) memo \"\" (owner key verified; delivery key NOT verifiable from this proposal)",
     "3: → 14.999 RAND to this account 4333dd507bcc4286 memo \"\" (owner key verified; delivery key NOT verifiable from this proposal)",
     "fee 0.001 RAND",
     "burn 0 of asset 0, 0 RAND"
@@ -102,7 +102,7 @@
       {
         "amount": 10000000000,
         "asset": 0,
-        "matches": "A5SR-HRMB-SY4M-5ZYF",
+        "matches": "A5SR-HRMB-SY4M-5ZYF (10 RAND)",
         "memo": "",
         "owner_fingerprint": "35bad5bd21a6f0f7",
         "to_account": false

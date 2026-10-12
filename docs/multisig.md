@@ -312,11 +312,18 @@ signer meant. So the signer flow is:
 
 1. Ask the payee, out of band, for their `rand1…` address (`rand address` prints it, and also its
    `owner fingerprint`).
-2. Sign with `--expect-to <address>` (repeat it for several payees). Every output that moves value
-   and is not the account's own change must pay one of those addresses' owner keys, or nothing is
-   signed: `output N pays <owner fingerprint>, not an expected recipient`. The paying line then says
-   `matches <address fingerprint>`. (Zero-amount outputs, a bundle's dummies, move nothing and are
-   not held to it.)
+2. Sign with `--expect-to <address>[:AMOUNT]` (repeat it for several payees). Three rules, or
+   nothing is signed:
+   - every output that moves value and is not the account's own change pays one of those
+     addresses' owner keys (`output N pays <owner fingerprint>, not an expected recipient`);
+   - every named address is paid by at least one such output
+     (`expected recipient <fp> is not paid`);
+   - with `:AMOUNT` (RAND, written as `--amount` is), the outputs paying that address sum to
+     exactly it (`expected recipient <fp> is paid <sum>, not <AMOUNT>`; a non-RAND output to it
+     is refused).
+
+   The paying line then says `matches <address fingerprint> (<amount>)`. (Zero-amount outputs, a
+   bundle's dummies, move nothing and are not held to it.)
 3. If you only have the payee's owner fingerprint, compare it by eye with the output line.
 
 Without `--expect-to` the share is still produced — the coordinator-trusting mode stays possible —
