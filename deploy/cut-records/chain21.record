@@ -33,3 +33,4 @@ perps-genesis-root: da0e3a53d93e50ec03fa40c6d2bd3dad8b9c7b4f542175e86a1dea567cbb
 # Who signed this record off, and when it was published (before the cut):
 signed-off: Dendi Suhubdy (the user, in the executing session: "yes go for it / confirm"), 2026-10-12T10:22:10Z
 published: fullnode branch feat/chain21-cutover, pushed to origin (github.com/randprotocol/fullnode) after the cut's values were recorded and before `push`, 2026-10-12T10:22:10Z
+second-rebuild-waived: 2026-10-12T10:22:50Z genesis ca76c2766ed6090ac6ba5dad86b724dd5d2b80c0edfaed287cd8b129e663ca9a by dendisuhubdy@Dendis-MacBook-Pro: one operator holds every validator key and every host; no second operator exists to rebuild the genesis for this cut
