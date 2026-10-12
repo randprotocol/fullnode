@@ -25,7 +25,7 @@
 | verify | **reuse `verify_auth(hc, proof, binding)`**. `ZkExecutor` dispatches on `hc`: the build's msauth digest → the msauth path, otherwise the single-key path; each path pins its own full shape. The verify cache keys on `hc` (kind 2), so the two guests never share an entry. Three new trait methods, all header/warm-only and **required** (no default): `auth_header`, `warm_auth_multisig`, `auth_multisig_key_ready` — forwarded, never cached |
 | gas (R-gas) | the msauth prover keeps the header ceiling; under a `gas` section admission requires `GAS == gas_max_with_modq(pinned header)`, the same function of public header words for every M. The run's exact gas is never required |
 | shape (R-hide) | admission pins tier, program, input, keccak, sha256 (0), modq, public and memory heights exactly to `msauth_heights()`, before any key is built |
-| proof size | ≈ **3.6 MB** at Production FRI (range 3.5–3.8 MB, §3.3); a multisig transfer ≈ 5.1 MB |
+| proof size | ≈ **3.6 MB** at Production FRI (range 3.5–3.8 MB, §3.3); a multisig transfer ≈ 5.1 MB. *(design-time estimate; superseded by §8 (≥ 3.4 MB auth, ≈ 4.8 MB with the bundle; Production size not yet measured))* |
 | wallet | `rand multisig-private new-policy / address / balance / prepare / sign / prove / submit`; the msauth proof is made **locally only** (delegated msauth proving is a follow-up, §6.6); the bundle proof may go to a paired prover as today |
 | fork | the MODQ re-vendor changes every verifier key and the `Proof` encoding: this build refuses chains 18–20 (`CHAINS_THIS_BUILD_CANNOT_RUN`, constraint set 9), and chain 21 too if it is cut before this lands (§9.2, a gate before any code) |
 | key build | the tier-18 msauth key is built **once** (`OnceLock<Arc<CommonData>>`, single flight), warmed first; the mempool defers a multisig-shaped proof (retryable) until it is warm |
@@ -124,7 +124,7 @@ The node, which can name guests, adds at startup (`check_build_runs_genesis`, be
 - `rand-node genesis --auth-multisig-guest` (requires `--auth-guest`) writes
   `hc_auth_multisig = ZkExecutor::hc_auth_multisig()`, and the summary line prints it.
 - **RPC body cap.** `rpc_max_body_bytes` (`rpc.rs`) counts two proofs at the cap, arguing that the
-  single-key auth proof is a small fixed shape (~1.36 MB). The msauth proof is ~3.6 MB, so on a
+  single-key auth proof is a small fixed shape (~1.36 MB). The msauth proof is ~3.6 MB (*design-time estimate; superseded by §8 (≥ 3.4 MB auth, ≈ 4.8 MB with the bundle; Production size not yet measured)*), so on a
   genesis with `hc_auth_multisig` it counts **three** (bundle + msauth + call, each at
   `max_proof_bytes`): `rpc_max_body_bytes(max_proof_bytes, max_call_envelope_bytes,
   three_proofs: bool)`, and its doc says why.
@@ -233,13 +233,16 @@ Measured sizes in this repository at Production FRI (80 queries, blowup 8):
   `docs/zkvm.md`), whatever its height, because every query opens a full-width leaf;
 - the modq table: about +75 KB (MODQ spec §6: 107 opened columns × 80 queries × 8 B).
 
+*(design-time estimate; superseded by §8 (≥ 3.4 MB auth, ≈ 4.8 MB with the bundle; Production size not yet measured).)*
+
 So the msauth proof is ≈ 1.49 MB + 4 × 30 KB (tier 14 → 18) + 1.91 MB + 75 KB ≈ **3.6 MB**
 (3.5–3.8 MB). Circuits Task 8 records the real figure (`research/docs/04-guests.md`). The rule
 is `MSAUTH_MIN_PROOF_BYTES = 4 MiB` if the measured proof is at most 95 % of it (3 984 588 bytes).
 Otherwise the constant becomes `6 << 20`, and chain 21's `MAX_PROOF_BYTES` 6 291 456. Its
 20 MiB block still clears `3 × 6 MiB + 1 MiB = 19 MiB`.
 
-A multisig transfer is therefore ≈ 5.1 MB of proof, about 3.5 times a single-key one's 2.85 MB.
+A multisig transfer is therefore ≈ 5.1 MB of proof, about 3.5 times a single-key one's 2.85 MB
+(*design-time estimate; superseded by §8 (≥ 3.4 MB auth, ≈ 4.8 MB with the bundle; Production size not yet measured)*).
 Bundle bytes are not priced today (`settled_floor` is `fee_floor(action)` for every non-call
 action), so it pays the same `BUNDLE_BASE`. That is a fee-policy question, recorded in §9, and not
 changed here.
@@ -788,13 +791,8 @@ they differ on the cut's numbers the cut script's asserted values win.
    ```markdown
    - **Chain 21 onward; not for chain 20.** Constraint set 9 (the MODQ chip) changes every verifier
      key and the proof encoding: this build refuses chains 18–20 at startup
-     (`CHAINS_THIS_BUILD_CANNOT_RUN`). Chain 20 stays on v0.7.x until chain 21's cut. Compact
-     blocks and the validator hot path's node-only half run on chain 21 from its genesis, so there
-     is no flag-day roll.
+     (`CHAINS_THIS_BUILD_CANNOT_RUN`). Chain 20 stays on v0.7.x until chain 21's cut.
    ```
-
-   (The last sentence is 10a's addition, keeping what the withdrawn bullet said about compact
-   blocks and the hot path; drop it if the user prefers the spec's three sentences alone.)
 
 3. **Private multisig** — a new bullet under "**Chain 21 and later, by genesis section:**", after
    its existing text:
@@ -805,7 +803,8 @@ they differ on the cut's numbers the cut script's asserted values win.
      the two auth guests apart by the proof's pinned shape, with no wire, txid or binding change;
      the chain learns only "multisig-authorised". The multisig auth proof's Production size is
      unmeasured (estimated ≥ 3.4 MB; a genesis naming the guest needs `max_proof_bytes` ≥ 4 MiB,
-     and chain 21 is cut at 6 MiB with 19 MiB blocks). Wallet: `rand multisig-private
+     and chain 21 is cut at 6 MiB with 19 MiB blocks: the decided chain-21 values, asserted by the
+     cut script on `feat/chain21-msauth` (`a7379a6c`), which merges after this branch). Wallet: `rand multisig-private
      new-policy|address|balance|prepare|check|sign|prove|submit` (`docs/cli.md`); the auth proof is
      proved locally (tier 18, ≥ 48 GB), the bundle proof may go to a paired prover. The signer
      checks are the pure crate `randprotocol-msig` (`randprotocol_client::multisig_private`,

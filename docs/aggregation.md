@@ -472,11 +472,14 @@ both have to clear before a genesis may switch it on.
    time since constraint set 8; the admission vectors were re-proved with it). Every earlier value
    in this list is superseded; `crates/randprotocol-node/tests/no_pre_phase4_recursion_pins.rs`
    refuses the stale full literals in code. No modq-bearing inner proof reaches the chip-free
-   recursion verifier (`docs/zkvm.md` §8a).
-   - **The N ceiling: production N ≤ 5.** The reduce chip runs a fixed 196 480 rows a production
-     inner proof (39 296 test) and `REDUCE_MAX_LOG_HEIGHT` is 20, so an aggregate verifies only
-     while `N × rows + 1 ≤ 2^20`: **N ≤ 5 production, N ≤ 26 test**. Tier 22 holds N ≤ 7 by cpu
-     rows, so inside it the ceiling is the reduce chip's. The rVM refuses to prove past it, and the
+   recursion verifier (`docs/zkvm.md` §8a). The reduce chip runs 196 960 rows a production proof
+   (39 392 test) with the MODQ chip; N ≤ 5 unchanged (5 × 196 960 + 1 ≤ 2^20); tier 22 admits
+   nothing.
+   - **The N ceiling: production N ≤ 5.** The reduce chip runs a fixed 196 960 rows a production
+     inner proof (39 392 test; 196 480 / 39 296 before the MODQ chip) and `REDUCE_MAX_LOG_HEIGHT` is 20, so an aggregate verifies only
+     while `N × rows + 1 ≤ 2^20`: **N ≤ 5 production, N ≤ 26 test**. Tiers {19, 20, 21} are
+     admitted (tier 22 is refused, `agg_executor::admitted_tiers`), and the ceiling inside them is
+     the reduce chip's. The rVM refuses to prove past it, and the
      node mirrors the rVM's own `machine::max_reduce_n`: `verify_aggregate` refuses an aggregate
      over more bundles by name before any key work (`agg_executor::check_n_ceiling`), and
      `rand-node genesis` refuses an `--aggregation` whose `max_covers` exceeds it for an admitted

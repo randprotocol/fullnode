@@ -572,4 +572,5 @@ MODQ chip, 880 102 in software). The Production msauth prove (time and peak RSS 
 machine, at least 48 GB), the proof's size and a warm tier-18 verify on a validator are the plan's
 Task 2 `MSAUTH-PROD:`/`MSAUTH-TEST:` lines, which have not been taken (a user-terminal run). Until
 they are: the auth proof is estimated at ≥ 3.4 MB (≈ 4.8 MB with the bundle proof), the node's floor
-beside `hc_auth_multisig` is a 4 MiB `max_proof_bytes`, and chain 21 is cut at 6 MiB.
+beside `hc_auth_multisig` is a 4 MiB `max_proof_bytes`, and chain 21 is cut at 6 MiB (6 291 456) with
+19 MiB blocks (19 922 944) — the decided chain-21 values; asserted by the cut script on `feat/chain21-msauth` (`a7379a6c`), which merges after this branch.

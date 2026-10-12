@@ -361,7 +361,8 @@ A node on a chain whose genesis names `hc_auth_multisig` verifies multisig autho
   refusal naming the path and both digests when the file is absent or not the pinned one, and never
   a build.
 - **The genesis field.** The chain-21 cut writes `hc_auth_multisig` via
-  `rand-node genesis --auth-multisig-guest`; see `deploy/cut-chain21-genesis.sh`.
+  `rand-node genesis --auth-multisig-guest`; see `deploy/cut-chain21-genesis.sh` (the gate lands
+  with `feat/chain21-msauth`).
 - **The roll.** `deploy/roll-all.sh` takes the blob as its fifth argument (or `MSAUTH_VK`;
   `NO_MSAUTH_VK=1` for a chain without multisig) and, on each host, checks the copy against the
   pin of the `rand-node` being installed before installing anything, then installs it beside the
