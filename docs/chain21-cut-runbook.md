@@ -55,17 +55,18 @@ the genesis is `testnet: true`.
 
 Inputs: fullnode **c0878c3f** (origin/main = a1785c95 + version 0.8.0, doc memory corrections, a
 dated CHANGELOG, and the CHANGELOG assets line naming msauth-vk-production.bin). Tag **v0.8.0** from
-it once its push CI run is green (`<CI RUN FOR c0878c3f>` below: read it with `gh run list -R
-randprotocol/fullnode -w ci.yml -c c0878c3f…`).
+it once its push CI run, **38208645768**
+(https://github.com/randprotocol/fullnode/actions/runs/38208645768), ends green. The tag happens
+only if that run ends green; otherwise a new run's id replaces it in the annotation below.
 
 1. **Tag** (the user; `docs/deploy.md` "Release rule": an annotated tag naming the green run):
 
    ```bash
    cd ~/Github/randprotocol/fullnode && git fetch origin
    gh run list -R randprotocol/fullnode -w ci.yml --commit c0878c3f --json databaseId,conclusion,headSha   # success
-   gh run view <CI RUN FOR c0878c3f> -R randprotocol/fullnode --json conclusion,headSha
+   gh run view 38208645768 -R randprotocol/fullnode --json conclusion,headSha
    git tag -a v0.8.0 c0878c3f -m "v0.8.0 — chain 21 onward (constraint set 9, private multisig)
-   ci: run <CI RUN FOR c0878c3f> (success) at c0878c3f"
+   ci: run 38208645768 (success) at c0878c3f"
    git push origin v0.8.0
    ```
 
@@ -335,9 +336,10 @@ chain 21's with `hc_auth_multisig` 9705f8e2… and 6/19 MiB, a `push`/`stop`/`sw
 matching `second-hash`, a `stop` before every host passes its gate, a `switch` on a running node or
 an active `rand-guardian`, and a `start` without the marker a full `switch` writes.
 
-**A failed switch** names the hosts; fix them and re-run `switch`, or roll the fleet back: `stop`
-(already stopped), then `rollback`, which restores the hosts that switched and leaves the rest
-alone. **A re-cut after a switch** (a second genesis) needs the rollback first — `halt`,
+**A failed switch** names the hosts; fix them and re-run `switch`, or roll the fleet back: the fleet
+is already stopped (`halt` only if a node somehow runs), then `rollback` → `start` → `wait20`, then
+restart the bridge on chain 20 (§g step 4). `rollback` restores the hosts that switched and leaves
+the rest alone. **A re-cut after a switch** (a second genesis) needs the rollback first — `halt`,
 `rollback`, `start`, `wait20` — and then `push`, `stop`, `switch` of the new file; `switch` refuses a
 unit or drop-in that already names another chain-21 genesis.
 
@@ -412,6 +414,12 @@ In this order (each line alone, `echo $?`):
    relayer's `done/` holds nothing newer than the snapshot, and the treasury: `rand_getMultisig
    <TREASURY ID>` still 100 000 RAND and no zUSD deposited. If anything moved, the rollback loses it
    — the user decides.
+
+   **If chain 21 never answered** (no node came up, or none is up now), `quiet` cannot read it and
+   refuses ("unreadable"). Then check `status` and the `wait` output: if no host ever reported a
+   chain-21 height above 0, no block committed and nothing can have been minted or burned there;
+   record that in the cut record and go on with step 3 on the user's word. If some host did report a
+   height and none answers now, bring one up (`start` on C) and run `quiet` before halting again.
 3. **The fleet:**
 
    ```bash

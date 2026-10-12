@@ -164,6 +164,7 @@ case "$body" in
       *-6210cf07|*/data-20) h=6210cf071a390d7ac61d8cbea5dd9d139d1a493a862b54a45a498f36af2d5135;;
       *) [ -d "$dd/db" ] || exit 7; t=$(mktemp -d); h=$($B/rand-node init --datadir $t/p --genesis $FAKE_ROOT/root/genesis-chain21.json | grep -o 'genesis [0-9a-f]*' | cut -d' ' -f2); rm -rf $t;;
     esac
+    [ "${REHEARSE_SERVE_OLD:-}" = "$FAKE_HOST" ] && h=6210cf071a390d7ac61d8cbea5dd9d139d1a493a862b54a45a498f36af2d5135
     echo "{\"id\":1,\"jsonrpc\":\"2.0\",\"result\":\"$h\"}";;
   *rand_getHealth*) echo '{"id":1,"jsonrpc":"2.0","result":{"status":"ok"}}';;
   *rand_getBridgeState*)
@@ -257,6 +258,7 @@ t "DRY_RUN=1 stop prints its gate" 0 "stop gate" env DRY_RUN=1 "${NEWENV[@]}" "$
 t "DRY_RUN=1 switch prints the msauth key check" 0 "keygen-msauth-vk --check" env DRY_RUN=1 "${NEWENV[@]}" "${OLDENV[@]}" "${LN[@]}" $F switch $G21
 t "DRY_RUN=1 start prints the key gate" 0 "msauth key on every host" env DRY_RUN=1 $F start
 t "DRY_RUN=1 quiet" 0 "rand_getBridgeState" env DRY_RUN=1 $F quiet $G21
+t "DRY_RUN=1 quiet with no genesis file does not crash" 0 "is not a file" env DRY_RUN=1 $F quiet $T/no-such-genesis.json
 t "DRY_RUN=1 rollback" 0 "[dry-run]" env DRY_RUN=1 "${OLDENV[@]}" $F rollback
 t "DRY_RUN=1 wait" 0 "msauth_key loaded" env DRY_RUN=1 "${LN[@]}" $F wait $G21
 t "DRY_RUN=1 wait20" 0 "serves genesis 6210cf07" env DRY_RUN=1 $F wait20
@@ -323,7 +325,7 @@ chk "…nothing copied" '! ls $T/hosts/*/root/genesis-chain21.json >/dev/null 2>
 record "$H21"
 t "start with no marker" 1 "no $MARKER_GLOB<prefix> marker" $F start
 t "stop with no genesis argument" 1 "stop <genesis file>" $F stop
-t "stop before push: refused, nothing stopped" 1 "NOTHING STOPPED" env "${NEWENV[@]}" "${LN[@]}" $F stop $G21
+t "stop before push: refused, nothing stopped" 1 "NOTHING STOPPED" env "${NEWENV[@]}" "${OLDENV[@]}" "${LN[@]}" $F stop $G21
 chk "…all 26 still active on chain 20" '[ "$(active)" = 26 ] && [ "$(units)" = "$U0" ]'
 t "push of the chain-21 genesis while chain 20 runs" 0 "PUSHED — chain 20 still runs" env "${NEWENV[@]}" "${LN[@]}" $F push $G21
 chk "26 hosts hold the genesis, byte-identical; all 26 still active" '[ "$(shasum $T/hosts/*/root/genesis-chain21.json | cut -d" " -f1 | sort -u | wc -l | tr -d " ")" = 1 ] && [ "$(ls $T/hosts/*/root/genesis-chain21.json | wc -l | tr -d " ")" = 26 ] && [ "$(active)" = 26 ]'
@@ -331,19 +333,30 @@ t "switch while the fleet still runs" 1 "some hosts are not ready" env "${NEWENV
 chk "…switched nothing, installed nothing, no marker" '[ "$(units)" = "$U0" ] && [ "$(installed rand-node)" = "26:$OLD_SHA " ] && [ "$(installed msauth-vk-production.bin)" = "26:none " ] && [ "$(nmark)" = 0 ]'
 # ── the gated stop ──
 mv "$T/hosts/192.0.2.14/root/genesis-chain21.json" "$T/g.aside"
-t "stop when one host lacks the pushed genesis" 1 "NOTHING STOPPED" env "${NEWENV[@]}" "${LN[@]}" $F stop $G21
+t "stop when one host lacks the pushed genesis" 1 "NOTHING STOPPED" env "${NEWENV[@]}" "${OLDENV[@]}" "${LN[@]}" $F stop $G21
 has "…that host says the genesis is not pushed" "the chain-21 genesis is not pushed here"
 chk "…all 26 still active" '[ "$(active)" = 26 ]'
 mv "$T/g.aside" "$T/hosts/192.0.2.14/root/genesis-chain21.json"
 cp "$TESTBLOB" "$T/hosts/192.0.2.16/root/msauth-vk-production.bin.c21"
-t "stop when one host's staged blob changed since stage" 1 "NOTHING STOPPED" env "${NEWENV[@]}" "${LN[@]}" $F stop $G21
+t "stop when one host's staged blob changed since stage" 1 "NOTHING STOPPED" env "${NEWENV[@]}" "${OLDENV[@]}" "${LN[@]}" $F stop $G21
 chk "…all 26 still active" '[ "$(active)" = 26 ]'
 cp "$BLOB" "$T/hosts/192.0.2.16/root/msauth-vk-production.bin.c21"
 record "$H21B"
-t "stop when the record's second-hash is another genesis's" 1 "differ" env "${NEWENV[@]}" "${LN[@]}" $F stop $G21
+t "stop when the record's second-hash is another genesis's" 1 "differ" env "${NEWENV[@]}" "${OLDENV[@]}" "${LN[@]}" $F stop $G21
 chk "…all 26 still active" '[ "$(active)" = 26 ]'
 record "$H21"
-t "stop (gated: all 26 ready)" 0 "STOPPED" env "${NEWENV[@]}" "${LN[@]}" $F stop $G21
+t "stop without v0.7.1's pins" 1 "OLD_SHA / OLD_SHA_WALLET" env "${NEWENV[@]}" "${LN[@]}" $F stop $G21
+chk "…all 26 still active" '[ "$(active)" = 26 ]'
+echo active > "$T/hosts/192.0.2.104/state/rand-guardian"
+t "stop while one guardian host's rand-guardian still runs" 1 "NOTHING STOPPED" env "${NEWENV[@]}" "${OLDENV[@]}" "${LN[@]}" $F stop $G21
+has "…that host names its rand-guardian" "rand-guardian still active"
+chk "…all 26 still active" '[ "$(active)" = 26 ]'
+echo inactive > "$T/hosts/192.0.2.104/state/rand-guardian"
+cp "$BIN/badrel/rand-node" "$T/hosts/192.0.2.13/usr/local/bin/rand-node"
+t "stop while one host's installed rand-node is not v0.7.1" 1 "NOTHING STOPPED" env "${NEWENV[@]}" "${OLDENV[@]}" "${LN[@]}" $F stop $G21
+has "…that host names its binary" "switch would refuse it"
+cp "$BIN/old/rand-node" "$T/hosts/192.0.2.13/usr/local/bin/rand-node"
+t "stop (gated: all 26 ready)" 0 "STOPPED" env "${NEWENV[@]}" "${OLDENV[@]}" "${LN[@]}" $F stop $G21
 chk "all 26 inactive" '[ "$(active)" = 0 ]'
 # ── switch ──
 record ""
@@ -353,7 +366,7 @@ t "switch without v0.7.1's pins" 1 "OLD_SHA / OLD_SHA_WALLET" env "${NEWENV[@]}"
 # the first switch attempt: every other host switches in it — a failed switch is re-run, never undone
 cp "$TESTBLOB" "$T/hosts/192.0.2.5/root/msauth-vk-production.bin.c21"
 cp "$BIN/badrel/rand-node" "$T/hosts/192.0.2.12/usr/local/bin/rand-node"
-t "switch with host 5's staged blob replaced and host 12 not on v0.7.1" 1 "Or roll the fleet back: stop (already stopped), then rollback" env "${NEWENV[@]}" "${OLDENV[@]}" "${LN[@]}" $F switch $G21
+t "switch with host 5's staged blob replaced and host 12 not on v0.7.1" 1 "rollback → start → wait20, then restart the bridge on chain 20" env "${NEWENV[@]}" "${OLDENV[@]}" "${LN[@]}" $F switch $G21
 has "…host 5 says its staged blob is not the pinned one (sha256, before the key check)" "files are not staged"
 has "…host 12 made no backup" "no backup made"
 chk "…host 5 installed nothing: still v0.7.1, no key, unit on chain 20; no marker" '[ "$(sha $T/hosts/192.0.2.5/usr/local/bin/rand-node)" = "$OLD_SHA" ] && [ ! -e $T/hosts/192.0.2.5/usr/local/bin/msauth-vk-production.bin ] && grep -q -- "-6210cf07 " $T/hosts/192.0.2.5/etc/systemd/system/rand-node.service && [ "$(nmark)" = 0 ]'
@@ -405,6 +418,12 @@ echo active > "$T/hosts/192.0.2.18/state/rand-node"
 t "quiet: nothing burned or minted on chain 21" 0 "QUIET" $F quiet $G21
 t "quiet when a deposit was minted on chain 21" 1 "NOT the genesis values" env REHEARSE_MINTED=5 $F quiet $G21
 # ── a re-cut over a switched fleet, without a rollback, is refused (M2) ──
+cp "$T/hosts/192.0.2.13/etc/systemd/system/rand-node.service" "$T/unit.keep"
+sed -i '' 's/--datadir [^ ]*//' "$T/hosts/192.0.2.13/etc/systemd/system/rand-node.service"
+t "halt with an active host whose datadir cannot be parsed" 1 "names no --datadir" $F halt
+cp "$T/unit.keep" "$T/hosts/192.0.2.13/etc/systemd/system/rand-node.service"
+t "halt with an active host that serves chain 20's genesis over RPC" 1 "SERVES CHAIN 20" env REHEARSE_SERVE_OLD=192.0.2.9 $F halt
+chk "…nothing halted" '[ "$(active)" = 26 ]'
 t "halt the chain-21 fleet" 0 "HALTED" $F halt
 record "$H21B"
 t "push of a re-cut while chain 21 is down" 0 "PUSHED" env "${NEWENV[@]}" "${LN[@]}" $F push $G21B
@@ -425,7 +444,7 @@ record "$H21"   # the second-hash names the FIRST cut
 t "push of a re-cut genesis whose second-hash is another cut's, no waiver" 1 "differ" env "${NEWENV[@]}" "${LN[@]}" $F push $G21B
 record "$H21B"
 t "push of the re-cut while chain 20 runs" 0 "PUSHED" env "${NEWENV[@]}" "${LN[@]}" $F push $G21B
-t "stop for the re-cut (gated)" 0 "STOPPED" env "${NEWENV[@]}" "${LN[@]}" $F stop $G21B
+t "stop for the re-cut (gated)" 0 "STOPPED" env "${NEWENV[@]}" "${OLDENV[@]}" "${LN[@]}" $F stop $G21B
 t "switch to the re-cut genesis (guardian hosts still hold the first cut's data-21)" 0 "SWITCHED" env "${NEWENV[@]}" "${OLDENV[@]}" "${LN[@]}" $F switch $G21B
 NEWB=$(cut -d' ' -f1 "$T"/markers/*)
 chk "each guardian host moved the first cut's data-21 aside (kept) and initialised a fresh one" '[ "$(ls -d $T/hosts/192.0.2.10{1..6}/var/lib/randnode/data-21.stale-$P/db | wc -l | tr -d " ")" = 6 ] && [ "$(ls -d $T/hosts/192.0.2.10{1..6}/var/lib/randnode/data-21/db | wc -l | tr -d " ")" = 6 ] && [ "$(cat $T/hosts/192.0.2.10{1..6}/var/lib/randnode/data-21.genesis | sort -u)" = "$NEWB" ] && [ "$NEWB" != "$NEW" ]'

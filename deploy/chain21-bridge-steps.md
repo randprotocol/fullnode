@@ -114,7 +114,8 @@ What is different from chain 20:
 4. Restore on each guardian host `rand-guardian.toml.chain20` and `cursors.chain20`; on
    `rand-relayer-1` the toml, the cursors **and the v0.7.1 `rand`**:
    ```
-   [ "$(sha256sum /usr/local/bin/rand.pre-c21 | cut -d' ' -f1)" = '<v0.7.1 rand sha256>' ] && install -m 755 /usr/local/bin/rand.pre-c21 /usr/local/bin/rand
+   [ "$(sha256sum /usr/local/bin/rand.pre-c21 | cut -d' ' -f1)" = '<v0.7.1 rand sha256>' ] || { echo 'rand.pre-c21 is NOT the v0.7.1 rand — nothing installed; stop here'; exit 1; }
+   install -m 755 /usr/local/bin/rand.pre-c21 /usr/local/bin/rand
    /usr/local/bin/rand --version                                       # 0.7.1
    ```
    and the laptop guardians' tomls and cursors. Start as in step 6. No endpoint fee changes (chain

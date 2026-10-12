@@ -466,6 +466,7 @@ stop)
   clear_markers
   need_local_node
   need_new_shas
+  need_old_shas
   need_genesis "$GENESIS"
   second_rebuild_ok
   echo "== stop gate on $(wc -w <<<"$ALL" | tr -d ' ') hosts: the staged v$WANT_VERSION files at their pins, the staged key verified, the pushed genesis $NEW $(date -u +%T)"
@@ -473,6 +474,14 @@ stop)
     $(staged_ok)
     $(staged_self)
     $(pushed_ok)
+    # What switch will need of the installed build, checked while chain 20 can still run: v$OLD_VERSION
+    # installed (or already backed up), and on a guardian host no rand-guardian running.
+    for b in rand-node:$OLD_SHA rand:$OLD_SHA_WALLET; do n=\${b%%:*}; s=\${b#*:}
+      [ -e /root/\$n.pre-c21 ] || [ \"\$(sha256sum /usr/local/bin/\$n | cut -d' ' -f1)\" = \"\$s\" ] || { echo \"installed \$n is not chain 20's v$OLD_VERSION binary (switch would refuse it)\"; exit 1; }
+    done
+    if [ -f /etc/systemd/system/rand-node.service.d/chain20.conf ] || [ -f /etc/systemd/system/rand-node.service.d/chain21.conf ]; then
+      systemctl is-active --quiet rand-guardian && { echo 'rand-guardian still active — the bridge steps stop it before the stop'; exit 1; }
+    fi
     echo \"\$(hostname) ready: staged v$WANT_VERSION, msauth key \${vk_pin:0:12}… verified, genesis $NEW pushed\"" \
     || { echo "stop: not every host is ready (above) — NOTHING STOPPED; chain 20 keeps running. Re-run stage / push for those hosts" >&2; exit 1; }
   echo "== stop all 26 $(date -u +%T)"
@@ -487,7 +496,12 @@ halt)
   clear_markers
   echo "== halt: no host may be running chain 20 (its datadir -$OLD / data-20) $(date -u +%T)"
   each "D=\$(systemctl cat rand-node 2>/dev/null | grep -o -- '--datadir [^ ]*' | tail -1 | cut -d' ' -f2)
-    if systemctl is-active --quiet rand-node; then case \"\$D\" in *-$OLD|*/data-20) echo \"\$(hostname) RUNS CHAIN 20 (\$D) — use stop <genesis>\"; exit 1;; esac; fi
+    if systemctl is-active --quiet rand-node; then
+      [ -n \"\$D\" ] || { echo \"\$(hostname) is active and its unit names no --datadir — cannot tell its chain; refusing\"; exit 1; }
+      case \"\$D\" in *-$OLD|*/data-20) echo \"\$(hostname) RUNS CHAIN 20 (\$D) — use stop <genesis>\"; exit 1;; esac
+      G=\$(curl -s -m5 -X POST 127.0.0.1:8545 -H 'content-type: application/json' -d '{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"rand_getGenesisHash\",\"params\":[]}' | grep -oE '\"result\":\"[0-9a-f]+\"' | cut -d'\"' -f4 || true)
+      case \"\$G\" in $OLD*) echo \"\$(hostname) SERVES CHAIN 20's genesis \$G — use stop <genesis>\"; exit 1;; esac
+    fi
     echo \"\$(hostname) may halt (\$(systemctl is-active rand-node || true), \$D)\"" \
     || { echo "halt: a host runs chain 20 — nothing halted; chain 20 is stopped only by \`stop <genesis>\`" >&2; exit 1; }
   stop_all
@@ -604,7 +618,7 @@ switch)
       sed -i 's/-$OLD /-$P /' \$U
       systemctl daemon-reload
       echo \"\$(hostname) ready: \$(/usr/local/bin/rand-node --version), msauth key \${vk_pin:0:12}… verified, \$(grep -o -- '--datadir [^ ]*' \$U)\"
-    fi" || { echo "switch: some hosts are not ready — fix them and re-run switch; do NOT start. Or roll the fleet back: stop (already stopped), then rollback — it restores the hosts that switched and leaves the rest alone" >&2; exit 1; }
+    fi" || { echo "switch: some hosts are not ready — fix them and re-run switch; do NOT start. Or roll the fleet back (the fleet is already stopped; \`halt\` if any node runs): rollback → start → wait20, then restart the bridge on chain 20 — rollback restores the hosts that switched and leaves the rest alone" >&2; exit 1; }
   # Only a switch that reached every host licenses `start`.
   local_write "echo '$NEW <UTC>' > $MARKER_GLOB$P" bash -c 'echo "$1 $(date -u +%FT%TZ)" > "$2"' _ "$NEW" "$MARKER_GLOB$P"
   echo "SWITCHED — marker $MARKER_GLOB$P written; next: start (alone; check \$?)"
@@ -751,6 +765,10 @@ quiet)
   # backing's `locked` must still be the genesis values (no burn emitted, no deposit minted). A
   # rollback after either loses it.
   GENESIS=${2:?quiet <genesis file>}
+  if [ ! -f "$GENESIS" ]; then
+    dry && { echo "== DRY RUN: $GENESIS is not a file — quiet would compare C and D's rand_getBridgeState with its burn_sequence and Σ locked"; rpc "$BOOT1" rand_getBridgeState; exit 0; }
+    echo "quiet: $GENESIS is not a file — the chain-21 genesis the fleet runs" >&2; exit 1
+  fi
   WANT=$(python3 -c 'import json,sys
 g=json.load(open(sys.argv[1])); b=g["bridge"]
 locked=sum(int(k.get("locked",0)) for t in g["tokens"]["tokens"] for k in t["backings"])
