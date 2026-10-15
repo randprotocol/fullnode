@@ -58,6 +58,12 @@ impl CompactBlock {
         }
     }
 
+    /// [`CompactBlock::of`] with the hashes already computed — by the recent cache, which filed
+    /// the block's bodies under them (`RecentTxs::remember_all`) and so hashed each once.
+    pub fn with_hashes(header: BlockHeader, signature: Signature, tx_hashes: Vec<Hash>) -> CompactBlock {
+        CompactBlock { header, signature, tx_hashes }
+    }
+
     /// The block this compact form elided, given its transactions in order. The caller has
     /// checked that each transaction hashes to the hash at its position (`compact::rebuild`).
     pub fn into_block(self, transactions: Vec<Transaction>) -> Block {

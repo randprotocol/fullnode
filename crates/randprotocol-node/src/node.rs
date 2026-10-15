@@ -602,12 +602,31 @@ pub fn startup_check(storage: &Storage, gs: &GenesisState, mode: VerifyMode, exe
             // The row vouches for the header (its hash); the tip's body and signature are
             // re-checked here, one block's work, so a tip altered under an unchanged header
             // still walks (final review #5).
-            Ok(head) => match tip_fault(storage, gs) {
-                Some(fault) => WalkReason::HeadUnreadable(fault),
-                None => {
-                    tracing::info!("chain verified: checkpoint at {} (build {}), replay skipped", head.height, &build[..12]);
-                    return Ok(StartupCheck { resume: head.height, stored: None, verify: StartupVerify::Skipped { height: head.height } });
-                }
+            Ok(head) => match storage.head_block() {
+                Err(e) => WalkReason::HeadUnreadable(e.to_string()),
+                Ok(tip) => match tip_fault_of(&tip, gs) {
+                    Some(fault) => WalkReason::HeadUnreadable(fault),
+                    None => {
+                        // The row's `state_root` is copied from the header, not recomputed, and
+                        // the header is what the QC certifies — the ledger snapshot it stands for
+                        // is a separate blob that no checkpoint vouches for (audit v10, CON-102).
+                        // So the skip still loads the snapshot and hashes it against the tip's
+                        // root, one state-root computation (OPS-5's comparison, brought forward
+                        // from `resume_consensus_from`); the load is handed on, so startup loads
+                        // once. A mismatch refuses to start: a pruned node holds no history to
+                        // rebuild from, and the walk would only have found the same blob.
+                        let ledger = storage.load_ledger(executor)?;
+                        snapshot_is_the_head_state(&tip, &ledger).with_context(|| {
+                            format!(
+                                "startup checkpoint at height {} (build {}) honoured for the chain, but the ledger snapshot is not the head's state;                                  the walk is not what repairs this",
+                                head.height,
+                                &build[..12]
+                            )
+                        })?;
+                        tracing::info!("chain verified: checkpoint at {} (build {}), replay skipped; snapshot matches the head's state root", head.height, &build[..12]);
+                        return Ok(StartupCheck { resume: head.height, stored: Some(ledger), verify: StartupVerify::Skipped { height: head.height } });
+                    }
+                },
             },
         },
     };
@@ -675,11 +694,7 @@ pub fn check_and_repair_chain(storage: &Storage, gs: &GenesisState, mode: Verify
 /// The tip block's own checks, as `apply_block_for_sync` makes them: the proposer's signature
 /// under the chain's signing domain and the tx root over the stored transactions. `None` when
 /// both hold; otherwise what failed.
-fn tip_fault(storage: &Storage, gs: &GenesisState) -> Option<String> {
-    let tip = match storage.head_block() {
-        Ok(b) => b,
-        Err(e) => return Some(e.to_string()),
-    };
+fn tip_fault_of(tip: &Block, gs: &GenesisState) -> Option<String> {
     // Genesis carries no proposer signature: it is this chain's own block, by hash.
     if tip.height() == 0 {
         if tip.hash() != gs.hash() {
@@ -3172,8 +3187,7 @@ impl Node {
         // Remembered before its verdict (spec 2026-10-08 §5.4): the leader may propose it while it
         // waits for a worker, and a compact proposal naming it then rebuilds without a fetch.
         // After the pre-screen, so bytes the refused cache already answered are not kept.
-        let hash = tx.hash();
-        self.recent_txs.remember_hashed(hash, tx.clone());
+        let hash = self.recent_txs.remember(tx.clone());
         // A body an open park is waiting for fills its slot (final review fold-in), whatever
         // the pool makes of it below: the rebuilt block is verified in full, as from the cache.
         let for_park = self.parked.values().any(|p| p.wants(&hash)).then(|| tx.clone());
@@ -3381,15 +3395,12 @@ impl Node {
                 Action::Broadcast(ConsensusMessage::Proposal(b)) | Action::SendTo(_, ConsensusMessage::Proposal(b)) => {
                     // Spec 2026-10-08 §4: the body stays here (the pool until commit, the tree,
                     // the recent cache) and the wire carries the hashes; validators that lack a
-                    // body fetch it by hash. Published first, so the frame does not wait on the
-                    // cache; the bodies are remembered under the hashes the compact form already
-                    // computed, each hashed once.
-                    let compact = CompactBlock::of(&b);
-                    let hashes = compact.tx_hashes.clone();
-                    self.net.broadcast(GossipMessage::CompactProposal(compact)).await;
-                    for (h, tx) in hashes.into_iter().zip(b.transactions) {
-                        self.recent_txs.remember_hashed(h, tx);
-                    }
+                    // body fetch it by hash. The cache hashes each body once as it files it and
+                    // hands the hashes back; the compact form is built from that list, so the
+                    // wire and the cache never disagree about a body's id (CON-102).
+                    let Block { header, transactions, signature } = b;
+                    let hashes = self.recent_txs.remember_all(transactions);
+                    self.net.broadcast(GossipMessage::CompactProposal(CompactBlock::with_hashes(header, signature, hashes))).await;
                 }
                 Action::Broadcast(m) | Action::SendTo(_, m) => {
                     self.net.broadcast(GossipMessage::Consensus(m)).await;
@@ -4440,20 +4451,26 @@ impl Node {
     /// refusal here is only logged; `Ignore` is handed on as the full path hands it on, the
     /// replica being the authority.
     ///
-    /// Its bodies are remembered before the replica validates the block: the next leader's
-    /// proposal often repeats them, and they are safe to keep whatever the verdict — each one's
-    /// hash is in a list whose root the leader signed, so they are the bodies a validator will
-    /// be asked for, and a remembered body is only ever a rebuild source for a block that is
-    /// itself validated in full.
+    /// Its bodies are remembered only once the precheck has *accepted* the block (audit v10,
+    /// NODE-101) — the leader's signature verified over a header whose root the list carries —
+    /// since the next leader's proposal often repeats them. A block the precheck ignores (stale,
+    /// far ahead, a proposer in no known set) is handed on as the full path hands it on, but its
+    /// list was never checked against a signed root, so nothing of it is cached: a remembered
+    /// body is a rebuild source for later blocks, and only bodies a leader committed to are.
     async fn handle_rebuilt(&mut self, block: Block) -> Result<()> {
         use randprotocol_core::consensus::GossipPrecheck;
         let m = ConsensusMessage::Proposal(block);
-        if let GossipPrecheck::Reject(why) = self.hs.precheck_gossip(&m) {
-            tracing::warn!("rebuilt proposal refused: {why}");
-            return Ok(());
-        }
-        if let ConsensusMessage::Proposal(b) = &m {
-            self.recent_txs.remember_block(b);
+        match self.hs.precheck_gossip(&m) {
+            GossipPrecheck::Reject(why) => {
+                tracing::warn!("rebuilt proposal refused: {why}");
+                return Ok(());
+            }
+            GossipPrecheck::Ignore(why) => tracing::debug!("rebuilt proposal handed on unremembered: {why}"),
+            GossipPrecheck::Accept => {
+                if let ConsensusMessage::Proposal(b) = &m {
+                    self.recent_txs.remember_block(b);
+                }
+            }
         }
         self.on_consensus(m).await
     }
@@ -5257,8 +5274,10 @@ mod tests {
         let loads = storage.ledger_loads();
         let again = startup(&storage, &gs, VerifyMode::Quick);
         assert_eq!(again.verify, StartupVerify::Skipped { height: head });
-        assert!(again.stored.is_none());
-        assert_eq!(storage.ledger_loads(), loads, "the skip loads nothing");
+        // CON-102: the skip loads the snapshot once, to hash it against the tip's state root,
+        // and hands the load on.
+        assert!(again.stored.is_some(), "the skip hands the snapshot it checked over");
+        assert_eq!(storage.ledger_loads(), loads + 1, "the skip loads the snapshot once");
         let executor: Arc<dyn ConfidentialExecutor> = Arc::new(StubExecutor);
         let hs = resume_consensus_from(&storage, &gs, Some(key(1)), Duration::from_secs(1), Duration::from_secs(8), executor, again.stored).unwrap();
         assert_eq!(storage.ledger_loads(), loads + 1, "one load for the whole startup");
@@ -5390,20 +5409,25 @@ mod tests {
         assert_eq!(st.verified_head().unwrap(), None, "a failed walk writes nothing");
     }
 
+    /// Audit v10, CON-102: the checkpoint row's `state_root` is the header's, copied; it vouches
+    /// for nothing about the snapshot blob. A same-build start whose row matches the head still
+    /// hashes the loaded snapshot against the tip's root and refuses to start on a mismatch, at
+    /// the checkpoint itself (OPS-5's comparison, before: only at `resume_consensus_from`). The
+    /// row is left: the walk is not what repairs a snapshot, and the message says what is.
     #[test]
-    fn a_valid_checkpoint_does_not_save_an_altered_snapshot() {
+    fn a_valid_checkpoint_does_not_start_on_an_altered_snapshot() {
         let (_d, storage, gs, _) = chain_past_a_boundary();
         storage.set_checkpoint_build_for_testing(Some(SHA_A));
         startup(&storage, &gs, VerifyMode::Quick);
+        assert!(matches!(startup(&storage, &gs, VerifyMode::Quick).verify, StartupVerify::Skipped { .. }), "the control: an honest snapshot skips");
         storage.plant_nullifier_for_testing(&[0xdead_beef; 8]).unwrap();
-        let c = startup(&storage, &gs, VerifyMode::Quick);
-        assert!(matches!(c.verify, StartupVerify::Skipped { .. }), "the walk is skipped…");
-        let executor: Arc<dyn ConfidentialExecutor> = Arc::new(StubExecutor);
-        let err = resume_consensus_from(&storage, &gs, Some(key(1)), Duration::from_secs(1), Duration::from_secs(8), executor, c.stored)
-            .err()
-            .expect("…but OPS-5 still refuses the altered snapshot")
-            .to_string();
-        assert!(err.contains("ledger snapshot") && err.contains("state root"), "{err}");
+        let row = storage.verified_head().unwrap().expect("the row stands");
+        assert_eq!(row.state_root, storage.head_block().unwrap().header.state_root, "the row is the header's root, copied");
+        let e = startup_check(&storage, &gs, VerifyMode::Quick, &StubExecutor).err().expect("the altered snapshot refuses to start");
+        let chain: Vec<String> = e.chain().map(|c| c.to_string()).collect();
+        assert!(chain[0].contains("startup checkpoint") && chain[0].contains("snapshot"), "{chain:?}");
+        assert!(chain.iter().any(|c| c.contains("ledger snapshot") && c.contains("state root")), "{chain:?}");
+        assert_eq!(storage.verified_head().unwrap(), Some(row), "the row is not what is wrong; it stays");
     }
 
     #[test]
@@ -7904,6 +7928,38 @@ mod tests {
         assert_eq!(p.accept(vec![tx]), 1);
         node.handle_rebuilt(p.into_block().expect("complete")).await.unwrap();
         assert!(node.hs.has_block(&block.hash()), "the real body's block is handled");
+    }
+
+    /// Audit v10, NODE-101: a rebuilt block's bodies are remembered only when the precheck
+    /// accepts it — a header the leader signed over a root its list carries. One the precheck
+    /// ignores (here: a view too far ahead, screened before the signature and the list) is
+    /// handed on as the full path hands it on, but nothing of it is cached; one it rejects (a
+    /// list the header does not commit to) is dropped, nothing cached either.
+    #[tokio::test]
+    async fn a_rebuilt_block_is_remembered_only_once_the_precheck_accepts_it() {
+        use randprotocol_core::consensus::PROPOSAL_VIEW_WINDOW;
+        let (_d, storage, gs, hs) = replica_past_a_boundary();
+        let head = storage.head_block().unwrap();
+        let (mut node, _seen) = bare_node(storage, gs, hs);
+        let ledger = node.hs.tip_ledger().clone();
+        let view = node.hs.view();
+
+        let far = block_on(&head, &ledger, &key(1), view + PROPOSAL_VIEW_WINDOW + 1, vec![next_tx(&ledger, 1)]);
+        assert!(matches!(node.hs.precheck_gossip(&ConsensusMessage::Proposal(far.clone())), randprotocol_core::consensus::GossipPrecheck::Ignore(_)));
+        node.handle_rebuilt(far.clone()).await.unwrap();
+        assert!(node.recent_txs.is_empty(), "an ignored block's bodies are not cached");
+        assert!(!node.hs.has_block(&far.hash()));
+
+        let mut swapped = block_on(&head, &ledger, &key(1), view, vec![next_tx(&ledger, 2)]);
+        swapped.transactions = vec![next_tx(&ledger, 3)];
+        assert!(matches!(node.hs.precheck_gossip(&ConsensusMessage::Proposal(swapped.clone())), randprotocol_core::consensus::GossipPrecheck::Reject(_)));
+        node.handle_rebuilt(swapped).await.unwrap();
+        assert!(node.recent_txs.is_empty(), "a rejected block's bodies are not cached");
+
+        let honest = block_on(&head, &ledger, &key(1), view, vec![next_tx(&ledger, 4)]);
+        node.handle_rebuilt(honest.clone()).await.unwrap();
+        assert!(node.hs.has_block(&honest.hash()));
+        assert!(honest.transactions.iter().all(|t| node.recent_txs.get(&t.hash()) == Some(t)), "an accepted block's bodies are cached");
     }
 
     /// A compact proposal for a block the replica already holds makes no fetch, even when its

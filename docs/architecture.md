@@ -354,8 +354,11 @@ same thing offline, without running the node.
 
 **The startup checkpoint.** A walk that succeeds writes one `meta` row, `verified_head`: the head's
 height, hash and state root, and the git sha of the build that verified it. A later start of
-the same build in `quick` mode, on a store whose head is still that block, skips the walk. Only a
-clean build is trusted: a sha that is not 40 hex characters (`-dirty`, `unknown`) neither writes
+the same build in `quick` mode, on a store whose head is still that block, skips the walk — but not
+the snapshot: the row's state root is the header's, copied, and vouches for no blob, so the skip
+still loads the ledger snapshot once, hashes it against the tip's `state_root` and refuses to start
+on a mismatch (audit v10, CON-102; the load is handed on to the resume, so a startup loads once).
+Only a clean build is trusted: a sha that is not 40 hex characters (`-dirty`, `unknown`) neither writes
 nor honours the row, so such builds always walk. `Storage::commit` carries the row forward in the
 same batch as the head when it matches the pre-commit head and this build's sha, so blocks the
 node commits itself stay covered; `truncate_to` clears it, and so does any walk that reports a
