@@ -19,6 +19,19 @@ stopped at v0.4 until 2026-09-30, when the entries v0.5 to v0.6.7 were written f
   production `aggregate_program_digest` `792a66d4…a982` (`8bc2cecb…d8c7` before). No ISA, AIR or
   key change; constraint set 9 and every wallet proof are untouched.
 
+Audit v10 fixes (node and client policies, no chain change unless a genesis field says so):
+
+- **CON-101** (consensus, node-only): a proposal whose bundle proof is the pruned marker form —
+  hash-equal to the leader's honest block — is refused on its body by both prechecks
+  (`MarkerFormInProposal`) and never takes the honest block's place in flight.
+- **CON-102 / NODE-101** (node-only): the recent-transaction cache hashes every body it files; a
+  rebuilt compact block's bodies are remembered only once the precheck accepts it; a startup
+  checkpoint skip still hashes the ledger snapshot against the tip's state root and refuses to
+  start on a mismatch.
+- **RPC-201** (client-only): `rand` reads envelopes by whole aligned chunks of `--scan-chunk`
+  leaves (256; `0` = every envelope) after paging scan heads, so the node learns the chunk and not
+  the leaf (`docs/rpc.md`, scan heads).
+
 ## v0.8.0 — 2026-10-12 (chain 21 onward)
 
 Tagged from fullnode `main` (vendoring circuits `d217252`: constraint set 9 — rVM phase 4's

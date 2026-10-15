@@ -58,8 +58,27 @@ struct Cli {
     /// Prove on the CPU even when a GPU is visible to a build that has the CUDA backend.
     #[arg(long, global = true)]
     cpu: bool,
+    /// How many leaves wide each envelope read is when a scan over scan heads fetches the leaves
+    /// this wallet's keys opened: the whole aligned chunk is read, so the node learns which
+    /// chunk held one of this wallet's leaves and not which leaf. `0` reads every envelope (what
+    /// a wallet did before scan heads: the node learns nothing, at full bandwidth). At most 1000,
+    /// the node's page cap; `1` is refused — it would name the leaf. `docs/rpc.md`, scan heads.
+    #[arg(long, global = true, value_name = "N", default_value_t = randprotocol_client::DEFAULT_SCAN_CHUNK, value_parser = scan_chunk_value)]
+    scan_chunk: u64,
     #[command(subcommand)]
     cmd: Cmd,
+}
+
+/// `--scan-chunk`'s range: `0` (every envelope) or 2..=1000 (the node's page cap); `1` would
+/// fetch exactly the wanted leaf, which is what the chunk exists to avoid (audit v10, RPC-201).
+fn scan_chunk_value(s: &str) -> std::result::Result<u64, String> {
+    let n: u64 = s.parse().map_err(|_| format!("`{s}` is not a number of leaves"))?;
+    match n {
+        0 => Ok(0),
+        1 => Err("a chunk of 1 reads exactly the wanted leaf and hides nothing; use 0 to read every envelope, or 2 or more".into()),
+        n if n > randprotocol_client::MAX_SCAN_CHUNK => Err(format!("at most {} leaves, the node's page cap", randprotocol_client::MAX_SCAN_CHUNK)),
+        n => Ok(n),
+    }
 }
 
 #[derive(Subcommand)]
@@ -2059,7 +2078,7 @@ async fn main() -> Result<()> {
             eprintln!("warning: {e}");
         }
     }
-    let rpc = RpcClient::new(cli.rpc.clone());
+    let rpc = RpcClient::new(cli.rpc.clone()).with_scan_chunk(cli.scan_chunk);
     match cli.cmd {
         Cmd::Keygen => {
             let w = Wallet::generate();
@@ -4047,6 +4066,21 @@ mod tests {
         run(sign(&stolen, vec![])).await.expect("the coordinator-trusting mode still signs (and says the payee was NOT checked)");
         let e = format!("{:#}", run(check(&valid, vec!["rand1nope".into()])).await.unwrap_err());
         assert!(e.contains("--expect-to rand1nope"), "{e}");
+    }
+
+    /// `--scan-chunk` (audit v10, RPC-201) is global, so every command that scans takes it: 0 or
+    /// 2..=1000, 256 by default; 1 and anything past the node's page cap are refused at parse.
+    #[test]
+    fn scan_chunk_is_global_and_bounded() {
+        let chunk = |args: &[&str]| Cli::try_parse_from([&["rand"], args].concat()).map(|c| c.scan_chunk);
+        assert_eq!(chunk(&["sync"]).unwrap(), randprotocol_client::DEFAULT_SCAN_CHUNK);
+        assert_eq!(chunk(&["sync", "--scan-chunk", "0"]).unwrap(), 0);
+        assert_eq!(chunk(&["--scan-chunk", "64", "balance"]).unwrap(), 64);
+        assert_eq!(chunk(&["sync", "--scan-chunk", "1000"]).unwrap(), 1000);
+        for bad in ["1", "1001", "many"] {
+            let err = chunk(&["sync", "--scan-chunk", bad]).unwrap_err().to_string();
+            assert!(err.contains("scan-chunk"), "{bad}: {err}");
+        }
     }
 
     /// `rand sync` scans from where the store left off; `--rescan` starts the store over first
