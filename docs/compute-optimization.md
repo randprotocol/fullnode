@@ -270,7 +270,8 @@ and `docs/07-rvm-rate-quarter.md`):** phase 3 moves the reduce chip's descriptor
 preprocessed layout and adds FOLD / POW row kinds (production inner proof 893 606 → 585 686 cpu
 rows, still tier 20; the register and RAM tables `2^22` → `2^21`; the aggregate program digest
 `c90b3f0a…74d8` → `dc350ecf…8ba0`; superseded since 2026-10-11 by rVM phase 4 and constraint
-set 9: `8bc2cecb…d8c7`, with `inner_vk_digest` `1b0c4b00…ddc7`, `docs/aggregation.md`). The rVM's own proofs then move from rate ⅛ to rate ¼
+set 9: `8bc2cecb…d8c7`, with `inner_vk_digest` `1b0c4b00…ddc7`, `docs/aggregation.md`; and since
+2026-10-15 by rVM phase 5, circuits `b3e21d9`: `792a66d4…a982`, production N = 1 at tier 18). The rVM's own proofs then move from rate ⅛ to rate ¼
 (`log_blowup 3 → 2`, 92 queries and 24 grinding bits in place of 80 and 20; 86.38 proven bits
 against 86.41, the inner RV32 profile untouched). Measured on the tier-18 test twin: peak live
 heap 33.27 GB (quotient layout) → 26.88 GB (phase 3) → **15.64 GB** (rate ¼), verify 7.07 →
