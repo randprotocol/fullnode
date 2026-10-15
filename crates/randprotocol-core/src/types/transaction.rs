@@ -1083,6 +1083,15 @@ impl Transaction {
         Transaction { chain_id, bundle: Some(bundle), action }
     }
 
+    /// Whether the bundle's proof is in the pruned marker form (`PRUNED_PROOF_MARKER` then the
+    /// proof's digest, spec §6.2) rather than a proof. Such a transaction hashes to the raw
+    /// transaction's id ([`Transaction::hash`]), so a body carrying it is a hash-equal variant of
+    /// the honest one; it is admissible only inside sealed-form sync, where a block's side table
+    /// vouches for the proof, and refused everywhere else (audit v10, CON-101).
+    pub fn is_pruned_form(&self) -> bool {
+        self.bundle.as_ref().is_some_and(|b| crate::notes::pruned_proof_hash(&b.proof).is_some())
+    }
+
     /// What a faucet minter signs: the chain, the new note's commitment and opening, its envelope
     /// and the public amount. Binding the chain keeps a testnet mint off another chain.
     pub fn mint_signing_hash(

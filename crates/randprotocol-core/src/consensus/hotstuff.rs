@@ -1095,6 +1095,14 @@ impl HotStuff {
         if !block.verify_signature(&self.cfg.domain) {
             return Err(ConsensusError::BadSignature);
         }
+        // A pruned-marker proof (audit v10, CON-101): the marker hashes to the raw transaction's
+        // id, so this body has an honest block's hash and the leader's own signature over it;
+        // the apply refuses it, but only after it has taken the honest block's place in flight
+        // on a node. Refused here on its body — in `on_proposal` and the precheck alike, before
+        // the parent is looked up — so the honest copy under the same hash is still taken.
+        if let Some(index) = block.pruned_form_index() {
+            return Err(BlockError::MarkerFormInProposal { index }.into());
+        }
         Ok(())
     }
 
@@ -1167,7 +1175,8 @@ impl HotStuff {
     /// the verified-QC cache, which this read-only path does not fill) and the tree's room.
     pub fn precheck_proposal(&self, block: &Block) -> Result<(), ConsensusError> {
         self.check_before_parent(block)?;
-        // Before the parent, so a block that waits for its parent is screened for it too.
+        // Before the parent, so a block that waits for its parent is screened for it too (the
+        // pruned marker form, CON-101, was refused by `check_before_parent` just above).
         match block.transaction_list_fault() {
             None => {}
             Some(_) if block.verify_tx_root() => return Err(BlockError::RepeatedTransaction.into()),
@@ -2011,7 +2020,9 @@ impl HotStuff {
         // The root, and no transaction twice (audit v6, GOSSIP-2): a block with its last
         // transaction repeated has the honest block's root, hash and signature, and the pool
         // dedupes by that hash — kept here, it held the honest orphan's place and then failed
-        // to execute when the parent arrived.
+        // to execute when the parent arrived. The pruned marker form (CON-101) is the same
+        // shape of forgery — the honest hash over a body the apply refuses — and is refused by
+        // `check_before_parent` before this; `transaction_list_fault` names it too.
         match block.transaction_list_fault() {
             None => {}
             Some(fault) if block.verify_tx_root() => {

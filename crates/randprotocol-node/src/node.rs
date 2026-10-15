@@ -11212,6 +11212,45 @@ mod tests {
         assert_eq!(exec.bundles(), 1, "the block's bundle was verified once");
     }
 
+    /// Audit v10, CON-101: the marker-form variant of the leader's block — its bundle proof
+    /// replaced by `PRUNED_PROOF_MARKER ‖ digest(proof)` — has the honest block's hash and
+    /// signature. Before, it passed `precheck_proposal`, took the in-flight slot, and the honest
+    /// block arriving behind it was dropped as a copy; the apply then refused the marker and the
+    /// honest block was lost until a child's fetch. Now the precheck refuses it on the loop,
+    /// nothing is in flight under the hash, and the honest block that follows is applied.
+    #[tokio::test]
+    async fn the_pruned_marker_variant_of_a_proposal_never_takes_the_honest_blocks_place_in_flight() {
+        use randprotocol_core::notes::PRUNED_PROOF_MARKER;
+        let (_d, storage, gs, hs) = replica_past_a_boundary();
+        let head = storage.head_block().unwrap();
+        let (mut node, mut seen, mut applied) = offloop_node(storage, gs, hs);
+        claiming_peer(&mut node, 3);
+        let ledger = node.hs.tip_ledger().clone();
+        let block = block_on(&head, &ledger, &key(1), node.hs.view(), vec![next_tx(&ledger, 1)]);
+        let hash = block.hash();
+        let mut marker = block.clone();
+        let proof_hash = Hash::digest(&block.transactions[0].bundle.as_ref().unwrap().proof);
+        marker.transactions[0].bundle.as_mut().unwrap().proof = [PRUNED_PROOF_MARKER, proof_hash.as_bytes().as_slice()].concat();
+        assert_eq!(marker.hash(), hash, "the finding: one hash, two bodies");
+        assert!(marker.verify_tx_root());
+
+        // The marker variant first: refused on the loop, no worker, no slot taken.
+        node.on_consensus(ConsensusMessage::Proposal(marker.clone())).await.unwrap();
+        assert!(node.in_flight.is_empty() && node.waiting.is_empty(), "the marker variant is not in flight");
+        assert!(!node.hs.has_block(&hash), "and not held");
+        assert!(applied.try_recv().is_err(), "no apply was started for it");
+
+        // The honest block behind it goes off the loop and is applied.
+        node.on_consensus(ConsensusMessage::Proposal(block.clone())).await.unwrap();
+        assert_eq!(node.in_flight, HashSet::from([hash]), "the honest block takes the slot");
+        // A marker copy arriving while the honest block is in flight is a copy, dropped.
+        node.on_consensus(ConsensusMessage::Proposal(marker)).await.unwrap();
+        assert_eq!(node.in_flight.len(), 1);
+        assert_eq!(complete(&mut node, &mut applied).await, hash);
+        assert!(node.hs.has_block(&hash), "the honest block is held");
+        assert!(voted_for(&drain(&mut seen).await, &block));
+    }
+
     /// Spec §5 test 9: with [`OFFLOOP_APPLIES`] applies in flight, the next proposal is
     /// delivered on the loop; the four in flight still complete.
     #[tokio::test]

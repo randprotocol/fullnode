@@ -27,7 +27,7 @@ pub fn recent_txs_bytes(max_block_bytes: usize) -> usize {
 /// rebuilt into the block, it makes the block fail and this node not vote. A marker-form body
 /// therefore never enters the compact path: not cached, not looked up, not accepted from a fetch.
 pub fn is_marker_form(tx: &Transaction) -> bool {
-    tx.bundle.as_ref().is_some_and(|b| randprotocol_core::notes::pruned_proof_hash(&b.proof).is_some())
+    tx.is_pruned_form()
 }
 
 /// FIFO of gossiped and proposed transactions by hash, capped by count and by serialized

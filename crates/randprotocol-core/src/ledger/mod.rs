@@ -438,6 +438,14 @@ pub enum BlockError {
     /// pool, which takes a block on its header; an executed block's repeat fails on its own.
     #[error("a transaction appears twice in the block")]
     RepeatedTransaction,
+    /// The block carries a transaction whose proof is the pruned marker form (audit v10,
+    /// CON-101). The marker hashes to the raw transaction's id, so such a block has the honest
+    /// block's root, hash and signature and the apply refused it only after it had taken the
+    /// honest block's place in flight, the honest copy dropped as a duplicate. Refused by the
+    /// precheck and the orphan pool instead, before any proof work, with a verdict that is about
+    /// the body, not the hash — the honest block under the same hash is still taken.
+    #[error("tx {index} carries its proof in the pruned marker form")]
+    MarkerFormInProposal { index: usize },
     #[error("state root mismatch: computed {computed}, header {header}")]
     StateRootMismatch { computed: Hash, header: Hash },
     #[error("bad proposer signature")]

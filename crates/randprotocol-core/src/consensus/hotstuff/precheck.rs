@@ -436,6 +436,50 @@ mod tests {
         assert_eq!(block.transaction_list_fault(), None);
     }
 
+    /// Audit v10, CON-101: a leader's proposal with its bundle proof replaced by the pruned
+    /// marker form hashes to the honest block's hash — `Transaction::hash` takes the proof by
+    /// digest, which is what the marker carries — and carries the leader's own signature. It is
+    /// refused here, on its body, so it never reaches a node's in-flight slot where the honest
+    /// copy would then be dropped as a duplicate; the honest block is forwarded as before.
+    #[test]
+    fn a_proposal_carrying_a_pruned_marker_proof_is_not_forwarded() {
+        use crate::notes::{Bundle, Envelope, PRUNED_PROOF_MARKER};
+        use crate::types::{Action, Transaction};
+        let hs = replica();
+        let leader = leader_key(&hs, VIEW);
+        let env = || Envelope { kem_ct: vec![1; 8], to_receiver: vec![], to_sender: vec![], body: vec![2; 8] };
+        let bundle = Bundle {
+            anchor: [3; 8],
+            nullifiers: [[1; 8], [2; 8], [3; 8], [4; 8]],
+            commitments: [[5; 8], [6; 8], [7; 8], [8; 8]],
+            fee: 1,
+            burn_a: 0,
+            burn_r: 0,
+            burn_asset: 0,
+            time: 0,
+            envelopes: [env(), env(), env(), env()],
+            proof: vec![9; 64],
+            auth_commit: [0; 8],
+            auth_proof: Vec::new(),
+        };
+        let raw = Transaction::shielded(1, bundle, Action::None);
+        let mut header = proposal(&hs, VIEW, &leader).header;
+        header.tx_root = Block::tx_root(std::slice::from_ref(&raw));
+        let honest = Block::sign(&hs.cfg.domain, header, vec![raw.clone()], &leader);
+        assert_eq!(hs.precheck_gossip(&ConsensusMessage::Proposal(honest.clone())), GossipPrecheck::Accept);
+
+        let mut marker = honest.clone();
+        let proof_hash = Hash::digest(&raw.bundle.as_ref().unwrap().proof);
+        marker.transactions[0].bundle.as_mut().unwrap().proof = [PRUNED_PROOF_MARKER, proof_hash.as_bytes().as_slice()].concat();
+        assert_eq!(marker.hash(), honest.hash(), "the finding: one hash, two bodies");
+        assert!(marker.verify_tx_root() && marker.verify_signature(&hs.cfg.domain));
+        assert_eq!(marker.pruned_form_index(), Some(0));
+        assert_eq!(marker.transaction_list_fault(), Some(crate::types::block::MARKER_FORM_FAULT));
+        assert_eq!(hs.precheck_gossip(&ConsensusMessage::Proposal(marker)), GossipPrecheck::Reject(crate::types::block::MARKER_FORM_FAULT));
+        assert_eq!(honest.pruned_form_index(), None);
+        assert_eq!(hs.precheck_gossip(&ConsensusMessage::Proposal(honest)), GossipPrecheck::Accept, "the honest block still forwards");
+    }
+
     #[test]
     fn a_vote_from_a_non_validator_is_not_forwarded_and_not_penalised() {
         let hs = replica();

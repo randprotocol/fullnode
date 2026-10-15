@@ -3924,6 +3924,62 @@ fn pre_execute_refusals_still_fire_with_a_pre_applied_result() {
     assert!(!pre.has_block(&second.hash()));
 }
 
+/// Audit v10, CON-101: the marker-form variant of a leader's block — every bundle proof replaced
+/// by `PRUNED_PROOF_MARKER ‖ digest(proof)` — has the honest block's hash and signature, and the
+/// apply refused it (`PrunedFormOutsideSync`) only after it had taken the honest block's place in
+/// flight on a node. `precheck_proposal` refuses it on its body, with a verdict of its own, and
+/// `on_proposal` refuses it the same way; the honest block passes both before and after.
+#[test]
+fn precheck_proposal_refuses_the_pruned_marker_variant_of_an_honest_block() {
+    use crate::gas;
+    use crate::ledger::BlockError;
+    use crate::notes::PRUNED_PROOF_MARKER;
+    use crate::types::Action;
+    use crate::Bundle;
+    let mut sim = setup(4, 4);
+    let (leader, view) = pending_leader(&sim);
+    sim.now += 1;
+    let tip = sim.nodes[leader].tip_ledger().clone();
+    let mut b = Bundle {
+        anchor: tip.root(),
+        nullifiers: [[9; 8], [10; 8], [19; 8], [20; 8]],
+        commitments: [[11; 8], [12; 8], [21; 8], [22; 8]],
+        fee: gas::BUNDLE_BASE,
+        burn_a: 0,
+        burn_r: 0,
+        burn_asset: 0,
+        time: tip.height() as u32,
+        envelopes: [env(), env(), env(), env()],
+        proof: vec![],
+        auth_commit: [0; 8],
+        auth_proof: Vec::new(),
+    };
+    let d = StubExecutor.bundle_digest(&b.digest_input());
+    b.proof = StubExecutor::make_bundle_proof(&tip.hc_bundle(), &d, &[0; 8]);
+    let tx = StubExecutor::bound(Transaction::shielded(1, b, Action::None));
+    let block = proposal_of(&sim.nodes[leader].propose(view, vec![tx.clone()], sim.now).unwrap());
+    assert_eq!(block.transactions, vec![tx.clone()], "the leader proposed the bundle");
+    let follower = (leader + 1) % 4;
+
+    let mut marker = block.clone();
+    let proof_hash = Hash::digest(&tx.bundle.as_ref().unwrap().proof);
+    marker.transactions[0].bundle.as_mut().unwrap().proof = [PRUNED_PROOF_MARKER, proof_hash.as_bytes().as_slice()].concat();
+    assert_eq!(marker.hash(), block.hash(), "the finding: one hash, two bodies");
+    assert!(marker.verify_tx_root() && marker.verify_signature(&sim.domain()));
+
+    let [(mut hs, exec), _] = counted_twins(&sim, follower);
+    assert_eq!(hs.precheck_proposal(&block), Ok(()));
+    let want = Err(ConsensusError::Execution(BlockError::MarkerFormInProposal { index: 0 }));
+    assert_eq!(hs.precheck_proposal(&marker), want);
+    assert_eq!(exec.calls(), 0, "refused before any proof work");
+    assert_eq!(hs.on_proposal(marker, sim.now).map(|_| ()), want, "on_proposal refuses it the same way");
+    assert!(!hs.has_block(&block.hash()), "and keeps nothing under the honest hash");
+    assert_eq!(exec.calls(), 0);
+    assert_eq!(hs.precheck_proposal(&block), Ok(()), "the honest block still passes");
+    hs.on_proposal(block.clone(), sim.now).expect("and is applied");
+    assert!(hs.has_block(&block.hash()));
+}
+
 /// Off-loop apply fix round 1 (I1): `precheck_proposal` — the node's screen before an off-loop
 /// apply — refuses each pre-execute case with the error `on_proposal` refuses it with, and
 /// executes nothing. Two cases differ by design: an unheld parent is `UnknownParent` without
