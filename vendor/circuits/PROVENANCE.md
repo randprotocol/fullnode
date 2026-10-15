@@ -12,12 +12,14 @@ lock is the one cargo reads) and `target/`; the manifests are verbatim, their `[
 included, which is why the root `Cargo.toml` lists all three paths under `[workspace] exclude`. The
 copies are byte-identical to this circuits commit:
 
-circuits: d217252afde318b2ff51976351f449a685b5832f
+circuits: b3e21d9ea16225452bcd03a94317cb61e1705979
 
-(Branch feat/private-multisig, not yet on zkp-circuits: rVM phase 4 (Merkle spans) and the MODQ
-chip (constraint set 9), with the `dilithium-verify` and `msauth` guests and the
-`dilithium-core` crate. `rand-zkvm-cuda/` and `research/src/poseidon2_constants.rs` are
-byte-identical at 71e1a04, the pushed commit both rand-zkvm-cuda revs name.)
+(Circuits main, the rVM phase-5 merge (`recursion/docs/10-phase5-n2-tier19.md`: the production
+N=2 aggregate in tier 19; `recursion/` alone moved). `research/`, `guests-compiled/` and these
+three crates are byte-identical to d217252 (constraint set 9: rVM phase 4, the MODQ chip, the
+`dilithium-verify` and `msauth` guests, the `dilithium-core` crate), and `rand-zkvm-cuda/` and
+`research/src/poseidon2_constants.rs` are byte-identical at 71e1a04, the pushed commit both
+rand-zkvm-cuda revs name.)
 
 That is the commit `.github/workflows/ci.yml` checks out as `CIRCUITS_PIN`, and the commit
 `crates/randprotocol-zkvm/guests-compiled/PROVENANCE.md` names;

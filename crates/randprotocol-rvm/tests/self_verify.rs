@@ -140,8 +140,10 @@ fn the_self_program_digest_is_deterministic_and_distinct() {
     // the `POW` bus (was b475a9f9…).
     // The rate-¼ profile (2026-10-06, docs/07): one Merkle level fewer per path at every height (was e9c9720d…).
     // Phase 4 (2026-10-09, the Merkle spans) re-recorded it: b42ae772… → 515fc2a1….
+    // Phase 5 (2026-10-12, S6a/S2b/S4a/S1b) re-recorded it: 515fc2a1… → 890d66fc… (the shared
+    // pipeline's assertions, sponges, tape tails and query-index bits changed).
     let hex: String = d1.iter().map(|w| format!("{:016x}", p3_field::PrimeField64::as_canonical_u64(w))).collect();
-    assert_eq!(hex, "515fc2a1adaeabcdd4e186c9ba699199f284285f9f968c4ea07a279988bbd32c",
+    assert_eq!(hex, "890d66fc75b37ef4b49fbdcecd104c43ebd33a23a2fca1468397d5e1b401b6e5",
                "the self-verifier's digest at the toy fixture shape");
 
     // And it is not the single-proof RV32-machine verifier's digest for the same profile: build
@@ -397,14 +399,16 @@ fn the_self_verifiers_measured_cost_at_two_fixture_shapes() {
     // Phase 4 (2026-10-09, the Merkle spans) re-recorded it: toy 101 209 → 66 560 rows, busy
     // 126 541 → 77 285 (was (101209, 6008, 247568, 103217, 23775) and
     // (126541, 7578, 291961, 128941, 29479)).
+    // Phase 5 (2026-10-12, S6a/S2b/S4a/S1b) re-recorded it: toy 66 560 → 52 318 rows, busy
+    // 77 285 → 61 300 (was (66560, 6008, 222897, 68568, 23775) and (77285, 7578, 256092, 79685, 29479)).
     assert_eq!(
         (r.cpu_rows, r.permutations, r.mem_accesses, r.program_instrs, r.witness_words),
-        (66560, 6008, 222897, 68568, 23775),
+        (52318, 6008, 216086, 53462, 22975),
         "the tier-8 toy fixture's CycleReport, pinned"
     );
     assert_eq!(
         (rb.cpu_rows, rb.permutations, rb.mem_accesses, rb.program_instrs, rb.witness_words),
-        (77285, 7578, 256092, 79685, 29479),
+        (61300, 7578, 248006, 62932, 28775),
         "the busy fixture's CycleReport, pinned"
     );
 
@@ -431,9 +435,12 @@ fn the_self_verifiers_measured_cost_at_two_fixture_shapes() {
     // not reach the constraint evaluation, which reads only the degree bits and the opened values.
     // Phase 4 (2026-10-09, the Merkle spans) re-recorded it: (7933, 8213) → (7929, 8209), measured
     // (cause not attributed by this re-pin).
+    // Phase 5 (2026-10-12, S6a/S2b/S4a/S1b) re-recorded it: (7929, 8209) → (7915, 8195), measured:
+    // −14 in both, independent of the heights; consistent with S6a's one-row `assert_eq` over the
+    // phase's fourteen equality assertions, but not attributed by this re-pin.
     let p5a: usize = vp.phase5.iter().map(|c| c.instrs).sum();
     let p5b: usize = vp_b.phase5.iter().map(|c| c.instrs).sum();
-    assert_eq!((p5a, p5b), (7929, 8209), "phase 5 varies with the degree bits, measured");
+    assert_eq!((p5a, p5b), (7915, 8195), "phase 5 varies with the degree bits, measured");
 }
 
 /// VERIFIER-1 for the rVM's own proofs: the rVM machine grinds zero commit-phase bits too

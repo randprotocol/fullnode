@@ -458,9 +458,10 @@ impl Builder {
     }
 
     /// `n` witness words, read in order into `n` fresh cells. `Precompiles::On` (Cut B): one
-    /// `HINTN` per full block of eight at immediate offset `8·j`, then `HINT; STORE` pairs for the
-    /// `n mod 8` tail — the tail stays compiled because a block always consumes eight words, and
-    /// the tape has exactly `n`. `Precompiles::Off`: the pairs throughout (the reference).
+    /// `HINTN` per full block of eight at immediate offset `8·j`, then the `n mod 8` tail in
+    /// `HINTE; STOREE` pairs (S4a), plus one `HINT; STORE` for an odd last word — a block always
+    /// consumes eight words, and the tape has exactly `n`. `Precompiles::Off`: `HINT; STORE`
+    /// throughout (the reference).
     pub fn hint_array(&mut self, n: usize) -> Array<Felt> {
         self.hint_array_padded(n, 0)
     }
@@ -477,7 +478,18 @@ impl Builder {
         for j in 0..blocks {
             self.emit(Op::Hintn, RRef::Raw(0), rp, BRef::Imm(imm(8 * j as i64)));
         }
-        for k in 8 * blocks..n {
+        let mut k = 8 * blocks;
+        if self.precompiles() == Precompiles::On {
+            // S4a (phase 5): the tail two words at a time — `HINTE` reads two tape words into a
+            // register pair, `STOREE` writes the pair to two cells. Same words, same cells.
+            let pair = self.take_scratch(2);
+            while k + 2 <= n {
+                self.emit(Op::Hinte, RRef::scratch(pair), RRef::Raw(0), BRef::Imm(F::ZERO));
+                self.emit(Op::Storee, RRef::scratch(pair), rp, BRef::Imm(imm(k as i64)));
+                k += 2;
+            }
+        }
+        for k in k..n {
             self.emit(Op::Hint, RRef::scratch(s), RRef::Raw(0), BRef::Imm(F::ZERO));
             self.emit(Op::Store, RRef::scratch(s), rp, BRef::Imm(imm(k as i64)));
         }
@@ -763,7 +775,7 @@ impl Builder {
     }
 
     /// One `POW` (Cut F): `base·g^{rev(bits, L)}` from the `len` bits at cells `off..off+len` of
-    /// the 65-cell bits buffer `bits` (`DslChallenger::sample_bits_mem`), by the reduce chip's
+    /// the 65-cell bits buffer `bits` (`DslChallenger::sample_index_bits`), by the reduce chip's
     /// pow run; the result is loaded from cell 64. `(g, base)` ride as one extension pair in `rd`.
     /// `len` is at least 1: a run has one chip row per bit and its first row is the one that
     /// receives the dispatch, so an empty run has nothing to receive it — the same shape
@@ -777,6 +789,18 @@ impl Builder {
         let rp = self.ptr_reg(bits);
         self.emit(Op::Pow, rgb, rp, BRef::Imm(F::from_u64((off + 256 * len) as u64)));
         self.load(bits, 64)
+    }
+
+    /// `LOAD r0, [v + offset]`, value discarded: a **range check** on `v` (phase 5 S1b). The cpu
+    /// AIR proves every LOAD/STORE address `< 2^24` with its three RANGE8 limbs, so this row proves
+    /// `v + offset < 2^24` as integers. Paired calls bound `v` from both sides: `v + 0 < 2^24` and
+    /// `v + (2^24 − 2^w) < 2^24` give `v < 2^w` (`v + c < 2^24` alone would admit `v ∈ [p − c, p)`).
+    /// The read reaches at most cell `2^24 − 1`, inside the address space; `r0` drops it.
+    pub fn range_load(&mut self, v: Felt, offset: u64) {
+        assert!(offset < 1 << 24, "range_load: offset {offset} is outside the 2^24 address space");
+        self.begin();
+        let rv = self.materialise(v.0);
+        self.emit(Op::Load, RRef::Raw(0), rv, BRef::Imm(F::from_u64(offset)));
     }
 
     /// The register a `Ptr`'s address lives in, folding any compile-time delta in first. An
@@ -812,15 +836,16 @@ impl Builder {
 
     // --------------------------------------------------------------- control
 
-    /// `a == b`, or the program traps at a `pc` that names `what`.
+    /// `a == b`, or the program traps at a `pc` that names `what`. One `JEQ a, b` over the trap:
+    /// the cpu's equality gadget constrains `D0 − A0` (zero or invertible) and selects the branch
+    /// on it, so the `FSUB` into scratch the pre-phase-5 form paid computed nothing the gadget does
+    /// not (phase 5 S6a: −10 124 rows a production inner verification).
     pub fn assert_eq(&mut self, a: Felt, b: Felt, what: &str) {
         self.begin();
         let ra = self.materialise(a.0);
         let rb = self.materialise(b.0);
-        let t = self.take_scratch(1);
-        self.emit_r(Op::Fsub, RRef::scratch(t), ra, bref_of(rb));
         let over = self.ops.len() as u32 + 2;
-        self.emit(Op::Jeq, RRef::scratch(t), RRef::Raw(0), BRef::Imm(F::ZERO));
+        self.emit(Op::Jeq, ra, rb, BRef::Imm(F::ZERO));
         self.set_target(over);
         self.trap(what);
     }

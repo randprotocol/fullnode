@@ -41,7 +41,13 @@ const MAX_CYCLES: usize = 1 << 24;
 /// Phase 4 (2026-10-09, the Merkle spans) re-recorded it: 274 → 327 (re-measured: N=1 104 477 =
 /// 104 150 + 327; the 53-row move is measured, not attributed span by span). MODQ chip (2026-10-11, private multisig phase 3): the inner cpu gained SYS_MODQ: 327 unchanged
 /// (re-measured: N=1 104 556 = 104 229 + 327).
-const LOOP_OVERHEAD: usize = 327;
+/// Phase 5 (2026-10-12, S6a/S2b/S4a/S1b) re-recorded it: 327 → 326 (re-measured: N=1 88 486 =
+/// 88 160 + 326). Bisected to S2b: the tree at S6a still measures 327, S2b alone moves it, and
+/// restoring only `emit_commit_root`'s leaf sponge to the old digest-copy form restores 327 (S6a,
+/// S4a and the other S2b site do not). The single-proof and looped builds both run that site, so
+/// the row is an address-layout / register-allocation interaction of the leaf's eight-cell
+/// allocation with the loop's own cells; the exact instruction was not traced.
+const LOOP_OVERHEAD: usize = 326;
 
 /// The N=3 total, measured on this tree. The per-N total is *not* a clean multiple of the
 /// per-proof rows: the staged absorb permutes when a block fills, and the fill phase advances
@@ -59,7 +65,8 @@ const LOOP_OVERHEAD: usize = 327;
 /// reduce chip): 578 950 → 555 622. Cut F (`POW`, the index powers in the reduce chip): 555 622 → 508 102.
 /// Phase 4 (2026-10-09, the Merkle spans) re-recorded it: 508 102 → 312 665. MODQ chip (2026-10-11, private multisig phase 3): the inner cpu gained SYS_MODQ
 /// (283 columns): 312 665 → 312 902.
-const N3_ROWS: usize = 312_902;
+/// Phase 5 (2026-10-12, S6a/S2b/S4a/S1b) re-recorded it: 312 902 → 264 692.
+const N3_ROWS: usize = 264_692;
 
 fn shape_and_key(p: &Proof) -> (InnerShape, InnerKey) {
     let shape = InnerShape::of(
@@ -359,7 +366,7 @@ fn a_one_proof_aggregate_round_trips_and_tampered_variants_are_refused() {
     let m = RvmMachine::new(FriProfile::Test);
     let a = aggregate(&m, &vk, std::slice::from_ref(&p.proof), &common::TEST_BINDING, None)
         .expect("one real bundle proof aggregates");
-    assert_eq!(a.proof.tier, RvmTier(18), "the test-profile N=1 aggregate lands at tier 18 (104 556 rows since the MODQ chip, 104 477 after phase 4's Merkle spans; 169 640 after phase 3's Cut F, 185 480 after Cut E2, 193 256 after Cut E1, 202 472 after Cut D, 231 224 before; tier 19 before phase 2's row cuts)");
+    assert_eq!(a.proof.tier, RvmTier(18), "the test-profile N=1 aggregate lands at tier 18 (88 486 rows since phase 5 — the tier ladder has no 17, so 18 holds; 104 556 rows since the MODQ chip, 104 477 after phase 4's Merkle spans; 169 640 after phase 3's Cut F, 185 480 after Cut E2, 193 256 after Cut E1, 202 472 after Cut D, 231 224 before; tier 19 before phase 2's row cuts)");
     eprintln!("N=1 aggregate proof: {} bytes", a.proof.size());
     let program = aggregate_program(&vk);
     let outs = verify_aggregate(&m, &program, &a, &common::TEST_BINDING).expect("the aggregate verifies");
@@ -578,7 +585,7 @@ fn a_tampered_tape_fails_the_prove_at_the_named_step() {
 }
 
 /// (e) the in-suite aggregate: two real test-profile bundle proofs prove and verify natively —
-/// tier 18 on this fixture shape since phase 4's Merkle spans (208 729 rows since the MODQ chip, 208 571 after phase 4; tier 19 after phase
+/// tier 18 on this fixture shape since phase 4's Merkle spans (176 589 rows since phase 5; 208 729 since the MODQ chip, 208 571 after phase 4; tier 19 after phase
 /// 2's row cuts, tier 20 before; the history below is
 /// the tier-20 prove's, and its GB figures are macOS RSS, which excludes compressed and swapped
 /// pages — `docs/04-phase2-row-cuts.md` §"The prover's live heap"). `#[ignore]`d after two jetsam deaths on the shared box: the
@@ -590,7 +597,7 @@ fn a_tampered_tape_fails_the_prove_at_the_named_step() {
 /// tier-19 proof at ≈ 52 GB live, past the 48 GB box; at rate ¼ it proves and verifies on this
 /// 48 GB box (`docs/07-rvm-rate-quarter.md` §3; ≈ 30 GB projected, heap not printed).
 #[test]
-#[ignore = "the N=2 in-suite aggregate: tier 18 since phase 4 (208 729 rows since the MODQ chip, 208 571 after phase 4; tier 19 after phase 2, 20 before); proved on the 48 GB box at rate 1/4 at tier 19 (docs/07 §3), \
+#[ignore = "the N=2 in-suite aggregate: tier 18 since phase 4 (176 589 rows since phase 5; 208 729 since the MODQ chip, 208 571 after phase 4; tier 19 after phase 2, 20 before); proved on the 48 GB box at rate 1/4 at tier 19 (docs/07 §3), \
             ~30 GB live projected then; heavy, so run alone: cargo test --release -p recursion --test aggregate \
             two_test_profile -- --ignored --nocapture"]
 fn two_test_profile_bundle_proofs_aggregate_and_verify_natively() {
@@ -600,7 +607,7 @@ fn two_test_profile_bundle_proofs_aggregate_and_verify_natively() {
     let vk = inner_vk(&shape, &key);
     let m = RvmMachine::new(FriProfile::Test);
     let a = aggregate(&m, &vk, &proofs, &common::TEST_BINDING, None).expect("two real bundle proofs aggregate");
-    assert_eq!(a.proof.tier, RvmTier(18), "the test-profile N=2 aggregate lands at tier 18 (208 729 rows since the MODQ chip, 208 571 after phase 4's Merkle spans; tier 19 at 338 871 after phase 3's Cut F, 370 551 after Cut E2, 386 103 after Cut E1, 404 535 after Cut D, 462 039 before; tier 20 before phase 2's row cuts)");
+    assert_eq!(a.proof.tier, RvmTier(18), "the test-profile N=2 aggregate lands at tier 18 (176 589 rows since phase 5; 208 729 since the MODQ chip, 208 571 after phase 4's Merkle spans; tier 19 at 338 871 after phase 3's Cut F, 370 551 after Cut E2, 386 103 after Cut E1, 404 535 after Cut D, 462 039 before; tier 20 before phase 2's row cuts)");
     eprintln!("N=2 aggregate proof: {} bytes", a.proof.size());
     let outs = verify_aggregate(&m, &aggregate_program(&vk), &a, &common::TEST_BINDING).expect("the aggregate verifies");
     assert_eq!(outs.len(), 2);
@@ -613,7 +620,7 @@ fn two_test_profile_bundle_proofs_aggregate_and_verify_natively() {
 }
 
 /// The M5.3 exit (spec §7, R4's profile ruling): an aggregate of **3 real test-profile bundle
-/// proofs** verifies natively — tier 19 since phase 3 (312 902 rows since the MODQ chip, 312 665 after phase 4's Merkle spans, 508 102 after phase 3; tier 20 after phase 2's row
+/// proofs** verifies natively — tier 19 since phase 3 (264 692 rows since phase 5; 312 902 since the MODQ chip, 312 665 after phase 4's Merkle spans, 508 102 after phase 3; tier 20 after phase 2's row
 /// cuts, 21 before; the GB figures in this note are the pre-cut macOS RSS readings, not live-heap
 /// numbers — `docs/04`). Not proved since its tier moved: docs/06's cell model put it at ≈ 78 GB
 /// live at rate ⅛ (`docs/06-phase3-fold-reduce.md` §3, §6); at rate ¼ ≈ 45 GB projected
@@ -622,7 +629,7 @@ fn two_test_profile_bundle_proofs_aggregate_and_verify_natively() {
 /// process at ~33 GB the attempt is expected to die there — the peak it reaches is the
 /// measurement, and the plan's fallback records N=1 (tier 19, completed) as the in-scope proof.
 #[test]
-#[ignore = "the N=3 exit twin: tier 19 since phase 3 (312 902 rows since the MODQ chip, 312 665 after phase 4; 20 after phase 2, 21 before), ~45 GB live projected at rate 1/4 (docs/07 §4), a >= 64 GB host; watchdog-guarded; \
+#[ignore = "the N=3 exit twin: tier 19 since phase 3 (264 692 rows since phase 5; 312 902 since the MODQ chip, 312 665 after phase 4; 20 after phase 2, 21 before), ~45 GB live projected at rate 1/4 (docs/07 §4), a >= 64 GB host; watchdog-guarded; \
             run alone: cargo test --release -p recursion --test aggregate twin -- --ignored --nocapture"]
 fn twin_three_test_profile_bundle_proofs_aggregate_and_verify_natively() {
     let proofs: Vec<Proof> =
@@ -633,7 +640,7 @@ fn twin_three_test_profile_bundle_proofs_aggregate_and_verify_natively() {
     let t0 = std::time::Instant::now();
     let a = aggregate(&m, &vk, &proofs, &common::TEST_BINDING, None).expect("three real bundle proofs aggregate");
     let prove_s = t0.elapsed().as_secs_f64();
-    assert_eq!(a.proof.tier, RvmTier(19), "the test-profile N=3 aggregate lands at tier 19 (312 902 rows since the MODQ chip, 312 665 after phase 4's Merkle spans, 508 102 after phase 3's Cut F; tier 20 at 555 622 after Cut E2, 578 950 after Cut E1, 606 598 after Cut D, 692 854 before; tier 21 before phase 2's row cuts)");
+    assert_eq!(a.proof.tier, RvmTier(19), "the test-profile N=3 aggregate lands at tier 19 (264 692 rows since phase 5; 312 902 since the MODQ chip, 312 665 after phase 4's Merkle spans, 508 102 after phase 3's Cut F; tier 20 at 555 622 after Cut E2, 578 950 after Cut E1, 606 598 after Cut D, 692 854 before; tier 21 before phase 2's row cuts)");
     let t1 = std::time::Instant::now();
     let outs = verify_aggregate(&m, &aggregate_program(&vk), &a, &common::TEST_BINDING).expect("the aggregate verifies");
     let verify_s = t1.elapsed().as_secs_f64();
@@ -724,7 +731,8 @@ fn the_per_n_cycle_budget_is_pinned() {
 /// (893 880 rows = 893 606 + 274, `docs/04-phase2-row-cuts.md`), still tier 20 after phase 3
 /// (585 960 = 585 686 + 274, `docs/06-phase3-fold-reduce.md`), tier 19 since phase 4's Merkle spans
 /// (316 279 = 315 952 + 327, measured 2026-10-11), still tier 19 with the MODQ chip (315 718 =
-/// 315 391 + 327, measured 2026-10-11; MODQ chip (2026-10-11, private multisig phase 3): the inner cpu gained SYS_MODQ).
+/// 315 391 + 327, measured 2026-10-11; MODQ chip (2026-10-11, private multisig phase 3): the inner cpu gained SYS_MODQ),
+/// tier 18 since phase 5 (2026-10-12, S6a/S2b/S4a/S1b: 235 744 = 235 418 + 326, measured by this test's `measure_aggregate`: production overhead 326, as at the Test shape).
 ///
 /// It also pins the N-generic program's digest at the production bundle shape — the number a
 /// chain's aggregation section registers and the fullnode re-pins at a chain cut (`docs/02`'s
@@ -740,6 +748,7 @@ fn the_per_n_cycle_budget_is_pinned() {
 /// `b362024c…fc55` → `dc350ecf…8ba0`. Phase 4 (2026-10-09, the Merkle spans) re-recorded it:
 /// `dc350ecf…8ba0` → `e0eede8b…b6c3`. MODQ chip (2026-10-11, private multisig phase 3): the inner
 /// cpu gained SYS_MODQ (283 columns; an inner shape and key change): `e0eede8b…b6c3` → `8bc2cecb…d8c7`.
+/// Phase 5 (2026-10-12, S6a/S2b/S4a/S1b) re-recorded it: `8bc2cecb…d8c7` → `792a66d4…a982`.
 #[test]
 #[ignore = "a production-profile fixture proof plus a ~2M-row emulation: the M5.2 budget test's own cost class"]
 fn the_production_n1_aggregate_is_the_m52_pin_plus_loop_overhead() {
@@ -763,7 +772,7 @@ fn the_production_n1_aggregate_is_the_m52_pin_plus_loop_overhead() {
     assert_eq!(single_rows, common::pins().cpu_rows, "the M5.2 pin still holds");
     assert_eq!(
         randprotocol_rvm::programs::digest_hex(&verify_rv32n(&shape, &key, Checkpoints::Off).program),
-        "8bc2cecbd30b975ec15a5e11354434bd7e1c2814d46dd0acc1d92b3ff944d8c7",
+        "792a66d4a995c7b3874d38ecb8c971d5494b57b4cce13db11e08a4f9b2f9a982",
         "the aggregate program's digest at the production bundle shape, as docs/02 and docs/04 state it"
     );
     let r = common::measure_aggregate(1, FriProfile::Production);
@@ -879,11 +888,12 @@ fn prove_production_aggregate(n: usize, expected_tier: RvmTier) {
 /// of four terms and is withdrawn; ≈ 64–75 GB projected at rate ¼, docs/07 §4 — a ≥ 96 GB host).
 /// Phase 4 (2026-10-09, the Merkle spans) re-recorded it: tier 20 → tier 19 (316 279 rows, emulated; 315 718 since the MODQ chip);
 /// the GB projection above is the tier-20 one, not re-taken.
+/// Phase 5 (2026-10-12, S6a/S2b/S4a/S1b) re-recorded it: tier 19 → tier 18 (235 744 rows = 235 418 + 326, emulated and measured by `the_production_n1_aggregate_is_the_m52_pin_plus_loop_overhead`; the projection is not re-taken).
 #[test]
-#[ignore = "issue45 A6: production N=1 aggregate proof, tier 19 since phase 4 (315 718 rows since the MODQ chip, 316 279 after phase 4; tier 20 before), ~64-75 GB projected at tier 20 at rate 1/4 (docs/07 §4), >=96 GB host. Run: \
+#[ignore = "issue45 A6: production N=1 aggregate proof, tier 18 since phase 5 (235 744 rows; 315 718 since the MODQ chip, tier 19 since phase 4, 316 279 after it; tier 20 before), ~64-75 GB projected at tier 20 at rate 1/4 (docs/07 §4), >=96 GB host. Run: \
             cargo test --release -p recursion --test aggregate production_n1_aggregate_proves_and_verifies -- --ignored --nocapture"]
 fn production_n1_aggregate_proves_and_verifies() {
-    prove_production_aggregate(1, RvmTier(19));
+    prove_production_aggregate(1, RvmTier(18));
 }
 
 /// A6, runbook row 7: the production N=2 aggregate (tier 21 since phase 2's row cuts; ≈ 475 GB
@@ -891,11 +901,12 @@ fn production_n1_aggregate_proves_and_verifies() {
 /// §3 at rate ⅛; ≈ 122–142 GB projected at rate ¼, docs/07 §4 — a ≥ 192 GB host). Phase 4
 /// (2026-10-09, the Merkle spans) re-recorded it: tier 21 → tier 20 (632 175 rows, emulated; 631 053 since the MODQ chip); the GB
 /// projection above is the tier-21 one, not re-taken.
+/// Phase 5 (2026-10-12, S6a/S2b/S4a/S1b) re-recorded it: tier 20 → tier 19 (471 105 rows, emulated; the projection is not re-taken).
 #[test]
-#[ignore = "issue45 A6: production N=2 aggregate proof, tier 20 since phase 4 (631 053 rows since the MODQ chip, 632 175 after phase 4; tier 21 before), ~122-142 GB projected at tier 21 at rate 1/4 (docs/07 §4), >=192 GB host. Run: \
+#[ignore = "issue45 A6: production N=2 aggregate proof, tier 19 since phase 5 (471 105 rows; tier 20 since phase 4 at 631 053 rows since the MODQ chip, 632 175 after phase 4; tier 21 before), ~122-142 GB projected at tier 21 at rate 1/4 (docs/07 §4), >=192 GB host. Run: \
             cargo test --release -p recursion --test aggregate production_n2_aggregate_proves_and_verifies -- --ignored --nocapture"]
 fn production_n2_aggregate_proves_and_verifies() {
-    prove_production_aggregate(2, RvmTier(20));
+    prove_production_aggregate(2, RvmTier(19));
 }
 
 /// A6, runbook row 8: the production N=3 aggregate (tier 21 since phase 3 — 1 757 062 rows; tier 22
@@ -962,18 +973,20 @@ fn emulate_production_aggregate(n: usize, expected_tier: RvmTier) {
 /// B3: production N=2 aggregate emulation (tier 20: 631 053 rows since the MODQ chip, 632 175 after phase 4; tier 21: 1 171 511
 /// rows after phase 3, 1 787 351 after phase 2's row cuts; tier 22, ~3.94M rows before). Phase 4
 /// (2026-10-09, the Merkle spans) re-recorded it: tier 21 → 20.
+/// Phase 5 (2026-10-12, S6a/S2b/S4a/S1b) re-recorded it: tier 20 → 19.
 #[test]
-#[ignore = "issue45 B3: production N=2 aggregate emulator run (631 053 rows since the MODQ chip, tier 20, no proving). Run: \
+#[ignore = "issue45 B3: production N=2 aggregate emulator run (471 105 rows since phase 5, tier 19; 631 053 rows since the MODQ chip, tier 20 before; no proving). Run: \
             cargo test --release -p recursion --test aggregate production_n2_aggregate_emulates_within_bounds -- --ignored --nocapture"]
 fn production_n2_aggregate_emulates_within_bounds() {
-    emulate_production_aggregate(2, RvmTier(20));
+    emulate_production_aggregate(2, RvmTier(19));
 }
 
 /// B3: production N=3 aggregate emulation (tier 20: 946 388 rows since the MODQ chip, 948 071 after phase 4; tier 21: 1 757 062
 /// rows after phase 3; tier 22, 2 680 822 rows after phase 2's row cuts; tier 23, ~5.9M rows before —
 /// the top rung then). Phase 4 (2026-10-09, the Merkle spans) re-recorded it: tier 21 → 20.
+/// Phase 5 (2026-10-12, S6a/S2b/S4a/S1b): 946 388 → 706 466 rows, still tier 20 (measured, emulated).
 #[test]
-#[ignore = "issue45 B3: production N=3 aggregate emulator run (946 388 rows since the MODQ chip, tier 20, no proving). Run: \
+#[ignore = "issue45 B3: production N=3 aggregate emulator run (706 466 rows since phase 5, tier 20; 946 388 rows since the MODQ chip; no proving). Run: \
             cargo test --release -p recursion --test aggregate production_n3_aggregate_emulates_within_bounds -- --ignored --nocapture"]
 fn production_n3_aggregate_emulates_within_bounds() {
     emulate_production_aggregate(3, RvmTier(20));

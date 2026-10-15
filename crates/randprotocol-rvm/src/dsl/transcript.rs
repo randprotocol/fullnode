@@ -156,32 +156,9 @@ impl DslChallenger {
     /// queries it is ~95 000 rows of a 524 288-row budget. Moving the bits into memory instead does
     /// not help (measured: 1 178) — the cost tracks *handles created*, not registers held — so the
     /// fix is liveness in the allocator, not a rewrite here. Task 6's measurement and Task 7's
-    /// precompile decision both need to know this.
+    /// precompile decision both need to know this. (Since phase 5 S1b the query indices go through
+    /// [`DslChallenger::sample_index_bits`]; this full decomposition is the PoW check's alone.)
     pub fn sample_bits(&mut self, b: &mut Builder, bits: usize) -> Vec<Felt> {
-        self.sample_bits_with(b, bits, |b| ((0..64).map(|_| b.hint()).collect(), None)).0
-    }
-
-    /// [`DslChallenger::sample_bits`] with the sixty-four bits hinted into a 65-cell buffer (Cut F):
-    /// the bits are then cells a `POW` run reads, and cell 64 is the run's output. Same tape, same
-    /// checks — the booleanity, canonicality and decomposition below run on the handles loaded
-    /// from those very cells, which nothing writes again (the buffer is fresh; `POW` writes only
-    /// cell 64).
-    pub fn sample_bits_mem(&mut self, b: &mut Builder, bits: usize) -> (Vec<Felt>, Ptr) {
-        let (v, buf) = self.sample_bits_with(b, bits, |b| {
-            let buf = b.hint_array_padded(64, 1);
-            ((0..64).map(|k| b.get(buf, k)).collect(), Some(buf.base))
-        });
-        (v, buf.expect("the bits buffer"))
-    }
-
-    /// The body both forms share: `read` produces the sixty-four bit handles (and, for the
-    /// buffered form, the buffer).
-    fn sample_bits_with(
-        &mut self,
-        b: &mut Builder,
-        bits: usize,
-        read: impl FnOnce(&mut Builder) -> (Vec<Felt>, Option<Ptr>),
-    ) -> (Vec<Felt>, Option<Ptr>) {
         b.span("sample_bits", |b| {
             assert!(bits <= 32, "sample_bits({bits}): p3 requires 2^bits < |F|, and a query index space \
                                  wider than 2^32 does not exist on this machine");
@@ -189,7 +166,7 @@ impl DslChallenger {
             let zero = b.zero();
 
             // The sixty-four bits first, so the tape's segment is one contiguous run.
-            let (bit, buf) = read(b);
+            let bit: Vec<Felt> = (0..64).map(|_| b.hint()).collect();
             for (k, &bk) in bit.iter().enumerate() {
                 let less_one = b.add_const(bk, F::NEG_ONE);
                 let p = b.mul(bk, less_one);
@@ -215,7 +192,18 @@ impl DslChallenger {
             let sum = b.add(lo, shifted);
             b.assert_eq(sum, x, "sample_bits decomposition");
 
-            (bit[..bits].to_vec(), buf)
+            bit[..bits].to_vec()
+        })
+    }
+
+    /// A query index: `sample()` then [`low_bits_gadget`] — only the `bits` used bits decomposed,
+    /// the rest range-checked (phase 5 S1b; tape [`low_bits_tape`]). Returns the 65-cell bits
+    /// buffer; the program loads the bits from it where it uses them. The PoW check keeps the
+    /// sixty-four-bit [`DslChallenger::sample_bits`].
+    pub fn sample_index_bits(&mut self, b: &mut Builder, bits: usize) -> Ptr {
+        b.span("sample_bits", |b| {
+            let x = self.sample(b);
+            low_bits_gadget(b, x, bits)
         })
     }
 
@@ -281,4 +269,73 @@ pub fn canonicality_hint(v: u64) -> F {
     } else {
         F::from_u64(lo).inverse()
     }
+}
+
+/// The tape [`low_bits_gadget`] reads for one sampled element `v` (canonical, `v < p`): the low
+/// `bits` bits, then `a = lo >> bits`, `h0 = hi mod 2^24`, `h1 = hi >> 24`, and the canonicality
+/// witness `u = lo / (hi − (2^32 − 1))` — `0` when `hi = 2^32 − 1` (then `lo = 0`, as `v < p`).
+pub fn low_bits_tape(v: u64, bits: usize) -> Vec<F> {
+    let mut out: Vec<F> = (0..bits).map(|k| F::from_u64((v >> k) & 1)).collect();
+    let (lo, hi) = (v & 0xFFFF_FFFF, v >> 32);
+    out.push(F::from_u64(lo >> bits));
+    out.push(F::from_u64(hi & 0xFF_FFFF));
+    out.push(F::from_u64(hi >> 24));
+    let d = F::from_u64(hi) - F::from_u64(0xFFFF_FFFF);
+    out.push(if d == F::ZERO { F::ZERO } else { F::from_u64(lo) * d.inverse() });
+    out
+}
+
+/// p3's `sample_bits(bits)` on an already-sampled `x`, decomposing only the `bits` low bits (phase
+/// 5 S1b; the argument is `docs/10` §S1b). With `idx = Σ b_k 2^k`:
+///
+/// 1. `b_k · b_k = b_k` — every bit boolean;
+/// 2. `a < 2^(32−bits)`, `h0 < 2^24`, `h1 < 2^8` — [`Builder::range_load`] rows;
+/// 3. `L = idx + 2^bits·a < 2^32`, `H = h0 + 2^24·h1 < 2^32` as integers;
+/// 4. `L + 2^32·H = x` and `L = (H − (2^32 − 1))·u`.
+///
+/// `X = L + 2^32·H < 2^64 < 2p` and `X ≡ x`, so `X ∈ {x_c, x_c + p}`; `X ≥ p` needs `H = 2^32 − 1`
+/// and `L ≥ 1`, which (4)'s second equation refuses for every `u`. So `X = x_c` and `idx = x_c mod
+/// 2^bits`. Returns the 65-cell buffer whose cells `0..bits` hold the bits (the `POW` runs read
+/// them); cells `bits..65` are allocated only — cell 64 is the runs' output.
+pub fn low_bits_gadget(b: &mut Builder, x: Felt, bits: usize) -> Ptr {
+    assert!(
+        (8..=32).contains(&bits),
+        "sample_index_bits({bits}): the range argument covers 8 ≤ bits ≤ 32 (a < 2^(32−bits) needs \
+         32 − bits ≤ 24, and p3 requires 2^bits < |F|)"
+    );
+    let arr = b.hint_array_padded(bits, 65 - bits);
+    let top = bits - 1;
+    let mut idx = b.get(arr, top);
+    let sq = b.mul(idx, idx);
+    b.assert_eq(sq, idx, &format!("sample_bits bit {top}"));
+    for k in (0..top).rev() {
+        let bk = b.get(arr, k);
+        let sq = b.mul(bk, bk);
+        b.assert_eq(sq, bk, &format!("sample_bits bit {k}"));
+        let d = b.mul_const(idx, F::TWO);
+        idx = b.add(d, bk);
+    }
+    let a = b.hint();
+    let h0 = b.hint();
+    let h1 = b.hint();
+    let u = b.hint();
+    let wa = 32 - bits;
+    b.range_load(a, 0);
+    if wa < 24 {
+        b.range_load(a, (1u64 << 24) - (1u64 << wa));
+    }
+    b.range_load(h0, 0);
+    b.range_load(h1, 0);
+    b.range_load(h1, (1u64 << 24) - (1u64 << 8));
+    let a_sh = b.mul_const(a, F::from_u64(1u64 << bits));
+    let lo = b.add(idx, a_sh);
+    let h1_sh = b.mul_const(h1, F::from_u64(1u64 << 24));
+    let hi = b.add(h0, h1_sh);
+    let d = b.add_const(hi, -F::from_u64(0xFFFF_FFFF));
+    let du = b.mul(d, u);
+    b.assert_eq(du, lo, "sample_bits canonicality");
+    let shifted = b.mul_const(hi, F::from_u64(1 << 32));
+    let sum = b.add(lo, shifted);
+    b.assert_eq(sum, x, "sample_bits decomposition");
+    arr.base
 }

@@ -10,10 +10,11 @@
 //!
 //! Three segments are more than a flattening:
 //!
-//! - `QueryBits` needs the *sampled elements*, not the query indices — the program's `sample_bits`
-//!   decomposes all sixty-four bits of the canonical representative and checks the decomposition is
-//!   canonical, so the tape carries the bits and the inverse-or-zero hint. It therefore runs the
-//!   same [`crate::reference::replay`] the tests compare against.
+//! - `QueryBits` needs the *sampled elements*, not the query indices — the program checks each
+//!   decomposition against the canonical representative. The PoW element is its sixty-four bits
+//!   plus the inverse-or-zero hint (`sample_bits`); each query index is its `log_global_max_height`
+//!   low bits, then the limbs `a, h0, h1` and the canonicality witness `u` (`sample_index_bits`,
+//!   phase 5 S1b). It therefore runs the same [`crate::reference::replay`] the tests compare against.
 //! - `InputPaths` and `CommitPhasePaths` expand each round's *pruned* multiproof into one full
 //!   authentication path per query, through `MerkleTreeMmcs::restore_and_recompute_paths` — which
 //!   exists in Plonky3 0.7 for exactly this caller (`p3-merkle-tree-0.7.0/src/mmcs/mod.rs:899-913`)
@@ -67,9 +68,10 @@ pub enum Segment {
     FinalPoly,
     /// `query_pow_witness`.
     QueryPow,
-    /// The bit decompositions `sample_bits` consumes: 64 bit words plus one canonicality hint per
-    /// sampled element, in **sampling** order — the query proof-of-work check's element first (it
-    /// is sampled before any query index), then one per query.
+    /// The decompositions the samplers consume, in **sampling** order — the query proof-of-work
+    /// check's element first (it is sampled before any query index): 64 bit words plus one
+    /// canonicality hint (`sample_bits`); then one per query: `log_global_max_height` bit words and
+    /// the four words `a, h0, h1, u` (`sample_index_bits`, phase 5 S1b).
     QueryBits,
     /// Per query, per input round, per height group (tallest first, `shape::height_groups`), per
     /// matrix: the opened row and its four salts — a group contiguous, because the program hints
@@ -163,6 +165,12 @@ impl Writer {
             self.usize(((v >> k) & 1) as usize);
         }
         self.f(crate::dsl::transcript::canonicality_hint(v));
+    }
+    /// A query index's `QueryBits` entry (phase 5 S1b): [`crate::dsl::transcript::low_bits_tape`].
+    fn low_bits(&mut self, v: u64, bits: usize) {
+        for x in crate::dsl::transcript::low_bits_tape(v, bits) {
+            self.f(x);
+        }
     }
 }
 
@@ -434,14 +442,16 @@ where
         w.f(fri.query_pow_witness);
         w.end();
 
-        // 10 ── every decomposition `sample_bits` consumes, in sampling order: the PoW check's
-        // element (sampled first, and only when the bit count is non-zero) then the query indices'.
+        // 10 ── every decomposition the samplers consume, in sampling order: the PoW check's
+        // element (sampled first, and only when the bit count is non-zero; sixty-four bits and the
+        // inverse-or-zero hint) then the query indices' (S1b: the `log_global_max_height` low bits,
+        // then `a, h0, h1, u`).
         w.begin(Segment::QueryBits);
         if let Some(v) = r.pow_sample {
             w.sampled_bits(v);
         }
         for &v in &r.index_samples {
-            w.sampled_bits(v);
+            w.low_bits(v, r.log_global_max_height);
         }
         w.end();
 

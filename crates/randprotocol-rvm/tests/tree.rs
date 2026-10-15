@@ -50,7 +50,7 @@ fn load_or_prove(name: &str, program: &Program, n: u64, may_prove: bool, prove: 
     p
 }
 
-/// Four test-profile leaves, `rv32n` over bundle fixture k = 0..3 each (L = 1; 169 640 rows,
+/// Four test-profile leaves, `rv32n` over bundle fixture k = 0..3 each (L = 1; 88 486 rows since phase 5, 169 640 before the Merkle spans,
 /// tier 18 — `tests/pins.json`'s `aggregate_test_n1_cpu_rows`).
 struct Leaves {
     inner: InnerVerifierKey,
@@ -131,7 +131,8 @@ fn the_tree_step_builds_under_the_replays_loop_invariant() {
     // the test chain's `t_leaf_digest` (M4). Re-pinned at the rVM's rate ¼ (2026-10-09, docs/07,
     // tree Task R): the child's Merkle paths are one level shorter (was bf80794d…ff4d5389).
     // Phase 4 (2026-10-09, the Merkle spans) re-recorded it: 2c586636… → d8d558ee….
-    assert_eq!(randprotocol_rvm::programs::digest_hex(&a), "d8d558eecb8fbdaaba7eaa93d7d04bae0a47808f31978ecea804f04f7e6e5d93", "rv32t_leaf's digest at the test leaf shape");
+    // Phase 5 (2026-10-12, S6a/S2b/S4a/S1b) re-recorded it: d8d558ee… → af535052….
+    assert_eq!(randprotocol_rvm::programs::digest_hex(&a), "af535052d2df18b5e313a6f0c2e412456d059d5f602d569989ad1b2b69e90cac", "rv32t_leaf's digest at the test leaf shape");
 }
 
 /// The program reads the child shape's words and never its committed program: a child program
@@ -180,6 +181,8 @@ fn the_tree_step_accepts_two_real_leaves_and_publishes_the_host_digest() {
     eprintln!("TREE_TEST phases rv32r {:?}", by_phase(&r, &rexec));
     eprintln!("TREE_TEST child {child} step_leaf {rows} overhead {overhead} tier {:?} program {} instrs",
         Tier::for_cycles(rows), vp.program.instrs.len());
+    // Phase 5 (2026-10-12, S6a/S2b/S4a/S1b) re-recorded `child_cpu_rows` 91 034 → 74 605 and `step_leaf_cpu_rows`
+    // 182 444 → 149 586 (overhead 376 and tier 18 unchanged; `step_int_*` and the reduce-rows pins are fixture-gated, not re-recorded).
     assert_eq!(child, common::pin("tree_test", "child_cpu_rows"));
     assert_eq!(rows, common::pin("tree_test", "step_leaf_cpu_rows"));
     assert_eq!(overhead, common::pin_i64("tree_test", "step_overhead"));
@@ -495,7 +498,10 @@ fn a_foreign_program_child_pair_passes_in_program_and_fails_the_root_recompute()
 
 /// The two step programs' digests at the test-profile shapes (M4). History: first pinned by tree
 /// Task 1b. Phase 4 (2026-10-09, the Merkle spans) re-recorded `T_LEAF_TEST`: 2c586636… → d8d558ee….
-const T_LEAF_TEST: &str = "d8d558eecb8fbdaaba7eaa93d7d04bae0a47808f31978ecea804f04f7e6e5d93";
+/// Phase 5 (2026-10-12, S6a/S2b/S4a/S1b) re-recorded `T_LEAF_TEST`: d8d558ee… → af535052… (the same
+/// digest `the_tree_step_builds_under_the_replays_loop_invariant` pins, measured there without
+/// fixtures). `T_INT_TEST` below is NOT re-recorded: it needs the fixture-gated `test_tree()`.
+const T_LEAF_TEST: &str = "af535052d2df18b5e313a6f0c2e412456d059d5f602d569989ad1b2b69e90cac";
 /// Phase 4 (2026-10-09, the Merkle spans) re-recorded `T_INT_TEST`: 04b16771… → a222637e….
 const T_INT_TEST: &str = "a222637e1eb9333b16b820bbacceaac9ea0e5d4cebfc5379d170796a2ac6dc62";
 

@@ -4,7 +4,7 @@
 use p3_field::{BasedVectorSpace, PrimeCharacteristicRing};
 use randprotocol_rvm::dsl::{Builder, Checkpoints};
 use randprotocol_rvm::emulator::{execute, ExecError};
-use randprotocol_rvm::isa::{EF, F};
+use randprotocol_rvm::isa::{Op, EF, F};
 
 fn run(b: Builder, witness: &[F]) -> Vec<F> {
     let p = b.finish();
@@ -125,6 +125,32 @@ fn a_failed_assert_eq_halts_at_the_named_checkpoint() {
             assert_eq!(p.checkpoint_at(pc), Some("the zeta checkpoint"));
         }
         other => panic!("expected a trap, got {other:?}"),
+    }
+}
+
+/// S6a (phase 5): `assert_eq` is one `JEQ a, b` over the trap — the cpu's equality gadget compares
+/// `rd` with `ra` itself, so no `FSUB` into scratch. Equal values pass and unequal trap, with
+/// either operand a constant zero (r0-backed) and in either order.
+#[test]
+fn assert_eq_is_one_jeq_over_the_trap_in_either_order() {
+    for (x, y, ok) in [(5u64, 5u64, true), (5, 6, false), (0, 0, true), (0, 7, false), (7, 0, false)] {
+        for swap in [false, true] {
+            let mut b = Builder::new(Checkpoints::Off);
+            let hx = if x == 0 { b.zero() } else { b.constant(F::from_u64(x)) };
+            let hy = if y == 0 { b.zero() } else { b.constant(F::from_u64(y)) };
+            let (l, r) = if swap { (hy, hx) } else { (hx, hy) };
+            b.assert_eq(l, r, "s6a check");
+            let z = b.zero();
+            b.public(z);
+            let p = b.finish();
+            let fsubs = p.instrs.iter().filter(|i| i.op == Op::Fsub).count();
+            assert_eq!(fsubs, 0, "assert_eq emits no FSUB");
+            match execute(&p, &[], 10_000) {
+                Ok(_) => assert!(ok, "{x} vs {y} (swap {swap}) must trap"),
+                Err(ExecError::InverseOfZero { .. }) => assert!(!ok, "{x} vs {y} (swap {swap}) must pass"),
+                Err(e) => panic!("unexpected {e:?}"),
+            }
+        }
     }
 }
 

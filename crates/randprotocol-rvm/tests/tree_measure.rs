@@ -415,7 +415,7 @@ fn production_rv32t_rows_at_the_emulated_leaf_shape() {
 #[ignore = "tree Task 0 on the laptop: the production leaf emulated (no proof) and rv32r's accepting path counted at its shape — ~2 min, 8 GB"]
 fn production_rv32r_rows_at_the_emulated_leaf_shape() {
     let (_program, leaf_rows, shape) = emulated_leaf_shape();
-    assert_eq!(Tier::for_cycles(leaf_rows), Some(Tier(20)), "the production L = 2 leaf is tier 20 since phase 4 ({leaf_rows} rows; tier 21 after phase 3)");
+    assert_eq!(Tier::for_cycles(leaf_rows), Some(Tier(19)), "the production L = 2 leaf is tier 19 since phase 5 ({leaf_rows} rows; tier 20 after phase 4, tier 21 after phase 3)");
     let t = Instant::now();
     let key = RvmKey::of(P, &shape);
     println!("leaf key built in {:.1} s, live {:.2} GB, peak {:.2} GB", t.elapsed().as_secs_f64(), gb(LIVE.load(Relaxed)), gb(heap::PEAK.load(Relaxed)));
@@ -446,6 +446,9 @@ fn production_rv32r_rows_at_the_emulated_leaf_shape() {
 /// tier 20. The measured step (Task 2), not the band, still decides the pinned step tier (R6).
 /// Phase 4 (2026-10-09, the Merkle spans) re-recorded it: tier 21 end to end → tier 20 end to end
 /// (band [1 102 455, 1 491 559] → [590 828, 799 356]; C 648 518 → 347 358, O −29 → +376).
+/// Phase 5 (2026-10-12, S6a/S2b/S4a/S1b) re-recorded it: C 347 358 → 254 177, band → [432 420, 585 040],
+/// which straddles the tier 19/20 line (2^19 − 1 = 524 287): tier 19 at the low end and at 2C + O
+/// (508 730), tier 20 only at the high end; the measured step (508 735 rows, tier 19) decides.
 #[test]
 fn the_pinned_band_is_the_emulated_childs() {
     let child = common::pin("tree_measure", "child_cpu_rows_emulated");
@@ -454,8 +457,8 @@ fn the_pinned_band_is_the_emulated_childs() {
     assert_eq!(hi, common::pin("tree_measure", "step_band_hi"), "step_band_hi is ceil(1.15·(2C + O))");
     assert_eq!(
         (Tier::for_cycles(lo), Tier::for_cycles(step), Tier::for_cycles(hi)),
-        (Some(Tier(20)), Some(Tier(20)), Some(Tier(20))),
-        "the band is tier 20 end to end"
+        (Some(Tier(19)), Some(Tier(19)), Some(Tier(20))),
+        "the band is tier 19 at its low end and at 2C + O, tier 20 at its high end"
     );
 }
 
