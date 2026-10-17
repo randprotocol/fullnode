@@ -71,6 +71,32 @@ lost quorum frees the slot. `initial_price_micros` is required. Pinned: a no-sec
 state root (identical to base `3119a29a`). Suites: core lib 810, node lib 623 (1 ignored), node bin
 55, rpc_contract 7, genesis_cli 14, client lib 210, clippy clean for the three crates. Recommended values deferred until aggregation is admitted (`docs/deploy.md`).
 
+### rVM phase 5 re-vendored (2026-10-15; branch `feat/rvm-phase5-revendor`, NOT merged)
+
+The branch's circuits pin is **`b3e21d9`** (circuits main, the merge of `spike/rvm-phase5`;
+`CIRCUITS_PIN` in `.github/workflows/ci.yml`, both PROVENANCE.md files; synced with
+`CUDA_REV=71e1a04` as before). Only `recursion/` moved between `d217252` and `b3e21d9`
+(`research/`, `guests-compiled/` and `vendor/circuits/` are byte-identical; constraint set 9 and
+every inner key, `inner_vk_digest` and the admission vectors are unchanged). **rVM phase 5**
+(`recursion/docs/10-phase5-n2-tier19.md`: `assert_eq` as one JEQ, sponges in their own state, tape
+tails in pairs, query-index `sample_bits` on the used low bits) is a program and `QueryBits`
+tape-layout change only — no ISA or AIR change, the rVM verifier keys did not move — so every
+program digest moved and a pre-phase-5 witness tape does not decode under the new program.
+**Current pins** (`tests/no_pre_phase4_recursion_pins.rs` now also refuses the phase-4 + MODQ full
+literals): `verify_rv32.digest`
+`c3065887a6a9885233d30cad9d09d864c72f0f2f0ea451d0c2e2f94595a01b24`; production
+`aggregate_program_digest` `792a66d4a995c7b3874d38ecb8c971d5494b57b4cce13db11e08a4f9b2f9a982`
+(`agg_executor.rs`'s `the_production_aggregate_program_digest_is_the_phase_5_pin`). One inner
+verification is 235 418 rows: production N=1 235 744 rows **tier 18**, N=2 471 105 tier 19, N=3
+706 466 tier 20, N=5 at 21, so `admitted_tiers` Production is **{18, 19, 20, 21}** (test {18, 19,
+20} unchanged: 88 486 / 176 589 / 264 692 rows). Not re-pinned, by docs/10 §5: the test tree's
+`rv32t_int` digest and the `vk_leaf` / `vk_t_leaf` / `vk_int` limbs wait on the operator's
+test-tree fixture regeneration in circuits (`cargo test --release --test tree
+generate_test_tree_fixtures -- --ignored --nocapture`, ≈ 34 GB), after which circuits' `tests/tree.rs`
+and `pins.json` are re-synced and `tests/genesis_cli.rs`'s tree section re-pinned with them.
+No chain carries an `aggregation` section yet, so no genesis pin moves with this; the digest
+becomes a cut parameter the day one is admitted.
+
 ### Constraint set 9 re-vendored (2026-10-11; branch `feat/private-multisig`, commit `6530861f`, NOT pushed)
 
 The branch's circuits pin is **`d217252`** (`CIRCUITS_PIN` in `.github/workflows/ci.yml`,
@@ -88,7 +114,7 @@ full literals anywhere in crates/deploy/scripts/vendor and this file): `inner_vk
 `1b0c4b0043dd5d00d710f10048bfde989a955034d7fd52f1a85595a61339ddc7`; admission interface digest
 `3753f2fd7ba2091910f1a5eb6b722c3b55e71e7661854c058d95ed446cb186b4` (fixtures re-proved);
 `verify_rv32.digest` `79ebe02b…`; production `aggregate_program_digest`
-`8bc2cecbd30b975ec15a5e11354434bd7e1c2814d46dd0acc1d92b3ff944d8c7` (now pinned by a node test).
+`8bc2cecb…d8c7` (pinned by a node test; both superseded by rVM phase 5, the entry above).
 Production N=1 is 315 391 rows, **tier 19**, so `admitted_tiers` Production is **{19, 20, 21}**
 (test {18, 19, 20}); the test tree's steps are tier 18 and its fixed point is level 2 (`vk_fix`
 dropped). `BUILD_CONSTRAINT_SET` = 9 refuses chains 14-20 by genesis hash.

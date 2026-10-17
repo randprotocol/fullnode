@@ -85,6 +85,33 @@ pub fn sponge(b: &mut Builder, src: Ptr, n: usize, out: Digest) {
     }
 }
 
+/// [`sponge`] into the eight cells at `st` instead of the hash scratch, with the digest **left in
+/// lanes 0..4 of `st`** — no copy out (phase 5 S2b). The lanes the first block does not reach are
+/// zeroed every call: an aggregate runs its verifier body in a counted loop, so `st` is not fresh
+/// on the second proof, and the padding-free rule needs them zero. `st` must not alias `src`; it
+/// may be [`Builder::hash_scratch`]. `Precompiles::Off`: the compiled sponge, its digest written
+/// into lanes 0..4 of `st`.
+pub fn sponge_state(b: &mut Builder, st: Ptr, src: Ptr, n: usize) {
+    assert!(n >= 1, "a padding-free sponge over an empty message is not a hash");
+    match b.precompiles() {
+        crate::dsl::Precompiles::Off => sponge_compiled(b, src, n, Digest(st)),
+        crate::dsl::Precompiles::On => {
+            let first = n.min(RATE);
+            b.zero_cells(st, first as i64, WIDTH - first);
+            let mut done = 0;
+            while done + RATE <= n {
+                let block = b.offset(src, done as i64);
+                b.sponge_absorb(st, block);
+                done += RATE;
+            }
+            if done < n {
+                b.copy_cells(st, 0, src, done as i64, n - done);
+                b.poseidon2(st);
+            }
+        }
+    }
+}
+
 /// [`sponge`] with the absorb loop compiled as plain instructions (`copy_cells` + `POSEIDON2`
 /// per block) — the precompile's differential reference, kept in the tree
 /// (`tests/transcript.rs` and `tests/precompiles.rs` pin the two to each other).
@@ -315,19 +342,20 @@ pub fn merkle_walk_with_injections(b: &mut Builder, leaf: Digest, index_bits: &[
     if b.precompiles() == crate::dsl::Precompiles::On {
         // Cut C: the running digest lives in four dedicated cells (`cur`); one COMPRESS per level
         // selects the children by the bit and writes the parent back over `cur`. An injection is
-        // sponged into a scratch digest and compressed in with the bit clear — `[digest ‖
-        // sponge]`, the reference's fixed order (`mmcs/batch.rs:245-262`). `sponge` works in the
-        // hash scratch, and `cur` and `tmp` are separate allocations, so the module's aliasing
-        // rule holds.
+        // sponged in the hash scratch and compressed in from it with the bit clear — `[digest ‖
+        // sponge]`, the reference's fixed order (`mmcs/batch.rs:245-262`). There is no tmp digest;
+        // `cur` is a separate allocation from the scratch, so the module's aliasing rule holds.
         let cur = leaf.0;
         let zero = b.zero();
         for (l, &bit) in index_bits.iter().enumerate().take(levels) {
             let sib = b.offset(siblings, (l * DIGEST_ELEMS) as i64);
             b.compress_step(cur, sib, bit);
             for inj in injections.iter().filter(|i| i.after_level == l) {
-                let tmp = Digest(b.alloc(DIGEST_ELEMS as u64));
-                sponge(b, inj.rows, inj.n_cells, tmp);
-                b.compress_step(cur, tmp.0, zero);
+                // S2 (phase 5): sponged in the hash scratch and compressed straight from its
+                // lanes 0..4 — no tmp digest, no copy out. `cur` (the leaf) never aliases the
+                // scratch (asserted above).
+                sponge_state(b, st, inj.rows, inj.n_cells);
+                b.compress_step(cur, st, zero);
             }
         }
         return leaf;

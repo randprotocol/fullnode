@@ -277,7 +277,7 @@ Proving is a wallet-side cost paid once; verification is the consensus cost paid
 
 ## 8a. Constraint set 9: the MODQ chip
 
-Vendored from circuits `d217252` (`CIRCUITS_PIN`; the chip itself landed at `57fb9dc`, spec
+Vendored from circuits `d217252` (`CIRCUITS_PIN` is `b3e21d9` since rVM phase 5, 2026-10-15, under which the chip and every inner key are byte-identical; the chip itself landed at `57fb9dc`, spec
 `circuits/docs/superpowers/specs/2026-10-11-rvm-modq-chip-design.md`) for private multisig
 (`docs/shielded.md` §2). A Dilithium2 verify is mostly polynomial arithmetic mod `q`; done in RV32
 instructions it costs 880 102 cycles, with the `MODQ` syscall (§4, row 8) 80 572. That is what

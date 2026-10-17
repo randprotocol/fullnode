@@ -93,10 +93,10 @@ pub struct Replay {
     /// Per query, after the last fold.
     pub folded_evals: Vec<EF>,
     /// The canonical `u64` of the element `sample_bits` drew for each query index, in sampling
-    /// order — not the masked index, the whole element. [`crate::witness`] needs all sixty-four
-    /// bits of it, because the program's `sample_bits` is a full decomposition with a canonicality
-    /// check (the plan's ruling: a `lo + 2^bits·hi` split with only `lo` range-checked would let a
-    /// prover choose its own query indices).
+    /// order — not the masked index, the whole element. [`crate::witness`] needs all of it,
+    /// because the program's `sample_index_bits` decomposes it canonically: the used low bits, then
+    /// range-checked limbs of the rest and a canonicality witness (phase 5 S1b; a split with only
+    /// the low part range-checked would let a prover choose its own query indices).
     pub index_samples: Vec<u64>,
     /// The same, for the query proof-of-work check — `None` when `query_pow_bits == 0`, because
     /// `check_witness` then neither observes the witness nor samples anything

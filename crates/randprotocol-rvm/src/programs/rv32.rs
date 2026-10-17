@@ -272,18 +272,11 @@ where
     let pow = b.hint();
     ch.check_witness(b, shape.query_pow_bits(), pow, "query pow");
 
-    // 6. The query indices — little-endian bit handles, `sample_bits(log_global_max_height)` each
-    // (`TwoAdicFriFolding::extra_query_index_bits() == 0`). `On` (Cut F): the bits are also cells
-    // of a 65-cell buffer, which the index powers' `POW` runs read.
-    let (index_bits, index_cells): (Vec<Vec<Felt>>, Vec<Option<Ptr>>) = (0..shape.num_queries())
-        .map(|_| match b.precompiles() {
-            Precompiles::On => {
-                let (bits, buf) = ch.sample_bits_mem(b, log_global);
-                (bits, Some(buf))
-            }
-            Precompiles::Off => (ch.sample_bits(b, log_global), None),
-        })
-        .unzip();
+    // 6. The query indices — `sample_bits(log_global_max_height)` each
+    // (`TwoAdicFriFolding::extra_query_index_bits() == 0`), decomposing only those low bits (phase
+    // 5 S1b), into a 65-cell buffer per query. The bits are loaded where the query uses them (a
+    // bit handle alive across all 80 queries is spill traffic); `On`'s `POW` runs read the buffer.
+    let index_bufs: Vec<Ptr> = (0..shape.num_queries()).map(|_| ch.sample_index_bits(b, log_global)).collect();
     mark(b, "phase 6 preamble: claimed evals, betas, final poly, pow, indices");
 
     // 7. Per query, unrolled: the count is a compile-time constant of the shape, and a counted
@@ -311,8 +304,11 @@ where
     }
     mark(b, "query segments: tape reads");
     b.unrolled(shape.num_queries(), |b, q| {
+        let buf = index_bufs[q];
+        let index_bits: Vec<Felt> = (0..log_global).map(|k| b.load(buf, k as i64)).collect();
+        let index_cells = (b.precompiles() == Precompiles::On).then_some(buf);
         emit_query(b, shape, &opened, &metas, &fri_caps, &betas, fri_alpha, final_poly,
-                   &index_bits[q], index_cells[q], &all_rows[q], &all_groups[q], &all_paths[q], &all_commit_openings[q],
+                   &index_bits, index_cells, &all_rows[q], &all_groups[q], &all_paths[q], &all_commit_openings[q],
                    &all_commit_paths[q]);
     });
     mark(b, "queries: merkle walks, reduction, folds");
@@ -699,7 +695,7 @@ fn emit_query<S: VerifierShape>(
         b.span("select", |b| own_slot_check(b, msg, own, folded, &format!("commit phase own slot[{r}]")));
         shift += la;
         let group_bits = &index_bits[shift..shift + log_folded];
-        let cells = index_cells.map(|p| (p, shift));
+        let cells = index_cells.map(|p| (p, shift, log_global));
         folded = b.span("fold_round", |b| fold_eval(b, log_folded, la, group_bits, betas[r], msg, cells));
         b.span("commit_root", |b| {
             emit_commit_root(b, la, msg, commit_paths[r], &index_bits[shift..], fri_caps[r], &format!("commit phase root[{r}]"))
@@ -762,7 +758,8 @@ pub fn own_slot_check(b: &mut Builder, msg: Ptr, own: &[Felt], folded: Ext, name
 /// One fold round over the committed row at `msg`. `Off` (the reference): load the row, run the
 /// compiled barycentric fold. `On` (Cut E2): `u = β·s⁻¹` on the cpu — `s` the coset's first point,
 /// one `INV`, one `EMULF` — and the inverse DFT plus Horner in the reduce chip's fold run. With
-/// `cells = Some((bits, off))` (Cut F) `s` is a `POW` run over the index's cells `off..off+log_folded`.
+/// `cells = Some((bits, off, written))` (Cut F) `s` is a `POW` run over the index's cells
+/// `off..off+log_folded`, of the `written` cells `sample_index_bits` wrote (asserted at build).
 pub fn fold_eval(
     b: &mut Builder,
     log_folded: usize,
@@ -770,7 +767,7 @@ pub fn fold_eval(
     group_bits: &[Felt],
     beta: Ext,
     msg: Ptr,
-    cells: Option<(Ptr, usize)>,
+    cells: Option<(Ptr, usize, usize)>,
 ) -> Ext {
     match b.precompiles() {
         Precompiles::Off => {
@@ -810,8 +807,10 @@ fn emit_input_round_root(
     // Cut A: the tallest group's rows were hinted straight into `groups[0]`; the leaf sponge
     // runs over that buffer in place. No copy.
     let (leaf_msg, n) = groups[0];
-    let leaf = Digest(b.alloc(DIGEST_ELEMS as u64));
-    hash::sponge(b, leaf_msg, n, leaf);
+    // S2b (phase 5): the leaf is sponged in its own eight cells and the walk runs over their lanes
+    // 0..4 in place — no copy out of the hash scratch. Zeroed every time (`sponge_state`).
+    let leaf = Digest(b.alloc(hash::WIDTH as u64));
+    hash::sponge_state(b, leaf.0, leaf_msg, n);
     let injections: Vec<hash::Injection> = distinct[1..]
         .iter()
         .zip(&groups[1..])
@@ -838,8 +837,8 @@ fn emit_input_round_root(
 /// message `flatten_to_base(row) ‖ salt(4)` of the round's hiding MMCS — sponged in place, walked,
 /// and compared against the round's cap.
 fn emit_commit_root(b: &mut Builder, log_arity: usize, msg: Ptr, path: Array<Felt>, index_bits: &[Felt], cap: [Digest; 4], name: &str) {
-    let leaf = Digest(b.alloc(DIGEST_ELEMS as u64));
-    hash::sponge(b, msg, 2 * (1usize << log_arity) + SALT_ELEMS, leaf);
+    let leaf = Digest(b.alloc(hash::WIDTH as u64));
+    hash::sponge_state(b, leaf.0, msg, 2 * (1usize << log_arity) + SALT_ELEMS);
     let levels = path.len / DIGEST_ELEMS;
     let reached = hash::merkle_walk(b, leaf, &index_bits[..levels], path.base, levels);
     assert_cap_eq(b, reached, &cap, &index_bits[levels..levels + CAP_HEIGHT], name);
@@ -1005,7 +1004,7 @@ fn emit_reduced_openings_layout<S: VerifierShape>(
         for (mi, m) in mats.iter().enumerate() {
             let h = m.log_height;
             if !xs.contains_key(&h) {
-                let cells = index_cells.map(|p| (p, log_global - h));
+                let cells = index_cells.map(|p| (p, log_global - h, log_global));
                 let x = index_power(b, F::two_adic_generator(h), h, &index_bits[log_global - h..], F::GENERATOR, cells);
                 xs.insert(h, x);
             }
@@ -1178,11 +1177,16 @@ fn emit_query_point(b: &mut Builder, log_height: usize, index_bits: &[Felt], shi
 }
 
 /// `base·g^{rev(index, log_rev)}`: Cut F's `POW` run when the bits are cells (`On`), the compiled
-/// ladder otherwise (`Off`, the reference).
-fn index_power(b: &mut Builder, g: F, log_rev: usize, bits: &[Felt], base: F, cells: Option<(Ptr, usize)>) -> Felt {
+/// ladder otherwise (`Off`, the reference). `cells = (buf, off, written)`: the run reads cells
+/// `off..off+log_rev` of a buffer whose first `written` cells hold the index bits (S1b: the cells
+/// past them are allocated only, never written — a run reaching them is refused at build).
+fn index_power(b: &mut Builder, g: F, log_rev: usize, bits: &[Felt], base: F, cells: Option<(Ptr, usize, usize)>) -> Felt {
     match cells {
-        Some((buf, off)) if b.precompiles() == Precompiles::On => {
+        Some((buf, off, written)) if b.precompiles() == Precompiles::On => {
             assert_eq!(bits.len(), log_rev, "POW starts its ladder at g itself: the run is the whole index");
+            assert!(off + log_rev <= written,
+                    "a POW run reads index-bit cells {off}..{} past the {written} bits sample_index_bits wrote",
+                    off + log_rev);
             b.span("bit_selected_power", |b| b.pow_run(buf, off, log_rev, g, base))
         }
         _ => bit_selected_power(b, g, log_rev, bits, base),

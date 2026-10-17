@@ -71,6 +71,45 @@ fn a_wrong_arithmetic_result_is_rejected() {
     assert!(rejects(|| prove_and_verify(&m, &p, &t)));
 }
 
+/// S6a (spec §5): an `assert_eq` site is a `JEQ`/`JNE` over a trap. A forged *unequal* pair that
+/// claims the equal branch (`EQ_AUX = 1`, the taken `NEXT_PC`) must break `EQ_AUX·(D0 − A0) = 0`.
+fn jeq_unequal_setup() -> (Machine, Program, Traces) {
+    let p = Program {
+        instrs: vec![
+            i(Op::Faddi, 5, 0, 1),  // 0: r5 = 1
+            i(Op::Faddi, 6, 0, 2),  // 1: r6 = 2
+            i(Op::Jeq, 5, 6, 7),    // 2: unequal, so honestly falls through to 3
+            i(Op::Public, 0, 5, 0), // 3..6: the four published words R5 requires
+            i(Op::Public, 0, 5, 0),
+            i(Op::Public, 0, 5, 0),
+            i(Op::Public, 0, 5, 0),
+            i(Op::Halt, 0, 0, 0),   // 7
+        ],
+        checkpoints: vec![],
+        reduce_layout: vec![],
+    };
+    let m = Machine::new(FriProfile::Test);
+    let exec = execute(&p, &[], 10_000).unwrap();
+    let t = build_traces(&p, &exec, Tier(8)).unwrap();
+    (m, p, t)
+}
+
+#[test]
+fn an_honest_unequal_jeq_passes() {
+    let (m, p, t) = jeq_unequal_setup();
+    prove_and_verify(&m, &p, &t).unwrap();
+}
+
+#[test]
+fn a_forged_equal_pair_at_an_assert_eq_site_is_rejected() {
+    let (m, p, mut t) = jeq_unequal_setup();
+    let w = cpu::col::WIDTH;
+    // Row 2 is the JEQ over r5 = 1, r6 = 2. Claim "equal": EQ_AUX = 1, the branch taken.
+    t.cpu.values[2 * w + cpu::col::EQ_AUX] = F::ONE;
+    t.cpu.values[2 * w + cpu::col::NEXT_PC] = F::from_u64(7);
+    assert!(rejects(|| prove_and_verify(&m, &p, &t)));
+}
+
 #[test]
 fn a_skipped_row_is_rejected() {
     let (m, p, mut t) = setup();

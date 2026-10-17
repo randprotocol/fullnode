@@ -6,6 +6,15 @@
 //!
 //! Not listed: `dsl-sample.digest` `8c77648e…` (phase-4-invariant — the DSL sample program has no
 //! `SPONGE`/`COMPRESS` span and circuits' suite still pins the same value at `57fb9dc`).
+//!
+//! rVM phase 5 (circuits `b3e21d9`, `recursion/docs/10-phase5-n2-tier19.md` §4–§5) moved every
+//! program digest again without an ISA, AIR or key change: the `QueryBits` tape layout changed
+//! between the writer and the program, so a pre-phase-5 digest names a program whose tapes no
+//! longer decode (and the reverse). The phase-4 + MODQ values below are stale since then. Not yet
+//! listed, by docs/10 §5: the test tree's `rv32t_int` digest (`a222637e…`) and the `vk_leaf` /
+//! `vk_t_leaf` / `vk_int` limbs, which circuits re-records from the operator's test-tree fixture
+//! regeneration; until then circuits' own `tests/tree.rs` and `pins.json` (vendored verbatim) and
+//! `tests/genesis_cli.rs`'s tree section still carry them.
 
 const STALE: &[&str] = &[
     // inner_vk_digest, pre-MODQ (unchanged by phase 4 itself; moved by the MODQ chip).
@@ -15,9 +24,18 @@ const STALE: &[&str] = &[
     // verify_rv32.digest: pre-phase-4, then phase 4 before the MODQ re-pin.
     "cf5a350a62fa00bb6e84fa0de311a726aac7c610d23ce272b8c80795bac51788",
     "6a70c377ac93c0aa4032d4ceed45c4747e77a8aa0758f3953b34732e187cd344",
-    // Production aggregate_program_digest: pre-phase-4, then phase 4 before the MODQ re-pin.
+    // Production aggregate_program_digest: pre-phase-4, then phase 4 before the MODQ re-pin,
+    // then the MODQ chip's (stale since rVM phase 5; now `792a66d4…a982`).
     "dc350ecf6b60af74f4bb032bdf607c3fa0fbd6317705f0b1077e71b455e38ba0",
     "e0eede8b4d72c32bd8808c7fa26be74eab401adc185e353a413fa3c0dde6b6c3",
+    "8bc2cecbd30b975ec15a5e11354434bd7e1c2814d46dd0acc1d92b3ff944d8c7",
+    // verify_rv32.digest with the MODQ chip (stale since rVM phase 5; now `c3065887…1b24`).
+    "79ebe02be4b90dfe13c26f42d00225995fd884c76984326b6a8147b8135d283b",
+    // Pre-phase-5 test-shape aggregate digest, Off-replay digest and self-verifier digest
+    // (circuits `tests/verifier.rs`, `tests/self_verify.rs`; docs/10 §4's table).
+    "e26f37e3682a42d2f9835dca49ac0ad7408ca27f24bc34867d5f2efb28a241a0",
+    "ac1f08cfc4aa66420718102d8b2eef9e157fb0a3aa94568c762e1313364fd406",
+    "515fc2a1adaeabcdd4e186c9ba699199f284285f9f968c4ea07a279988bbd32c",
     // The pre-phase-4 test tree's step programs (rv32t_leaf, rv32t_int at tier 19).
     "2c586636c4c0f94cdf13b410154679d995eefad11e27371e0786e89e206ccd34",
     "04b1677122526e51c0d278375b0c30ebd37f94ba8a2afed3cd3e019ecdc3c226",
@@ -55,7 +73,7 @@ fn no_pre_phase4_recursion_digest_or_key_remains() {
             hits.push(format!("{}: {lit}", agents.display()));
         }
     }
-    assert!(hits.is_empty(), "pre-rVM-phase-4 pins remain:\n{}", hits.join("\n"));
+    assert!(hits.is_empty(), "pre-rVM-phase-5 pins remain:\n{}", hits.join("\n"));
 }
 
 fn walk(d: &std::path::Path, f: &mut dyn FnMut(&std::path::Path, &str)) {

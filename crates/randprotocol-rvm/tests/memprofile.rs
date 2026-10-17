@@ -133,7 +133,7 @@ fn tier16_synthetic_threads() {
 /// re-recorded it: 169 366 → 104 150 rows, still tier 18 (`TIERS` has no 17 rung; not re-profiled).
 /// MODQ chip (2026-10-11, private multisig phase 3): the inner cpu gained SYS_MODQ: 104 150 → 104 229 rows (emulated by `tests/profile.rs`), still tier 18.
 #[test]
-#[ignore = "one exit-twin rVM proof under the heap profiler (tier 18 since phase 2; 104 229 rows since the MODQ chip, 104 150 after phase 4): proved on this 48 GB box at 26.88 GB live, 2026-10-06, at phase 3's end (33.27 GB at the quotient-layout fork, 2026-10-05; 78.7 GB live when killed at tier 19 before it); ~2.5 min on 16 threads with --features parallel"]
+#[ignore = "one exit-twin rVM proof under the heap profiler (tier 18 since phase 2; 88 160 rows since phase 5, 104 229 since the MODQ chip, 104 150 after phase 4): proved on this 48 GB box at 26.88 GB live, 2026-10-06, at phase 3's end (33.27 GB at the quotient-layout fork, 2026-10-05; 78.7 GB live when killed at tier 19 before it); ~2.5 min on 16 threads with --features parallel"]
 fn tier19_exit_twin() {
     use randprotocol_zkvm::machine::FriProfile;
     use randprotocol_rvm::dsl::Checkpoints;

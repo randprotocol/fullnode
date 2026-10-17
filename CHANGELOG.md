@@ -12,6 +12,13 @@ stopped at v0.4 until 2026-09-30, when the entries v0.5 to v0.6.7 were written f
 
 ## Unreleased
 
+- **rVM phase 5 re-vendored** (circuits `b3e21d9`, `recursion/docs/10-phase5-n2-tier19.md`;
+  node-only until a chain admits aggregation): the recursion programs are 235 418 rows an inner
+  verification (315 391 before), so a production N=1 aggregate is tier 18 and N=2 tier 19;
+  `admitted_tiers` production is {18, 19, 20, 21}; `verify_rv32.digest` `c3065887…1b24` and the
+  production `aggregate_program_digest` `792a66d4…a982` (`8bc2cecb…d8c7` before). No ISA, AIR or
+  key change; constraint set 9 and every wallet proof are untouched.
+
 ## v0.8.0 — 2026-10-12 (chain 21 onward)
 
 Tagged from fullnode `main` (vendoring circuits `d217252`: constraint set 9 — rVM phase 4's
