@@ -13,6 +13,13 @@ wallet ──https──> nginx (web droplet, TLS, per-address limit, no access 
                           └─ …
 ```
 
+**Status, 2026-10-22 — re-keyed.** The four members' hosts were lost with the hosting account. Two
+members now, keys made on their hosts: `a` (rand-node-a 165.22.51.80, 4SK4-P64N-XWEN-ZSZZ) and `b`
+(rand-prover-b 142.93.64.41, a dedicated `s-8vcpu-16gb`, 0XZX-NZ1J-SPMB-GWZN), both the signed `v0.8.0`
+rand-prover (`TAG=v0.8.0 MEMBER=… install-host.sh`, then `install-web.sh a:8611=… b:8612=…`). One real
+chain-21 transfer proved through each (a 108.9 s, b 96.8 s). Clients pin them from wallet 0.8.1 and
+`rand prover pair --trusted` from this commit; older wallets refuse both. The history below is kept.
+
 **Status, 2026-10-01 13:00 UTC — per-member keys only.** Four members, each with its own key made
 on its host and never copied: `a` (rand-node-a, ZEXQ-1JHV-ZT60-KFB5), `archive2` (rand-archive-2,
 D2XV-WXVT-PZRC-D7G8), `nyc3` (SR28-MYT0-GR6A-03DE), `sfo3` (GMNX-Q1QD-FEXG-JHJM), at
