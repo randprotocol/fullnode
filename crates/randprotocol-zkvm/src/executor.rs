@@ -369,7 +369,7 @@ pub const MIN_PRIVATE_TABLE_LOG_HEIGHT: u8 = 7;
 /// Reads the header only; nothing is verified. Next to the call caps `verify_call` enforces, but
 /// policy, not one of them (see the constant's doc comment).
 pub fn call_private_table_under_floor(proof: &[u8]) -> Option<(&'static str, u8)> {
-    let proof = decode_canonical(proof).ok()?;
+    let proof = decode_canonical_shared(proof).ok()?;
     let min = MIN_PRIVATE_TABLE_LOG_HEIGHT;
     if proof.input_log_height < min {
         return Some(("input", proof.input_log_height));
@@ -389,7 +389,7 @@ pub fn call_private_table_under_floor(proof: &[u8]) -> Option<(&'static str, u8)
 /// a forged header can only get its own transaction refused (PST-1:
 /// `program_state::panicked`).
 pub fn call_proof_outputs(proof: &[u8]) -> Option<[u32; 8]> {
-    let proof = decode_canonical(proof).ok()?;
+    let proof = decode_canonical_shared(proof).ok()?;
     let mut out = [0u32; 8];
     for (i, o) in out.iter_mut().enumerate() {
         *o = u32::try_from(*proof.public_values.get(pv::OUT0 + i)?).ok()?;
@@ -663,7 +663,7 @@ pub fn honest_fri_arities(proof: &Proof) -> Option<Vec<u8>> {
 /// [`non_canonical`] over proof bytes: `None` for bytes that do not decode canonically — those
 /// are refused as `MalformedProof` wherever they are verified.
 pub fn non_canonical_proof(bytes: &[u8]) -> Option<String> {
-    non_canonical(&decode_canonical(bytes).ok()?)
+    non_canonical(&*decode_canonical_shared(bytes).ok()?)
 }
 
 /// The largest `input_log_height` a call at `tier` can honestly declare — the input table's
@@ -966,15 +966,11 @@ impl ZkExecutor {
         public_log_height: u8,
         exact: bool,
         pinned_tier: usize,
-    ) -> Result<Proof, ConfidentialError> {
-        self.check_decoded(
-            decode_canonical(proof)?,
-            program_log_height,
-            input_log_height,
-            public_log_height,
-            exact,
-            pinned_tier,
-        )
+    ) -> Result<std::sync::Arc<Proof>, ConfidentialError> {
+        // #152: the memoised decode — one decode per proof per admission, shared by every check.
+        let proof = decode_canonical_shared(proof)?;
+        self.check_decoded_ref(&proof, program_log_height, input_log_height, public_log_height, exact, pinned_tier)?;
+        Ok(proof)
     }
 
     /// [`Self::decode_and_check`] on a proof already decoded (by [`decode_canonical`]): for
@@ -988,6 +984,20 @@ impl ZkExecutor {
         exact: bool,
         pinned_tier: usize,
     ) -> Result<Proof, ConfidentialError> {
+        self.check_decoded_ref(&proof, program_log_height, input_log_height, public_log_height, exact, pinned_tier)?;
+        Ok(proof)
+    }
+
+    /// [`Self::check_decoded`] by reference (#152: on a memoised decode, which is shared).
+    fn check_decoded_ref(
+        &self,
+        proof: &Proof,
+        program_log_height: u8,
+        input_log_height: u8,
+        public_log_height: u8,
+        exact: bool,
+        pinned_tier: usize,
+    ) -> Result<(), ConfidentialError> {
         // Constraint set 9: a modq table is the multisig auth guest's alone, and that guest has
         // its own path (`decode_and_check_msauth`). A call, hardened call, invoke or state proof
         // (`exact` false) declaring one is refused here, before anything is sized from the header
@@ -1082,7 +1092,7 @@ impl ZkExecutor {
         if proof.public_values[pv::IN0..pv::IN0 + 8].iter().any(|v| *v > u32::MAX as u64) {
             return Err(ConfidentialError::InvalidProof("H_IN word not a u32".into()));
         }
-        Ok(proof)
+        Ok(())
     }
 
     /// The chain's bundle guest: since chain 14 the hidden-asset guest
@@ -1383,7 +1393,7 @@ impl ZkExecutor {
     /// header (all eight words — a junk header costs comparisons, never a tier-18 key build), the
     /// machine's own ranges, the degree-bits vector of the pinned shape (which is also the
     /// instance-count check), and the public-value layout.
-    fn check_msauth_decoded(&self, proof: Proof) -> Result<Proof, ConfidentialError> {
+    fn check_msauth_decoded(&self, proof: &Proof) -> Result<(), ConfidentialError> {
         if let Some(field) = Self::msauth_header_mismatch(&proof) {
             return Err(ConfidentialError::InvalidProof(format!("not the multisig auth guest's shape: {field}")));
         }
@@ -1421,12 +1431,15 @@ impl ZkExecutor {
         if proof.public_values[pv::IN0..pv::IN0 + 8].iter().any(|v| *v > u32::MAX as u64) {
             return Err(ConfidentialError::InvalidProof("H_IN word not a u32".into()));
         }
-        Ok(proof)
+        Ok(())
     }
 
-    /// [`Self::check_msauth_decoded`] over proof bytes (the canonical decode first).
-    fn decode_and_check_msauth(&self, proof: &[u8]) -> Result<Proof, ConfidentialError> {
-        self.check_msauth_decoded(decode_canonical(proof)?)
+    /// [`Self::check_msauth_decoded`] over proof bytes (the canonical decode first, memoised:
+    /// #152).
+    fn decode_and_check_msauth(&self, proof: &[u8]) -> Result<std::sync::Arc<Proof>, ConfidentialError> {
+        let p = decode_canonical_shared(proof)?;
+        self.check_msauth_decoded(&p)?;
+        Ok(p)
     }
 
     /// The `c` a multisig auth proof publishes, after the structural checks at the pinned shape.
@@ -1600,12 +1613,14 @@ impl ZkExecutor {
         proof: &[u8],
     ) -> Result<(randprotocol_core::confidential::AuthShape, Word8, Option<u64>), ConfidentialError> {
         use randprotocol_core::confidential::AuthShape;
-        let p = decode_canonical(proof)?;
-        let (shape, p) = if Self::is_single_key_header(&p) {
+        let p = decode_canonical_shared(proof)?;
+        let shape = if Self::is_single_key_header(&p) {
             let (plh, ilh, pubh) = Self::auth_heights();
-            (AuthShape::SingleKey, self.check_decoded(p, plh, ilh, pubh, true, AUTH_TIER)?)
+            self.check_decoded_ref(&p, plh, ilh, pubh, true, AUTH_TIER)?;
+            AuthShape::SingleKey
         } else {
-            (AuthShape::Multisig, self.check_msauth_decoded(p)?)
+            self.check_msauth_decoded(&p)?;
+            AuthShape::Multisig
         };
         Ok((shape, published_digest(&p.public_values)?, Some(p.public_values[pv::GAS])))
     }
@@ -2198,6 +2213,55 @@ pub fn decode_canonical(bytes: &[u8]) -> Result<Proof, ConfidentialError> {
     Ok(proof)
 }
 
+/// How many canonical decodes [`decode_canonical_shared`] keeps: a bundle and an auth proof for
+/// each of a few admissions in flight at once (a node verifies `cores − 2` transactions
+/// concurrently). Each entry is a copy of the bytes and the decoded proof, ~3 MB for a tier-14
+/// bundle proof, so the memo holds at most ~50 MB.
+pub const DECODE_MEMO_ENTRIES: usize = 16;
+
+type DecodeMemo = std::collections::VecDeque<(std::sync::Arc<[u8]>, std::sync::Arc<Proof>)>;
+static DECODE_MEMO: std::sync::Mutex<DecodeMemo> = std::sync::Mutex::new(std::collections::VecDeque::new());
+static DECODES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// #152: [`decode_canonical`], memoised on the exact bytes. One admission asks for the same proof
+/// four times — the canonical-proof rule, `check_auth_fields`' header, the digest and gas reads,
+/// and the verify — and each used to decode (and re-encode, the canonical check) its 1.4–1.5 MB
+/// afresh: ~10 ms of a 73 ms warm admission. The ledger asks through `&dyn ConfidentialExecutor`
+/// with the bytes, as before; this is where those calls meet, so the first decodes and the rest
+/// share it. A pure function of the bytes (a hit compares them in full), so no verdict can
+/// differ from an unmemoised decode; refusals are not kept. Least recently inserted out.
+pub fn decode_canonical_shared(bytes: &[u8]) -> Result<std::sync::Arc<Proof>, ConfidentialError> {
+    {
+        let memo = DECODE_MEMO.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((_, p)) = memo.iter().find(|(b, _)| **b == *bytes) {
+            return Ok(p.clone());
+        }
+    }
+    DECODES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let proof = std::sync::Arc::new(decode_canonical(bytes)?);
+    let mut memo = DECODE_MEMO.lock().unwrap_or_else(|e| e.into_inner());
+    if !memo.iter().any(|(b, _)| **b == *bytes) {
+        if memo.len() >= DECODE_MEMO_ENTRIES {
+            memo.pop_front();
+        }
+        memo.push_back((std::sync::Arc::from(bytes), proof.clone()));
+    }
+    Ok(proof)
+}
+
+/// A test and bench instrument: how many canonical decodes [`decode_canonical_shared`] ran
+/// (misses) in this process.
+#[doc(hidden)]
+pub fn shared_decodes() -> usize {
+    DECODES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// A test and bench instrument: empty the decode memo (a bench timing a cold admission).
+#[doc(hidden)]
+pub fn clear_decode_memo() {
+    DECODE_MEMO.lock().unwrap_or_else(|e| e.into_inner()).clear();
+}
+
 impl ConfidentialExecutor for ZkExecutor {
     fn check_program(&self, base_pc: u32, words: &[u32]) -> Result<Vec<u8>, ConfidentialError> {
         if !base_pc.is_multiple_of(4) {
@@ -2572,7 +2636,7 @@ impl ConfidentialExecutor for ZkExecutor {
     /// Constraint set 8: `pv::GAS` of the canonically decoded proof — a decode, no verification
     /// (the trait's contract: trusted only once `verify_bundle` accepted the same bytes).
     fn bundle_gas_limit(&self, proof: &[u8]) -> Result<Option<u64>, ConfidentialError> {
-        let proof = decode_canonical(proof)?;
+        let proof = decode_canonical_shared(proof)?;
         if proof.public_values.len() != pv::NUM {
             return Err(ConfidentialError::MalformedProof);
         }

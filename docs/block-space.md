@@ -17,6 +17,20 @@ Measured on the research crate (`docs/03-privacy.md` there), `fib` guest, one ma
 | verify, uncached, tier 12 | 809 ms | 838 ms |
 | verify, warm key | ~16 ms | ~16 ms |
 
+Those two verify rows are the research crate's tier-12 `fib` proof. A chain-21 transfer carries a
+tier-14 bundle proof and a tier-10 auth proof (2.87–2.90 MB together), and admitting one costs more
+(2026-10-28, Apple M4 Max, n = 38 chain-21 transactions, the node's own executor without its verdict
+cache; fullnode issue #152):
+
+| admission of one chain-21 transfer | v0.8.0 – v0.8.2 | v0.8.3 |
+|---|---|---|
+| verify, warm keys (header checks + bundle STARK + auth STARK), p50 | 73 ms (72.2 re-measured) | 62 ms |
+| verify, cold (first after start: both keys built), p50 | 1.6 s | 1.56 s |
+| decode of the `rand_sendTransaction` body (hex + bincode), p50 | 18.5 ms | 1.2 ms |
+
+v0.8.3 decodes each proof once per admission instead of four times and decodes the hex body with
+`faster-hex`; the two STARK verifies themselves (~31 ms and ~27 ms) are unchanged.
+
 A shielded bundle (`bundle` guest, tier 14) is not yet measured at 80 queries; each tier above
 12 adds two FRI layers, so expect **about 1.3 MB**. Everything else in a transfer is small: two
 nullifiers and two commitments (128 bytes), two envelopes (ML-KEM-768 ciphertext 1 088 bytes plus
@@ -68,8 +82,9 @@ works the arithmetic).
 
 Fees are flat floors (`docs/fees.md`): 0.001 RAND per bundle regardless of size, because a
 validator's cost is one nearly constant STARK verification. That was true at 27 queries and
-remains true at 80: verification moved from 809 ms to 838 ms uncached, 16 ms warm. The floor
-prices **verification**, not **bytes**.
+remains true at 80: verification moved from 809 ms to 838 ms uncached, 16 ms warm (the tier-12
+`fib` figures; a chain-21 transfer's two proofs take 62 ms warm and 1.56 s cold as of v0.8.3, §1).
+The floor prices **verification**, not **bytes**.
 
 Bytes are the scarce thing now. Three slots per block with a flat 0.001 RAND floor and a
 first-come mempool means demand above 1.5 transfers per second is rationed by arrival order,

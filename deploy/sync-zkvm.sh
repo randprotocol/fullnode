@@ -257,7 +257,7 @@ rsync -a --delete --exclude executor.rs --exclude shielded.rs --exclude call_env
       --exclude viewing.rs --exclude bundle.rs --exclude hidden_bundle.rs \
       --exclude hidden_cheating.rs --exclude hidden_trace_forgery.rs --exclude guest_provenance.rs --exclude 'auth*.rs' --exclude evm_rt.rs --exclude sbpf_rt.rs \
       --exclude perps_vectors.rs --exclude modq_cheating.rs \
-      --exclude counter_rng.rs --exclude prover_data_cache.rs \
+      --exclude counter_rng.rs --exclude prover_data_cache.rs --exclude decode_memo.rs \
       "$SRC/tests/" "$DST/tests/"
 [ -f "$DST/src/guests.rs" ] || cp "$SRC/src/guests.rs" "$DST/src/guests.rs"
 # M4.1/M4.2: vendor the compiled guest binaries the vendored `tests/e2e.rs` and the local
