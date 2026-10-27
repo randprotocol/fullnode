@@ -1254,12 +1254,13 @@ fn may_be_ours(w: &Wallet, leaf: &ScanLeaf) -> bool {
 /// The `rand_getCommitments` reads — `(from, limit)` — that fetch the envelopes of `wanted`
 /// (sorted leaf indices) at a fetch width of `chunk` leaves (audit v10, RPC-201). Each read is one
 /// aligned chunk, `from` a multiple of `chunk` and `limit` the whole chunk, so the node learns
-/// which chunk held a leaf of the wallet's and never which leaf: a read is never one wanted leaf
+/// which chunk held a leaf of the wallet's, not which leaf (a partial tip chunk narrows that; docs/rpc.md): a read is never one wanted leaf
 /// (for a chunk of at least 2), and the leaves between two wanted ones in a chunk ride in the
 /// same read — the gap merging the scan always did, now inside the chunk. A chunk is read once
 /// however many wanted leaves it holds; a read past the tree's end simply comes back short.
 /// `chunk` is at least 1 here: the caller reads the page in full for `0`.
 pub(crate) fn fetch_chunks(wanted: &[u64], chunk: u64) -> Vec<(u64, usize)> {
+    // (Callers page by `heads_page`, so every wanted leaf of one page lies in chunks wholly inside it.)
     debug_assert!(chunk >= 1, "a zero chunk reads the page in full");
     let chunk = chunk.max(1);
     let mut reads: Vec<(u64, usize)> = Vec::new();
@@ -1270,6 +1271,19 @@ pub(crate) fn fetch_chunks(wanted: &[u64], chunk: u64) -> Vec<(u64, usize)> {
         }
     }
     reads
+}
+
+/// The heads page [`leaf_page`] reads for a cursor at `from` under a scan chunk of `chunk`
+/// (`chunk >= 1`): `(start, limit)`, `start` the chunk boundary at or below `from` and `limit` the
+/// smallest multiple of `chunk` that is at least [`PAGE`] (audit v10, RPC-201 review). Pages then
+/// begin and end on chunk boundaries, so no chunk straddles two pages — a chunk read during a page
+/// says only "a leaf of this chunk", never "of the part of it this page covers" — and each chunk is
+/// read at most once per pass. Within the 1000-row cap for every legal chunk (≤ 1000).
+pub(crate) fn heads_page(from: u64, chunk: u64) -> (u64, usize) {
+    let chunk = chunk.max(1);
+    let start = from - from % chunk;
+    let limit = (PAGE as u64).div_ceil(chunk) * chunk;
+    (start, limit as usize)
 }
 
 /// One page of leaves from `from`, as [`offer_row`] takes them. Against a node that serves scan
@@ -1284,9 +1298,14 @@ async fn leaf_page(rpc: &RpcClient, w: &Wallet, from: u64, rebuilt: &BTreeMap<Wo
     if chunk == 0 {
         return rpc.commitments(from, PAGE).await;
     }
-    let Some(leaves) = rpc.scan_leaves(from, PAGE).await? else {
+    // RPC-201: the heads page starts on the chunk boundary at or below the cursor and spans whole
+    // chunks (`heads_page`); the leaves under the cursor were offered by the pass before and are
+    // dropped here, unread in full.
+    let (start, limit) = heads_page(from, chunk);
+    let Some(mut leaves) = rpc.scan_leaves(start, limit).await? else {
         return rpc.commitments(from, PAGE).await;
     };
+    leaves.retain(|l| l.index >= from);
     let wanted: Vec<u64> = leaves.iter().filter(|l| !rebuilt.contains_key(&l.cm) && may_be_ours(w, l)).map(|l| l.index).collect();
     let mut full: BTreeMap<u64, CommitmentRow> = BTreeMap::new();
     for (start, span) in fetch_chunks(&wanted, chunk) {
@@ -5456,6 +5475,34 @@ pub(crate) mod tests {
                 }
                 assert!(wanted.iter().all(|w| reads.iter().any(|(from, limit)| *from <= *w && *w < from + *limit as u64)), "every wanted leaf is covered");
                 assert!(reads.windows(2).all(|w| w[0].0 < w[1].0), "once per chunk, in order");
+            }
+        }
+    }
+
+    /// RPC-201 review: heads pages start on the chunk boundary at or below the cursor and span
+    /// whole chunks, at least a [`PAGE`] and within the node's 1000-row cap, so a chunk never
+    /// straddles two pages; a pass that pages from 0 visits each chunk in exactly one page.
+    #[test]
+    fn heads_pages_are_aligned_to_the_chunk_and_no_chunk_straddles_two() {
+        assert_eq!(heads_page(0, 256), (0, 512));
+        assert_eq!(heads_page(512, 256), (512, 512));
+        assert_eq!(heads_page(300, 256), (256, 512), "a mid-chunk cursor pages from its chunk's start");
+        assert_eq!(heads_page(7, 1000), (0, 1000));
+        assert_eq!(heads_page(9, 4), (8, 500));
+        for chunk in [2u64, 3, 4, 7, 256, 333, 500, 501, 1000] {
+            for from in [0u64, 1, chunk - 1, chunk, 5 * chunk + 3, 123_457] {
+                let (start, limit) = heads_page(from, chunk);
+                assert_eq!(start % chunk, 0);
+                assert!(start <= from && from < start + chunk);
+                assert_eq!(limit as u64 % chunk, 0, "whole chunks");
+                assert!(limit >= PAGE && limit <= 1000, "{limit} at chunk {chunk}");
+            }
+            // A pass paging from 0 with full pages: each page starts where the last ended, on a boundary.
+            let mut from = 0u64;
+            for _ in 0..5 {
+                let (start, limit) = heads_page(from, chunk);
+                assert_eq!(start, from, "every page after the first starts at the previous end");
+                from = start + limit as u64;
             }
         }
     }

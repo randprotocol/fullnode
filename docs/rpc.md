@@ -216,11 +216,17 @@ wallet reads in full after paging heads, and those are the wallet's own leaves �
 served full pages to everyone learned nothing. `rand` therefore reads envelopes in whole
 **aligned chunks**: a wanted leaf at index `i` is fetched as `rand_getCommitments(i - i mod N, N)`
 with `N` = `--scan-chunk` (256 by default), so the node learns that *some* leaf of the chunk is the
-wallet's, never which one, and the leaves between two of the wallet's in one chunk ride in the
-same read. A chunk is read once however many of the wallet's leaves it holds; a read is never one
-leaf (`--scan-chunk 1` is refused). What the node still learns: how many chunks hold a leaf of
-the wallet's (an upper bound on its note count, coarsened to 256 leaves) and the wallet's
-viewing-key-independent timing. `--scan-chunk 0` reads every envelope, as a wallet before scan
+wallet's, not which one (but see the tip, below), and the leaves between two of the wallet's in one chunk ride in the
+same read. Heads are paged on chunk boundaries too (each page starts at a multiple of `N` and
+spans whole chunks, at least 500 leaves), so a chunk never straddles two pages and is read once
+per scan however many of the wallet's leaves it holds; a read is never one leaf (`--scan-chunk 1`
+is refused). What the node still learns: how many chunks hold a leaf of the wallet's — a *lower*
+bound on its note count (several of its notes can share a chunk), plus every chunk holding a head
+that is not 1 208 bytes, which is read whatever its owner — and the wallet's timing. **The tip is
+the weak spot:** the last chunk is partial while the chain grows, so a wanted leaf in it is hidden
+only among the leaves written so far — right after a new block that can be a single bundle — and
+the chunk is read again on each later scan as it fills, which tells the node a leaf of the wallet's
+is in it. A wallet that cares can scan less often than blocks arrive, or use `--scan-chunk 0`. `--scan-chunk 0` reads every envelope, as a wallet before scan
 heads did: the node learns nothing from the reads, at a full page's bandwidth — the setting for a
 node you do not trust with your note count. Larger `N` (up to the 1000-row cap) hides more at
 more bandwidth per wanted leaf; 256 full rows are ~1 MB of JSON per chunk that holds a note.

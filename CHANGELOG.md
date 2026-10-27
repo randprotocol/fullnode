@@ -30,7 +30,10 @@ Audit v10 fixes (node and client policies, no chain change unless a genesis fiel
   start on a mismatch.
 - **RPC-201** (client-only): `rand` reads envelopes by whole aligned chunks of `--scan-chunk`
   leaves (256; `0` = every envelope) after paging scan heads, so the node learns the chunk and not
-  the leaf (`docs/rpc.md`, scan heads).
+  the leaf (`docs/rpc.md`, scan heads). Heads are paged on chunk boundaries (whole chunks, at
+  least 500 leaves), so no chunk straddles two pages and each is read once per scan; the chunk
+  count is a lower bound on the wallet's notes, and a partial tip chunk hides a leaf only among
+  the leaves written so far (documented).
 - **MSA-4** (genesis-gated, next cut): genesis `multisig.max_accounts` caps the public multisig
   register; a `CreateMultisig` past it is refused (`RegisterFull`, permanent). Absent — chain 21 —
   the register is unbounded and the genesis hash is unchanged. Node-only: each account's leaf hash
