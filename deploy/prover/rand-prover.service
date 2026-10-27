@@ -4,7 +4,7 @@
 # this one, and the pool's shared pairing needs `--per-token`, which the node's flags do not carry.
 #
 # Installed by deploy/prover/install-host.sh, which fills in @THREADS@ (the cores the proof may
-# use: all but one, which stays the validator's), @MEMORY_MAX@, @HOME@ and @PORT@. Two instances
+# use: all but one, which stays the validator's), @MEMORY_MAX@, @MAX_PARALLEL@, @HOME@ and @PORT@. Two instances
 # may run on one host while the pool moves to per-member keys (audit v7, VK-9):
 #   rand-prover-member.service  the member's own key, /var/lib/randprover-member, 127.0.0.1:8610
 #   rand-prover.service         the retiring shared pool key (wallet 0.6.8), /var/lib/randprover, :8600
@@ -23,7 +23,7 @@ Group=randprover
 # --per-token is the whole capacity because every wallet pairs with the member's public token.
 Environment=RAYON_NUM_THREADS=@THREADS@
 ExecStart=/usr/local/bin/rand-prover --home @HOME@ run \
-    --listen 127.0.0.1:@PORT@ --max-parallel 1 --max-queue 1 --per-token 2 \
+    --listen 127.0.0.1:@PORT@ --max-parallel @MAX_PARALLEL@ --max-queue 1 --per-token 2 \
     --allow-origin chrome-extension://* --allow-origin moz-extension://* \
     --allow-origin safari-web-extension://* --allow-origin http://localhost:* \
     --allow-origin http://127.0.0.1:* --allow-origin http://[::1]:* \
