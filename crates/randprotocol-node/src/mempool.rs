@@ -433,8 +433,9 @@ pub struct Mempool {
     cold_keys: ColdKeyBudget,
     /// CON-60 (b): the separate reserve for cold canonical shapes, which no other shape drains.
     lineage_keys: ColdKeyBudget,
-    /// CON-60: the cost the gate last computed, keyed by transaction hash, for `state_proof_queued`.
-    last_cost: std::sync::Mutex<Option<(Hash, ProofCost)>>,
+    /// CON-60: the cost the gate just computed, keyed by transaction hash and the tip's height,
+    /// for the `state_proof_queued` that follows it ([`Mempool::cost_once`]).
+    last_cost: std::sync::Mutex<Option<(Hash, u64, ProofCost)>>,
 }
 
 /// CON-60 (b): the burst of verifier-key builds for state-proof shapes this node has no key for
@@ -576,29 +577,39 @@ impl Mempool {
         }
     }
 
-    /// [`Self::state_proof_cost`] once per transaction: the gate computes it, `state_proof_queued`
-    /// (which follows the gate on the same tip) reads it back.
-    fn cost_once(&self, tx: &Transaction, ledger: &Ledger, executor: &dyn ConfidentialExecutor) -> ProofCost {
+    /// [`Self::state_proof_cost`] once per queued transaction. The gate (`fresh`) always computes
+    /// it and leaves it for the `state_proof_queued` that follows it on the same tip, which reads
+    /// it back only for the same transaction at the same tip height (`fresh` false) and takes it.
+    /// A precheck that fails after the gate drops it ([`Mempool::precheck`]), so a cost is never
+    /// reused across a tip, a change in key readiness or a later resubmission.
+    fn cost_once(&self, tx: &Transaction, ledger: &Ledger, executor: &dyn ConfidentialExecutor, fresh: bool) -> ProofCost {
         if !matches!(tx.action, Action::PerpStateProof { .. }) {
             return ProofCost::Free;
         }
-        let h = tx.hash();
+        let (h, at) = (tx.hash(), ledger.height());
         let mut last = self.last_cost.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some((lh, c)) = *last {
-            if lh == h {
-                return c;
+        if !fresh {
+            if let Some((lh, lat, c)) = last.take() {
+                if (lh, lat) == (h, at) {
+                    return c;
+                }
             }
+            return Self::state_proof_cost(tx, ledger, executor);
         }
         let c = Self::state_proof_cost(tx, ledger, executor);
-        *last = Some((h, c));
+        *last = Some((h, at, c));
         c
+    }
+
+    fn forget_cost(&self) {
+        *self.last_cost.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
 
     /// CON-60 (b): `Ok` unless `tx` is a state proof that would cost a key build and its bucket
     /// — the reserve for the chain's canonical shapes, the general one otherwise — is spent.
     fn state_proof_gate(&self, tx: &Transaction, ledger: &Ledger, executor: &dyn ConfidentialExecutor) -> Result<(), MempoolError> {
         let now = Instant::now();
-        let ok = match self.cost_once(tx, ledger, executor) {
+        let ok = match self.cost_once(tx, ledger, executor, true) {
             ProofCost::Free => true,
             ProofCost::Canonical => self.lineage_keys.available(now),
             ProofCost::Foreign => self.cold_keys.available(now),
@@ -614,7 +625,7 @@ impl Mempool {
     /// that will cost a key build takes a token from its bucket.
     pub fn state_proof_queued(&mut self, tx: &Transaction, ledger: &Ledger, executor: &dyn ConfidentialExecutor) {
         let now = Instant::now();
-        match self.cost_once(tx, ledger, executor) {
+        match self.cost_once(tx, ledger, executor, false) {
             ProofCost::Free => {}
             ProofCost::Canonical => {
                 self.lineage_keys.take(now);
@@ -623,7 +634,6 @@ impl Mempool {
                 self.cold_keys.take(now);
             }
         }
-        *self.last_cost.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
 
     #[cfg(test)]
@@ -1024,10 +1034,10 @@ impl Mempool {
         let pricing = self.gas_policy_floor(tx, ledger, executor).map_err(MempoolError::Invalid)?;
         (c.floor, c.gas_limit) = (pricing.floor, pricing.gas_limit);
         Self::defer_until_msauth_warm(tx, ledger, executor)?;
-        self.state_proof_gate(tx, ledger, executor)?;
+        self.state_proof_gate(tx, ledger, executor).inspect_err(|_| self.forget_cost())?;
         // Before any proof is verified for it: a transaction the byte cap would refuse costs no
         // verification (audit v6, CH-7).
-        c.evict = self.make_room(tx, c.floor, ledger)?;
+        c.evict = self.make_room(tx, c.floor, ledger).inspect_err(|_| self.forget_cost())?;
         Ok(c)
     }
 
@@ -4848,6 +4858,36 @@ mod tests {
         assert!(m.cold_keys_mut().available(t0), "the general bucket untouched");
         m.lineage_keys_mut().take(t0);
         assert!(!m.lineage_keys_mut().available(t0), "the reserve paid for it");
+    }
+
+    /// CON-60 round 4: the gate's cost is read back only for the same transaction at the same tip.
+    /// A cold canonical proof the gate priced on one tip, queued against a tip that refuses its
+    /// window (so it would be refused for free), takes no token — the stale `Canonical` is not
+    /// reused — and a gate that ran without a following queue leaves nothing a later one reads.
+    #[test]
+    fn a_state_proofs_cost_is_never_reused_across_tips() {
+        use fixtures::{key, make_perps_block, perp_deposit_tx, perp_state_proof_tx};
+        let gs = fixtures::perps_genesis(7);
+        let mut l = gs.ledger.clone();
+        let deposit = perp_deposit_tx(&l, &key(50), 300, 5_000_000);
+        let b1 = make_perps_block(&gs.block, &mut l, vec![deposit], &key(1));
+        let before = l.clone();
+        make_perps_block(&b1, &mut l, vec![], &key(1));
+        assert_ne!(before.height(), l.height());
+        let mut cold = perp_state_proof_tx(&l, 2, [7; 8], vec![], 0);
+        let Action::PerpStateProof { proof, .. } = &mut cold.action else { unreachable!() };
+        proof[37..41].copy_from_slice(&[0, 1, 0, 0]); // the cold canonical shape
+        let mut m = Mempool::new(100);
+        let ex = &StubExecutor;
+        let t0 = Instant::now();
+        assert!(m.precheck(&cold, &l, ex).is_ok(), "priced Canonical on the tip that closes its window");
+        m.state_proof_queued(&cold, &before, ex);
+        m.state_proof_queued(&cold, &before, ex);
+        assert!(m.lineage_keys_mut().available(t0) && m.lineage_keys_mut().level(t0) >= 2.0, "no token: the other tip refuses it for free");
+        // On its own tip the same transaction pays its one token.
+        assert!(m.precheck(&cold, &l, ex).is_ok());
+        m.state_proof_queued(&cold, &l, ex);
+        assert!(m.lineage_keys_mut().level(t0) < 2.0);
     }
 
     /// An invoke's payout notes are leaves like any other: the pool claims them (through
