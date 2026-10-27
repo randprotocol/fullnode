@@ -732,17 +732,19 @@ pub struct ZkExecutor {
     /// CON-60: the perps engine's state proofs' own `Machine`, so no call, bundle or auth shape
     /// evicts an engine key and no junk state-proof shape evicts theirs. Its LRU bounds what junk
     /// can hold (each shape is built once while cached); a shape whose proof verified is pinned
-    /// here ([`ZkExecutor::keep_perp_key`], at most [`PERP_PINNED_SHAPES`]) and never evicted.
+    /// here ([`ZkExecutor::keep_perp_key`], at most [`PERP_GENERAL_PINS`]) and never evicted.
     perp_machine: Machine,
     /// CON-60: keys of the chain's canonical state-proof shapes ([`ZkExecutor::is_perp_canonical`])
-    /// — their own small LRU ([`PERP_CANONICAL_KEYS`]), which no other shape reaches.
+    /// — their own small LRU ([`PERP_CANONICAL_KEYS`]), which no other shape reaches, with their
+    /// own pins ([`PERP_CANONICAL_PINS`]), which no other shape can take.
     perp_lineage_machine: Machine,
     /// CON-60: the genesis `engine_program_log_height` pin (0 = none) and `max_tier`, set once by
     /// [`ConfidentialExecutor::set_perp_config`].
     perp_engine_plh: std::sync::atomic::AtomicU8,
     perp_max_tier: std::sync::atomic::AtomicU8,
-    /// CON-60: the shapes pinned in `perp_machine` / `perp_lineage_machine`.
-    perp_pinned: std::sync::Mutex<std::collections::BTreeSet<randprotocol_core::confidential::ProofShape>>,
+    /// CON-60: the shapes pinned, each with whether its pin is in `perp_lineage_machine` (true)
+    /// or `perp_machine` (false) — counted per machine against its own cap.
+    perp_pinned: std::sync::Mutex<std::collections::BTreeMap<randprotocol_core::confidential::ProofShape, bool>>,
     /// The tier-18 msauth verifier key, built once (spec §3.5, pre-flight finding 3): measured at
     /// Production on the 48 GB laptop at 78.6 s and ~4.0 GB peak (and resident after, on macOS's
     /// allocator — the key itself is a commitment and lookups), on 2–4 GB validators, so four
@@ -791,7 +793,7 @@ impl ZkExecutor {
             perp_lineage_machine: Machine::with_key_cache_capacity(profile, PERP_CANONICAL_KEYS),
             perp_engine_plh: std::sync::atomic::AtomicU8::new(0),
             perp_max_tier: std::sync::atomic::AtomicU8::new(0),
-            perp_pinned: std::sync::Mutex::new(std::collections::BTreeSet::new()),
+            perp_pinned: std::sync::Mutex::new(std::collections::BTreeMap::new()),
             msauth_key: std::sync::OnceLock::new(),
             msauth_key_builds: std::sync::atomic::AtomicUsize::new(0),
             msauth_key_source: std::sync::OnceLock::new(),
@@ -1851,7 +1853,7 @@ impl ZkExecutor {
         if pin != 0 && shape.program_log_height == pin && shape.keccak_log_height == 0 && shape.sha256_log_height == 0 {
             return true;
         }
-        self.perp_pinned.lock().unwrap().iter().any(|p| {
+        self.perp_pinned.lock().unwrap().keys().any(|p| {
             p.program_log_height == shape.program_log_height
                 && p.keccak_log_height == shape.keccak_log_height
                 && p.sha256_log_height == shape.sha256_log_height
@@ -1869,6 +1871,15 @@ impl ZkExecutor {
             && shape.keccak_log_height == 0
             && shape.sha256_log_height == 0
             && self.is_perp_lineage(shape)
+    }
+
+    /// CON-60: whether the canonical (`true`) or the general machine has a pin left.
+    fn perp_pin_left(
+        pinned: &std::collections::BTreeMap<randprotocol_core::confidential::ProofShape, bool>,
+        canonical: bool,
+    ) -> bool {
+        let cap = if canonical { PERP_CANONICAL_PINS } else { PERP_GENERAL_PINS };
+        pinned.values().filter(|c| **c == canonical).count() < cap
     }
 
     fn perp_cached_in(m: &Machine, shape: &randprotocol_core::confidential::ProofShape) -> bool {
@@ -1992,19 +2003,31 @@ fn pinned_heights(program: &Program, input_words: usize) -> (u8, u8, u8) {
     )
 }
 
-/// CON-60: the most state-proof shapes a node pins (an honest prover's tier, input and public
-/// heights move with the window, so a handful; each key is tens of MB at most at tier 18).
-pub const PERP_PINNED_SHAPES: usize = 8;
 /// CON-60: the canonical-shape key cache: a chain has at most four canonical shapes (one per
 /// public height, `ledger::perps::segment_public_log_height` over 1..=64 blocks), so 8 is the set
 /// plus slack.
 pub const PERP_CANONICAL_KEYS: usize = 8;
+/// CON-60: the pins of the canonical cache — one per canonical shape. Only canonical shapes
+/// build there, so only they take these.
+pub const PERP_CANONICAL_PINS: usize = 4;
 /// CON-60: the general state-proof key cache (every non-canonical shape). Sized by memory: a
 /// tier-14 key measured ~60 MB retained (`MAX_CALL_KECCAK_LOG_HEIGHT`'s doc comment), and a
 /// key's preprocessed data grows with the tier's row count, so a tier-18 key is estimated at up
-/// to ~16× that, a few hundred MB. Two keep the worst case well under 1 GB beside the canonical
-/// cache; a non-canonical honest shape is the prover's choice, and it pays a rebuild.
+/// to ~16× that, about 1 GB (not measured). A non-canonical honest shape is the prover's
+/// choice, and it pays a rebuild.
 pub const PERP_GENERAL_KEYS: usize = 2;
+/// CON-60: the pins of the general cache. The vendored LRU never evicts a pinned key and grows
+/// past its capacity once only pinned keys remain (it then holds `pins + 1`), so a cache's real
+/// bound is `max(capacity, pins + 1)`. With pins below capacity in both caches that is the
+/// capacity itself: **at most `PERP_GENERAL_KEYS + PERP_CANONICAL_KEYS` = 10 state-proof keys
+/// built and held**, whatever is sent (2 general, and on a chain with the genesis pin at most
+/// the 4 canonical shapes' keys in the canonical cache, so 6 in practice) — at the ~1 GB tier-18
+/// estimate, ≤ 2 GB general beside the canonical set every node needs anyway (4 keys under the
+/// genesis pin, the cache bounding it at 8 on a chain without one).
+/// Beyond that, at most one key per verify worker (4) can be mid-build in a slot the LRU already
+/// dropped. The startup warm builds a shape only while its cache has a pin left.
+pub const PERP_GENERAL_PINS: usize = 1;
+const _: () = assert!(PERP_GENERAL_PINS < PERP_GENERAL_KEYS && PERP_CANONICAL_PINS < PERP_CANONICAL_KEYS);
 
 /// CON-60: the leading header of a postcard-encoded [`Proof`], field for field in its order —
 /// `tier`, then the declared table heights — so [`proof_shape`] reads them without decoding the
@@ -2252,19 +2275,22 @@ impl ConfidentialExecutor for ZkExecutor {
     }
 
     /// CON-60: pin `shape`'s key where it is built, once a proof of it verified — only when the
-    /// key is built already (this never builds) and while fewer than [`PERP_PINNED_SHAPES`] are.
-    /// Pinning is the vendored install of the machine's own key, which marks the slot never
-    /// evictable.
+    /// key is built already (this never builds) and while that machine has a pin left
+    /// ([`PERP_CANONICAL_PINS`] in the canonical machine, [`PERP_GENERAL_PINS`] in the general
+    /// one: pins are per cache, so non-canonical proofs, however many verify, never take a
+    /// canonical shape's pin). Pinning is the vendored install of the machine's own key, which
+    /// marks the slot never evictable.
     fn keep_perp_key(&self, shape: &randprotocol_core::confidential::ProofShape) {
-        let m = if Self::perp_cached_in(&self.perp_lineage_machine, shape) {
-            &self.perp_lineage_machine
+        let canonical = if Self::perp_cached_in(&self.perp_lineage_machine, shape) {
+            true
         } else if Self::perp_cached_in(&self.perp_machine, shape) {
-            &self.perp_machine
+            false
         } else {
             return;
         };
+        let m = if canonical { &self.perp_lineage_machine } else { &self.perp_machine };
         let mut pinned = self.perp_pinned.lock().unwrap();
-        if pinned.contains(shape) || pinned.len() >= PERP_PINNED_SHAPES {
+        if pinned.contains_key(shape) || !Self::perp_pin_left(&pinned, canonical) {
             return;
         }
         let blob = m.export_verifier_key_with_modq(
@@ -2277,9 +2303,10 @@ impl ConfidentialExecutor for ZkExecutor {
             shape.public_log_height,
         );
         if m.install_verifier_key(&blob).is_ok() {
-            pinned.insert(*shape);
+            pinned.insert(*shape, canonical);
         }
     }
+
 
     /// CON-60: build `shape`'s key (a node's startup warm, from the shapes its chain's state
     /// proofs used) where a proof of it would verify, and pin it. A shape the header rules
@@ -2298,6 +2325,15 @@ impl ConfidentialExecutor for ZkExecutor {
             .is_err()
         {
             return;
+        }
+        // A warm key is built to be pinned: with its machine's pins taken it would only sit in
+        // the LRU until the next cold shape evicts it, so it is not built at all.
+        let canonical = std::ptr::eq(self.perp_machine_for(shape), &self.perp_lineage_machine);
+        {
+            let pinned = self.perp_pinned.lock().unwrap();
+            if pinned.contains_key(shape) || !Self::perp_pin_left(&pinned, canonical) {
+                return;
+            }
         }
         self.warming(|| {
             self.perp_machine_for(shape).verifier_key(
@@ -3794,6 +3830,45 @@ mod tests {
         assert!(fresh.is_perp_canonical(&canon));
         assert!(!fresh.is_perp_canonical(&ProofShape { input_log_height: 15, ..canon }));
         assert!(!fresh.is_perp_canonical(&ProofShape { tier: 16, ..canon }));
+    }
+
+    /// CON-60 round 4: pins are per cache. The general cache takes [`PERP_GENERAL_PINS`] pins and
+    /// so never holds more than [`PERP_GENERAL_KEYS`] keys, however many shapes verify; valid
+    /// non-canonical shapes cannot take a canonical shape's pin; a warm with no pin left builds
+    /// nothing.
+    #[test]
+    fn pins_are_per_cache_and_the_general_cache_stays_at_its_capacity() {
+        use super::*;
+        use crate::machine::FriProfile;
+        use randprotocol_core::confidential::ProofShape;
+        let program = crate::guests::fib(10);
+        let binding = [9u32; TX_BINDING_WORDS];
+        let (bytes, _, _) = prove_call_hardened(FriProfile::Test, &program, &[], &[], &binding, [0; 4], None, None).unwrap();
+        let base = proof_shape(&bytes).unwrap();
+        let zk = ZkExecutor::new(FriProfile::Test);
+        zk.set_perp_config(base.tier, base.program_log_height);
+        let canon_h = randprotocol_core::ledger::perps::canonical_input_log_height(base.tier);
+        let general: Vec<ProofShape> =
+            (7..=12u8).filter(|h| *h != canon_h).take(4).map(|h| ProofShape { input_log_height: h, ..base }).collect();
+        // Four valid general shapes "verify" (built, then kept): one pin, and never more than
+        // two keys held, where the global cap of 8 let this cache grow to 9.
+        for s in &general {
+            zk.perp_machine.verifier_key(Tier(s.tier as usize), s.program_log_height, s.input_log_height, 0, 0, s.public_log_height);
+            zk.keep_perp_key(s);
+            assert!(zk.perp_machine.cached_keys() <= PERP_GENERAL_KEYS, "{} keys", zk.perp_machine.cached_keys());
+        }
+        assert!(zk.perp_key_ready(&general[0]), "the first is pinned");
+        assert_eq!(zk.perp_pinned.lock().unwrap().len(), 1);
+        // A warm of another general shape has no pin to take: nothing built.
+        let builds = zk.perp_key_builds();
+        zk.warm_perp(&ProofShape { input_log_height: 13, ..base });
+        assert_eq!(zk.perp_key_builds(), builds, "no pin left, no warm build");
+        // The canonical shape still has its own pin.
+        let canon = ProofShape { input_log_height: canon_h, ..base };
+        assert!(zk.is_perp_canonical(&canon));
+        zk.warm_perp(&canon);
+        assert!(ZkExecutor::perp_cached_in(&zk.perp_lineage_machine, &canon));
+        assert_eq!(zk.perp_pinned.lock().unwrap().get(&canon), Some(&true), "pinned in the canonical cache");
     }
 
     /// CON-60: `perp_proof_admissible` is `check_perp`'s header rules plus `Machine::check_pre_key`

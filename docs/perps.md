@@ -520,17 +520,21 @@ bridged one.
     free never spends a token and never builds a key;
   - tokens come from two buckets of 2, each refilled one per 30 s: a **reserve** for the chain's
     canonical shapes, and a general bucket for every other shape. Canonical keys live in their
-    own cache of 8 (a chain has at most four canonical shapes); other shapes share a cache of 2
-    (a tier-14 key is ~60 MB retained and a tier-18 key is estimated at a few hundred MB, so this
-    keeps the worst case well under 1 GB beside the canonical cache). With its bucket spent a
+    own cache of 8 (a chain has at most four canonical shapes); other shapes share a cache of 2.
+    Pins are per cache — 4 in the canonical cache, 1 in the general one, each below its cache's
+    size — so neither cache ever holds more keys than its size: at most 10 state-proof keys in
+    all, 6 on a chain with the genesis pin (a tier-14 key is ~60 MB retained; a tier-18 key is
+    estimated, not measured, at up to ~1 GB, so ~2 GB for the general cache beside the
+    canonical set every node needs anyway). With its bucket spent a
     proof is refused `this node is at its limit of verifier-key builds for new state-proof
     shapes; retry later` (`StateProofBusy`, retryable, never cached, no peer penalised, no
     timing). No refusal moves a bucket. An attacker can force at most one build per canonical
     shape before every honest shape is warm;
-  - a shape whose proof verified here, or that a committed block carried, is pinned (never
-    evicted, at most 8) and recorded in the node's database; at startup, off the node loop and
-    after the bundle key, the node builds and pins the 8 newest recorded or recently committed
-    shapes.
+  - a shape whose proof verified here, or that a committed block carried, is pinned in its
+    cache while that cache has a pin left (never evicted; non-canonical proofs can never take a
+    canonical shape's pin) and recorded in the node's database; at startup, off the node loop and
+    after the bundle key, the node walks the 8 newest recorded or recently committed shapes and
+    builds and pins each whose cache still has a pin.
 
   **The canonical state-proof shape** (`ledger::perps::canonical_input_log_height`,
   `canonical_witness_words`, `segment_public_log_height`; `rand perp prove` proves at it unless
