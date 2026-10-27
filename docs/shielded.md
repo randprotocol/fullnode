@@ -663,7 +663,8 @@ worth naming.
   around the leaves its keys opened, which told the node which leaves — or which 256-leaf chunks
   — were its). What the node does learn: that *somebody* at your IP is scanning, when, from which
   cursor and how far — which bounds when the wallet last synced — and, on a first sync, that it
-  is a fresh store. Trial decryption is local and, on that path, the node never
+  is a fresh store. `--proxy socks5h://127.0.0.1:9050` (Tor; `docs/cli.md`) keeps the IP itself
+  from the node. Trial decryption is local and, on that path, the node never
   sees a viewing key. The exception is the explorer's import below: a node an operator handed a
   viewing key to knows exactly which leaves that key opens — which the key's holder could have
   computed anyway — and the IP of whoever asked it to.

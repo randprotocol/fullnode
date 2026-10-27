@@ -388,6 +388,37 @@ fn node_reading() -> Fake {
     }))
 }
 
+/// Issue #148: `--proxy` (and `RAND_PROXY`) sends the RPC through a SOCKS5 proxy — the node is
+/// reached only as the proxy's CONNECT target — and a dead proxy fails the command instead of
+/// falling back to a direct connection.
+#[test]
+fn proxy_routes_the_rpc_through_socks5_and_a_dead_proxy_is_never_bypassed() {
+    let node = node_reading();
+    let dir = tempfile::tempdir().unwrap();
+    let key = dir.path().join("none.json");
+    let target = node.url.trim_start_matches("http://").to_string();
+
+    let (proxy, seen) = socks5_stub();
+    let r = rand(&node.url, &key, &["--proxy", &proxy, "head"]);
+    assert!(r.ok, "{}", r.err);
+    assert_eq!(serde_json::from_str::<Value>(&r.out).unwrap()["height"], 7);
+    assert!(seen.lock().unwrap().contains(&target), "{:?}", seen.lock().unwrap());
+
+    let (proxy, seen) = socks5_stub();
+    let r = rand_env(&node.url, &key, &["head"], &[("RAND_PROXY", &proxy)]);
+    assert!(r.ok, "{}", r.err);
+    assert!(seen.lock().unwrap().contains(&target), "RAND_PROXY too: {:?}", seen.lock().unwrap());
+
+    let calls = node.calls.lock().unwrap().len();
+    let dead = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
+    let r = rand(&node.url, &key, &["--proxy", &format!("socks5h://{dead}"), "head"]);
+    assert!(!r.ok, "a dead proxy fails the command");
+    assert_eq!(node.calls.lock().unwrap().len(), calls, "and the node was never reached directly");
+
+    let r = rand(&node.url, &key, &["--proxy", "socks4://127.0.0.1:9050", "head"]);
+    assert!(!r.ok && r.err.contains("--proxy"), "{}", r.err);
+}
+
 #[test]
 fn head_status_peers_validators_print_the_reply_as_pretty_json() {
     let node = node_reading();

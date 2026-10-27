@@ -539,6 +539,7 @@ Global options, accepted before or after the subcommand:
 | `--cpu` | | off | prove on the CPU even when a GPU is visible to a build with the CUDA backend; without `--cpu` or `--cuda` such a build takes the GPU and says so once on stderr |
 | `--scan-chunk <N>` | | | ignored since v0.8.3 (issue #147), with a warning, so old scripts still run: every scan reads every envelope, paging `rand_getCommitments` in fixed 500-row pages from the store's cursor to the tip, and decides ownership locally — the requests are the same whatever leaves the wallet owns, so the node learns nothing about which are its own (v0.8.0–v0.8.2 read full envelopes only around the leaves its keys opened, which the node could see). The cost is ~2.26× the bytes of the old heads-only read at most (`docs/rpc.md`, `rand_getScanLeaves`) |
 | `--wait-timeout <SECS>` | `RAND_WAIT_TIMEOUT` | each command's own (`send` and the other bundle commands 180 s, `faucet` 60 s, `call`/`invoke` receipts 120 s) | how long a command waits for its transaction to commit, or for a call's receipt, before it gives up. A wait that runs out after the node accepted the transaction exits **4** (below), never 1 |
+| `--proxy <URL>` | `RAND_PROXY` | none (reqwest's `HTTP(S)_PROXY` environment) | send every request — to the node, and to a paired prover (`--prover`, `prover pair`) — through this proxy (v0.8.3, issue #148): `socks5h://host:port` (names resolved at the proxy: Tor's `socks5h://127.0.0.1:9050`), `socks5://` (names resolved on this machine, which leaks them to its resolver), or an `http://`/`https://` CONNECT proxy. A proxy that is down or refuses fails the command; nothing ever falls back to a direct connection. Overrides `HTTP(S)_PROXY`. Recipe below |
 
 **Submitting, and exit codes (v0.8.3, issue #141).** The moment the node accepts a transaction
 (`rand_sendTransaction` answers with its hash) `rand` prints `submitted <kind> <hash>` on
@@ -677,6 +678,27 @@ The default fee is `BUNDLE_BASE + call_fee(tier, bytes)` (0.001 RAND plus the ca
 units), where `bytes` is the proof plus the sealed transcript — or, on a node announcing a gas
 policy (`rand_getLimits.gas_metering`), the greater of that and the gas floor of the proof's
 header (`docs/fees.md` §1.1), printed as `gas bound …` before the bundle is proved.
+
+### Through Tor (`--proxy`)
+
+The node's operator sees the IP every request comes from, and a submission's timing links the
+transaction to it (`docs/shielded.md`, what the node learns). To keep the IP out of that, run Tor
+and point `rand` at its SOCKS port:
+
+```sh
+brew install tor && brew services start tor        # or: apt install tor; systemctl start tor
+export RAND_PROXY=socks5h://127.0.0.1:9050         # every rand command from this shell
+rand --rpc https://rpc.randprotocol.org balance
+rand send rand1… 1.5 --yes                         # node and paired prover both via Tor
+```
+
+Use `socks5h://`, not `socks5://`: with `h` the node's name is resolved by Tor, so this machine's
+DNS resolver never sees which node you use. The RPC URL must be one the Tor exit can reach — a
+public `https://` endpoint or an onion address; `http://127.0.0.1:8545` through Tor reaches the
+exit's own loopback, not yours. A paired prover is reached the same way, so a prover on
+`http://127.0.0.1` cannot be used with `--proxy` either. Tor hides the IP, not the timing: a
+wallet that scans or sends at the same moments every day is still a pattern. If Tor is not
+running the command fails (`connecting to …`) rather than going direct.
 
 ### A first shielded transfer
 

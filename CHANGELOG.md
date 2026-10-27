@@ -30,6 +30,10 @@ v0.8.3 (wallet; client-only, no node or chain change):
   so its requests do not depend on what it owns; it no longer reads `rand_getScanLeaves`. Cost: at
   most ~2.26× the bytes of the v0.8.0–v0.8.2 heads scan (3 885 vs 1 720 bytes of JSON a leaf on
   chain 21's envelope). `--scan-chunk` is accepted and ignored, with a warning.
+- **`--proxy <URL>` / `RAND_PROXY`** (#148): every request to the node and to a paired prover goes
+  through a SOCKS5 (`socks5h://` for Tor, `socks5://`) or HTTP(S) CONNECT proxy; a dead proxy fails
+  the command, never a direct connection. reqwest's `socks` feature is enabled in the client (no
+  new crates: reqwest 0.12.28 proxies through hyper-util). Tor recipe in `docs/cli.md`.
 
 ## v0.8.2 — 2026-10-27 (chain 21, node-only; the genesis-gated rules wait for the next cut)
 

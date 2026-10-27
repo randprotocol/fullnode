@@ -19,7 +19,8 @@ randprotocol-msig = { workspace = true }
 randprotocol-prover = { workspace = true, default-features = false, features = ["parallel"] }
 # Available memory for the local-proving gate (`memory.rs`); the same version and features the prover's service build uses.
 sysinfo = { version = "0.33", default-features = false, features = ["system"] }
-reqwest = { workspace = true }
+# `socks`: `rand --proxy socks5h://…` (Tor, issue #148).
+reqwest = { workspace = true, features = ["socks"] }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

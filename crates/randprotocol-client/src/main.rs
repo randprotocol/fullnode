@@ -71,6 +71,12 @@ struct Cli {
     /// out after the node accepted the transaction exits 4, "submitted, confirmation unknown".
     #[arg(long, global = true, env = "RAND_WAIT_TIMEOUT", value_name = "SECS")]
     wait_timeout: Option<u64>,
+    /// Send every request — to the node and to a paired prover — through this proxy:
+    /// `socks5h://127.0.0.1:9050` for Tor (names resolved at the proxy), `socks5://`, or an
+    /// `http://`/`https://` CONNECT proxy. A proxy that is down fails the command; nothing falls
+    /// back to a direct connection. `docs/cli.md` has a Tor recipe.
+    #[arg(long, global = true, env = "RAND_PROXY", value_name = "URL")]
+    proxy: Option<String>,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -2127,6 +2133,11 @@ async fn run() -> Result<()> {
         if let Err(e) = proving::install_thread_pool(threads) {
             eprintln!("warning: {e}");
         }
+    }
+    // Before any client is built: every `RpcClient` and `RemoteProver` this process makes goes
+    // through it (issue #148).
+    if let Some(proxy) = &cli.proxy {
+        randprotocol_client::set_default_proxy(proxy)?;
     }
     if cli.scan_chunk.is_some() {
         eprintln!("warning: --scan-chunk is ignored since v0.8.3: a scan reads every envelope, in fixed pages, so the node cannot tell which leaves are yours (issue #147)");

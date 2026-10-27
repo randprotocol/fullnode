@@ -771,13 +771,60 @@ impl PollBackoff {
     }
 }
 
+/// `--proxy` / `RAND_PROXY` (issue #148): a SOCKS5 proxy — `socks5h://host:port`, which resolves
+/// names at the proxy (Tor's `socks5h://127.0.0.1:9050`; nothing is looked up here), or
+/// `socks5://`, which resolves them on this machine — or an HTTP(S) CONNECT proxy, `http://` /
+/// `https://`. Every request a client built with it makes goes through it, and a proxy that is
+/// down fails the request: there is no fallback to a direct connection.
+pub fn parse_proxy(url: &str) -> Result<reqwest::Proxy> {
+    let scheme = url.split_once("://").map(|(s, _)| s.to_ascii_lowercase());
+    match scheme.as_deref() {
+        Some("socks5h" | "socks5" | "http" | "https") => {}
+        _ => return Err(anyhow!("--proxy {url:?}: a proxy is socks5h://host:port (Tor: socks5h://127.0.0.1:9050), socks5://, http:// or https://")),
+    }
+    let u = reqwest::Url::parse(url).map_err(|e| anyhow!("--proxy {url:?}: not a URL ({e})"))?;
+    if u.host_str().is_none_or(str::is_empty) {
+        return Err(anyhow!("--proxy {url:?}: names no host"));
+    }
+    reqwest::Proxy::all(url).map_err(|e| anyhow!("--proxy {url:?}: {e}"))
+}
+
+/// The proxy every client this process builds goes through unless told otherwise
+/// ([`set_default_proxy`]; `rand` sets it from `--proxy` / `RAND_PROXY` before anything connects).
+static DEFAULT_PROXY: std::sync::OnceLock<reqwest::Proxy> = std::sync::OnceLock::new();
+
+/// Route every [`RpcClient`] and [`prover::RemoteProver`] built from now on through `url`
+/// ([`parse_proxy`]). Once per process; a second call is refused.
+pub fn set_default_proxy(url: &str) -> Result<()> {
+    DEFAULT_PROXY.set(parse_proxy(url)?).map_err(|_| anyhow!("the proxy is already set"))
+}
+
+/// A client builder carrying `proxy`, or the process's default ([`set_default_proxy`]) when
+/// `None`; with neither, reqwest's own (the `HTTP(S)_PROXY` environment). Adding a proxy turns the
+/// environment's off, so `--proxy` always wins.
+pub(crate) fn http_builder(proxy: Option<reqwest::Proxy>) -> reqwest::ClientBuilder {
+    let b = reqwest::Client::builder();
+    match proxy.or_else(|| DEFAULT_PROXY.get().cloned()) {
+        Some(p) => b.proxy(p),
+        None => b,
+    }
+}
+
 impl RpcClient {
+    /// This client, going through the proxy at `url` ([`parse_proxy`]) — or, for `None`, the
+    /// process's default ([`set_default_proxy`]).
+    pub fn with_proxy(mut self, url: Option<&str>) -> Result<RpcClient> {
+        let proxy = url.map(parse_proxy).transpose()?;
+        self.http = http_builder(proxy).timeout(READ_TIMEOUT).build().context("building the http client")?;
+        Ok(self)
+    }
+
     pub fn new(url: impl Into<String>) -> RpcClient {
         RpcClient {
             url: url.into(),
             // The per-request timeout for an upload is set on the request itself, which overrides
             // this one; this is the read timeout.
-            http: reqwest::Client::builder().timeout(READ_TIMEOUT).build().expect("client"),
+            http: http_builder(None).timeout(READ_TIMEOUT).build().expect("client"),
             legacy_status: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             legacy_scan: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             envelope_format: std::sync::Arc::new(tokio::sync::OnceCell::new()),
@@ -1687,6 +1734,68 @@ pub(crate) mod test_rpc {
     }
 }
 
+/// A minimal SOCKS5 proxy for the `--proxy` tests (issue #148): no authentication, CONNECT
+/// only, to an IPv4, IPv6 or domain target, then bytes copied both ways. Returns its
+/// `socks5h://` URL and every `host:port` it was asked to connect to.
+#[cfg(test)]
+pub(crate) mod socks_stub {
+    use std::sync::{Arc, Mutex};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    pub async fn socks5_stub() -> (String, Arc<Mutex<Vec<String>>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let log = seen.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else { return };
+                let log = log.clone();
+                tokio::spawn(async move {
+                    let mut hello = [0u8; 2];
+                    sock.read_exact(&mut hello).await.ok()?;
+                    let mut methods = vec![0u8; hello[1] as usize];
+                    sock.read_exact(&mut methods).await.ok()?;
+                    (hello[0] == 5 && methods.contains(&0)).then_some(())?;
+                    sock.write_all(&[5, 0]).await.ok()?;
+                    let mut req = [0u8; 4];
+                    sock.read_exact(&mut req).await.ok()?;
+                    (req[0] == 5 && req[1] == 1).then_some(())?;
+                    let host = match req[3] {
+                        1 => {
+                            let mut ip = [0u8; 4];
+                            sock.read_exact(&mut ip).await.ok()?;
+                            std::net::Ipv4Addr::from(ip).to_string()
+                        }
+                        4 => {
+                            let mut ip = [0u8; 16];
+                            sock.read_exact(&mut ip).await.ok()?;
+                            format!("[{}]", std::net::Ipv6Addr::from(ip))
+                        }
+                        3 => {
+                            let mut len = [0u8; 1];
+                            sock.read_exact(&mut len).await.ok()?;
+                            let mut name = vec![0u8; len[0] as usize];
+                            sock.read_exact(&mut name).await.ok()?;
+                            String::from_utf8(name).ok()?
+                        }
+                        _ => return None,
+                    };
+                    let mut port = [0u8; 2];
+                    sock.read_exact(&mut port).await.ok()?;
+                    let target = format!("{host}:{}", u16::from_be_bytes(port));
+                    log.lock().unwrap().push(target.clone());
+                    let mut upstream = tokio::net::TcpStream::connect(&target).await.ok()?;
+                    sock.write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0]).await.ok()?;
+                    let _ = tokio::io::copy_bidirectional(&mut sock, &mut upstream).await;
+                    Some(())
+                });
+            }
+        });
+        (format!("socks5h://{addr}"), seen)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2006,6 +2115,45 @@ mod tests {
         let tx = Transaction { chain_id: 1, bundle: None, action: randprotocol_core::Action::PauseMints { nonce: 1, signature: randprotocol_core::Signature::empty() } };
         assert_eq!(action_kind(&tx.action), "pause_mints");
         assert_eq!(submitted_line(&tx, &Hash([1; 32])), format!("submitted pause_mints {}", Hash([1; 32])));
+    }
+
+    // ----------------------------------------------------- --proxy / RAND_PROXY (issue #148)
+
+    /// Every RPC call goes through the proxy: the node is reached only by way of the SOCKS stub,
+    /// which saw the node's address as its CONNECT target.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_rpc_client_with_a_proxy_reaches_the_node_through_it() {
+        use test_rpc::{rpc_fn, Reply};
+        let node = rpc_fn(|_, _| Reply::Ok(json!({ "height": 3 }))).await;
+        let (proxy, seen) = socks_stub::socks5_stub().await;
+        let client = RpcClient::new(node.clone()).with_proxy(Some(&proxy)).unwrap();
+        assert_eq!(client.head().await.unwrap()["height"], 3);
+        let target = node.trim_start_matches("http://").to_string();
+        assert!(seen.lock().unwrap().contains(&target), "the proxy carried the call: {:?}", seen.lock().unwrap());
+    }
+
+    /// A proxy that is down fails the call — it never falls back to a direct connection, which
+    /// would hand the node the IP the proxy was there to hide.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_dead_proxy_fails_the_call_rather_than_going_direct() {
+        use test_rpc::{rpc_fn, Reply};
+        let node = rpc_fn(|_, _| Reply::Ok(json!({ "height": 3 }))).await;
+        let dead = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
+        let client = RpcClient::new(node).with_proxy(Some(&format!("socks5h://{dead}"))).unwrap();
+        assert!(client.head().await.is_err(), "a dead proxy must not be bypassed");
+    }
+
+    /// The schemes `--proxy` takes: SOCKS5 (`socks5h://` resolves names at the proxy, Tor's way;
+    /// `socks5://` resolves them here) and an HTTP(S) CONNECT proxy. Anything else is refused.
+    #[test]
+    fn a_proxy_url_is_held_to_the_supported_schemes() {
+        for ok in ["socks5h://127.0.0.1:9050", "socks5://127.0.0.1:1080", "http://127.0.0.1:8080", "https://proxy.example:443"] {
+            assert!(parse_proxy(ok).is_ok(), "{ok}");
+        }
+        for bad in ["socks4://127.0.0.1:9050", "ftp://x:1", "127.0.0.1:9050", "not a url", ""] {
+            let e = parse_proxy(bad).unwrap_err().to_string();
+            assert!(e.contains("--proxy"), "{bad}: {e}");
+        }
     }
 
     // ---------------------------------------------------- the call limits (Task 5)
