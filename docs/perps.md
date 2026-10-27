@@ -490,6 +490,11 @@ bridged one.
   evicted to make room, and offered to a block after governance and ahead of fee order, so a pool
   full of free orders cannot keep out the proof that settles them. A second proof while the slot
   is held is pooled like anything else.
+- **A cancel names an order (I-4).** The pool refuses a `PerpCancel` whose `target` is its own
+  nonce, or a nonce no order of the account has taken — not accepted in the account's nonce window
+  and not a pooled order — `the cancel names order nonce N, which no order of this account has
+  taken` (retryable, never cached). A target older than the window remembers is let through.
+  Cancels share the account's 16 fee-less slots with orders and withdrawals.
 - **State-proof shapes (CON-60).** The executor builds the verifier key a proof's header
   declares before it verifies anything, so junk state proofs of ever new shapes each cost a key
   build (a tier-18 key is over a minute in a debug build). Node policy, on every chain: a proof of
@@ -514,7 +519,7 @@ bridged one.
   dense chain records a digest every block, so on chain 21 it would hold every order for good once
   proving fell behind): while
   `PERP_BACKPRESSURE_WINDOWS` (4) × `max_window_blocks` recorded digests wait for a proof, the node
-  admits no new order (deposits, cancels, withdrawals, oracle prices and proofs are unaffected),
+  admits no new order or cancel (deposits, cancels, withdrawals, oracle prices and proofs are unaffected),
   so a lagging prover is not buried further. None of this returns collateral without a proof: the
   "no forced exit" limit below stands.
 - **Transport.** `rand_getPerps`, `rand_getPerpAccount`, `rand_getPerpAccounts` and

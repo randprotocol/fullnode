@@ -83,6 +83,10 @@ pub enum MempoolError {
     /// order until a prover catches up. The same scope and class as `PerpBackpressure`.
     #[error("the exchange is {behind} heights past its proved height ({max} is this node's limit for new orders); retry once a state proof lands")]
     PerpHeightBackpressure { behind: u64, max: u64 },
+    /// I-4: a `PerpCancel` whose target nonce no order of the account took — neither accepted in
+    /// its nonce window nor pooled here. Retryable (the order may yet arrive), never cached.
+    #[error("the cancel names order nonce {0}, which no order of this account has taken")]
+    PerpCancelUnknownOrder(u64),
     /// CON-60 (b): this node is verifying, or a moment ago refused, a state proof of a shape it
     /// had never verified, and verifies no other such proof for about `remaining_ms` (a proof of
     /// a shape it has verified passes). Retryable, never cached, no peer penalised for a proof
@@ -124,6 +128,7 @@ impl MempoolError {
                 | MempoolError::PerpPoolFull
                 | MempoolError::PerpBackpressure { .. }
                 | MempoolError::PerpHeightBackpressure { .. }
+                | MempoolError::PerpCancelUnknownOrder(_)
                 | MempoolError::StateProofBackoff { .. }
         )
     }
@@ -630,7 +635,19 @@ impl Mempool {
         // PERP-1 (e) / I-3: only on a chain whose genesis sets `sparse_windows` (chain 22 on). A
         // dense chain records a digest every block, so with proving slower than the block rate
         // the limit would hold every new order for good; chain 21 keeps accepting them.
-        if let (Action::PerpOrder { .. }, Some(p)) = (&tx.action, ledger.perps().filter(|p| p.config.sparse_windows)) {
+        // I-4: a cancel names an order — one the account's nonce window has accepted (or one
+        // older than the window remembers), or one this pool holds — never a nonce no order took,
+        // so free cancels cannot stand in for inputs. Retryable: the order may still arrive.
+        if let (Action::PerpCancel { account, nonce, target, .. }, Some(p)) = (&tx.action, ledger.perps()) {
+            let in_window = matches!(p.account(account).map(|a| a.nonce_seen(*target)), Some(Some(true) | None));
+            if target == nonce || !(in_window || self.pools_perp_order(account, *target)) {
+                return Err(MempoolError::PerpCancelUnknownOrder(*target));
+            }
+        }
+        // I-4: a cancel is a block input as an order is, so both are held back alike.
+        if let (Action::PerpOrder { .. } | Action::PerpCancel { .. }, Some(p)) =
+            (&tx.action, ledger.perps().filter(|p| p.config.sparse_windows))
+        {
             let max = (p.config.max_window_blocks as usize).saturating_mul(PERP_BACKPRESSURE_WINDOWS);
             let unproved = p.pending_digests();
             if unproved >= max {
@@ -646,6 +663,11 @@ impl Mempool {
             }
         }
         Ok(())
+    }
+
+    /// Whether this pool holds `account`'s order of nonce `nonce` (I-4).
+    fn pools_perp_order(&self, account: &randprotocol_core::ledger::perps::AccountId, nonce: u64) -> bool {
+        self.txs.values().any(|p| matches!(&p.tx.action, Action::PerpOrder { account: a, body, .. } if a == account && body.nonce == nonce))
     }
 
     /// Whether `tx` is admitted into the pool's reserved slot (RPL-3 final fix wave, I1): a
@@ -4456,19 +4478,24 @@ mod tests {
             let mut parent = make_perps_block(&gs.block, &mut l, vec![d], &key(1));
             for i in 2..=max {
                 let d = perp_deposit_tx(&l, &a, 300 + 10 * i as u32, 5_000_000);
-                parent = make_perps_block(&parent, &mut l, vec![d], &key(1));
+                // Block 2 also records the order a cancel below names.
+                let txs = if i == 2 { vec![d, perp_order_tx(&a, 1)] } else { vec![d] };
+                parent = make_perps_block(&parent, &mut l, txs, &key(1));
             }
             assert_eq!(l.perps().unwrap().pending_digests(), max);
             (l, max)
         };
         let m = Mempool::new(100);
-        let order = perp_order_tx(&a, 1);
+        let order = perp_order_tx(&a, 3);
         let (dense, _) = chain(false);
         assert!(m.precheck(&order, &dense, &StubExecutor).is_ok(), "chain 21's rule: orders are never held");
         let (l, max) = chain(true);
         let held = MempoolError::PerpBackpressure { unproved: max, max };
         assert_eq!(m.precheck(&order, &l, &StubExecutor).unwrap_err(), held);
         assert!(held.is_retryable());
+        // I-4: a cancel (of the order block 2 recorded) is an input too, and held alike.
+        assert_eq!(m.precheck(&perp_cancel_tx(&a, 2, 1), &l, &StubExecutor).unwrap_err(), held, "a cancel is held as well");
+        assert!(m.precheck(&perp_cancel_tx(&a, 2, 1), &dense, &StubExecutor).is_ok(), "not on a dense chain");
         assert!(m.precheck(&perp_withdraw_tx(7, &a, 3, 1_000, l.height() as u32), &l, &StubExecutor).is_ok(), "a request passes");
         assert!(m.precheck(&perp_deposit_tx(&l, &a, 900, 5_000_000), &l, &StubExecutor).is_ok(), "a deposit passes");
         assert!(m.precheck(&perp_oracle_tx(7, &key(1), 100, 1), &l, &StubExecutor).is_ok(), "an oracle passes");
@@ -4480,6 +4507,32 @@ mod tests {
         after.apply_transactions(std::slice::from_ref(&proof), &key(1).address(), &StubExecutor).unwrap();
         assert_eq!(after.perps().unwrap().pending_digests(), max - 8);
         assert!(m.precheck(&order, &after, &StubExecutor).is_ok(), "orders flow again");
+    }
+
+    /// I-4: a cancel must name an order — a nonce the account's window accepted, or an order
+    /// this pool holds — and is never its own target; one that names no order is refused
+    /// (retryable). Cancels count against the account's fee-less budget (PERP-1 (a)) and, on a
+    /// sparse chain, are held back with orders.
+    #[test]
+    fn a_cancel_must_name_an_order_and_is_held_back_with_orders() {
+        use fixtures::key;
+        let a = key(50);
+        let (_gs, mut l) = perps_chain_with(&[&a]);
+        // Block 2 records a's order of nonce 1.
+        let order1 = perp_order_tx(&a, 1);
+        let mut at2 = l.clone();
+        at2.set_height(2);
+        at2.apply_transactions(std::slice::from_ref(&order1), &key(1).address(), &StubExecutor).unwrap();
+        l = at2;
+        let mut m = Mempool::new(100);
+        assert!(m.precheck(&perp_cancel_tx(&a, 2, 1), &l, &StubExecutor).is_ok(), "an accepted order");
+        let unknown = m.precheck(&perp_cancel_tx(&a, 2, 5), &l, &StubExecutor).unwrap_err();
+        assert_eq!(unknown, MempoolError::PerpCancelUnknownOrder(5));
+        assert!(unknown.is_retryable());
+        assert_eq!(m.precheck(&perp_cancel_tx(&a, 2, 2), &l, &StubExecutor).unwrap_err(), MempoolError::PerpCancelUnknownOrder(2), "its own nonce");
+        // A pooled order may be cancelled before it lands.
+        m.insert(perp_order_tx(&a, 3), &l, &StubExecutor).unwrap();
+        assert!(m.precheck(&perp_cancel_tx(&a, 4, 3), &l, &StubExecutor).is_ok());
     }
 
     /// PERP-101: under `sparse_windows` few digests may wait while many heights do, so a new

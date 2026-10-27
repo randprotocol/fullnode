@@ -478,6 +478,20 @@ impl PerpAccount {
     /// Accept nonce `n` once. Nonces need not arrive in order — a trader may have several orders
     /// in flight — but each is good once, and one more than 63 below the highest is refused,
     /// since the window no longer remembers whether it was used.
+    /// Whether nonce `n` has been accepted, as far as the window remembers: `Some(false)` above
+    /// the highest or unused inside the window, `Some(true)` used, `None` more than 63 below the
+    /// highest (the window has forgotten). For a node's pool (I-4: a cancel must name an order).
+    pub fn nonce_seen(&self, n: u64) -> Option<bool> {
+        if n > self.nonce_high {
+            return Some(false);
+        }
+        let back = self.nonce_high - n;
+        if back >= NONCE_WINDOW {
+            return None;
+        }
+        Some(self.used & (1 << back) != 0)
+    }
+
     pub fn accept_nonce(&mut self, n: u64) -> Result<(), PerpError> {
         if n > self.nonce_high {
             let shift = n - self.nonce_high;

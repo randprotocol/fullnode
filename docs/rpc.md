@@ -1651,6 +1651,8 @@ state proof a new order is refused `the exchange has N unproved block digests â€
 "The node"); and there also while the head is four
 `max_window_heights` or more past the proved height, refused `the exchange is N heights past its
 proved height â€¦`. All of them are `mempool full`'s class: about this node, retryable, never cached. A
+`PerpCancel` naming no order of its account is refused `the cancel names order nonce N, which no
+order of this account has taken` (I-4); on a sparse chain cancels are held back with orders. A
 `PerpStateProof` of a proof shape this node has not verified is refused `state-proof verification
 of a new proof shape is backing off for N ms; retry then` while another such proof is being
 verified, and for 60 s after one was refused (CON-60, `docs/perps.md`, "The node"); same class.
