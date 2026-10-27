@@ -8726,7 +8726,7 @@ mod tests {
         let cfs: Vec<&str> = ALL_CFS
             .iter()
             .copied()
-            .filter(|c| *c != CF_RECEIPTS_BY_PROGRAM && *c != CF_PROGRAM_PUBLIC && *c != CF_PERP_INPUTS)
+            .filter(|c| *c != CF_RECEIPTS_BY_PROGRAM && *c != CF_PROGRAM_PUBLIC && *c != CF_PERP_INPUTS && *c != CF_MULTISIG_ACCOUNTS)
             .collect();
         assert_eq!(cfs.len(), 15);
         cfs
@@ -8794,7 +8794,7 @@ mod tests {
             opts.create_missing_column_families(true);
             let cfs = ALL_CFS
                 .iter()
-                .filter(|c| **c != CF_PROGRAM_PUBLIC && **c != CF_PERP_INPUTS)
+                .filter(|c| **c != CF_PROGRAM_PUBLIC && **c != CF_PERP_INPUTS && **c != CF_MULTISIG_ACCOUNTS)
                 .map(|n| ColumnFamilyDescriptor::new(*n, Options::default()));
             let st = Storage { db: DB::open_cf_descriptors(&opts, dir.path().join("db"), cfs).unwrap(), tree_cache: Default::default(), tree_builds: Default::default(), checkpoint_build: Default::default(), ledger_loads: Default::default(), torn_floor_warned: std::sync::atomic::AtomicU64::new(u64::MAX), seal_rows_examined: Default::default(), token_rows: Default::default(), token_rows_written: Default::default(), multisig_rows: Default::default(), multisig_rows_written: Default::default() };
             st.backfill_receipts_index().unwrap();
@@ -9665,8 +9665,11 @@ mod tests {
             let st = Storage::open(dir.path()).unwrap();
             st.init_genesis(&genesis_with_two_notes_state()).unwrap();
         }
-        assert!(open_as_pre_rpl3(dir.path()).is_err(), "eighteen families on disk, seventeen listed");
+        assert!(open_as_pre_rpl3(dir.path()).is_err(), "nineteen families on disk, seventeen listed");
         assert!(Storage::drop_perp_inputs(dir.path()).unwrap(), "dropped");
+        // This build's MSA-4 family is the other one an older build lacks: its own rollback.
+        assert!(open_as_pre_rpl3(dir.path()).is_err(), "multisig_accounts is still there");
+        assert!(Storage::restore_multisig_blob(dir.path()).unwrap().family);
         drop(open_as_pre_rpl3(dir.path()).expect("the pre-RPL-3 build opens it again"));
         assert!(!Storage::drop_perp_inputs(dir.path()).unwrap(), "a rerun finds nothing to drop");
         let st = Storage::open(dir.path()).unwrap();
