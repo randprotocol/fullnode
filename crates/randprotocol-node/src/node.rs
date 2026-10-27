@@ -3125,6 +3125,8 @@ impl Node {
         if let (Some(key), Err(e)) = (v.proof_key, &v.result) {
             self.proof_refused.insert(hash, key, e.clone());
         }
+        // N-1: the verdict is in; a queued order leaves the queue index before it is pooled.
+        self.mempool.verify_done(&v.tx);
         // CON-60 (b): a verified state proof's shape keeps its key (pinned) and is recorded for
         // the next start's warm. A refusal changes nothing: it delays no other proof.
         if v.result.is_ok() {
@@ -3220,6 +3222,7 @@ impl Node {
             self.report(id, GossipOutcome::Report(a)).await;
         } else {
             self.mempool.state_proof_queued(&tx, self.executor.as_ref());
+            self.mempool.verify_queued(&tx);
             self.verify_queue.push_back((tx, VerifySource::Gossip(id)));
             self.pump_verify();
         }
@@ -3318,6 +3321,7 @@ impl Node {
             return;
         }
         self.mempool.state_proof_queued(&tx, self.executor.as_ref());
+        self.mempool.verify_queued(&tx);
         self.verify_queue.push_back((tx, VerifySource::Rpc(reply)));
         self.pump_verify();
     }

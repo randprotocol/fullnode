@@ -425,6 +425,10 @@ pub struct Mempool {
     perp_pool_cap: usize,
     /// PERP-1 (c): the next [`Pooled::seq`].
     next_seq: u64,
+    /// N-1: pooled `PerpOrder`s by (account, nonce), kept on `admit`/`remove_one`.
+    perp_orders: HashMap<(randprotocol_core::ledger::perps::AccountId, u64), usize>,
+    /// N-1: `PerpOrder`s queued for or in verification on this node ([`Mempool::verify_queued`]).
+    queued_perp_orders: HashMap<(randprotocol_core::ledger::perps::AccountId, u64), usize>,
     /// CON-60 (b): the bucket over cold state-proof key builds ([`ColdKeyBudget`]).
     cold_keys: ColdKeyBudget,
 }
@@ -522,6 +526,8 @@ impl Mempool {
             perp_pooled: 0,
             perp_pool_cap: MAX_PERP_POOLED,
             next_seq: 0,
+            perp_orders: HashMap::new(),
+            queued_perp_orders: HashMap::new(),
             cold_keys: ColdKeyBudget::default(),
         }
     }
@@ -603,9 +609,18 @@ impl Mempool {
         // I-4: a cancel names an order — one the account's nonce window has accepted (or one
         // older than the window remembers), or one this pool holds — never a nonce no order took,
         // so free cancels cannot stand in for inputs. Retryable: the order may still arrive.
-        if let (Action::PerpCancel { account, nonce, target, .. }, Some(p)) = (&tx.action, ledger.perps()) {
-            let in_window = matches!(p.account(account).map(|a| a.nonce_seen(*target)), Some(Some(true) | None));
-            if target == nonce || !(in_window || self.pools_perp_order(account, *target)) {
+        // N-1: only on a `sparse_windows` chain (chain 22 on); chain 21's cancels are v0.8.0's.
+        // A target the window has not seen is let through when it is above the account's highest
+        // nonce (an order still on its way) or an order this node holds or is verifying — a
+        // gossiped order's cancel can reach precheck while the order waits in the verify queue.
+        if let (Action::PerpCancel { account, nonce, target, .. }, Some(p)) =
+            (&tx.action, ledger.perps().filter(|p| p.config.sparse_windows))
+        {
+            let seen = match p.account(account) {
+                Some(a) => !matches!(a.nonce_seen(*target), Some(false)) || *target > a.nonce_high,
+                None => false,
+            };
+            if target == nonce || !(seen || self.knows_perp_order(account, *target)) {
                 return Err(MempoolError::PerpCancelUnknownOrder(*target));
             }
         }
@@ -630,9 +645,43 @@ impl Mempool {
         Ok(())
     }
 
-    /// Whether this pool holds `account`'s order of nonce `nonce` (I-4).
-    fn pools_perp_order(&self, account: &randprotocol_core::ledger::perps::AccountId, nonce: u64) -> bool {
-        self.txs.values().any(|p| matches!(&p.tx.action, Action::PerpOrder { account: a, body, .. } if a == account && body.nonce == nonce))
+    /// Whether this pool holds, or this node is verifying, `account`'s order of nonce `nonce`
+    /// (I-4, N-1): two counted indexes, no scan.
+    fn knows_perp_order(&self, account: &randprotocol_core::ledger::perps::AccountId, nonce: u64) -> bool {
+        self.perp_orders.contains_key(&(*account, nonce)) || self.queued_perp_orders.contains_key(&(*account, nonce))
+    }
+
+    fn order_key(tx: &Transaction) -> Option<(randprotocol_core::ledger::perps::AccountId, u64)> {
+        match &tx.action {
+            Action::PerpOrder { account, body, .. } => Some((*account, body.nonce)),
+            _ => None,
+        }
+    }
+
+    fn bump(map: &mut HashMap<(randprotocol_core::ledger::perps::AccountId, u64), usize>, k: (randprotocol_core::ledger::perps::AccountId, u64), up: bool) {
+        if up {
+            *map.entry(k).or_insert(0) += 1;
+        } else if let Some(n) = map.get_mut(&k) {
+            *n -= 1;
+            if *n == 0 {
+                map.remove(&k);
+            }
+        }
+    }
+
+    /// N-1: `tx` passed precheck and waits for (or is in) verification on this node; its verdict
+    /// comes back through [`Mempool::verify_done`].
+    pub fn verify_queued(&mut self, tx: &Transaction) {
+        if let Some(k) = Self::order_key(tx) {
+            Self::bump(&mut self.queued_perp_orders, k, true);
+        }
+    }
+
+    /// N-1: `tx`'s verification finished (before it is pooled, if it is).
+    pub fn verify_done(&mut self, tx: &Transaction) {
+        if let Some(k) = Self::order_key(tx) {
+            Self::bump(&mut self.queued_perp_orders, k, false);
+        }
     }
 
     /// Whether `tx` is admitted into the pool's reserved slot (RPL-3 final fix wave, I1): a
@@ -1027,6 +1076,9 @@ impl Mempool {
         if let Some(account) = fee_less_perp_account(&tx.action) {
             *self.perp_accounts.entry(*account).or_insert(0) += 1;
             self.perp_pooled += 1;
+        }
+        if let Some(k) = Self::order_key(&tx) {
+            Self::bump(&mut self.perp_orders, k, true);
         }
         let seq = self.next_seq;
         self.next_seq += 1;
@@ -1532,6 +1584,9 @@ impl Mempool {
                 }
             }
             self.perp_pooled = self.perp_pooled.saturating_sub(1);
+        }
+        if let Some(k) = Self::order_key(&p.tx) {
+            Self::bump(&mut self.perp_orders, k, false);
         }
         for nf in p.tx.nullifiers() {
             // Only withdraw the index entries this transaction owns: a conflicting one was never
@@ -4474,30 +4529,51 @@ mod tests {
         assert!(m.precheck(&order, &after, &StubExecutor).is_ok(), "orders flow again");
     }
 
-    /// I-4: a cancel must name an order — a nonce the account's window accepted, or an order
-    /// this pool holds — and is never its own target; one that names no order is refused
-    /// (retryable). Cancels count against the account's fee-less budget (PERP-1 (a)) and, on a
-    /// sparse chain, are held back with orders.
+    /// I-4 / N-1: on a `sparse_windows` chain a cancel must name an order — a nonce the account's
+    /// window accepted (or one older than it remembers), a nonce above its highest (an order on
+    /// its way), an order this pool holds, or one this node is verifying (the gossip race: the
+    /// cancel's precheck runs while its order waits in the verify queue). It is never its own
+    /// target. On a dense chain (chain 21) a cancel is v0.8.0's: no target rule.
     #[test]
-    fn a_cancel_must_name_an_order_and_is_held_back_with_orders() {
-        use fixtures::key;
+    fn a_cancel_must_name_an_order_on_a_sparse_chain_and_the_verify_queue_counts() {
+        use fixtures::{key, make_perps_block, perp_deposit_tx};
         let a = key(50);
-        let (_gs, mut l) = perps_chain_with(&[&a]);
-        // Block 2 records a's order of nonce 1.
-        let order1 = perp_order_tx(&a, 1);
-        let mut at2 = l.clone();
-        at2.set_height(2);
-        at2.apply_transactions(std::slice::from_ref(&order1), &key(1).address(), &StubExecutor).unwrap();
-        l = at2;
+        let chain = |sparse: bool| {
+            let mut file = fixtures::perps_genesis_file(7);
+            let c = file.perps.as_mut().unwrap();
+            c.sparse_windows = sparse;
+            c.max_window_heights = if sparse { 16 } else { 0 };
+            let gs = file.build(&StubExecutor).unwrap();
+            let mut l = gs.ledger.clone();
+            let d = perp_deposit_tx(&l, &a, 300, 5_000_000);
+            let b1 = make_perps_block(&gs.block, &mut l, vec![d], &key(1));
+            // Block 2 records a's orders of nonces 1 and 5: nonce_high 5, nonces 2..=4 unused.
+            make_perps_block(&b1, &mut l, vec![perp_order_tx(&a, 1), perp_order_tx(&a, 5)], &key(1));
+            l
+        };
+        let l = chain(true);
         let mut m = Mempool::new(100);
-        assert!(m.precheck(&perp_cancel_tx(&a, 2, 1), &l, &StubExecutor).is_ok(), "an accepted order");
-        let unknown = m.precheck(&perp_cancel_tx(&a, 2, 5), &l, &StubExecutor).unwrap_err();
-        assert_eq!(unknown, MempoolError::PerpCancelUnknownOrder(5));
+        assert!(m.precheck(&perp_cancel_tx(&a, 6, 1), &l, &StubExecutor).is_ok(), "an accepted order");
+        let unknown = m.precheck(&perp_cancel_tx(&a, 6, 3), &l, &StubExecutor).unwrap_err();
+        assert_eq!(unknown, MempoolError::PerpCancelUnknownOrder(3), "a nonce in the window no order took");
         assert!(unknown.is_retryable());
-        assert_eq!(m.precheck(&perp_cancel_tx(&a, 2, 2), &l, &StubExecutor).unwrap_err(), MempoolError::PerpCancelUnknownOrder(2), "its own nonce");
-        // A pooled order may be cancelled before it lands.
-        m.insert(perp_order_tx(&a, 3), &l, &StubExecutor).unwrap();
-        assert!(m.precheck(&perp_cancel_tx(&a, 4, 3), &l, &StubExecutor).is_ok());
+        assert_eq!(m.precheck(&perp_cancel_tx(&a, 6, 6), &l, &StubExecutor).unwrap_err(), MempoolError::PerpCancelUnknownOrder(6), "its own nonce");
+        assert!(m.precheck(&perp_cancel_tx(&a, 6, 9), &l, &StubExecutor).is_ok(), "above the highest: an order on its way");
+        // The gossip race: the order of nonce 3 is queued for verification, its cancel arrives.
+        let order3 = perp_order_tx(&a, 3);
+        m.verify_queued(&order3);
+        assert!(m.precheck(&perp_cancel_tx(&a, 7, 3), &l, &StubExecutor).is_ok(), "an order in the verify queue");
+        // Its verdict comes back and it is pooled: still known, from the pool's index now.
+        m.verify_done(&order3);
+        m.insert(order3.clone(), &l, &StubExecutor).unwrap();
+        assert!(m.precheck(&perp_cancel_tx(&a, 7, 3), &l, &StubExecutor).is_ok(), "a pooled order");
+        m.remove(&[order3.hash()]);
+        assert_eq!(m.precheck(&perp_cancel_tx(&a, 7, 3), &l, &StubExecutor).unwrap_err(), MempoolError::PerpCancelUnknownOrder(3), "gone again");
+        // Chain 21's rule: no target check at all.
+        let dense = chain(false);
+        for target in [3, 6, 9] {
+            assert!(m.precheck(&perp_cancel_tx(&a, 6, target), &dense, &StubExecutor).is_ok(), "dense: target {target}");
+        }
     }
 
     /// PERP-101: under `sparse_windows` few digests may wait while many heights do, so a new

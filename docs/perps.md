@@ -495,11 +495,13 @@ bridged one.
   evicted to make room, and offered to a block after governance and ahead of fee order, so a pool
   full of free orders cannot keep out the proof that settles them. A second proof while the slot
   is held is pooled like anything else.
-- **A cancel names an order (I-4).** The pool refuses a `PerpCancel` whose `target` is its own
-  nonce, or a nonce no order of the account has taken — not accepted in the account's nonce window
-  and not a pooled order — `the cancel names order nonce N, which no order of this account has
-  taken` (retryable, never cached). A target older than the window remembers is let through.
-  Cancels share the account's 16 fee-less slots with orders and withdrawals.
+- **A cancel names an order (I-4), on a `sparse_windows` chain.** The pool refuses a
+  `PerpCancel` whose `target` is its own nonce, or a nonce inside the account's window that no
+  order took and that is neither pooled here nor waiting in this node's verify queue: `the cancel
+  names order nonce N, which no order of this account has taken` (retryable, never cached). A
+  target above the account's highest nonce (an order still on its way) or older than the window
+  remembers is let through. On a dense chain (chain 21) cancels are admitted as in v0.8.0. Either
+  way cancels share the account's 16 fee-less slots with orders and withdrawals.
 - **State-proof verifier keys (CON-60).** The executor builds the key a proof's header declares
   before it verifies anything, and a state proof is fee-less, so junk of ever new shapes would
   each cost a key build (a tier-18 key is over a minute in a debug build). Node policy, on every
