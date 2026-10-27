@@ -47,6 +47,10 @@ Audit v10 fixes (node and client policies, no chain change unless a genesis fiel
   constraint set 9) as the running chain and chain 20 as retired; the chain-18 gas pages no longer
   say "not yet cut"; `docs/tokens.md` no longer says RPL is uncut; the README release table gains
   v0.8.0.
+- **OPS-402** (deploy tooling): with chain 21's genesis committed, `deploy/cut-chain21-genesis.sh`'s
+  `DRY_RUN` (and so its selftest and the 26-host rehearsal, which cuts two dry-run files) scans a
+  copy of the committed genesis files without chain 21's own; the real cut still refuses chain id
+  21. Selftest 237 of 237.
 
 ## v0.8.0 — 2026-10-12 (chain 21 onward)
 
