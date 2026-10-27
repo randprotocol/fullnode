@@ -2665,7 +2665,8 @@ pub async fn start_with(cfg: NodeConfig, rpc_options: RpcOptions, net_options: N
     let status = Arc::new(RwLock::new(NodeStatus {
         is_validator: hs.is_validator(),
         active_validator: hs.current_set().contains(&key.address()),
-        faucet: gs.faucet,
+        // #153: "this node can mint here", not just "the genesis turns the faucet on".
+        faucet: admission::faucet_refusal(&gs, hs.is_validator(), &key.address()).is_none(),
         confidential: gs.confidential,
         testnet: gs.testnet,
         fri_profile: gs.fri_profile.clone(),
@@ -3827,12 +3828,14 @@ impl Node {
     /// preserving and no reason to keep an outgoing-viewing record, so the `to_sender` half of
     /// the envelope is addressed to a key that is dropped on the next line and never recoverable.
     /// Only `to` can open the note, which is the whole intent.
+    ///
+    /// #153: and only a key among the chain's faucet minters (`admission::faucet_refusal`, the
+    /// predicate `rand_status.faucet` reports) — refused here, naming the minter set, before
+    /// anything is built, rather than by the pool after.
     async fn mint(&mut self, to: ShieldedAddress, amount: u64) -> std::result::Result<Hash, String> {
-        if !self.gs.faucet {
-            return Err("faucet is disabled on this chain".into());
-        }
-        if !self.hs.is_validator() {
-            return Err("faucet mints are signed by validators; ask a validator node".into());
+        let key = Keypair::from_seed(self.cfg.seed).expect("seed validated at startup");
+        if let Some(why) = admission::faucet_refusal(&self.gs, self.hs.is_validator(), &key.address()) {
+            return Err(why);
         }
         if amount > FAUCET_MAX_UNITS {
             return Err(format!("mint of {amount} exceeds the faucet cap of {FAUCET_MAX_UNITS}"));
@@ -3848,7 +3851,6 @@ impl Node {
                 admission::FAUCET_MINT_PER_SEC
             ));
         }
-        let key = Keypair::from_seed(self.cfg.seed).expect("seed validated at startup");
         let height = self.hs.tip_ledger().height();
         let envelope_bytes = self.hs.tip_ledger().envelope_bytes();
         let domain = *self.hs.tip_ledger().binding_domain();
@@ -7605,6 +7607,39 @@ mod tests {
             apply_inline: false,
         };
         (node, seen_rx, applied_rx)
+    }
+
+    /// #153: a validator whose key is outside the chain's faucet minters — a guardian host bonded
+    /// after genesis — refuses `rand_mint` up front, naming the minter set, and nothing reaches the
+    /// pool.
+    #[tokio::test]
+    async fn a_validator_outside_the_faucet_minters_refuses_rand_mint_up_front() {
+        use randprotocol_core::genesis::{FaucetMinter, StakingConfig};
+        let mint_on = |minters: Vec<randprotocol_core::Address>| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let storage = Storage::open(dir.path()).unwrap();
+            let mut g = crate::storage::fixtures::genesis_file_of(1, &[&key(1)], Vec::new(), 10);
+            g.faucet = true;
+            g.staking = Some(StakingConfig {
+                faucet_budget_per_epoch: 1_000 * randprotocol_core::UNITS_PER_RAND,
+                bond_activation_epochs: 2,
+                faucet_minters: Some(minters.into_iter().map(FaucetMinter).collect()),
+                ..Default::default()
+            });
+            let gs = g.build(&StubExecutor).unwrap();
+            storage.init_genesis(&gs).unwrap();
+            let hs = resume_consensus(&storage, &gs, Some(key(1)), Duration::from_secs(1), Duration::from_secs(8), Arc::new(StubExecutor)).unwrap();
+            let (mut node, _seen) = bare_node(storage, gs, hs);
+            let r = node.mint(crate::storage::fixtures::payout(9), 1_000).await;
+            (r, node.mempool.len())
+        };
+        let (r, pooled) = mint_on(vec![key(9).address()]).await;
+        let why = r.unwrap_err();
+        assert!(why.contains(&format!("this node's key {} is not a faucet minter", key(1).address())), "{why}");
+        assert!(why.contains("staking.faucet_minters (1)") && why.contains(&key(9).address().to_base58()), "{why}");
+        assert_eq!(pooled, 0, "refused before a mint was built or pooled");
+        // (A listed key gets past this check — `admission::faucet_refusal`'s own test; building the
+        // mint itself needs the real executor, `a_faucet_mint_is_sealed_in_the_chains_declared_envelope_format`.)
     }
 
     /// One connected peer claiming `height`.

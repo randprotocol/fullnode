@@ -274,6 +274,9 @@ pub struct NodeStatus {
     /// validator that has bonded in but whose epoch has not arrived — or one that has unbonded
     /// below the minimum — is `is_validator` without being `active_validator`.
     pub active_validator: bool,
+    /// #153: this node can serve `rand_mint` — the genesis turns the faucet on, this node runs as a
+    /// validator, and its key is one of the chain's faucet minters (`admission::faucet_refusal`).
+    /// Before v0.8.3 it was the genesis flag alone, `true` on validators whose every mint failed.
     pub faucet: bool,
     pub confidential: bool,
     /// Audit v6, STAKE-2: the genesis says `testnet: true` — the marker that lets a faucet sit
