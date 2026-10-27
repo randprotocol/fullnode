@@ -464,6 +464,45 @@ PY
 grep -q 'pub fn check_pre_key' "$DST/src/machine.rs" && grep -q 'self.check_pre_key(hc, proof)?;' "$DST/src/machine.rs" \
   && echo "anchors: check_pre_key ok" \
   || { echo "sync-zkvm.sh: Machine::verify moved; update the check_pre_key patch" >&2; exit 1; }
+# CON-60 (fullnode audit, round 5): an optional key-build gate. A hook set once on a machine
+# (`Machine::set_key_build_gate`) wraps every verifier-key build — the `get_or_init` closure, and
+# nothing else — so the chain executor can hold all its state-proof machines to one build at a
+# time across every thread (a tier-18 build peaks at ~3.3–4 GB). Unset, nothing changes.
+# Asserts its anchors and aborts the sync when upstream's struct or key build moved.
+python3 - "$DST/src/machine.rs" <<'PY'
+import sys; p=sys.argv[1]; s=open(p).read()
+if "pub fn set_key_build_gate" in s:
+    sys.exit(0)
+def rep(old, new):
+    global s
+    assert s.count(old) == 1, "machine.rs: the key-build gate anchor moved: " + old[:60]
+    s = s.replace(old, new)
+rep("pub struct Machine { pub config: Config, pub profile: FriProfile, keys: Mutex<KeyCache>, key_builds: std::sync::atomic::AtomicUsize }\n",
+    "pub struct Machine { pub config: Config, pub profile: FriProfile, keys: Mutex<KeyCache>, key_builds: std::sync::atomic::AtomicUsize, build_gate: std::sync::OnceLock<KeyBuildGate> }\n\n"
+    "/// A wrapper every verifier-key build of a machine runs inside ([`Machine::set_key_build_gate`]):\n"
+    "/// called with the build, it must run it exactly once (fullnode CON-60 holds it to one build at\n"
+    "/// a time across its state-proof machines).\n"
+    "pub type KeyBuildGate = Arc<dyn Fn(&mut dyn FnMut()) + Send + Sync>;\n")
+rep("            key_builds: std::sync::atomic::AtomicUsize::new(0),\n        }\n    }\n",
+    "            key_builds: std::sync::atomic::AtomicUsize::new(0),\n            build_gate: std::sync::OnceLock::new(),\n        }\n    }\n\n"
+    "    /// Run every later verifier-key build of this machine inside `gate` (set once; a second call\n"
+    "    /// is ignored). Only builds: a cached key is returned without it.\n"
+    "    pub fn set_key_build_gate(&self, gate: KeyBuildGate) { let _ = self.build_gate.set(gate); }\n")
+old = ("            self.key_builds.fetch_add(1, std::sync::atomic::Ordering::SeqCst);\n"
+       "            Arc::new(ProverData::from_airs_and_degrees(&key_config(self.profile), &chips_with_modq(tier, keccak_log_height, sha256_log_height, modq_log_height), &self.log_ext_degrees_with_modq(tier, program_log_height, input_log_height, keccak_log_height, sha256_log_height, modq_log_height, public_log_height, mem_log_height)).common)\n")
+new = ("            let mut built = None;\n"
+       "            let mut build = || {\n"
+       "                self.key_builds.fetch_add(1, std::sync::atomic::Ordering::SeqCst);\n"
+       "                built = Some(Arc::new(ProverData::from_airs_and_degrees(&key_config(self.profile), &chips_with_modq(tier, keccak_log_height, sha256_log_height, modq_log_height), &self.log_ext_degrees_with_modq(tier, program_log_height, input_log_height, keccak_log_height, sha256_log_height, modq_log_height, public_log_height, mem_log_height)).common));\n"
+       "            };\n"
+       "            match self.build_gate.get() { Some(gate) => gate(&mut build), None => build() }\n"
+       "            built.expect(\"a key-build gate runs the build\")\n")
+rep(old, new)
+open(p, "w").write(s)
+PY
+grep -q 'pub fn set_key_build_gate' "$DST/src/machine.rs" && grep -q 'match self.build_gate.get()' "$DST/src/machine.rs" \
+  && echo "anchors: key-build gate ok" \
+  || { echo "sync-zkvm.sh: Machine or its key build moved; update the key-build gate patch" >&2; exit 1; }
 # M3.4/M4.1: `hash.rs`'s program-digest header and `tables/cpu.rs`'s in-circuit copy of the same
 # constant both read `crate::notes::domain::HC` upstream; M4.1 added a second such pair for the
 # input digest, `crate::notes::domain::IN`. Constraint set 6 added a third: `crate::notes::

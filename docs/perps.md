@@ -534,7 +534,10 @@ bridged one.
     cache while that cache has a pin left (never evicted; non-canonical proofs can never take a
     canonical shape's pin) and recorded in the node's database; at startup, off the node loop and
     after the bundle key, the node walks the 8 newest recorded or recently committed shapes and
-    builds and pins each whose cache still has a pin.
+    builds and pins each whose cache still has a pin (reserving the pin before it builds);
+  - **one state-proof key build at a time** per process, across both caches, every verify
+    worker and the startup warm: a second cold shape waits for the first build, while proofs of
+    warm shapes keep verifying.
 
   **The canonical state-proof shape** (`ledger::perps::canonical_input_log_height`,
   `canonical_witness_words`, `segment_public_log_height`; `rand perp prove` proves at it unless

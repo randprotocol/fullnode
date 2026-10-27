@@ -1724,7 +1724,12 @@ fn common_from_bytes(bytes: &[u8]) -> Result<CommonData<Config>, InstallKeyError
     Ok(CommonData { preprocessed, lookups: wire.lookups })
 }
 
-pub struct Machine { pub config: Config, pub profile: FriProfile, keys: Mutex<KeyCache>, key_builds: std::sync::atomic::AtomicUsize }
+pub struct Machine { pub config: Config, pub profile: FriProfile, keys: Mutex<KeyCache>, key_builds: std::sync::atomic::AtomicUsize, build_gate: std::sync::OnceLock<KeyBuildGate> }
+
+/// A wrapper every verifier-key build of a machine runs inside ([`Machine::set_key_build_gate`]):
+/// called with the build, it must run it exactly once (fullnode CON-60 holds it to one build at
+/// a time across its state-proof machines).
+pub type KeyBuildGate = Arc<dyn Fn(&mut dyn FnMut()) + Send + Sync>;
 
 impl Machine {
     pub fn new(profile: FriProfile) -> Self { Self::with_key_cache_capacity(profile, KEY_CACHE_CAPACITY) }
@@ -1739,8 +1744,13 @@ impl Machine {
             profile,
             keys: Mutex::new(KeyCache { capacity, ..KeyCache::default() }),
             key_builds: std::sync::atomic::AtomicUsize::new(0),
+            build_gate: std::sync::OnceLock::new(),
         }
     }
+
+    /// Run every later verifier-key build of this machine inside `gate` (set once; a second call
+    /// is ignored). Only builds: a cached key is returned without it.
+    pub fn set_key_build_gate(&self, gate: KeyBuildGate) { let _ = self.build_gate.set(gate); }
 
     /// A test instrument: how many verifier keys this machine has built (cache misses that ran
     /// the preprocessing pass), since construction.
@@ -1869,8 +1879,13 @@ impl Machine {
             // floor is the canonical one, and using it makes this function's result independent
             // of which proof happened to miss the cache first.
             let mem_log_height = tier.min_mem_log_height();
-            self.key_builds.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            Arc::new(ProverData::from_airs_and_degrees(&key_config(self.profile), &chips_with_modq(tier, keccak_log_height, sha256_log_height, modq_log_height), &self.log_ext_degrees_with_modq(tier, program_log_height, input_log_height, keccak_log_height, sha256_log_height, modq_log_height, public_log_height, mem_log_height)).common)
+            let mut built = None;
+            let mut build = || {
+                self.key_builds.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                built = Some(Arc::new(ProverData::from_airs_and_degrees(&key_config(self.profile), &chips_with_modq(tier, keccak_log_height, sha256_log_height, modq_log_height), &self.log_ext_degrees_with_modq(tier, program_log_height, input_log_height, keccak_log_height, sha256_log_height, modq_log_height, public_log_height, mem_log_height)).common));
+            };
+            match self.build_gate.get() { Some(gate) => gate(&mut build), None => build() }
+            built.expect("a key-build gate runs the build")
         })
         .clone()
     }
