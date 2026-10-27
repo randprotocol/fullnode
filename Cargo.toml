@@ -9,7 +9,7 @@ members = ["crates/randprotocol-core", "crates/randprotocol-zkvm", "crates/randp
 exclude = ["vendor/circuits/evm-core", "vendor/circuits/sbpf-core", "vendor/circuits/dilithium-core"]
 
 [workspace.package]
-version = "0.8.0"
+version = "0.8.2"
 edition = "2021"
 license = "GPL-3.0-only"
 authors = ["RandProtocol Contributors"]

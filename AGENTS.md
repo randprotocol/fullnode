@@ -6,6 +6,17 @@ invariants, and known traps.
 
 ## Project memory (state as of 2026-10-09)
 
+### v0.8.2 (2026-10-27; branch `release/v0.8.2` off main `b9c38f29`, NOT pushed, NOT tagged; node-only on chain 21)
+
+Merges `fix/prover-ram`, `audit/v10-node` and `audit/v10-perps` and bumps the workspace to 0.8.2
+(`CHANGELOG.md`, v0.8.2, has every row). The consensus rules among them (PST-1
+`program_state.refuse_panics`, MSA-4 `multisig.max_accounts`, PERP-6 `perps.bound_payouts` /
+`initial_collateral`, PERP-101 `perps.sparse_windows` / `max_window_heights`, CON-60
+`perps.engine_program_log_height`) are genesis fields that default off, are written to the file
+and the hash only when set, and are absent from chain 21's genesis, whose hash `ca76c276…ca9a`
+the node tests re-derive from `deploy/genesis-chain21.json`. Roll: snapshot each datadir first
+(MSA-4 splits the multisig register into rows at the first open).
+
 ### Tree aggregation (2026-10-09; branch `feat/tree-aggregation`, NOT pushed; genesis-gated, on no chain)
 
 Circuits `92b750e` (branch `feat/tree-aggregation`, **not yet on zkp-circuits**; re-pinned at

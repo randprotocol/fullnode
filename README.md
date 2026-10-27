@@ -358,6 +358,7 @@ a time.
 | v0.6.9 | node-only: headers carry invokes in `public_notes`, so a wallet rebuilds RPL-2 payouts from public fields | 20 |
 | v0.7.0 | node-only: the audit v7 addendum (bounded by-hash deferral, header pages capped by reply size, a prover timeout, the wallet's resumable first sync hardened) and the last audit v6 rows (a clean-clone build, an incremental token root, the key-separation schedule); the first workflow-built, signed release | 20 |
 | v0.8.0 | chain 21's cut build: constraint set 9 (rVM phase 4's Merkle spans, the MODQ chip), tree aggregation, scan heads, compact blocks, the `fees` section, RPL-3 perps, public and private multisig | 21 |
+| v0.8.2 | node-only on chain 21: the audit v10 node, perps and prover-pool fixes (the prover memory gate, the two-member pool pin, threshold release signatures); its consensus rules are genesis-gated to the next cut | 21 |
 
 ## v0.5: RPL, zUSD and bridge hardening
 
@@ -455,7 +456,7 @@ Next:
   account, by 2026-11-01 and before any mainnet genesis — is in `docs/deploy.md` and enforced by
   `deploy/lib/cut-policy.sh` (no genesis without `testnet: true` until it is met).
 - **The prover pool.** Each pool member has its own key; the old shared key is retired. Two
-  members run it now, `a` and `b`, which fullnode v0.8.2 (the next release) pins (wallet 0.8.1 already does).
+  members run it now, `a` and `b`, which fullnode v0.8.2 pins (wallet 0.8.1 already does).
 
 ## License
 

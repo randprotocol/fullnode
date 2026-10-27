@@ -12,6 +12,15 @@ stopped at v0.4 until 2026-09-30, when the entries v0.5 to v0.6.7 were written f
 
 ## Unreleased
 
+Nothing yet.
+
+## v0.8.2 — 2026-10-27 (chain 21, node-only; the genesis-gated rules wait for the next cut)
+
+Runs on chain 21 as it is: every rule below that changes what a block may contain is switched on
+by a genesis field chain 21 does not have, so chain 21's genesis hash (`ca76c276…ca9a`) and its
+replay are unchanged. Upgrade note: MSA-4 below splits the multisig register into rows at the
+first open; snapshot each datadir before rolling.
+
 - **rVM phase 5 re-vendored** (circuits `b3e21d9`, `recursion/docs/10-phase5-n2-tier19.md`;
   node-only until a chain admits aggregation): the recursion programs are 235 418 rows an inner
   verification (315 391 before), so a production N=1 aggregate is tier 18 and N=2 tier 19;
@@ -74,6 +83,55 @@ Audit v10 fixes (node and client policies, no chain change unless a genesis fiel
   observed sources expire 24 h after they were last in use — a source with a connection open
   never expires (bootstrap addresses never do). Every validator
   should be in the fleet's `--bootstrap` lists, since learned sources do not survive a restart.
+
+Prover pool and release tooling:
+
+- **VK-9 / PROV-301** (client): `rand` pins the two pool members `a` and `b` (names, key
+  fingerprints, URLs); the four retired members and their keys are removed. `deploy/prover` docs
+  carry no host addresses.
+- **Prover memory gate** (client, prover): `rand` refuses a local proof before any work when the
+  machine reports less free memory than one proof peaks at (6.2 GB measured); `--skip-memory-check`
+  (or `RAND_SKIP_MEMORY_CHECK`) overrides, as `rand-prover run` does. Proofs that are always local
+  (`call`, `invoke`) are checked whatever `--prover` says. `deploy/prover` sets `MemoryMax` to 7 GB
+  a proving slot plus 1 GB.
+- **CLI-301** (client): `rand prover pair --trusted` on a build whose pins are out of date says to
+  update `rand` to 0.8.2 or later; it says so only when a member answers with a different key, and
+  says to try later when no member answers.
+- **CLI-303** (CI): CI and the release workflow run the pool-pin test by name.
+- **VK-10** (deploy): the pool router's per-address submit limit defaults to a burst of 2 and 1 a
+  minute; CI runs the router's tests.
+- **VK-2** (deploy): `deploy/enable-public-rpc.sh` and a `vps-setup` option turn on the node's
+  public RPC listener (`--public-rpc 127.0.0.1:8546`); a unit whose `ExecStart` continues on the
+  next line is refused.
+- **PROC-5** (deploy): release verification accepts a threshold of the listed release keys
+  (`deploy/release-threshold`, signatures `SHA256SUMS.sig` and `.sig2`–`.sig9`);
+  `deploy/sign-release.sh` signs with every key it is given; `cert-authority` lines are refused.
+- **DOC-301** (docs): the prover guide, `AGENTS.md` and the README describe the two-member pool and
+  name chain 21 as the running chain.
+- **WEB-502** (repo): the tree carries no real host addresses or SSH host-key fingerprints
+  (documentation-range placeholders; `deploy/nodes.env` is a placeholder list); the deploy scripts
+  read the fleet list from `NODES_ENV` and refuse placeholder hosts.
+
+Perpetual futures (RPL-3):
+
+- **PERP-1** (pool policy): the pool bounds fee-less perp actions per account and in all, ranks
+  withdrawals first and offers accounts round robin. Holding new orders while state proofs lag
+  applies only on a chain with `perps.sparse_windows`; chain 21 keeps accepting orders.
+- **PERP-6** (genesis-gated, next cut): `perps.bound_payouts` — a state proof may not pay out more
+  collateral than the exchange was given (with `perps.initial_collateral` for a seeded engine).
+  Without it the collateral counters saturate and nothing new is refused; the stored perps row
+  stays readable by v0.8.x.
+- **PERP-101** (genesis-gated, next cut): `perps.sparse_windows` with `perps.max_window_heights` —
+  blocks with no perp inputs are left out of state-proof windows, with height back-pressure; on
+  such a chain a cancel must name an order of its own account. `rand_getPerps` also returns
+  `engine_program_log_height`.
+- **CON-60** (node-only, plus a genesis-gated pin): an invalid state proof no longer forces a
+  verifier-key build. Every check `Machine::verify` makes before its key runs first
+  (`Machine::check_pre_key`); engine keys are pinned per cache; the startup warm builds at most the
+  8 newest shapes after the bundle key; cold builds take a token from a bucket that foreign proofs
+  cannot drain, one build at a time. `perps.engine_program_log_height` (next cut) pins the engine's
+  canonical shape, and `rand perp prove` defaults to that shape only on a chain with the pin
+  (`--smallest`, `--canonical`).
 
 ## v0.8.0 — 2026-10-12 (chain 21 onward)
 

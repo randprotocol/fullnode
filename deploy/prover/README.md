@@ -17,7 +17,7 @@ wallet ──https──> nginx (web droplet, TLS, per-address limit, no access 
 (0XZX-NZ1J-SPMB-GWZN), each with a key made on its own host, both running the signed `v0.8.0`
 rand-prover (`TAG=v0.8.0 MEMBER=… install-host.sh`, then `install-web.sh a:8611=… b:8612=…`). One
 real chain-21 transfer proved through each. Clients pin them from wallet 0.8.1 and
-`rand prover pair --trusted` from the next release; older wallets and CLIs refuse both. The
+`rand prover pair --trusted` from fullnode v0.8.2; older wallets and CLIs refuse both. The
 history below is kept for the retired members.
 
 **Status, 2026-10-01 13:00 UTC — per-member keys only.** Four members, each with its own key made

@@ -1995,7 +1995,16 @@ What changed for clients, in one place. Newest first.
   `InvalidAuthProof`, permanently; one sent while the node's key is still cold is deferred with a
   retryable refusal.
 
-### Unreleased — the wallet's scan reads envelopes by aligned chunk (client-only; audit v10, RPC-201)
+### v0.8.2 — perps fields in `rand_getPerps` and `rand_getSupply` (node-only on chain 21; the rules they report are genesis-gated)
+
+- `rand_getPerps`: `bound_payouts`, `initial_collateral`, `collateral_in`, `collateral_out`,
+  `collateral_held` (PERP-6), `sparse_windows`, `max_window_heights` (PERP-101) and
+  `engine_program_log_height` (CON-60). On chain 21 they read `false` / `"0"` / `0` except the
+  counters; a node before v0.8.2 omits them (read absence as off).
+- `rand_getSupply`: `perps_collateral_in`, `perps_collateral_out`, `perps_collateral_held`
+  (`"0"` without a `perps` section).
+
+### v0.8.2 — the wallet's scan reads envelopes by aligned chunk (client-only; RPC-201)
 
 Against a node with `rand_getScanLeaves`, `rand` no longer reads with `rand_getCommitments` exactly
 the leaves its keys opened (which told the node which leaves were the wallet's): it reads the whole
