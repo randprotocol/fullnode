@@ -346,10 +346,13 @@ pub fn reload_ledger_from(
     // state's: nothing on chain moves it, so a stored fee that differs is a damaged blob, and the
     // file's value is what this node prices creates at (`verify_chain` names the blob — the fee
     // is inside the register's root — and the repair rewrites it).
+    // `max_accounts` (audit v10, MSA-4) is the same kind of parameter: the file's, not the rows'
+    // (a store written before the field holds none).
     if let (Some(genesis), Some(stored)) = (gs.ledger.multisig(), ledger.multisig()) {
-        if stored.create_fee != genesis.create_fee {
+        if stored.create_fee != genesis.create_fee || stored.max_accounts != genesis.max_accounts {
             let mut fixed = stored.clone();
             fixed.create_fee = genesis.create_fee;
+            fixed.max_accounts = genesis.max_accounts;
             ledger.set_multisig(Some(fixed));
         }
     }

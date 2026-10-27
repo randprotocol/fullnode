@@ -4716,6 +4716,23 @@ mod tests {
         assert!(!gen.to_json().contains("staking"), "rewriting the file adds no section");
     }
 
+    /// Chain 21, the running chain (cut 2026-10-12, v0.8.0), byte for byte, after audit v10's
+    /// `multisig.max_accounts` (MSA-4): the file lists none, so its hash may not move by one
+    /// bit, its register is unbounded as cut, and rewriting the file adds no field.
+    #[test]
+    fn chain_21s_genesis_file_still_builds_chain_21() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../deploy/genesis-chain21.json");
+        let gen = Genesis::from_json(&std::fs::read_to_string(path).unwrap()).unwrap();
+        let m = gen.multisig.as_ref().expect("chain 21 carries the treasury");
+        assert_eq!((m.accounts.len(), m.max_accounts), (1, None), "chain 21 predates max_accounts");
+        let executor = node::executor_for_profile(&gen.fri_profile).unwrap();
+        let state = gen.build(executor.as_ref()).unwrap();
+        assert_eq!(state.hash().to_hex(), "ca76c2766ed6090ac6ba5dad86b724dd5d2b80c0edfaed287cd8b129e663ca9a");
+        let reg = state.ledger.multisig().expect("the register");
+        assert_eq!((reg.len(), reg.max_accounts, reg.is_full()), (1, None, false));
+        assert!(!gen.to_json().contains("max_accounts"), "rewriting the file adds no field");
+    }
+
     /// Chain 15, the running chain, byte for byte, after RESCAN-LEDGER-1's
     /// `staking.faucet_minters`, C15-1's bridge replay floor and the v0.6 `hardening_v6` switch:
     /// the file lists none of them, so its
@@ -6678,7 +6695,7 @@ mod tests {
             balance: 10 * UNITS_PER_RAND,
         };
         let id = account.id(ledger.chain_id());
-        ledger.set_multisig(Some(MultisigRegister::from_config(&MultisigConfig { create_fee: 0, accounts: vec![account] }, ledger.chain_id())));
+        ledger.set_multisig(Some(MultisigRegister::from_config(&MultisigConfig { create_fee: 0, accounts: vec![account], max_accounts: None }, ledger.chain_id())));
         (ledger, id, signers)
     }
 

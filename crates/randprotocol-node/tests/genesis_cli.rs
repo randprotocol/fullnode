@@ -645,7 +645,7 @@ fn the_genesis_command_writes_the_multisig_section_and_prints_the_derived_ids() 
     let key = |i: u8| randprotocol_core::Keypair::from_seed([i; 32]).unwrap().public_key().clone();
     let treasury = MultisigAccountConfig { salt: [3; 32], signers: vec![key(20), key(21), key(22)], threshold: 2, balance: 500_000 * randprotocol_core::UNITS_PER_RAND };
     let unfunded = MultisigAccountConfig { salt: [4; 32], signers: vec![key(23)], threshold: 1, balance: 0 };
-    let cfg = MultisigConfig { create_fee: 1_000_000_000, accounts: vec![treasury.clone(), unfunded.clone()] };
+    let cfg = MultisigConfig { create_fee: 1_000_000_000, accounts: vec![treasury.clone(), unfunded.clone()], max_accounts: None };
     let cfg_path = dir.path().join("multisig.json");
     std::fs::write(&cfg_path, serde_json::to_string_pretty(&cfg).unwrap()).unwrap();
 

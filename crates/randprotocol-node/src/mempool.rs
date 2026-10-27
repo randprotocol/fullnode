@@ -1958,7 +1958,7 @@ mod tests {
 
         // The same account (same id, same nonce 0) now holding 5 RAND.
         let mut drained = l.clone();
-        let config = MultisigConfig { create_fee: fixtures::MULTISIG_CREATE_FEE, accounts: vec![fixtures::multisig_account_config(5 * u)] };
+        let config = MultisigConfig { create_fee: fixtures::MULTISIG_CREATE_FEE, accounts: vec![fixtures::multisig_account_config(5 * u)], max_accounts: None };
         drained.set_multisig(Some(MultisigRegister::from_config(&config, drained.chain_id())));
         assert_eq!(drained.multisig().unwrap().get(&id).unwrap().nonce, 0, "the nonce did not move");
         assert!(m.candidates(&drained, 10).is_empty(), "a pay its row cannot cover is not offered");

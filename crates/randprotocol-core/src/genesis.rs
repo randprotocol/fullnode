@@ -1826,6 +1826,12 @@ impl Genesis {
                 for k in &a.signers { commit.extend_from_slice(k.as_bytes()); }
                 commit.extend_from_slice(&a.balance.to_be_bytes());
             }
+            // `max_accounts` (audit v10, MSA-4): tagged and present-only, after the accounts, so
+            // a section without it — chain 21's — hashes byte for byte as before.
+            if let Some(cap) = m.max_accounts {
+                commit.extend_from_slice(b"max_accounts");
+                commit.extend_from_slice(&cap.to_be_bytes());
+            }
         }
         // Tree aggregation (R4), after `multisig` — last — tagged, and only when the file has the
         // section, so every genesis cut before it hashes byte-for-byte as before. The whole
@@ -5715,7 +5721,7 @@ mod tests {
         assert!(plain.ledger.multisig().is_none());
         assert!(!base_genesis().to_json().contains("multisig"), "absent from the file when absent");
         let mut g = base_genesis();
-        g.multisig = Some(MultisigConfig { create_fee: 1_000_000_000, accounts: vec![multisig_account(2, 300 * UNITS_PER_RAND), multisig_account(1, 700 * UNITS_PER_RAND)] });
+        g.multisig = Some(MultisigConfig { create_fee: 1_000_000_000, accounts: vec![multisig_account(2, 300 * UNITS_PER_RAND), multisig_account(1, 700 * UNITS_PER_RAND)], max_accounts: None });
         let on = build(&g);
         let reg = on.ledger.multisig().expect("seeded");
         assert_eq!((reg.len(), reg.issued, reg.create_fee), (2, 1_000 * UNITS_PER_RAND, 1_000_000_000));
@@ -5741,6 +5747,18 @@ mod tests {
         assert_ne!(with(&|m| m.accounts[0].threshold = 3), on.hash());
         assert_ne!(with(&|m| m.accounts[0].signers.swap(0, 1)), on.hash());
         assert_ne!(with(&|m| m.accounts[0].balance += 1), on.hash());
+        // MSA-4: `max_accounts` is in the hash only when present — the file above has none and
+        // hashes as it did before the field existed (`on.hash()` is computed without it) — and
+        // the register carries it.
+        assert!(!g.to_json().contains("max_accounts"), "absent from the file when absent");
+        assert_eq!(reg.max_accounts, None);
+        assert_ne!(with(&|m| m.max_accounts = Some(10)), on.hash());
+        assert_ne!(with(&|m| m.max_accounts = Some(10)), with(&|m| m.max_accounts = Some(11)));
+        let mut capped = g.clone(); capped.multisig.as_mut().unwrap().max_accounts = Some(2);
+        assert!(capped.to_json().contains("\"max_accounts\": 2"));
+        assert_eq!(Genesis::from_json(&capped.to_json()).unwrap(), capped, "round-trips");
+        assert_eq!(build(&capped).ledger.multisig().unwrap().max_accounts, Some(2));
+        assert!(build(&capped).ledger.multisig().unwrap().is_full(), "two seeded accounts fill a cap of two");
         // An empty section is a switch with nothing seeded.
         let mut empty = base_genesis(); empty.multisig = Some(MultisigConfig::default());
         let e = build(&empty);
@@ -5753,12 +5771,13 @@ mod tests {
         use crate::ledger::multisig::MultisigConfig;
         let bad = |f: &dyn Fn(&mut MultisigConfig)| {
             let mut g = base_genesis();
-            let mut m = MultisigConfig { create_fee: 0, accounts: vec![multisig_account(1, 5)] };
+            let mut m = MultisigConfig { create_fee: 0, accounts: vec![multisig_account(1, 5)], max_accounts: None };
             f(&mut m); g.multisig = Some(m); g.build(&StubExecutor).err()
         };
         assert!(matches!(bad(&|m| m.accounts[0].threshold = 0), Some(GenesisError::BadMultisig(_))));
         assert!(matches!(bad(&|m| m.accounts[0].signers.clear()), Some(GenesisError::BadMultisig(_))));
         assert!(matches!(bad(&|m| m.create_fee = u64::MAX), Some(GenesisError::BadMultisig(_))));
+        assert!(matches!(bad(&|m| m.max_accounts = Some(0)), Some(GenesisError::BadMultisig(_))), "MSA-4: one account listed over a cap of none");
         assert!(matches!(bad(&|m| m.accounts[0].balance = u64::MAX - 1), Some(GenesisError::SupplyOverflow)));
         let json = base_genesis().to_json().replace("\"chain_id\"", "\"multisig\": {\"accounts\": [], \"nonsense\": 1}, \"chain_id\"");
         assert!(Genesis::from_json(&json).is_err(), "a stray key is refused");

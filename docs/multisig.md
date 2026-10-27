@@ -57,6 +57,7 @@ number of them with RAND, in its `multisig` section:
 |---|---|
 | `create_fee` | units of RAND a later `CreateMultisig` must pay **above** the bundle's settled floor (the 0.001 RAND base, plus `fees.prove_base` on an aggregating chain) — not burned: it is part of the bundle's fee, which goes to the proposer, or, on a chain with the `aggregation` section, follows the fee split (the proposer keeps the 0.001 RAND `BUNDLE_BASE`, the rest is bucketed). `0` to 1 000 RAND. Spam on a permanent register is what it prices. |
 | `accounts` | may be empty: a section with no accounts switches the module on with an empty register. |
+| `max_accounts` | optional: the most accounts the register will ever hold, the seeded ones included. A `CreateMultisig` that would take the register past it is refused (`the multisig register is full`), permanently — no account is ever removed. Absent (chain 21 and every chain cut before the field), the register is unbounded. Part of the genesis hash only when present, so a file without it hashes as before; `rand_getLimits.multisig.max_accounts` serves it. |
 | `salt` | 32 bytes (64 hex characters), the creator's randomness in the id. The chain never learns a name. |
 | `signers` | 1 to 10 distinct Dilithium2 public keys. **The order matters**: a signature names its signer by position (`0:<hex>`). |
 | `threshold` | `1 ≤ threshold ≤ signers`. **Use 2 of 3 or 3 of 5** for a treasury, so one lost key is survived by a rotation. |
@@ -64,7 +65,7 @@ number of them with RAND, in its `multisig` section:
 
 The example is the foundation treasury: 500 000 000 RAND, 2 of 3. `rand-node genesis` refuses a file
 with more than ten signers, a duplicate key, a threshold outside `1..=signers`, a `create_fee` over
-1 000 RAND, two accounts with the same id, or balances that overflow a u64 (or, with the notes,
+1 000 RAND, more seeded accounts than `max_accounts`, two accounts with the same id, or balances that overflow a u64 (or, with the notes,
 stakes and vesting entries, the supply).
 
 ### The id
@@ -362,7 +363,7 @@ core), so a browser signer runs the same code.
 |---|---|
 | `rand_getMultisig [id]` | `{ "enabled", "id", "signers", "threshold", "nonce", "vault": [{ "asset", "amount" }] }`; `null` for an unknown id; `{ "enabled": false }` without the section |
 | `rand_getSupply []` | adds `multisig_issued`, `multisig_rand_in`, `multisig_rand_out`, `multisig_base_out`, `multisig_rand_held`; the identity `total_supply == issued` covers the register (`docs/supply.md`) |
-| `rand_getLimits []` | `multisig`: `{ create_fee, max_signers, max_payouts }`, or `null` |
+| `rand_getLimits []` | `multisig`: `{ create_fee, max_signers, max_payouts }` plus `max_accounts` when the genesis sets it, or `null` |
 
 Every amount is a decimal string. The same account from a shell: `rand-node multisig status <id>`.
 

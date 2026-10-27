@@ -31,6 +31,13 @@ Audit v10 fixes (node and client policies, no chain change unless a genesis fiel
 - **RPC-201** (client-only): `rand` reads envelopes by whole aligned chunks of `--scan-chunk`
   leaves (256; `0` = every envelope) after paging scan heads, so the node learns the chunk and not
   the leaf (`docs/rpc.md`, scan heads).
+- **MSA-4** (genesis-gated, next cut): genesis `multisig.max_accounts` caps the public multisig
+  register; a `CreateMultisig` past it is refused (`RegisterFull`, permanent). Absent — chain 21 —
+  the register is unbounded and the genesis hash is unchanged. Node-only: each account's leaf hash
+  is cached, so a state root rehashes only the accounts that changed, and the store keeps one row
+  per account (`multisig_accounts` column family) plus a totals row, so a commit writes only the
+  accounts its blocks touched; a store's one-blob register is split into rows at the first open
+  (a store opened by this build cannot be opened by an older one).
 
 ## v0.8.0 — 2026-10-12 (chain 21 onward)
 

@@ -14,6 +14,7 @@
 //! actions (create, deposit, pay, rotate) and `still_applies`, the pool's selection-time re-check.
 
 use crate::crypto::{merkle_root, Hash, PublicKey, PUBLIC_KEY_LEN};
+use crystals_dilithium::dilithium2;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -47,6 +48,14 @@ pub struct MultisigConfig {
     pub create_fee: u64,
     #[serde(default)]
     pub accounts: Vec<MultisigAccountConfig>,
+    /// Audit v10, MSA-4: the most accounts the register ever holds, genesis-seeded ones included.
+    /// A `CreateMultisig` that would take the register past it is refused, permanently
+    /// ([`MultisigError::RegisterFull`]). Absent — chain 21 and every chain cut before this field
+    /// — the register is unbounded, as it was; bound into the genesis hash only when present, so
+    /// a file without it hashes as before. A validity rule: every node of a chain reads the same
+    /// file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_accounts: Option<u64>,
 }
 
 impl MultisigConfig {
@@ -55,6 +64,11 @@ impl MultisigConfig {
     pub fn check(&self, chain_id: u64) -> Result<u64, String> {
         if self.create_fee > MAX_CREATE_FEE {
             return Err(format!("multisig create_fee {} exceeds the maximum {MAX_CREATE_FEE}", self.create_fee));
+        }
+        if let Some(cap) = self.max_accounts {
+            if self.accounts.len() as u64 > cap {
+                return Err(format!("{} accounts listed, over max_accounts {cap}", self.accounts.len()));
+            }
         }
         let mut total = 0u64;
         let mut seen: Vec<[u8; 32]> = Vec::with_capacity(self.accounts.len());
@@ -83,8 +97,13 @@ pub fn check_signers(signers: &[PublicKey], threshold: u8) -> Result<(), String>
         return Err(format!("{} signers, an account has 1..=10 signers", signers.len()));
     }
     for (i, k) in signers.iter().enumerate() {
-        if k.as_bytes().len() != PUBLIC_KEY_LEN {
-            return Err(format!("signer {i} is not a Dilithium2 public key"));
+        // The crate's own parse (audit v10, MSA-4), the one `PublicKey::verify` runs before a
+        // signature is checked: a key it does not take could never verify anything, so an account
+        // listing one is refused at creation rather than funded and then unspendable. A Dilithium2
+        // public key is `ρ ‖ packed t1` with no structure past its length, so this is the whole
+        // of what a parse can refuse.
+        if k.as_bytes().len() != PUBLIC_KEY_LEN || dilithium2::PublicKey::from_bytes(k.as_bytes()).is_err() {
+            return Err(format!("signer {i} does not parse as a Dilithium2 public key"));
         }
         if signers[..i].contains(k) {
             return Err(format!("signer {i} is listed twice"));
@@ -127,8 +146,11 @@ impl Account {
     }
 
     /// `id ‖ threshold ‖ n ‖ keys ‖ nonce ‖ rows ‖ (asset, amount)*` under `rand-multisig-leaf-1`,
-    /// every field fixed-width.
+    /// every field fixed-width. Hashes up to 10 × 1 312 bytes of keys, so the register caches it
+    /// per account ([`MultisigRegister::root`] reads the cache; audit v10, MSA-4).
     pub fn leaf(&self, id: &[u8; 32]) -> Hash {
+        #[cfg(test)]
+        LEAF_HASHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut b = Vec::with_capacity(32 + 2 + self.signers.len() * PUBLIC_KEY_LEN + 12 + self.vault.len() * 12);
         b.extend_from_slice(id);
         b.push(self.threshold);
@@ -154,12 +176,28 @@ impl Account {
     }
 }
 
+/// How many [`Account::leaf`] hashes have run (tests only): the structural check that a root
+/// after one change hashes one leaf, not the register.
+#[cfg(test)]
+pub(crate) static LEAF_HASHES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 /// Every account, plus the running totals that let the supply identity be checked without
 /// walking the accounts.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// Each account's leaf hash is cached beside it (`leaves`, audit v10, MSA-4) and kept current by
+/// the two mutation paths, [`MultisigRegister::insert`] and [`MultisigRegister::update`], so
+/// [`MultisigRegister::root`] hashes only the changed accounts' leaves since the last change and
+/// one Merkle pass over 32-byte leaves — not 10 × 1 312 bytes of keys per account per state root.
+/// The cache is a function of the accounts; equality ignores it.
+#[derive(Clone, Debug, Default)]
 pub struct MultisigRegister {
     accounts: BTreeMap<[u8; 32], Account>,
+    leaves: BTreeMap<[u8; 32], Hash>,
     pub create_fee: u64,
+    /// Genesis `multisig.max_accounts` (MSA-4): `None` is unbounded. A genesis parameter like
+    /// `create_fee`, restored from the file at every start; not in [`MultisigRegister::root`],
+    /// which the genesis hash binds it beside.
+    pub max_accounts: Option<u64>,
     /// RAND the genesis opened the vaults with.
     pub issued: u64,
     /// RAND deposited into vaults / paid out of them / burned as base fees since genesis.
@@ -168,16 +206,84 @@ pub struct MultisigRegister {
     pub base_out: u64,
 }
 
+impl PartialEq for MultisigRegister {
+    fn eq(&self, o: &MultisigRegister) -> bool {
+        self.accounts == o.accounts
+            && self.create_fee == o.create_fee
+            && self.max_accounts == o.max_accounts
+            && (self.issued, self.rand_in, self.rand_out, self.base_out) == (o.issued, o.rand_in, o.rand_out, o.base_out)
+    }
+}
+impl Eq for MultisigRegister {}
+
+/// The register without its accounts (MSA-4): what a node stores as one small row beside one row
+/// per account, so a commit writes the accounts a block touched and not the register.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RegisterTotals {
+    pub create_fee: u64,
+    #[serde(default)]
+    pub max_accounts: Option<u64>,
+    pub issued: u64,
+    pub rand_in: u64,
+    pub rand_out: u64,
+    pub base_out: u64,
+    /// How many accounts the register holds — what the account rows must add up to.
+    pub accounts: u64,
+}
+
 impl MultisigRegister {
     pub fn from_config(c: &MultisigConfig, chain_id: u64) -> MultisigRegister {
-        let mut r = MultisigRegister { create_fee: c.create_fee, ..Default::default() };
+        let mut r = MultisigRegister { create_fee: c.create_fee, max_accounts: c.max_accounts, ..Default::default() };
         for a in &c.accounts {
             let mut acct = Account { signers: a.signers.clone(), threshold: a.threshold, nonce: 0, vault: BTreeMap::new() };
             acct.set_balance(0, a.balance);
             r.issued = r.issued.saturating_add(a.balance);
-            r.accounts.insert(a.id(chain_id), acct);
+            r.insert(a.id(chain_id), acct);
         }
         r
+    }
+
+    /// The totals a node stores beside the account rows ([`RegisterTotals`]).
+    pub fn totals(&self) -> RegisterTotals {
+        RegisterTotals {
+            create_fee: self.create_fee,
+            max_accounts: self.max_accounts,
+            issued: self.issued,
+            rand_in: self.rand_in,
+            rand_out: self.rand_out,
+            base_out: self.base_out,
+            accounts: self.accounts.len() as u64,
+        }
+    }
+
+    /// The register back from its stored halves; every leaf is hashed here, once per start.
+    /// `Err` when the rows do not add up to the totals' count.
+    pub fn assemble(t: RegisterTotals, accounts: BTreeMap<[u8; 32], Account>) -> Result<MultisigRegister, String> {
+        if accounts.len() as u64 != t.accounts {
+            return Err(format!("{} account rows, the totals say {}", accounts.len(), t.accounts));
+        }
+        let leaves = accounts.iter().map(|(id, a)| (*id, a.leaf(id))).collect();
+        Ok(MultisigRegister {
+            accounts,
+            leaves,
+            create_fee: t.create_fee,
+            max_accounts: t.max_accounts,
+            issued: t.issued,
+            rand_in: t.rand_in,
+            rand_out: t.rand_out,
+            base_out: t.base_out,
+        })
+    }
+
+    /// The cached leaf of every account, in id order: what a node compares its stored rows
+    /// against to write only the accounts a commit changed.
+    pub fn leaves(&self) -> &BTreeMap<[u8; 32], Hash> {
+        &self.leaves
+    }
+
+    /// Whether `max_accounts` is set and reached: the next create is refused (MSA-4).
+    pub fn is_full(&self) -> bool {
+        self.max_accounts.is_some_and(|cap| self.accounts.len() as u64 >= cap)
     }
 
     pub fn get(&self, id: &[u8; 32]) -> Option<&Account> {
@@ -204,9 +310,11 @@ impl MultisigRegister {
     }
 
     /// `blake3("rand-multisig-root-1", merkle_root(leaves in id order) ‖ count ‖ create_fee ‖
-    /// issued ‖ rand_in ‖ rand_out ‖ base_out)`, the integers 8-byte big-endian.
+    /// issued ‖ rand_in ‖ rand_out ‖ base_out)`, the integers 8-byte big-endian. The leaves come
+    /// from the cache (MSA-4), so this hashes 32 bytes per account, not its keys.
     pub fn root(&self) -> Hash {
-        let leaves: Vec<Hash> = self.accounts.iter().map(|(id, a)| a.leaf(id)).collect();
+        debug_assert_eq!(self.leaves.len(), self.accounts.len(), "every account has a cached leaf");
+        let leaves: Vec<Hash> = self.leaves.values().copied().collect();
         let mut b = merkle_root(&leaves).as_bytes().to_vec();
         b.extend_from_slice(&(self.accounts.len() as u64).to_be_bytes());
         for v in [self.create_fee, self.issued, self.rand_in, self.rand_out, self.base_out] {
@@ -215,11 +323,19 @@ impl MultisigRegister {
         Hash::digest_domain(b"rand-multisig-root-1", &b)
     }
 
-    pub(super) fn get_mut(&mut self, id: &[u8; 32]) -> Option<&mut Account> {
-        self.accounts.get_mut(id)
+    /// Change one account in place; its cached leaf is rehashed after `f`. `false` for an
+    /// unknown id (nothing runs). The one way to mutate a held account, so the cache cannot go
+    /// stale.
+    pub fn update(&mut self, id: &[u8; 32], f: impl FnOnce(&mut Account)) -> bool {
+        let Some(a) = self.accounts.get_mut(id) else { return false };
+        f(a);
+        self.leaves.insert(*id, a.leaf(id));
+        true
     }
 
-    pub(super) fn insert(&mut self, id: [u8; 32], a: Account) {
+    /// Put an account under `id` (replacing one there), its leaf hashed and cached.
+    pub fn insert(&mut self, id: [u8; 32], a: Account) {
+        self.leaves.insert(id, a.leaf(&id));
         self.accounts.insert(id, a);
     }
 }
@@ -230,6 +346,10 @@ pub enum MultisigError {
     UnknownAccount(String),
     #[error("multisig account {0} already exists")]
     AccountExists(String),
+    /// Audit v10, MSA-4: the register holds genesis `multisig.max_accounts` accounts; no account
+    /// is ever removed, so the refusal is permanent.
+    #[error("the multisig register is full: max_accounts {cap}")]
+    RegisterFull { cap: u64 },
     #[error("bad signer set: {0}")]
     BadSigners(String),
     #[error("nonce {actual}, the account is at {expected}")]
@@ -264,13 +384,23 @@ mod tests {
     use crate::types::actions::{multisig_pay_message, multisig_rotate_message};
 
     fn key(seed: u8) -> PublicKey { Keypair::from_seed([seed; 32]).unwrap().public_key().clone() }
+    /// A `PublicKey` of `len` bytes that is not a Dilithium2 key: through serde, which does not
+    /// run the constructor's length check.
+    fn junk_key(len: usize) -> PublicKey {
+        bincode::deserialize(&bincode::serialize(&vec![0xABu8; len]).unwrap()).unwrap()
+    }
+    impl MultisigConfig {
+        fn to_json_has_max_accounts(&self) -> bool {
+            serde_json::to_string(self).unwrap().contains("max_accounts")
+        }
+    }
     fn cfg(n: usize, threshold: u8, balance: u64) -> MultisigAccountConfig {
         MultisigAccountConfig { salt: [7; 32], signers: (1..=n as u8).map(key).collect(), threshold, balance }
     }
 
     #[test]
     fn the_config_rules_are_each_refused() {
-        let ok = MultisigConfig { create_fee: 0, accounts: vec![cfg(3, 2, 100)] };
+        let ok = MultisigConfig { create_fee: 0, accounts: vec![cfg(3, 2, 100)], max_accounts: None };
         assert_eq!(ok.check(20), Ok(100));
         let bad = |f: &dyn Fn(&mut MultisigConfig), why: &str| {
             let mut c = ok.clone(); f(&mut c);
@@ -283,6 +413,13 @@ mod tests {
         bad(&|c| c.accounts[0].threshold = 4, "threshold");
         bad(&|c| c.accounts.push(cfg(3, 2, 1)), "already"); // same salt+signers+threshold = same id
         bad(&|c| c.create_fee = MAX_CREATE_FEE + 1, "create_fee");
+        // MSA-4: the cap counts the seeded accounts; a junk key fails the crate's parse.
+        bad(&|c| c.max_accounts = Some(0), "over max_accounts");
+        bad(&|c| c.accounts[0].signers[1] = junk_key(100), "Dilithium2 public key");
+        bad(&|c| c.accounts[0].signers[1] = junk_key(PUBLIC_KEY_LEN + 1), "Dilithium2 public key");
+        let mut capped = ok.clone(); capped.max_accounts = Some(1);
+        assert_eq!(capped.check(20), Ok(100), "a cap at the seeded count is fine");
+        assert!(!ok.to_json_has_max_accounts(), "absent from the file when absent");
         bad(&|c| { c.accounts.push(cfg(3, 2, u64::MAX)); c.accounts[1].salt = [8; 32]; }, "overflow");
         assert_eq!(MultisigConfig::default().check(20), Ok(0), "an empty section switches the module on");
     }
@@ -304,23 +441,24 @@ mod tests {
 
     #[test]
     fn the_register_root_moves_with_every_field_and_a_zero_row_disappears() {
-        let c = MultisigConfig { create_fee: 5, accounts: vec![cfg(3, 2, 100)] };
+        let c = MultisigConfig { create_fee: 5, accounts: vec![cfg(3, 2, 100)], max_accounts: None };
         let reg = MultisigRegister::from_config(&c, 20);
         let id = c.accounts[0].id(20);
         assert_eq!(reg.get(&id).unwrap().balance(0), 100);
         assert_eq!((reg.issued, reg.rand_held()), (100, 100));
         let r0 = reg.root();
         let m = |f: &dyn Fn(&mut MultisigRegister)| { let mut r = reg.clone(); f(&mut r); assert_ne!(r.root(), r0); };
-        m(&|r| r.get_mut(&id).unwrap().nonce += 1);
-        m(&|r| r.get_mut(&id).unwrap().threshold = 3);
-        m(&|r| r.get_mut(&id).unwrap().signers.swap(0, 1));
-        m(&|r| r.get_mut(&id).unwrap().set_balance(2, 1));
+        m(&|r| assert!(r.update(&id, |a| a.nonce += 1)));
+        m(&|r| assert!(r.update(&id, |a| a.threshold = 3)));
+        m(&|r| assert!(r.update(&id, |a| a.signers.swap(0, 1))));
+        m(&|r| assert!(r.update(&id, |a| a.set_balance(2, 1))));
         m(&|r| r.create_fee = 6);
         m(&|r| r.rand_in = 1);
         m(&|r| r.base_out = 1);
         let mut r = reg.clone();
-        r.get_mut(&id).unwrap().set_balance(0, 0);
+        assert!(r.update(&id, |a| a.set_balance(0, 0)));
         assert!(r.get(&id).unwrap().vault.is_empty(), "a zero row is removed, so absent has one encoding");
+        assert!(!r.update(&[0; 32], |_| unreachable!("an unknown id runs nothing")));
         // Known-answer vector for the register root: a consensus encoding every node must reproduce.
         assert_eq!(hex::encode(reg.root().as_bytes()), "d143907c34caa45ea340472dc5a51ef9c45422b2a80e2837743eb6005dff4fb9");
         let mut full = reg.clone();
@@ -531,6 +669,9 @@ pub(super) fn validate(
             if reg.get(&id).is_some() {
                 return Err(MultisigError::AccountExists(hex::encode(id)).into());
             }
+            if reg.is_full() {
+                return Err(MultisigError::RegisterFull { cap: reg.max_accounts.unwrap_or(0) }.into());
+            }
             let b = tx.bundle.as_ref().ok_or(TxError::MissingBundle)?;
             credit(ledger, None, b)?;
             // The create fee on top of the bundle's settled floor (R2): `BUNDLE_BASE`, plus
@@ -596,10 +737,12 @@ pub(super) fn apply(
             let rows = credit(ledger, ledger.multisig().and_then(|r| r.get(id)), b)?;
             let reg = ledger.multisig_mut().ok_or(NOT_MULTISIG)?;
             let rand_in = reg.rand_in.checked_add(b.burn_r).ok_or(MultisigError::Overflow)?;
-            let a = reg.get_mut(id).expect("validated above");
-            for (asset, amount) in rows {
-                a.set_balance(asset, amount);
-            }
+            let known = reg.update(id, |a| {
+                for (asset, amount) in rows {
+                    a.set_balance(asset, amount);
+                }
+            });
+            debug_assert!(known, "validated above");
             reg.rand_in = rand_in;
         }
         Action::MultisigPay { account: id, time, pays, .. } => {
@@ -611,11 +754,13 @@ pub(super) fn apply(
             let reg = ledger.multisig_mut().ok_or(NOT_MULTISIG)?;
             let rand_out = reg.rand_out.checked_add(paid).ok_or(MultisigError::Overflow)?;
             let base_out = reg.base_out.checked_add(gas::BUNDLE_BASE).ok_or(MultisigError::Overflow)?;
-            let a = reg.get_mut(id).expect("validated above");
-            for (asset, amount) in rows {
-                a.set_balance(asset, amount);
-            }
-            a.nonce += 1;
+            let known = reg.update(id, |a| {
+                for (asset, amount) in rows {
+                    a.set_balance(asset, amount);
+                }
+                a.nonce += 1;
+            });
+            debug_assert!(known, "validated above");
             reg.rand_out = rand_out;
             reg.base_out = base_out;
             for cm in cms {
@@ -626,10 +771,12 @@ pub(super) fn apply(
         }
         Action::MultisigRotate { account: id, signers, threshold, .. } => {
             let reg = ledger.multisig_mut().ok_or(NOT_MULTISIG)?;
-            let a = reg.get_mut(id).expect("validated above");
-            a.signers = signers.clone();
-            a.threshold = *threshold;
-            a.nonce += 1;
+            let known = reg.update(id, |a| {
+                a.signers = signers.clone();
+                a.threshold = *threshold;
+                a.nonce += 1;
+            });
+            debug_assert!(known, "validated above");
         }
         _ => return Err(NOT_MULTISIG),
     }
@@ -653,6 +800,80 @@ pub fn still_applies(ledger: &Ledger, tx: &Transaction) -> Result<(), TxError> {
         return Err(MultisigError::TooManyPayouts(pays.len()).into());
     }
     check_pay_state(ledger, id, *nonce, pays).map(|_| ())
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use super::*;
+    use crate::crypto::Keypair;
+    use std::sync::atomic::Ordering::Relaxed;
+
+    fn account(n: u8) -> Account {
+        let signers = (1..=3u8).map(|i| Keypair::from_seed([i; 32]).unwrap().public_key().clone()).collect();
+        let mut a = Account { signers, threshold: 2, nonce: u64::from(n), vault: BTreeMap::new() };
+        a.set_balance(0, 1 + u64::from(n));
+        a
+    }
+
+    fn id(i: u32) -> [u8; 32] {
+        let mut id = [0u8; 32];
+        id[..4].copy_from_slice(&i.to_be_bytes());
+        id
+    }
+
+    /// Audit v10, MSA-4: the register caches each account's leaf, so a state root after one
+    /// insert or one update hashes one leaf — not 20 000 × (up to 13 KB of keys) — and the root
+    /// is the one a fresh register over the same accounts computes. Structural (the leaf-hash
+    /// counter) and, loosely, wall-clock: before, 20 000 accounts cost 300 ms and more per root.
+    #[test]
+    fn a_root_after_one_change_hashes_one_leaf_on_a_register_of_twenty_thousand() {
+        const N: u32 = 20_000;
+        let mut reg = MultisigRegister::default();
+        for i in 0..N {
+            reg.insert(id(i), account((i % 251) as u8));
+        }
+        assert_eq!(reg.len(), N as usize);
+        let r0 = reg.root();
+        let started = std::time::Instant::now();
+        LEAF_HASHES.store(0, Relaxed);
+        reg.insert(id(N), account(7));
+        let r1 = reg.root();
+        assert_eq!(LEAF_HASHES.load(Relaxed), 1, "the insert hashed its own leaf and the root hashed none");
+        assert_ne!(r1, r0);
+        LEAF_HASHES.store(0, Relaxed);
+        assert!(reg.update(&id(3), |a| a.nonce += 1));
+        let r2 = reg.root();
+        assert_eq!(LEAF_HASHES.load(Relaxed), 1, "an update rehashes the one leaf");
+        assert_ne!(r2, r1);
+        let elapsed = started.elapsed();
+        assert!(elapsed < std::time::Duration::from_secs(2), "two roots over 20 001 cached leaves took {elapsed:?}");
+        // The cache is a function of the accounts: a register assembled from the stored halves,
+        // and a clone, give the same root; equality ignores the cache.
+        let rows: BTreeMap<[u8; 32], Account> = reg.iter().map(|(id, a)| (*id, a.clone())).collect();
+        let again = MultisigRegister::assemble(reg.totals(), rows).unwrap();
+        assert_eq!(again.root(), r2);
+        assert_eq!(again, reg);
+        assert_eq!(reg.clone().root(), r2);
+        let mut short = reg.totals();
+        short.accounts -= 1;
+        assert!(MultisigRegister::assemble(short, BTreeMap::new()).is_err(), "rows that do not add up");
+        assert_eq!(reg.totals().accounts, N as u64 + 1);
+    }
+
+    /// The cap: `is_full` at the count, `None` never full, and `from_config` carries it.
+    #[test]
+    fn the_cap_is_carried_and_read() {
+        let c = MultisigConfig { create_fee: 1, accounts: vec![], max_accounts: Some(2) };
+        let mut reg = MultisigRegister::from_config(&c, 20);
+        assert_eq!((reg.max_accounts, reg.is_full()), (Some(2), false));
+        reg.insert(id(1), account(1));
+        assert!(!reg.is_full());
+        reg.insert(id(2), account(2));
+        assert!(reg.is_full());
+        reg.max_accounts = None;
+        assert!(!reg.is_full(), "unbounded without the field");
+        assert_eq!(MultisigRegister::default().totals().max_accounts, None);
+    }
 }
 
 #[cfg(test)]
@@ -715,7 +936,7 @@ mod rule_tests {
             .unwrap();
         assert_eq!(index, TOKEN);
         l.set_tokens(Some(tokens));
-        let cfg = MultisigConfig { create_fee: CREATE_FEE, accounts };
+        let cfg = MultisigConfig { create_fee: CREATE_FEE, accounts, max_accounts: None };
         cfg.check(CHAIN).unwrap();
         l.set_multisig(Some(MultisigRegister::from_config(&cfg, CHAIN)));
         l.set_genesis_supply(1_000_000 * U, 10);
@@ -730,10 +951,11 @@ mod rule_tests {
         let a = genesis_account(1, rand);
         let id = a.id(CHAIN);
         let mut l = ledger(vec![a]);
-        let acct = l.multisig_mut().unwrap().get_mut(&id).unwrap();
-        for (asset, amount) in token_rows {
-            acct.set_balance(*asset, *amount);
-        }
+        l.multisig_mut().unwrap().update(&id, |acct| {
+            for (asset, amount) in token_rows {
+                acct.set_balance(*asset, *amount);
+            }
+        });
         (l, id)
     }
 
@@ -871,6 +1093,30 @@ mod rule_tests {
         assert_eq!(l.validate(&create(&l, 10, fee, 4, &SIGNERS, 2, (0, 0, 0)), &StubExecutor), Ok(()));
     }
 
+    /// Audit v10, MSA-4: under genesis `max_accounts` a create past the cap is refused by name,
+    /// at validate and at apply alike; one under it goes through and then fills the register; a
+    /// register without the field takes any number.
+    #[test]
+    fn a_create_past_max_accounts_is_refused_and_the_refusal_is_by_name() {
+        let mut l = ledger(vec![genesis_account(1, 0)]);
+        let fee = BASE + CREATE_FEE;
+        let ok = create(&l, 10, fee, 4, &SIGNERS, 2, (0, 0, 0));
+        l.multisig_mut().unwrap().max_accounts = Some(1);
+        assert!(l.multisig().unwrap().is_full());
+        assert_eq!(refusal(&l, &ok), ms(MultisigError::RegisterFull { cap: 1 }));
+        assert!(ap!(l, ok.clone()).is_err(), "and the apply refuses it the same way");
+        assert_eq!(l.multisig().unwrap().len(), 1);
+        l.multisig_mut().unwrap().max_accounts = Some(2);
+        assert_eq!(l.validate(&ok, &StubExecutor), Ok(()));
+        ap!(l, ok).unwrap();
+        assert_eq!(l.multisig().unwrap().len(), 2);
+        assert!(l.multisig().unwrap().is_full());
+        let next = create(&l, 20, fee, 5, &SIGNERS, 2, (0, 0, 0));
+        assert_eq!(refusal(&l, &next), ms(MultisigError::RegisterFull { cap: 2 }));
+        l.multisig_mut().unwrap().max_accounts = None;
+        assert_eq!(l.validate(&next, &StubExecutor), Ok(()), "unbounded without the field, as chain 21 is");
+    }
+
     #[test]
     fn a_deposit_credits_rand_and_a_registered_token_and_refuses_an_empty_or_unknown_one() {
         let (mut l, id) = account_with(U, &[]);
@@ -884,7 +1130,7 @@ mod rule_tests {
         assert_eq!(refusal(&l, &deposit(&l, 30, &id, (0, 9, 1))), TxError::Token(TokenError::UnknownToken(9)));
         assert_eq!(refusal(&l, &deposit(&l, 30, &[8; 32], (U, 0, 0))), ms(MultisigError::UnknownAccount(hex::encode([8; 32]))));
         // A row at the top of u64 cannot take more.
-        l.multisig_mut().unwrap().get_mut(&id).unwrap().set_balance(TOKEN, u64::MAX);
+        l.multisig_mut().unwrap().update(&id, |a| a.set_balance(TOKEN, u64::MAX));
         assert_eq!(refusal(&l, &deposit(&l, 30, &id, (0, TOKEN, 1))), ms(MultisigError::Overflow));
     }
 
@@ -1118,7 +1364,7 @@ mod rule_tests {
         // is refused there too, before any write.
         let (mut l, id) = account_with(10 * U, &[]);
         let tx = signed_pay(&l, &id, 0, vec![pay(0, U, 2)], &TWO);
-        l.multisig_mut().unwrap().get_mut(&id).unwrap().set_balance(0, U);
+        l.multisig_mut().unwrap().update(&id, |a| a.set_balance(0, U));
         let before = l.clone();
         assert_eq!(super::apply(&mut l, &tx, &tx.action, &proposer(), &StubExecutor), Err(ms(MultisigError::VaultShort { asset: 0, have: U, want: U + BASE })));
         assert!(l == before, "nothing written");

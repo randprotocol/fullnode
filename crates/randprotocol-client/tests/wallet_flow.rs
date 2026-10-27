@@ -1101,7 +1101,7 @@ fn genesis_multisig(validator: &Keypair) -> Genesis {
     use randprotocol_core::genesis::{TokensConfig, MIN_REGISTRATION_FEE};
     let tokens = TokensConfig { registration_fee: MIN_REGISTRATION_FEE, mint_cap_per_day: 0, max_tokens: None, burn_registration_fee: None, bound_note_value: None, incremental_root: None, tokens: vec![] };
     Genesis {
-        multisig: Some(randprotocol_core::ledger::multisig::MultisigConfig { create_fee: MULTISIG_CREATE_FEE, accounts: vec![] }),
+        multisig: Some(randprotocol_core::ledger::multisig::MultisigConfig { create_fee: MULTISIG_CREATE_FEE, accounts: vec![], max_accounts: None }),
         ..genesis_full(validator, None, None, Some(tokens))
     }
 }
@@ -1272,6 +1272,7 @@ fn genesis_private_multisig(validator: &Keypair, public_signers: &[Keypair]) -> 
         multisig: Some(MultisigConfig {
             create_fee: 0,
             accounts: vec![MultisigAccountConfig { salt: [33; 32], signers: public_signers.iter().map(|k| k.public_key().clone()).collect(), threshold: 2, balance: 20 * UNITS_PER_RAND }],
+            max_accounts: None,
         }),
         ..genesis_v3(validator)
     }

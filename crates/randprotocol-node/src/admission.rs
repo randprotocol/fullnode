@@ -249,7 +249,7 @@ pub fn is_permanent(e: &TxError) -> bool {
         use randprotocol_core::ledger::multisig::MultisigError as M;
         return matches!(
             m,
-            M::BadSigners(_) | M::DuplicateSigner(_) | M::NoPayouts | M::TooManyPayouts(_) | M::ZeroPayout | M::EmptyDeposit
+            M::BadSigners(_) | M::DuplicateSigner(_) | M::NoPayouts | M::TooManyPayouts(_) | M::ZeroPayout | M::EmptyDeposit | M::RegisterFull { .. }
         );
     }
     // RPL-2's verdicts, split the same way. Cacheable are the ones `program_state::check_shape`

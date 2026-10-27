@@ -950,6 +950,10 @@ pub struct MultisigLimits {
     /// The most signers an account lists, and the most payouts one `MultisigPay` carries.
     pub max_signers: usize,
     pub max_payouts: usize,
+    /// Genesis `multisig.max_accounts` (audit v10, MSA-4): the most accounts the register ever
+    /// holds, a `CreateMultisig` past it refused. Absent on a chain without the field (unbounded).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_accounts: Option<u64>,
 }
 
 impl ChainLimits {
@@ -983,7 +987,7 @@ impl ChainLimits {
             }),
             multisig: ledger.multisig().map(|m| {
                 use randprotocol_core::ledger::multisig::{MAX_PAYOUTS, MAX_SIGNERS};
-                MultisigLimits { create_fee: m.create_fee, max_signers: MAX_SIGNERS, max_payouts: MAX_PAYOUTS }
+                MultisigLimits { create_fee: m.create_fee, max_signers: MAX_SIGNERS, max_payouts: MAX_PAYOUTS, max_accounts: m.max_accounts }
             }),
             fee_rules: Some(ledger.fees()).filter(|f| f.any()).map(|f| FeeRules {
                 burn_base: f.burn_base(),
@@ -3250,10 +3254,11 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
         "rand_getMultisig" => {
             let id: [u8; 32] = parse_hash(p, 0)?.0;
             let storage = st.storage.clone();
-            let Some(reg) = blocking(st, move || storage.multisig()).await? else {
+            // One row read (MSA-4), not the register: an account's row by id.
+            let Some(account) = blocking(st, move || Ok(storage.multisig_enabled()?.then(|| storage.multisig_account(&id)).transpose()?)).await? else {
                 return Ok(json!({ "enabled": false }));
             };
-            Ok(reg.get(&id).map_or(Value::Null, |a| {
+            Ok(account.map_or(Value::Null, |a| {
                 json!({
                     "enabled": true, "id": hex::encode(id),
                     "signers": a.signers.iter().map(|k| k.to_hex()).collect::<Vec<_>>(),
