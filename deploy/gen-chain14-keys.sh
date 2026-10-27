@@ -100,7 +100,7 @@ ip_of() { sed -n "s#^NODE_$1=/ip4/\([0-9.]*\)/tcp/30303/p2p/.*#\1#p" deploy/node
   printf '# Chain 14: every peer id changed with the OPS-1 key rotation (a p2p identity is\n'
   printf '# `derive_subkey(b"rand-p2p-identity")` of the validator key). Generated %s by\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   printf '# deploy/gen-chain14-keys.sh; the IPs are unchanged from chain 13.\n'
-  printf 'NODE_A_PEER=%s   # laptop, LAN 192.168.100.123 (NAT)\n' "$(peer_of a)"
+  printf 'NODE_A_PEER=%s   # laptop, LAN 203.0.113.36 (NAT)\n' "$(peer_of a)"
   for n in b c d e f lon1 sfo3 tor1 blr1 syd1 atl1 ams3 nyc1 nyc2 sfo2 mkc1 mem1; do
     u=$(printf '%s' "$n" | tr '[:lower:]' '[:upper:]')
     ip=$(ip_of "$u")

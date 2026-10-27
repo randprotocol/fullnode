@@ -19,7 +19,7 @@ set -euo pipefail
 # release download, no agent forwarding). Kept for the record only.
 echo "$(basename "$0") is retired: it forwards the ssh agent to every droplet (issue #47); see its header" >&2
 exit 1
-IP=$1; NAME=$2; NEW=$3; GENESIS=$4; BUILD_HOST=${5:-188.166.235.187}
+IP=$1; NAME=$2; NEW=$3; GENESIS=$4; BUILD_HOST=${5:-203.0.113.33}
 OLD_SERVICE=${OLD_SERVICE:-shrugg-node}
 BUILD_DIR=${BUILD_DIR:-/root/fullnode/target/release}
 SSH="ssh -A -o StrictHostKeyChecking=accept-new -o ConnectTimeout=20 root@$IP"

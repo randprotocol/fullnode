@@ -188,7 +188,7 @@ for v in RELEASE_URL STAGE_URL WANT_VERSION; do
   case "${!v}" in *[\'\;\ \"\`\$\\\|\<\>\(\)\{\}]*) echo "$v contains a quote, ';', a space or a shell metacharacter — refused" >&2; exit 1;; esac
 done
 for f in $NEED_FLAGS; do [[ "$f" =~ ^--[a-z0-9-]+$ ]] || { echo "NEED_FLAGS: '$f' is not a --flag — refused" >&2; exit 1; }; done
-BOOTS=${BOOTS:-164.90.239.200 165.245.173.74}   # C, D — started first, as in every cut
+BOOTS=${BOOTS:-203.0.113.23 203.0.113.25}   # C, D — started first, as in every cut
 # shellcheck disable=SC2046,SC2005  # word-split on purpose: one space-separated list
 IPS=$(echo $(grep -oE '/ip4/[0-9.]+' deploy/nodes.env | cut -d/ -f3 | sort -u))   # 20: A–F, 12 regional, obs1, archive-2
 NIPS=$(wc -w <<<"$IPS" | tr -d ' ')

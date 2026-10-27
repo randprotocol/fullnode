@@ -114,7 +114,7 @@ toolchain, and ports 22 and 30303 open (`docs/deploy.md`).
 On the build host (E), build the pinned commit from your machine:
 
 ```bash
-deploy/rebuild-vps.sh 188.166.235.187      # rsync this checkout, cargo build --release, restart E
+deploy/rebuild-vps.sh 203.0.113.33      # rsync this checkout, cargo build --release, restart E
 ```
 
 On the new droplet, as root, with the binaries copied from E to `/usr/local/bin/` and the repo

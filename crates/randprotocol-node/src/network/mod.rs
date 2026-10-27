@@ -1056,7 +1056,7 @@ mod tests {
         // public addresses and which is unreachable from a laptop.
         for a in [
             "/ip4/10.100.0.2/tcp/30303",
-            "/ip4/192.168.100.79/tcp/30303",
+            "/ip4/192.168.1.10/tcp/30303",
             "/ip4/172.16.4.1/tcp/1",
             "/ip4/169.254.1.1/tcp/1",
             "/ip6/fe80::1/tcp/1",
@@ -1072,8 +1072,8 @@ mod tests {
     #[test]
     fn a_public_advertised_address_is_always_dialable() {
         for a in [
-            "/ip4/107.170.49.234/tcp/30303",
-            "/ip4/188.166.235.187/tcp/30303",
+            "/ip4/9.9.9.9/tcp/30303",
+            "/ip4/1.1.1.1/tcp/30303",
             "/ip6/2606:4700::1/tcp/1",
             "/dns4/node.example/tcp/30303",
         ] {
@@ -1089,13 +1089,13 @@ mod tests {
     fn filtering_a_chain_8_advertisement_keeps_only_the_public_address() {
         let advertised = [
             "/ip4/127.0.0.1/tcp/30303",
-            "/ip4/107.170.49.234/tcp/30303",
+            "/ip4/9.9.9.9/tcp/30303",
             "/ip4/10.13.0.5/tcp/30303",
             "/ip4/10.100.0.2/tcp/30303",
         ];
         let kept: Vec<&str> =
             advertised.iter().copied().filter(|a| is_dialable_advertised_addr(&addr(a), false)).collect();
-        assert_eq!(kept, vec!["/ip4/107.170.49.234/tcp/30303"]);
+        assert_eq!(kept, vec!["/ip4/9.9.9.9/tcp/30303"]);
     }
 
     /// The premise `node::on_status_gossip`'s author rule rests on (SYNC-1, network scan

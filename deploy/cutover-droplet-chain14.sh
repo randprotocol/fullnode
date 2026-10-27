@@ -34,7 +34,7 @@ cd "$(dirname "$0")/.."
 . deploy/lib/key-guard.sh
 . deploy/lib/relay-binaries.sh
 
-IP=$1; NAME=$2; NEW=$3; GENESIS=$4; BUILD_HOST=${5:-188.166.235.187}
+IP=$1; NAME=$2; NEW=$3; GENESIS=$4; BUILD_HOST=${5:-203.0.113.33}
 SERVICE=${SERVICE:-rand-node}
 BIN_NODE=${BIN_NODE:-rand-node}
 BIN_WALLET=${BIN_WALLET:-rand}

@@ -1454,7 +1454,7 @@ rate-limit bucket. **F's Caddy is `disabled`/dead (never started since boot), F 
 ranges — the access log shows separate clients metered separately (one curl 429'd while another
 client in the same hour was not), none from F. Every note below that says "Caddy on droplet F"
 describes a hop that never carried traffic past 2026-09-20; `deploy/caddy/README.md` has the real
-chain and the operator housekeeping (dead `set_real_ip_from 159.89.185.254` on the main vhost,
+chain and the operator housekeeping (dead `set_real_ip_from 203.0.113.21` on the main vhost,
 `.bak` files loaded from `sites-enabled/`). **Trap:** a committed config file is not a running
 service — check `systemctl is-active` and `ss -ltn` before reasoning from one.
 
@@ -1522,10 +1522,10 @@ for rollback — retire them with `deploy/retire-chain-dirs.sh` once chain 15 ha
   Solana USDT 1, one genesis note to his address. `total_supply == Σ locked == custody` at block 0.
 - Relayer funded by 3 × 100 RAND faucet mints (blocks 32/36/40).
 - **2026-09-27, off the laptop and 26 validators.** Validator A moved to droplet `rand-node-a`
-  (139.59.238.151, sgp1; same key, `--prune-history 24h`); the laptop's launchd job is retired and
+  (203.0.113.15, sgp1; same key, `--prune-history 24h`); the laptop's launchd job is retired and
   `deploy/run-a.sh` refuses to start (two signers on one key = equivocation); the laptop keeps
   only an SSH tunnel on 127.0.0.1:8545 → A's RPC for the bridge daemons still there. New second
-  archive `rand-archive-2` (206.81.29.236, fra1, 250 GiB volume `/mnt/rand_archive_2`, full
+  archive `rand-archive-2` (203.0.113.38, fra1, 250 GiB volume `/mnt/rand_archive_2`, full
   history). Both droplets and the six guardian hosts live in DigitalOcean team "My Team"
   (dendi@systematictrading.group); the 17 original validator droplets are in another team whose
   token is not on this machine. Eight nodes were bonded as new validators (1 000 RAND each,
@@ -2089,7 +2089,7 @@ evict them).
 - **(Until 2026-09-27; since then the upstream is obs1, the archive, through an SSH tunnel — `deploy/caddy/README.md`.) The sale service's RPC upstream is a Caddy route on E, and it lives in randscan's repo.**
   `SALE_RPC_UPSTREAM = https://randscan.org/rpc` (web droplet `/etc/randprotocol/sale.env`) is a
   route in randscan's `deploy/Caddyfile` (since randscan `412a55d`) that `remote_ip`-allowlists the
-  web droplet `159.65.138.161` to E's `127.0.0.1:8545` and 403s the rest. It was first hand-added
+  web droplet `203.0.113.20` to E's `127.0.0.1:8545` and 403s the rest. It was first hand-added
   on E and wiped hours later by a randscan redeploy (`vps-setup.sh` re-renders
   `/etc/caddy/Caddyfile` from the template) — randprotocol.org's `/account` then showed zUSD as
   "asset #1" ("the node could not name every token") until the route was restored. This is safe for

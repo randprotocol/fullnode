@@ -9,11 +9,11 @@ still the bridge repository's `daemons/mainnet/cut-chain19.sh` lineage (print ev
 with `--yes`, one step at a time) — derive a `cut-chain21.sh` with the differences below. The fleet
 side is `deploy/cutover-fleet-chain21.sh` and `docs/chain21-cut-runbook.md`.
 
-**The relayer host.** Hostname `rand-relayer-1`, public **167.172.65.45**, private 10.104.0.8. The
+**The relayer host.** Hostname `rand-relayer-1`, public **203.0.113.28**, private 10.104.0.8. The
 ssh alias `rand-relayer-1` is NOT in the user's `~/.ssh/config`; every command here uses
-`RELAYER="ssh -i ~/.ssh/rand_guardian_ed25519 root@167.172.65.45"` (written out in full). On the
-first connect check the host key is **ED25519 SHA256:emiVrQXryU8L12wv4PWsmkap04SAh8bfqss2bpR0pyI**
-(`ssh-keyscan -t ed25519 167.172.65.45 | ssh-keygen -lf -`) before accepting it. Read on
+`RELAYER="ssh -i ~/.ssh/rand_guardian_ed25519 root@203.0.113.28"` (written out in full). On the
+first connect check the host key is **ED25519 <the host-key fingerprint from the operator's record>**
+(`ssh-keyscan -t ed25519 203.0.113.28 | ssh-keygen -lf -`) before accepting it. Read on
 2026-10-12: it runs **rand 0.6.8**, `/usr/local/bin/rand` sha256 `155dfe66…ee2d`, no `rand-node`,
 `rand-relayer` active.
 
@@ -22,7 +22,7 @@ What is different from chain 20:
 - **A new build: v0.8.0, and every prover-side `rand` needs it.** v0.8.0 carries constraint set 9:
   every verifier key and the proof encoding change, so a proof made by a chain-20 `rand` does not
   decode on chain 21, and a v0.8.0 `rand` does not prove for chain 20. So:
-  - **The relayer** (`rand-relayer-1` = 167.172.65.45, unit `rand-relayer`, CLI
+  - **The relayer** (`rand-relayer-1` = 203.0.113.28, unit `rand-relayer`, CLI
     `/usr/local/bin/rand`, wallet `/var/lib/rand-relayer/wallet/`) runs **rand 0.6.8** (sha256
     `155dfe6667a85ea8071977512dc40c750127b9baa9b4fa4796d101c8fc1eee2d`, the v0.6.8 Linux `rand`
     installed at the chain-20 cut; the v0.7.0 roll did not touch it). For chain 21 it needs the
@@ -32,7 +32,7 @@ What is different from chain 20:
     cut. **Keep the 0.6.8 binary as `/usr/local/bin/rand.pre-c21`**, checked against the sha above,
     and install the new one while the relayer is stopped, after the fleet's `switch`, never before (a
     v0.8.0 `rand` cannot serve chain 20 in the meantime). On the relayer host
-    (`ssh -i ~/.ssh/rand_guardian_ed25519 root@167.172.65.45`):
+    (`ssh -i ~/.ssh/rand_guardian_ed25519 root@203.0.113.28`):
     ```
     systemctl is-active --quiet rand-relayer && { echo 'stop the relayer first'; exit 1; }
     [ "$(sha256sum /usr/local/bin/rand | cut -d' ' -f1)" = '155dfe6667a85ea8071977512dc40c750127b9baa9b4fa4796d101c8fc1eee2d' ] || { echo 'installed rand is NOT the 0.6.8 binary recorded 2026-10-12 — no backup made, nothing installed'; exit 1; }
@@ -83,7 +83,7 @@ What is different from chain 20:
    builds are ready (the record's `clients:` line); the pause key holder has `rand-bridge-gov`.
 1. **`stop`** — before the snapshot, so nothing moves chain 20 after it is read:
    ```
-   ssh -i ~/.ssh/rand_guardian_ed25519 root@167.172.65.45 'systemctl stop rand-relayer'   # rand-relayer-1; host key ED25519 SHA256:emiVrQXr…0pyI
+   ssh -i ~/.ssh/rand_guardian_ed25519 root@203.0.113.28 'systemctl stop rand-relayer'   # rand-relayer-1; host key ED25519 SHA256:emiVrQXr…0pyI
    pkill -f 'rand-guardian --config mainnet/guardian-[78].toml'          # laptop
    for i in 1..6: ssh (guardian key) root@<host i> 'systemctl stop rand-guardian'
    ```
@@ -92,7 +92,7 @@ What is different from chain 20:
    `cursors/rand.json` `next_sequence`. If a lock is in flight, let it mint on chain 20 first.
 2. Fleet: snapshot → balances → the cut → the second operator's hash → `push` (chain 20 still
    running) → the user's go → `stop <genesis>` → `switch` → `start` → `wait` → `check-limits`.
-3. **Relayer `rand`** — on `rand-relayer-1` (`ssh -i ~/.ssh/rand_guardian_ed25519 root@167.172.65.45`), the 0.6.8 → v0.8.0 swap above (backup
+3. **Relayer `rand`** — on `rand-relayer-1` (`ssh -i ~/.ssh/rand_guardian_ed25519 root@203.0.113.28`), the 0.6.8 → v0.8.0 swap above (backup
    `rand.pre-c21` first).
 4. **`droplet <1..6>`** — on each guardian host, once its node answers chain 21's genesis hash and
    `rand_getHealth` ok:
@@ -104,11 +104,11 @@ What is different from chain 20:
    echo '{"next_block": 0, "next_sequence": <chain 21 burn_sequence>}' > /var/lib/rand-guardian/data/cursors/rand.json
    systemctl start rand-guardian; sleep 5; journalctl -u rand-guardian -n 5 --no-pager
    ```
-5. **`rand-relayer-1`** (`ssh -i ~/.ssh/rand_guardian_ed25519 root@167.172.65.45`): the relayer's toml → `chain_id = 21` (copy kept as `.chain20`), its
+5. **`rand-relayer-1`** (`ssh -i ~/.ssh/rand_guardian_ed25519 root@203.0.113.28`): the relayer's toml → `chain_id = 21` (copy kept as `.chain20`), its
    `cursors` copied to `cursors.chain20` and `rand.json` reset to chain 21's `burn_sequence`;
    `/usr/local/bin/rand --version` says 0.8.0. Laptop: the same for guardians 7 and 8.
 6. Start: `GUARDIAN_PQ_FROM_NEXT=1 mainnet/run-guardians-set1.sh` on the laptop, then
-   `ssh -i ~/.ssh/rand_guardian_ed25519 root@167.172.65.45 'systemctl start rand-relayer'`.
+   `ssh -i ~/.ssh/rand_guardian_ed25519 root@203.0.113.28 'systemctl start rand-relayer'`.
 7. Audit — `rand-bridge-audit` against chain 21 and the four endpoints: `total_supply` == Σ `locked`
    == custody; `rand_getBridgeState` shows chain 20's emitters, the cut's floors, `burn_sequence`,
    `rotation_rules`, `fees`. The carried zUSD holders open their notes with a v0.8.0 wallet.
@@ -126,7 +126,7 @@ What is different from chain 20:
    20; a chain-21 mint is re-mintable on chain 20 only below its floor): the user decides.
 3. Fleet: `halt` → `rollback` → `start` → `wait20` (all 26 on chain 20 and C's height moving).
 4. Restore on each guardian host `rand-guardian.toml.chain20` and `cursors.chain20`; on
-   `rand-relayer-1` (`ssh -i ~/.ssh/rand_guardian_ed25519 root@167.172.65.45`) the toml, the cursors
+   `rand-relayer-1` (`ssh -i ~/.ssh/rand_guardian_ed25519 root@203.0.113.28`) the toml, the cursors
    **and its 0.6.8 `rand`**:
    ```
    systemctl is-active --quiet rand-relayer && { echo 'stop the relayer first'; exit 1; }

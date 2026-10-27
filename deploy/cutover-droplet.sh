@@ -4,7 +4,7 @@
 #
 #   deploy/cutover-droplet.sh <ip> <old-genesis-prefix> <new-genesis-prefix> <genesis-file> [build-host]
 #
-# - the binaries come from BUILD_HOST (default: node E, 188.166.235.187), fanned out
+# - the binaries come from BUILD_HOST (default: node E, 203.0.113.33), fanned out
 #   droplet-to-droplet over the forwarded agent (`ssh -A`), never from the laptop's uplink;
 # - the genesis file is copied from this checkout and its hash is checked against
 #   <new-genesis-prefix> before anything is stopped;
@@ -21,7 +21,7 @@ set -euo pipefail
 # release download, no agent forwarding). Kept for the record only.
 echo "$(basename "$0") is retired: it forwards the ssh agent to every droplet (issue #47); see its header" >&2
 exit 1
-IP=$1; OLD=$2; NEW=$3; GENESIS=$4; BUILD_HOST=${5:-188.166.235.187}
+IP=$1; OLD=$2; NEW=$3; GENESIS=$4; BUILD_HOST=${5:-203.0.113.33}
 SERVICE=${SERVICE:-rand-node}
 BIN_NODE=${BIN_NODE:-rand-node}
 BIN_WALLET=${BIN_WALLET:-rand}

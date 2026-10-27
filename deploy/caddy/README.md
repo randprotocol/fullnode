@@ -10,7 +10,7 @@ be started (see "RS-2" below for why that would be a regression).
 ## What actually serves a public request
 
 ```
-client → Cloudflare (proxied DNS) → web droplet 159.65.138.161, nginx vhost rpc.randprotocol.org
+client → Cloudflare (proxied DNS) → web droplet 203.0.113.20, nginx vhost rpc.randprotocol.org
          (randprotocol.org repo, server/nginx-rpc.conf = /etc/nginx/sites-enabled/rpc-randprotocol;
           its own Let's Encrypt certificate, DNS-01 via Cloudflare, valid to 2026-12-19;
           set_real_ip_from <Cloudflare ranges> + real_ip_header CF-Connecting-IP;
@@ -19,7 +19,7 @@ client → Cloudflare (proxied DNS) → web droplet 159.65.138.161, nginx vhost 
        → the sale service's RPC proxy (randprotocol.org repo, server/sale/src/rpc.rs)
        → SALE_RPC_UPSTREAM = http://127.0.0.1:18545 (since 2026-09-27; was https://randscan.org/rpc)
        → rpc-tunnel-obs1.service on the web droplet: ssh -N -L 127.0.0.1:18545:127.0.0.1:8545
-         rpctunnel@168.144.46.203 (key /root/.ssh/obs1_rpc_tunnel, host key pinned in
+         rpctunnel@203.0.113.29 (key /root/.ssh/obs1_rpc_tunnel, host key pinned in
          /root/.ssh/obs1_rpc_known_hosts)
        → obs1's node on 127.0.0.1:8545 — the archive, no --prune-history, datadir on the
          250 GiB volume
@@ -50,7 +50,7 @@ back).
 
 ## RS-2 — "every caller shares F's rate-limit bucket" — refuted (2026-09-27)
 
-The suspicion (also the 2026-09-24 deep scan's, which added `set_real_ip_from 159.89.185.254` and
+The suspicion (also the 2026-09-24 deep scan's, which added `set_real_ip_from 203.0.113.21` and
 `real_ip_recursive on` to the main randprotocol.org vhost for it): F's Caddy re-enters Cloudflare,
 so Cloudflare would set `CF-Connecting-IP` to F and every public caller would share one bucket.
 It would be true if F were in the path — Caddy's `X-Forwarded-For` is not the header nginx reads,
@@ -66,7 +66,7 @@ two octets:
  37 83.110.x.x  10–11h 200                           (a browser)
 ```
 
-No request in the two uncompressed logs comes from `159.89.185.254`. The limits are per client, as
+No request in the two uncompressed logs comes from `203.0.113.21`. The limits are per client, as
 designed. What remains for the operator is housekeeping, listed at the end.
 
 ## The node's own public listener (audit v6, VK-2 / RPC-4) — point the tunnel at it
@@ -140,7 +140,7 @@ path:
 - **Do not start `caddy` on F.** If it ran and DNS moved back to F, the double Cloudflare hop would
   make RS-2 real: every caller would share F's bucket. Either leave it disabled or remove the
   package and this file together.
-- The main randprotocol.org vhost's `set_real_ip_from 159.89.185.254;` and `real_ip_recursive on;`
+- The main randprotocol.org vhost's `set_real_ip_from 203.0.113.21;` and `real_ip_recursive on;`
   (added 2026-09-24 for the non-existent F hop) are dead config; drop them with the next edit of
   that file (`nginx -t && systemctl reload nginx`).
 - `/etc/nginx/sites-enabled/` on the web droplet holds `randprotocol.bak-20260924` and

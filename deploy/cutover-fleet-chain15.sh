@@ -22,12 +22,12 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 PHASE=${1:?stage|stop|switch|start}
-BUILD_HOST=${BUILD_HOST:-188.166.235.187}
+BUILD_HOST=${BUILD_HOST:-203.0.113.33}
 BUILD_DIR=${BUILD_DIR:-/root/build15/target/release}
 BIN_NODE=rand-node; BIN_WALLET=rand
 OLD=${OLD:-1cff3b7d}
 OPTS="-o StrictHostKeyChecking=accept-new -o ConnectTimeout=20 -o BatchMode=yes"
-BOOTS="164.90.239.200 165.245.173.74"          # C, D — started first, as in every cut
+BOOTS="203.0.113.23 203.0.113.25"          # C, D — started first, as in every cut
 IPS=$(grep -oE '/ip4/[0-9.]+' deploy/nodes.env | cut -d/ -f3 | sort -u)   # 17 droplets + obs1
 NODE_A_HOME=${NODE_A_HOME:-$HOME/rand-node-a}
 

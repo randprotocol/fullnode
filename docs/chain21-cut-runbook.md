@@ -109,11 +109,11 @@ only if that run ends green; otherwise a new run's id replaces it in the annotat
    `OLD_VERSION` 0.7.0, `OLD_GIT_SHA` 806ed349…), read for preflight, the stop gate, the
    `*.pre-c21` backups and the rollback. **Confirm before the cut** with
    `deploy/cutover-fleet-chain21.sh status` (every host: version 0.7.0, git_sha 806ed349…) — and
-   the relayer's own `rand`: on 2026-10-12 `rand-relayer-1` (167.172.65.45) ran rand 0.6.8, sha256
-   155dfe66…ee2d — re-read it (`ssh -i ~/.ssh/rand_guardian_ed25519 root@167.172.65.45 'rand
+   the relayer's own `rand`: on 2026-10-12 `rand-relayer-1` (203.0.113.28) ran rand 0.6.8, sha256
+   155dfe66…ee2d — re-read it (`ssh -i ~/.ssh/rand_guardian_ed25519 root@203.0.113.28 'rand
    --version; sha256sum /usr/local/bin/rand'`; the alias `rand-relayer-1` is not in
    `~/.ssh/config`; on the first connect check the host key is ED25519
-   SHA256:emiVrQXryU8L12wv4PWsmkap04SAh8bfqss2bpR0pyI); see `deploy/chain21-bridge-steps.md`; if anything else answers, set `OLD_VERSION`/`OLD_GIT_SHA` and
+   <the host-key fingerprint from the operator's record>); see `deploy/chain21-bridge-steps.md`; if anything else answers, set `OLD_VERSION`/`OLD_GIT_SHA` and
    that release's sums instead:
 
    ```bash
@@ -164,18 +164,18 @@ the snapshot and the balances scan, with chain 20 still committing.
 
 1. **Bridge stop** (the bridge session owns the daemons; `deploy/chain21-bridge-steps.md` is a
    DRAFT from chain 20's for it to review, step 1): relayer on
-   `rand-relayer-1` (`ssh -i ~/.ssh/rand_guardian_ed25519 root@167.172.65.45`) and the six guardian daemons stopped, nothing in flight (each endpoint's
+   `rand-relayer-1` (`ssh -i ~/.ssh/rand_guardian_ed25519 root@203.0.113.28`) and the six guardian daemons stopped, nothing in flight (each endpoint's
    `sequence()` = the relayer's `next_sequence`; chain 20's `burn_sequence` = the relayer's cursor).
    `cutover-fleet-chain21.sh switch` refuses a guardian host whose `rand-guardian` is still active.
 
 2. **The tunnel** to an archive's RPC (the public RPC is Cloudflare and 403s urllib). obs1
-   (`168.144.46.203`, validator+archive, no pruning) is the script's default:
+   (`203.0.113.29`, validator+archive, no pruning) is the script's default:
 
    ```bash
-   ssh -N -L 8545:127.0.0.1:8545 root@168.144.46.203        # in its own terminal; keep it open
+   ssh -N -L 8545:127.0.0.1:8545 root@203.0.113.29        # in its own terminal; keep it open
    ```
 
-   Fallback: rand-archive-2 (`206.81.29.236`, fra1, full history) — its tunnel timed out during
+   Fallback: rand-archive-2 (`203.0.113.38`, fra1, full history) — its tunnel timed out during
    chain 20's balances scan; node A (sgp1) worked then but now runs `--prune-history 24h`, so do not
    rely on it for a scan from leaf 0. The script refuses a dead tunnel or one that is not chain 20's.
 
@@ -252,7 +252,7 @@ echo $?
 | `EXPECT_ENGINE_HC`, `EXPECT_HC_AUTH_MULTISIG` | f286a611…, 9705f8e2…8247 | the script's decided defaults; any other value is refused |
 | `CHAIN20_GENESIS` / `_HASH` / `_SHA256`, `EMITTER_2..5`, `BONDED`, `GENESIS_NAMES`, `STAKE_RAND` | the script's defaults (chain 20's) | local-known; leave them |
 | `MIN_INBOUND_*` | `auto` (from the snapshot) | default; explicit floors only if a lock was in flight at the snapshot |
-| `RELAYER_DONE_DIR` | a copy of `rand-relayer-1`'s `done/` | optional cross-check; **needs the user** (`scp -r -i ~/.ssh/rand_guardian_ed25519 root@167.172.65.45:<relayer data>/done …`) |
+| `RELAYER_DONE_DIR` | a copy of `rand-relayer-1`'s `done/` | optional cross-check; **needs the user** (`scp -r -i ~/.ssh/rand_guardian_ed25519 root@203.0.113.28:<relayer data>/done …`) |
 | `REWARDS_DROPPED_OK`, `PENDING_OK`, `UNCOVERED_ALLOCS_OK`, `NODE_VERSION_OK` | unset | set one only knowingly, after the cut refuses and says why; whatever it drops goes in `drops:` |
 
 The cut prints the genesis file (`deploy/genesis-chain21.json`), its **genesis hash**, `TREASURY
@@ -293,9 +293,9 @@ quorum 18):
 
 | group | hosts | shape |
 |---|---|---|
-| bootstraps, started first | C 164.90.239.200, D 165.245.173.74 | nodes.env, root unit, datadir `/root/data-rand-node-<x>-6210cf07` |
-| nodes.env (18 more) | A 139.59.238.151, B 168.144.102.43, E 188.166.235.187, F 159.89.185.254, lon1 139.59.160.76, sfo3 24.144.89.22, tor1 146.190.243.29, blr1 167.71.235.108, syd1 170.64.226.65, atl1 165.245.142.90, ams3 146.190.233.230, nyc1 192.81.214.91, nyc2 107.170.49.234, sfo2 143.110.135.126, mkc1 201.79.35.212, mem1 168.144.61.10, obs1 168.144.46.203 (archive), archive2 206.81.29.236 (archive) | same; `-6210cf07` → `-<chain-21 prefix>` |
-| guardian hosts | g1 104.248.5.129, g2 137.184.12.108, g3 167.71.14.228, g4 164.90.184.247, g5 209.97.179.217, g6 157.230.249.150 (`~/.rand-bridge/mainnet-set1/hosts.txt`, ssh key `~/.ssh/rand_guardian_ed25519`) | user `randnode`, drop-in `chain20.conf`/`data-20` → `chain21.conf`/`data-21` |
+| bootstraps, started first | C 203.0.113.23, D 203.0.113.25 | nodes.env, root unit, datadir `/root/data-rand-node-<x>-6210cf07` |
+| nodes.env (18 more) | A 203.0.113.15, B 203.0.113.31, E 203.0.113.33, F 203.0.113.21, lon1 203.0.113.14, sfo3 203.0.113.10, tor1 203.0.113.18, blr1 203.0.113.27, syd1 203.0.113.32, atl1 203.0.113.24, ams3 203.0.113.17, nyc1 203.0.113.34, nyc2 203.0.113.12, sfo2 203.0.113.16, mkc1 203.0.113.37, mem1 203.0.113.30, obs1 203.0.113.29 (archive), archive2 203.0.113.38 (archive) | same; `-6210cf07` → `-<chain-21 prefix>` |
+| guardian hosts | g1 203.0.113.11, g2 203.0.113.13, g3 203.0.113.26, g4 203.0.113.22, g5 203.0.113.40, g6 203.0.113.19 (`~/.rand-bridge/mainnet-set1/hosts.txt`, ssh key `~/.ssh/rand_guardian_ed25519`) | user `randnode`, drop-in `chain20.conf`/`data-20` → `chain21.conf`/`data-21` |
 
 `deploy/nodes.env` in this tree matches `configuration/fleet/nodes.env`, and the guardian list
 matches `configuration/fleet/guardian-hosts.txt`. Re-check against the live fleet in `preflight`
@@ -415,7 +415,7 @@ constraint set 9, so rollback is "chain 20 again from where it stopped", never "
 In this order (each line alone, `echo $?`):
 
 1. **The bridge stops FIRST** (`deploy/chain21-bridge-steps.md`, rollback step 1): the relayer on
-   `rand-relayer-1` (`ssh -i ~/.ssh/rand_guardian_ed25519 root@167.172.65.45`) and all eight guardians. The fleet's `rollback` refuses a guardian host whose
+   `rand-relayer-1` (`ssh -i ~/.ssh/rand_guardian_ed25519 root@203.0.113.28`) and all eight guardians. The fleet's `rollback` refuses a guardian host whose
    `rand-guardian` is still active.
 2. **Nothing happened on chain 21?** With chain 21 still up (read-only):
 
