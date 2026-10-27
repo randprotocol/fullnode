@@ -1742,8 +1742,16 @@ impl ZkExecutor {
     /// 3. `check_declared_heights` and the degree bits ([`Self::check_decoded`]), then the two
     ///    hash tables under a call's caps, the input height under the tier's, and the public
     ///    height exactly the segment's — every one before a key is built;
-    /// 4. `Machine::verify_public(engine_hc, segment, proof)`; on the decode path, the
-    ///    `H_PUB` compare alone, so the verified set's verdict stands for this segment only.
+    /// 4. the `H_PUB` compare against `segment` — on both paths, and on the verify path before
+    ///    any key (CON-60: `verify_public` makes the same compare only after `Machine::verify`
+    ///    has built the key, so a proof of the wrong segment would otherwise buy a key build);
+    /// 5. on the verify path, `Machine::check_pre_key` and then
+    ///    `Machine::verify_public(engine_hc, segment, proof)` — steps 1–5 are
+    ///    [`Self::perp_pre_key`], the very function the pool's
+    ///    [`ConfidentialExecutor::perp_proof_admissible`] asks, so a proof the pool lets through
+    ///    without a token is never one whose verification builds a key. Moving the compare
+    ///    ahead of the key changes no verdict: both orders refuse exactly the proofs failing
+    ///    either check, and every refusal but the tier is `InvalidProof`.
     ///
     /// The program height is ranged, not pinned: the chain does not hold the engine's words.
     /// The outcome is a call's (`check_call`'s), the ledger reading the outputs.
@@ -1755,22 +1763,20 @@ impl ZkExecutor {
         bytes: &[u8],
         verify: bool,
     ) -> Result<CallOutcome, ConfidentialError> {
-        let proof = self.perp_header(max_tier, segment.len(), bytes)?;
-        let tier = u8::try_from(proof.tier.0).unwrap_or(u8::MAX);
-        let public_values =
-            || ConfidentialError::InvalidProof(format!("{:?}", crate::machine::VerifyError::PublicValues));
-        if verify {
+        let proof = if verify {
+            let proof = self.perp_pre_key(engine_hc, max_tier, segment, bytes)?;
             // CON-60: the engine's own machines — the canonical one for the chain's canonical
             // shapes, the general one otherwise; whichever already holds the key first.
             self.perp_machine_for(&shape_of(&proof))
                 .verify_public(engine_hc, segment, &proof)
                 .map_err(|e| ConfidentialError::InvalidProof(format!("{e:?}")))?;
+            proof
         } else {
-            let want = crate::hash::public_digest(segment);
-            if (0..8).any(|i| proof.public_values[pv::PUB0 + i] != want[i] as u64) {
-                return Err(public_values());
-            }
-        }
+            let proof = self.perp_header(max_tier, segment.len(), bytes)?;
+            Self::perp_public_digest_matches(segment, &proof)?;
+            proof
+        };
+        let tier = u8::try_from(proof.tier.0).unwrap_or(u8::MAX);
         Ok(CallOutcome {
             tier,
             outputs: std::array::from_fn(|i| proof.public_values[pv::OUT0 + i] as u32),
@@ -1779,6 +1785,29 @@ impl ZkExecutor {
             sha256_log_height: proof.sha256_log_height,
             gas_limit: proof.public_values[pv::GAS],
         })
+    }
+
+    /// CON-60: `segment`'s `H_PUB` against the proof's `pv::PUB0..7` — `Machine::verify_public`'s
+    /// post-check, made here before any key.
+    fn perp_public_digest_matches(segment: &[u32], proof: &Proof) -> Result<(), ConfidentialError> {
+        let want = crate::hash::public_digest(segment);
+        if (0..8).any(|i| proof.public_values.get(pv::PUB0 + i) != Some(&(want[i] as u64))) {
+            return Err(ConfidentialError::InvalidProof(format!("{:?}", crate::machine::VerifyError::PublicValues)));
+        }
+        Ok(())
+    }
+
+    /// CON-60: every refusal the verify path of [`Self::check_perp`] makes before a verifier key
+    /// is built or looked up, in its order — [`Self::perp_header`], the segment's public digest,
+    /// then `Machine::check_pre_key` against `engine_hc` (the verifier's own pre-key prefix;
+    /// `verify` runs it again, a few comparisons). `check_perp` and the pool's
+    /// [`ConfidentialExecutor::perp_proof_admissible`] both call this, so the two cannot drift:
+    /// a proof refused here costs no key on either side.
+    fn perp_pre_key(&self, engine_hc: &Word8, max_tier: u8, segment: &[u32], bytes: &[u8]) -> Result<Proof, ConfidentialError> {
+        let proof = self.perp_header(max_tier, segment.len(), bytes)?;
+        Self::perp_public_digest_matches(segment, &proof)?;
+        self.perp_machine.check_pre_key(engine_hc, &proof).map_err(|e| ConfidentialError::InvalidProof(format!("{e:?}")))?;
+        Ok(proof)
     }
 
     /// Every rule [`Self::check_perp`] applies before a verifier key is touched — the canonical
@@ -2196,9 +2225,10 @@ impl ConfidentialExecutor for ZkExecutor {
         Self::perp_cached_in(&self.perp_machine, shape) || Self::perp_cached_in(&self.perp_lineage_machine, shape)
     }
 
-    /// CON-60: [`ZkExecutor::perp_header`]'s rules, then `Machine::check_pre_key` — the very
-    /// prefix `Machine::verify` runs before its key — against `engine_hc`, then `segment`'s public
-    /// digest (`verify_public`'s check), then the genesis pin when set.
+    /// CON-60: [`ZkExecutor::perp_pre_key`] — the very function `check_perp`'s verify path runs
+    /// before its key (the header rules, `segment`'s public digest, `Machine::check_pre_key`
+    /// against `engine_hc`) — then the genesis pin when set (the ledger's own check before
+    /// `verify_perp`). So whatever this refuses, verifying it builds no key.
     fn perp_proof_admissible(
         &self,
         proof: &[u8],
@@ -2207,14 +2237,7 @@ impl ConfidentialExecutor for ZkExecutor {
         segment: &[u32],
         engine_program_log_height: u8,
     ) -> bool {
-        let Ok(p) = self.perp_header(max_tier, segment.len(), proof) else { return false };
-        if self.perp_machine.check_pre_key(engine_hc, &p).is_err() {
-            return false;
-        }
-        let want = crate::hash::public_digest(segment);
-        if (0..8).any(|i| p.public_values.get(pv::PUB0 + i) != Some(&(want[i] as u64))) {
-            return false;
-        }
+        let Ok(p) = self.perp_pre_key(engine_hc, max_tier, segment, proof) else { return false };
         engine_program_log_height == 0
             || (p.program_log_height == engine_program_log_height && p.keccak_log_height == 0 && p.sha256_log_height == 0)
     }
@@ -3812,6 +3835,78 @@ mod tests {
         // Admitted, then verified: one build.
         zk.check_perp(&hc, 20, seg, &bytes, true).expect("the honest proof verifies as a state proof");
         assert_eq!(zk.perp_key_builds(), 1);
+    }
+
+    /// CON-60 round 4: on the real executor, a state proof of the wrong segment (a wrong public
+    /// digest) — which the pool admits for free — makes `verify_perp` build no key; nor does any
+    /// other proof `perp_proof_admissible` refuses. And comparing the digest before the key moved
+    /// no verdict: for every refusal class, `check_perp` refuses exactly when the old order
+    /// (`perp_header`, then `Machine::verify_public`, which builds the key before it compares the
+    /// digest) did, with the same error kind.
+    #[test]
+    fn a_wrong_digest_state_proof_builds_no_key_and_no_refusal_changes_its_verdict() {
+        use super::*;
+        use crate::machine::{FriProfile, Val};
+        use p3_field::PrimeCharacteristicRing;
+        let program = crate::guests::fib(10);
+        let hc = program.digest();
+        let segment: Vec<u32> = (0..40).collect();
+        let (bytes, _, tier) = prove_perp(FriProfile::Test, &program, &[], &segment, None).unwrap();
+        let mut wrong_seg = segment.clone();
+        wrong_seg[29] ^= 1;
+        let mut other_hc = hc;
+        other_hc[0] ^= 1;
+        let edit = |f: &dyn Fn(&mut Proof)| {
+            let mut p = decode_canonical(&bytes).unwrap();
+            f(&mut p);
+            p.to_bytes()
+        };
+        let pow = edit(&|p| p.batch.opening_proof.1.commit_pow_witnesses[0] = Val::from_u64(1));
+        let degree = edit(&|p| p.batch.degree_bits[0] += 1);
+        let output = edit(&|p| p.public_values[pv::OUT0 + 2] ^= 1);
+        let mut padded = bytes.clone();
+        padded.push(0);
+        let long = vec![0u32; 4096];
+        // (name, proof, hc, max_tier, segment): every class the pool refuses for free first.
+        let refused: Vec<(&str, Vec<u8>, Word8, u8, &[u32])> = vec![
+            ("wrong public digest", bytes.clone(), hc, 20, &wrong_seg),
+            ("HC0 flipped", bytes.clone(), other_hc, 20, &segment),
+            ("HC0 flipped and wrong digest", bytes.clone(), other_hc, 20, &wrong_seg),
+            ("PoW witness", pow.clone(), hc, 20, &segment),
+            ("PoW witness and wrong digest", pow, hc, 20, &wrong_seg),
+            ("degree bits", degree, hc, 20, &segment),
+            ("over max_tier", bytes.clone(), hc, tier - 2, &segment),
+            ("another public height", bytes.clone(), hc, 20, &long),
+            ("not canonical", padded, hc, 20, &segment),
+            ("junk", b"junk".to_vec(), hc, 20, &segment),
+        ];
+        let zk = ZkExecutor::new(FriProfile::Test);
+        let old_machine = Machine::new(FriProfile::Test);
+        let old_order = |p: &[u8], hc: &Word8, max_tier: u8, seg: &[u32]| {
+            zk.perp_header(max_tier, seg.len(), p).and_then(|proof| {
+                old_machine.verify_public(hc, seg, &proof).map_err(|e| ConfidentialError::InvalidProof(format!("{e:?}")))?;
+                Ok(())
+            })
+        };
+        let kind = |r: &Result<(), ConfidentialError>| r.as_ref().err().map(std::mem::discriminant);
+        for (name, p, h, t, seg) in &refused {
+            assert!(!zk.perp_proof_admissible(p, h, *t, seg, 0), "{name}: the pool refuses it for free");
+            let new = zk.verify_perp(h, *t, seg, p).map(|_| ());
+            assert!(new.is_err(), "{name}");
+            assert_eq!(zk.perp_key_builds(), 0, "{name}: verifying it built a key");
+            assert_eq!(kind(&new), kind(&old_order(p, h, *t, seg)), "{name}: the verdict moved");
+        }
+        assert_eq!(old_machine.key_builds(), 1, "the old order built a key for the wrong digest: the hole this closes");
+        // What the pool does let through costs a key, and keeps the old verdict too: a forged
+        // output (the STARK refuses it), then the honest proof under the same key.
+        assert!(zk.perp_proof_admissible(&output, &hc, 20, &segment, 0));
+        let new = zk.verify_perp(&hc, 20, &segment, &output).map(|_| ());
+        assert!(new.is_err());
+        assert_eq!(kind(&new), kind(&old_order(&output, &hc, 20, &segment)));
+        assert_eq!(zk.perp_key_builds(), 1);
+        assert!(zk.verify_perp(&hc, 20, &segment, &bytes).is_ok());
+        assert!(old_order(&bytes, &hc, 20, &segment).is_ok());
+        assert_eq!(zk.perp_key_builds(), 1, "the honest proof reuses the key");
     }
 
     /// ZKG-1: an output word past 32 bits is refused, never narrowed. `x as u32` of

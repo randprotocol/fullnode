@@ -4821,15 +4821,33 @@ mod tests {
         let mut m = Mempool::new(100);
         let ex = &StubExecutor;
         // 101..109 is the engine binding (the stub's hc), 69..101 the public digest.
+        let builds = randprotocol_core::confidential::stub_perp_key_builds;
+        let before = builds();
         for salt in 0..50u64 {
             for byte in [101, 70] {
                 let junk = forged(byte, salt);
                 assert!(m.precheck(&junk, &l, ex).is_ok());
                 m.state_proof_queued(&junk, &l, ex);
+                // Round 4: free here means free to verify — the verifier refuses it before its key
+                // (the zkVM's own order is pinned by its `a_wrong_digest_state_proof_builds_no_key…`).
+                assert!(l.validate(&junk, ex).is_err());
             }
         }
+        assert_eq!(builds(), before, "a proof the pool let through without a token built a key");
         let t0 = Instant::now();
         assert!(m.lineage_keys_mut().available(t0) && m.cold_keys_mut().available(t0), "no token taken");
+        // The same cold canonical shape unforged passes the pre-key rules: it takes a reserve
+        // token, and its verification is the one key build.
+        let mut cold = honest.clone();
+        let Action::PerpStateProof { proof, .. } = &mut cold.action else { unreachable!() };
+        proof[37..41].copy_from_slice(&[0, 1, 0, 0]);
+        assert!(m.precheck(&cold, &l, ex).is_ok());
+        m.state_proof_queued(&cold, &l, ex);
+        let _ = l.validate(&cold, ex);
+        assert_eq!(builds(), before + 1);
+        assert!(m.cold_keys_mut().available(t0), "the general bucket untouched");
+        m.lineage_keys_mut().take(t0);
+        assert!(!m.lineage_keys_mut().available(t0), "the reserve paid for it");
     }
 
     /// An invoke's payout notes are leaves like any other: the pool claims them (through

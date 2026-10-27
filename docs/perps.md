@@ -514,8 +514,10 @@ bridged one.
     height of the tip's segment), the verifier's own pre-key prefix (`Machine::check_pre_key`,
     the function `Machine::verify` runs first: the public values against the genesis
     `engine_hc`, canonical values, `TIER`, `GAS`, the pc window, the commit PoW witnesses, the
-    degree bits), the segment's public digest, and the genesis pin. A proof refused for free
-    never spends a token;
+    degree bits), the segment's public digest, and the genesis pin. The executor's verify path
+    runs the same function (`perp_pre_key`) before it builds a key — the digest included, which
+    `Machine::verify_public` alone would compare only after the key — so a proof refused for
+    free never spends a token and never builds a key;
   - tokens come from two buckets of 2, each refilled one per 30 s: a **reserve** for the chain's
     canonical shapes, and a general bucket for every other shape. Canonical keys live in their
     own cache of 8 (a chain has at most four canonical shapes); other shapes share a cache of 2

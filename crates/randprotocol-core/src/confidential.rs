@@ -471,6 +471,18 @@ pub trait ConfidentialExecutor: Send + Sync {
 pub struct StubExecutor;
 
 pub const STUB_MARKER: &[u8; 4] = b"STUB";
+
+std::thread_local! {
+    static STUB_PERP_KEY_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// CON-60, a test instrument: how many state-proof verifier keys [`StubExecutor::verify_perp`]
+/// would have built on this thread — one per verification of a cold shape (not
+/// `perp_key_ready`) that passed every pre-key rule, where the zkVM builds its key.
+#[doc(hidden)]
+pub fn stub_perp_key_builds() -> usize {
+    STUB_PERP_KEY_BUILDS.with(|n| n.get())
+}
 /// The program height an unshaped stub state proof declares (CON-60): the engine's honest one in
 /// the stub's world, what a test pins `engine_program_log_height` to.
 pub const STUB_PERP_PROGRAM_LOG_HEIGHT: u8 = 14;
@@ -858,6 +870,14 @@ impl ConfidentialExecutor for StubExecutor {
         }
         if word8_from_bytes(&proof[69..101]).expect("32 bytes") != self.public_digest(segment) {
             return Err(ConfidentialError::InvalidProof("PublicValues".into()));
+        }
+        // CON-60: the zkVM builds the key here, after every pre-key rule (the header, the
+        // binding, the segment's digest) — the stub counts it, so a test can hold the pool's
+        // "free" verdict to "verifying it builds nothing" ([`stub_perp_key_builds`]).
+        if let Some(shape) = self.perp_proof_shape(proof) {
+            if !self.perp_key_ready(&shape) {
+                STUB_PERP_KEY_BUILDS.with(|n| n.set(n.get() + 1));
+            }
         }
         let outputs = std::array::from_fn(|i| u32::from_le_bytes(proof[5 + 4 * i..9 + 4 * i].try_into().unwrap()));
         let gas_limit = u64::from_le_bytes(proof[STUB_LEN - 8..].try_into().expect("8 bytes"));
