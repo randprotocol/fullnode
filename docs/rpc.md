@@ -148,6 +148,13 @@ let a fast gossip peer censor the honest transaction network-wide (`docs/confide
 
 Acceptance is not commitment: poll `rand_getTransaction` until it returns a block.
 
+Since v0.8.3 an accepted transaction is not gossiped from this node at once: it takes the
+Dandelion++ stem (`docs/architecture.md` §8, issue #145) and is published by another node a few
+hops on. The result is the same hash; until a node publishes it, every node — this one included —
+answers `rand_getTransactionStatus` with `unknown` for it and leaves it out of
+`rand_getMempoolInfo`. Submitting the same bytes again while it is on the stem returns the hash
+again and does nothing else.
+
 A transaction larger than the chain's block cap (`max_block_bytes` from `rand_getLimits`; 4 MiB by
 default) is refused here with `-32000`, naming both sizes, before it reaches the mempool. The
 request body itself is capped at `2 × (2 × max_proof_bytes + 4 × 2048 + max_call_envelope_bytes +
@@ -1515,7 +1522,11 @@ Params: `[[hash, …]]`, 1 to 64 hashes. Result: one entry per hash, in order:
   { "hash": "…", "status": "unknown" } ]
 ```
 Lookup order per hash: committed (storage), then pending (the mempool), then rejected (the refused
-cache — the same cache `rand_status`'s `refused_cache` counts), else `unknown`. A hash this node
+cache — the same cache `rand_status`'s `refused_cache` counts), else `unknown`. A transaction on the
+Dandelion++ stem (v0.8.3) is in no mempool yet and reads `unknown` on every node, the one it was
+submitted to included, until some node publishes it — about a second on the fleet, at most its
+embargo (`rand_sendTransaction`). A client should treat `unknown` after a successful submit as
+"not yet", as `wait_for_transaction` does. A hash this node
 never saw and one a peer refused both read `unknown`; that is honest, since a wallet's submit goes
 to one node, not to every node that might have an opinion. A rejection is not kept forever — the
 cache evicts at 8192 entries — but a client polling sees it long before that.
@@ -1664,7 +1675,8 @@ Params: `[]`. Result:
 ```json
 { "count": 2, "bytes": 2611200, "oldest_ms": 1450, "max_count": 10000 }
 ```
-`bytes` is the sum of every pooled transaction's encoded length. `oldest_ms` is how long the
+`bytes` is the sum of every pooled transaction's encoded length. Transactions held on the
+Dandelion++ stem (v0.8.3) are not pooled and not counted. `oldest_ms` is how long the
 longest-pooled transaction has waited, `null` when the pool is empty. Beside `max_count` the pool
 is capped at eight times the genesis `max_block_bytes` in `bytes` (audit v6, CH-7): past it a
 transaction paying more above its floor per KiB displaces the cheapest, and one paying less is

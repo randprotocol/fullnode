@@ -12,6 +12,14 @@ stopped at v0.4 until 2026-09-30, when the entries v0.5 to v0.6.7 were written f
 
 ## Unreleased
 
+- **Dandelion++ stem relay for transactions** (issue #145): a transaction submitted over RPC is
+  sent to one stem successor over the new request-response protocol `/rand/<chain>/stem/1`, relays
+  pass it on and fluff it (publish on gossip) with probability q, and an embargo timer on every
+  holder fluffs it if the stem drops it. Stem transactions sit in a stempool no RPC, sync request
+  or proposal sees. `--dandelion on|off` (on), `--dandelion-fluff-prob` (0.1),
+  `--dandelion-embargo-ms` (3000). The transaction lane publishes without `flood_publish`. Only
+  peers that advertise the protocol get stems, so it rolls node by node (`docs/deploy.md`,
+  "Dandelion++").
 - **Transactions gossip anonymously** (issue #146): a second gossipsub behaviour,
   `MessageAuthenticity::Anonymous` under `ValidationMode::Anonymous`, protocol
   `/rand/<chain>/txsub`, topic `rand/<chain>/tx/2`; consensus, status and peer bindings stay

@@ -58,7 +58,7 @@ impl TestNode {
 
 /// A one-validator chain. `hc_bundle` must be this build's own guest, or `node::start` refuses to
 /// run at all.
-fn genesis(key: &Keypair) -> Genesis {
+pub fn genesis(key: &Keypair) -> Genesis {
     Genesis {
         chain_id: 7,
         timestamp_ms: 0,

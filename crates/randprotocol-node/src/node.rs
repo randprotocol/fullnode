@@ -4,6 +4,7 @@
 
 use crate::admission::{self, GossipOutcome, Verdict, VerifySource, VerifyLimits};
 use crate::compact;
+use crate::dandelion::{Dandelion, DandelionConfig, DandelionStats, Decision, Edge, FluffReason, LoopAction};
 use crate::mempool::{Mempool, MempoolError};
 use crate::network::{
     self, CompactBlock, GossipId, GossipMessage, NetworkConfig, NetworkEvent, NetworkHandle, Status, SyncRequest, SyncResponse,
@@ -108,6 +109,9 @@ pub struct NodeHandle {
     pub public_rpc_task: Option<tokio::task::JoinHandle<()>>,
     /// What the startup integrity check did (startup-checkpoint spec §4).
     pub startup: StartupVerify,
+    /// What Dandelion++ did on this node (issue #145): for tests and in-process readers only,
+    /// never served over RPC ([`DandelionStats`]).
+    pub dandelion: Arc<DandelionStats>,
 }
 
 impl NodeHandle {
@@ -1357,6 +1361,8 @@ struct Node {
     consensus_byte_limiter: admission::PeerLimiter,
     /// The policy over every peer's `binding_bucket` ([`crate::peer_bindings::on_binding_gossip`]).
     binding_limiter: admission::PeerLimiter,
+    /// The policy over every peer's `stem_bucket` (Dandelion++, issue #145).
+    stem_limiter: admission::PeerLimiter,
     /// The validators' libp2p identities this node has verified, and the operator's pinned ones
     /// (audit v6, NET-1): reserved at the swarm, persisted, and SYNC-3's "validator peer".
     peer_bindings: crate::peer_bindings::PeerBindings,
@@ -1413,6 +1419,11 @@ struct Node {
     in_flight_keys: HashMap<(u64, randprotocol_core::Address), Hash>,
     /// [`NodeConfig::apply_inline`]: deliver every proposal straight to the replica, on the loop.
     apply_inline: bool,
+    /// Dandelion++ (issue #145): the stem successors, the per-edge routes and the stempool of
+    /// verified stem transactions that nothing outside this loop sees until they are fluffed.
+    dandelion: Dandelion,
+    /// What it did, for [`NodeHandle::dandelion`].
+    dandelion_stats: Arc<DandelionStats>,
 }
 
 /// Incoming proposals applied on blocking workers at once (spec 2026-10-11 off-loop apply §4.1).
@@ -1581,6 +1592,10 @@ struct Peer {
     /// The same, for the peer bindings this peer forwards (audit v6, NET-1): each new one costs a
     /// signature verify.
     binding_bucket: admission::TokenBucket,
+    /// The same, for the transactions this peer stems to us that we do not already hold
+    /// (Dandelion++, issue #145): each costs a verification. Its own bucket, so a peer's stems and
+    /// its gossip do not share one allowance ([`crate::dandelion::STEM_PEER_BURST`]).
+    stem_bucket: admission::TokenBucket,
     /// Not asked for a batch before this instant (SYNC-2): set by [`back_off_sync_peer`] when the
     /// peer answered our live batch request with nothing we could use, or when that request failed
     /// or was abandoned (CN-1, [`on_sync_batch_failed`]).
@@ -1900,6 +1915,7 @@ struct PeerMeters {
     consensus_bucket: admission::TokenBucket,
     sync_bucket: admission::TokenBucket,
     binding_bucket: admission::TokenBucket,
+    stem_bucket: admission::TokenBucket,
     sync_backoff_until: Option<Instant>,
     sync_backoff: Duration,
 }
@@ -1912,6 +1928,7 @@ impl PeerMeters {
             consensus_bucket: p.consensus_bucket,
             sync_bucket: p.sync_bucket,
             binding_bucket: p.binding_bucket,
+            stem_bucket: p.stem_bucket,
             sync_backoff_until: p.sync_backoff_until,
             sync_backoff: p.sync_backoff,
         }
@@ -1923,6 +1940,7 @@ impl PeerMeters {
         p.consensus_bucket = self.consensus_bucket;
         p.sync_bucket = self.sync_bucket;
         p.binding_bucket = self.binding_bucket;
+        p.stem_bucket = self.stem_bucket;
         p.sync_backoff_until = self.sync_backoff_until;
         p.sync_backoff = self.sync_backoff;
     }
@@ -2511,6 +2529,10 @@ pub struct NetOptions {
     /// Gossip transactions on the anonymous lane only (`--anonymous-tx-only`, issue #146): see
     /// [`network::EdgeConfig::anonymous_tx_only`].
     pub anonymous_tx_only: bool,
+    /// Dandelion++'s stem relay for transactions (`--dandelion`, `--dandelion-fluff-prob`,
+    /// `--dandelion-embargo-ms`, issue #145). On by default: only peers that advertise the stem
+    /// protocol are ever sent a stem, so it rolls onto a mixed fleet node by node.
+    pub dandelion: DandelionConfig,
 }
 
 pub async fn start(cfg: NodeConfig) -> Result<NodeHandle> {
@@ -2631,6 +2653,7 @@ pub async fn start_with(cfg: NodeConfig, rpc_options: RpcOptions, net_options: N
     if !peer_bindings.is_empty() {
         tracing::info!(bound = peer_bindings.len(), "validator peer bindings restored from the last run");
     }
+    let dandelion_stats = Arc::new(DandelionStats::default());
     let (net, mut events) = network::start_with(
         NetworkConfig {
             chain_id: gs.chain_id,
@@ -2645,6 +2668,7 @@ pub async fn start_with(cfg: NodeConfig, rpc_options: RpcOptions, net_options: N
             bound: peer_bindings.bound_peers(),
             strict_gossip: net_options.strict_gossip,
             anonymous_tx_only: net_options.anonymous_tx_only,
+            dandelion: net_options.dandelion.enabled,
         },
     )
     .await?;
@@ -2917,6 +2941,7 @@ pub async fn start_with(cfg: NodeConfig, rpc_options: RpcOptions, net_options: N
             crate::peer_bindings::BINDING_GOSSIP_BURST,
             crate::peer_bindings::BINDING_GOSSIP_PER_SEC,
         ),
+        stem_limiter: admission::PeerLimiter::new(crate::dandelion::STEM_PEER_BURST, crate::dandelion::STEM_PEER_PER_SEC),
         peer_bindings,
         binding_signer,
         binding_announced_at: None,
@@ -2939,6 +2964,8 @@ pub async fn start_with(cfg: NodeConfig, rpc_options: RpcOptions, net_options: N
         waiting_hashes: HashSet::new(),
         in_flight_keys: HashMap::new(),
         apply_inline,
+        dandelion: Dandelion::new(net_options.dandelion.clone()),
+        dandelion_stats: dandelion_stats.clone(),
     };
     // A fatal error in the loop ends the node, but most embedders (every cluster test, and any
     // caller that keeps the handle without awaiting it) never look at the `JoinHandle`, so
@@ -2953,7 +2980,20 @@ pub async fn start_with(cfg: NodeConfig, rpc_options: RpcOptions, net_options: N
         outcome
     });
     let (public_rpc_addr, public_rpc_task) = public_rpc.map_or((None, None), |(a, t)| (Some(a), Some(t)));
-    Ok(NodeHandle { rpc_addr, public_rpc_addr, network: net, listen_addrs, status, storage, address, task, rpc_task, public_rpc_task, startup: startup_verify })
+    Ok(NodeHandle {
+        rpc_addr,
+        public_rpc_addr,
+        network: net,
+        listen_addrs,
+        status,
+        storage,
+        address,
+        task,
+        rpc_task,
+        public_rpc_task,
+        startup: startup_verify,
+        dandelion: dandelion_stats,
+    })
 }
 
 async fn sleep_until(t: Option<Instant>) {
@@ -3023,6 +3063,9 @@ impl Node {
                     self.expire_parked_requests().await;
                 }
                 _ = sync_tick.tick() => self.maybe_sync().await,
+                // Dandelion++'s fail-safe (issue #145): a stem transaction not seen on gossip by
+                // its embargo is fluffed here.
+                _ = sleep_until(self.dandelion.stempool.next_deadline()) => self.on_embargo().await,
             }
         }
     }
@@ -3210,6 +3253,8 @@ impl Node {
                 VerifySource::Rpc(reply) => {
                     let _ = reply.send(Err(MempoolError::StateProofBusy));
                 }
+                // The predecessor's embargo covers it.
+                VerifySource::Stem(_) => {}
             }
             self.pump_verify();
             return Ok(());
@@ -3227,26 +3272,173 @@ impl Node {
             self.keep_state_proof_key(&v.tx);
         }
         self.note_refusal(hash);
-        // A verified transaction is pooled against the *current* tip, not the snapshot it was
-        // verified on: `insert_verified` re-runs `precheck` there, so a nullifier spent or an anchor
-        // scrolled out in the meantime is caught on the state it is actually being pooled on.
-        let pooled = match &v.result {
-            Ok(()) => self.mempool.insert_verified(v.tx.clone(), self.hs.tip_ledger(), self.executor.as_ref()),
-            Err(e) => Err(MempoolError::Invalid(e.clone())),
-        };
         match v.source {
-            // `acceptance`, not `pooled`: a transaction that verified and then lost a pool conflict
-            // is still a valid message, and another node's pool may have room for it.
-            VerifySource::Gossip(id) => self.net.report_validation(id, acceptance.into()).await,
-            VerifySource::Rpc(reply) => {
-                if pooled.is_ok() {
-                    self.net.broadcast(GossipMessage::Transaction(v.tx)).await;
+            // A verified transaction is pooled against the *current* tip, not the snapshot it was
+            // verified on: `insert_verified` re-runs `precheck` there, so a nullifier spent or an
+            // anchor scrolled out in the meantime is caught on the state it is actually being
+            // pooled on. `acceptance`, not the pool's answer, is reported: a transaction that
+            // verified and then lost a pool conflict is still a valid message, and another node's
+            // pool may have room for it.
+            VerifySource::Gossip(id) => {
+                if v.result.is_ok() {
+                    let _ = self.mempool.insert_verified(v.tx, self.hs.tip_ledger(), self.executor.as_ref());
                 }
-                let _ = reply.send(pooled);
+                self.net.report_validation(id, acceptance.into()).await
+            }
+            // This node's own RPC and a peer's stem take Dandelion++'s stem (issue #145).
+            VerifySource::Rpc(reply) => {
+                let answer = match v.result {
+                    Ok(()) => self.route_verified(v.tx, Edge::Local).await,
+                    Err(e) => Err(MempoolError::Invalid(e)),
+                };
+                let _ = reply.send(answer);
+            }
+            VerifySource::Stem(from) => {
+                if v.result.is_ok() {
+                    let _ = self.route_verified(v.tx, Edge::Peer(from)).await;
+                }
             }
         }
         self.pump_verify();
         Ok(())
+    }
+
+    /// Dandelion++ (issue #145): where a transaction that verified on a stem edge — this node's
+    /// own RPC (`Local`) or a peer's stem — goes. Stemmed: held in the stempool under an embargo
+    /// and sent to the edge's successor; nothing is pooled or published. Fluffed (the q coin at
+    /// a relay, no stem-capable peer, a full stempool): pooled and published on gossip, as every
+    /// accepted transaction was before. The answer is the RPC caller's: `Ok` once it is held or
+    /// pooled.
+    async fn route_verified(&mut self, tx: Transaction, from: Edge) -> Result<Hash, MempoolError> {
+        let hash = tx.hash();
+        let now = Instant::now();
+        // It came back while it was being verified: the stem looped here.
+        if self.dandelion.stempool.contains(&hash) {
+            self.on_stem_loop(hash, from).await;
+            return Ok(hash);
+        }
+        match self.dandelion.decide(from, now) {
+            Decision::Fluff(why) => self.fluff(tx, why).await,
+            Decision::Stem(peer) => {
+                // What `insert_verified` would re-check against the tip, so a stem never carries a
+                // transaction this node would not pool.
+                guard_precheck(|| self.mempool.precheck(&tx, self.hs.tip_ledger(), self.executor.as_ref()))?;
+                if !self.dandelion.hold(hash, tx.clone(), from, now) {
+                    return self.fluff(tx, FluffReason::Full).await;
+                }
+                self.dandelion.stempool.sent(&hash, peer);
+                DandelionStats::bump(&self.dandelion_stats.stem_sent);
+                tracing::debug!(%hash, %peer, local = from == Edge::Local, "stem");
+                self.net.stem(peer, tx).await;
+                Ok(hash)
+            }
+        }
+    }
+
+    /// Pool a verified transaction and publish it on gossip: the end of its stem, or no stem at
+    /// all. Published only when pooled, so a transaction gone stale (spent, committed) on the way
+    /// is dropped here instead of sent.
+    async fn fluff(&mut self, tx: Transaction, why: FluffReason) -> Result<Hash, MempoolError> {
+        let pooled = self.mempool.insert_verified(tx.clone(), self.hs.tip_ledger(), self.executor.as_ref());
+        if let Ok(hash) = &pooled {
+            self.dandelion_stats.count_fluff(why);
+            tracing::debug!(%hash, ?why, "fluff");
+            self.net.broadcast(GossipMessage::Transaction(tx)).await;
+        }
+        pooled
+    }
+
+    /// A stem copy of a transaction this node already holds in its stempool (issue #145): the
+    /// stem looped. Decided as a fresh arrival on that edge, without verifying it again
+    /// ([`Dandelion::on_loop`]). `from` is `Local` only when this node's own RPC submitted a
+    /// transaction a peer had already stemmed here: nothing more to do.
+    async fn on_stem_loop(&mut self, hash: Hash, from: Edge) {
+        let Edge::Peer(sender) = from else { return };
+        match self.dandelion.on_loop(&hash, sender, Instant::now()) {
+            LoopAction::Restem(peer) => {
+                let Some(tx) = self.dandelion.stempool.tx(&hash).cloned() else { return };
+                self.dandelion.stempool.sent(&hash, peer);
+                DandelionStats::bump(&self.dandelion_stats.loop_restem);
+                DandelionStats::bump(&self.dandelion_stats.stem_sent);
+                self.net.stem(peer, tx).await;
+            }
+            LoopAction::Fluff(why) => {
+                if let Some(tx) = self.dandelion.stempool.take(&hash) {
+                    let _ = self.fluff(tx, why).await;
+                }
+            }
+            LoopAction::Absorb => DandelionStats::bump(&self.dandelion_stats.loop_absorbed),
+        }
+    }
+
+    /// The embargo fail-safe (issue #145): every stem transaction whose timer ran out without it
+    /// coming back over gossip is fluffed by this node.
+    async fn on_embargo(&mut self) {
+        for (hash, tx) in self.dandelion.stempool.expired(Instant::now()) {
+            tracing::debug!(%hash, "embargo expired; fluffing");
+            let _ = self.fluff(tx, FluffReason::Embargo).await;
+        }
+    }
+
+    /// A transaction a peer stemmed to this node (issue #145). One already in the stempool is a
+    /// loop: sent on without a verification ([`Node::on_stem_loop`]), and not metered, since a
+    /// node forwards one transaction at most [`crate::dandelion::MAX_STEM_FORWARDS`] times. Any
+    /// other is pre-screened as a gossiped one is — the peer's stem allowance, the refused cache,
+    /// the verification queue — and verified on the same queue; one already pooled was fluffed and
+    /// needs nothing. The hash comes before the meter here, unlike gossip's: the request codec has
+    /// already decoded the whole transaction, which costs more.
+    async fn on_stem_tx(&mut self, from: PeerId, tx: Transaction) {
+        DandelionStats::bump(&self.dandelion_stats.stem_received);
+        if !self.dandelion.cfg.enabled {
+            return;
+        }
+        let hash = tx.hash();
+        if self.dandelion.stempool.contains(&hash) {
+            return self.on_stem_loop(hash, Edge::Peer(from)).await;
+        }
+        let outcome = {
+            let bucket = &mut self.peers.entry(from).or_default().stem_bucket;
+            GossipOutcome::for_transaction(
+                &tx,
+                Some(bucket),
+                &mut self.refused,
+                &self.stem_limiter,
+                self.verify_queue.len(),
+                self.verify_limits.queue,
+                Instant::now(),
+            )
+        };
+        if outcome != GossipOutcome::Verify {
+            tracing::debug!(%hash, %from, ?outcome, "stem dropped before verification");
+            return;
+        }
+        if self.mempool.contains(&hash) || self.cached_proof_refusal(&tx).is_some() {
+            return;
+        }
+        if let Err(e) = guard_precheck(|| self.mempool.precheck(&tx, self.hs.tip_ledger(), self.executor.as_ref())) {
+            let _ = admission::acceptance_for_pool(&e, hash, &mut self.refused);
+            self.note_refusal(hash);
+            return;
+        }
+        self.mempool.state_proof_queued(&tx, self.hs.tip_ledger(), self.executor.as_ref());
+        self.mempool.verify_queued(&tx);
+        self.verify_queue.push_back((tx, VerifySource::Stem(from)));
+        self.pump_verify();
+    }
+
+    /// A stem send failed (issue #145): the successor is dropped for the epoch, and the
+    /// transaction goes to the edge's new successor if there is one; otherwise its embargo fluffs it.
+    async fn on_stem_failed(&mut self, peer: PeerId, hash: Hash) {
+        self.dandelion.router.remove_peer(&peer, &mut self.dandelion.rng);
+        self.dandelion_stats.stem_peers.store(self.dandelion.router.capable(), Ordering::Relaxed);
+        let Some((origin, sent)) = self.dandelion.stempool.route_of(&hash).map(|(o, s)| (o, s.to_vec())) else { return };
+        let next = self.dandelion.router.route(origin, Instant::now(), &mut self.dandelion.rng);
+        if let Some(next) = next.filter(|n| !sent.contains(n)) {
+            let Some(tx) = self.dandelion.stempool.tx(&hash).cloned() else { return };
+            self.dandelion.stempool.sent(&hash, next);
+            DandelionStats::bump(&self.dandelion_stats.stem_sent);
+            self.net.stem(next, tx).await;
+        }
     }
 
     /// Hand one decision to gossipsub. Every path that delivers a gossip message ends here or in
@@ -3293,6 +3485,24 @@ impl Node {
         if outcome != GossipOutcome::Verify {
             self.report(id, outcome).await;
             return Ok(());
+        }
+        // Dandelion++ (issue #145): a transaction this node holds on the stem came back fluffed by
+        // another node. It verified here already: pooled, accepted (so relayed), and its embargo
+        // is off; a park waiting for it is filled as from any gossiped body. The hash is taken
+        // only while the stempool holds anything.
+        if !self.dandelion.stempool.is_empty() {
+            let hash = tx.hash();
+            if let Some(held) = self.dandelion.stempool.take(&hash) {
+                let a = match self.mempool.insert_verified(held, self.hs.tip_ledger(), self.executor.as_ref()) {
+                    Ok(_) => admission::Acceptance::Accept,
+                    Err(e) => admission::acceptance_for_pool(&e, hash, &mut self.refused),
+                };
+                self.report(id, GossipOutcome::Report(a)).await;
+                if self.parked.values().any(|p| p.wants(&hash)) {
+                    self.fill_parks(tx).await?;
+                }
+                return Ok(());
+            }
         }
         // I1: a state proof this node already refused over the segment the tip builds for it is
         // not verified again. Not a byte verdict (the segment is state), so an `Ignore`.
@@ -3389,6 +3599,12 @@ impl Node {
     /// bounded by `RpcState::max_body_bytes`.
     async fn submit_tx(&mut self, tx: Transaction, reply: oneshot::Sender<Result<Hash, MempoolError>>) {
         let hash = tx.hash();
+        // Dandelion++ (issue #145): one already on the stem from here is not stemmed again. The
+        // answer is the one a first submission gets, so it says nothing about the stempool.
+        if self.dandelion.stempool.contains(&hash) {
+            let _ = reply.send(Ok(hash));
+            return;
+        }
         let outcome = GossipOutcome::for_transaction(
             &tx,
             None,
@@ -3902,6 +4118,8 @@ impl Node {
                 self.binding_announce_wanted = true;
             }
             NetworkEvent::PeerDisconnected(p) => {
+                self.dandelion.router.remove_peer(&p, &mut self.dandelion.rng);
+                self.dandelion_stats.stem_peers.store(self.dandelion.router.capable(), Ordering::Relaxed);
                 let held_our_batch = self.sync_inflight.map(|s| s.0) == Some(p);
                 disconnect_peer(&mut self.peers, &mut self.peer_memory, p, held_our_batch, Instant::now());
                 if held_our_batch {
@@ -4031,6 +4249,15 @@ impl Node {
             NetworkEvent::SyncResponse { peer, request_id, response } => {
                 self.on_sync_response(peer, request_id, response).await?;
             }
+            // Dandelion++ (issue #145).
+            NetworkEvent::StemPeer { peer, outbound } => {
+                if self.dandelion.cfg.enabled {
+                    self.dandelion.router.add_peer(peer, outbound, &mut self.dandelion.rng);
+                    self.dandelion_stats.stem_peers.store(self.dandelion.router.capable(), Ordering::Relaxed);
+                }
+            }
+            NetworkEvent::StemTx { from, tx } => self.on_stem_tx(from, tx).await,
+            NetworkEvent::StemFailed { peer, hash } => self.on_stem_failed(peer, hash).await,
             NetworkEvent::SyncFailed { peer, request_id, error } => {
                 let was_batch = self.sync_inflight.map(|s| s.1) == Some(request_id);
                 if was_batch {
@@ -5315,9 +5542,10 @@ impl Node {
 ///
 /// Factored out of [`Node::mint`] as the pure half — no network, no mempool, no rate limiter —
 /// so it is unit-testable against a bare ledger rather than the whole running node. No memo: a
-/// faucet has no sender's intent to write one for.
+/// faucet has no sender's intent to write one for. Public for the integration tests, which need a
+/// transaction that verifies without a proof (`tests/dandelion.rs`).
 #[allow(clippy::too_many_arguments)]
-fn faucet_mint_tx(
+pub fn faucet_mint_tx(
     domain: &randprotocol_core::BindingDomain,
     chain_id: u64,
     envelope_bytes: Option<usize>,
@@ -7457,6 +7685,7 @@ mod tests {
         Broadcast(GossipMessage),
         Sync(PeerId, SyncRequest),
         Report(libp2p::gossipsub::MessageAcceptance),
+        Stem(PeerId, Transaction),
     }
 
     /// A `Node` over `storage` and `hs` with no swarm, RPC or loop behind it, for tests that call
@@ -7505,6 +7734,7 @@ mod tests {
                         Seen::Sync(peer, request)
                     }
                     network::NetworkCommand::Broadcast(m) => Seen::Broadcast(m),
+                    network::NetworkCommand::Stem { peer, tx } => Seen::Stem(peer, tx),
                     network::NetworkCommand::ReportValidation { acceptance, .. } => Seen::Report(acceptance),
                     _ => continue,
                 };
@@ -7585,6 +7815,7 @@ mod tests {
                 crate::peer_bindings::BINDING_GOSSIP_BURST,
                 crate::peer_bindings::BINDING_GOSSIP_PER_SEC,
             ),
+            stem_limiter: admission::PeerLimiter::new(crate::dandelion::STEM_PEER_BURST, crate::dandelion::STEM_PEER_PER_SEC),
             peer_bindings,
             binding_signer: None,
             binding_announced_at: None,
@@ -7607,6 +7838,8 @@ mod tests {
             waiting_hashes: HashSet::new(),
             in_flight_keys: HashMap::new(),
             apply_inline: false,
+            dandelion: Dandelion::new(DandelionConfig { seed: Some(1), ..DandelionConfig::default() }),
+            dandelion_stats: Arc::new(DandelionStats::default()),
         };
         (node, seen_rx, applied_rx)
     }
@@ -7928,6 +8161,227 @@ mod tests {
     /// fixture chain's.
     fn next_tx(ledger: &Ledger, i: u32) -> Transaction {
         bundle_tx(ledger, [[40 + i; 8], [50 + i; 8]], [[60 + i; 8], [70 + i; 8]], bundle_fee())
+    }
+
+    // ------------------------------------------- Dandelion++ (issue #145)
+
+    /// A bare node on [`replica_past_a_boundary`] with one stem-capable peer, at fluff
+    /// probability `q` and embargo `embargo`.
+    fn stem_node(q: f64, embargo: Duration) -> (tempfile::TempDir, Node, mpsc::UnboundedReceiver<Seen>, PeerId) {
+        let (d, storage, gs, hs) = replica_past_a_boundary();
+        let (mut node, seen) = bare_node(storage, gs, hs);
+        node.dandelion = Dandelion::new(DandelionConfig { fluff_prob: q, embargo, seed: Some(7), ..DandelionConfig::default() });
+        let succ = PeerId::random();
+        node.dandelion.router.add_peer(succ, true, &mut node.dandelion.rng);
+        (d, node, seen, succ)
+    }
+
+    fn stems(seen: &[Seen]) -> Vec<(PeerId, Hash)> {
+        seen.iter().filter_map(|s| match s { Seen::Stem(p, tx) => Some((*p, tx.hash())), _ => None }).collect()
+    }
+
+    fn broadcast_txs(seen: &[Seen]) -> Vec<Hash> {
+        seen.iter()
+            .filter_map(|s| match s {
+                Seen::Broadcast(GossipMessage::Transaction(tx)) => Some(tx.hash()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    async fn tx_status(node: &mut Node, h: Hash) -> rpc::PoolStatus {
+        let (reply, rx) = oneshot::channel();
+        node.on_command(NodeCommand::TxStatus { hashes: vec![h], reply }).await.unwrap();
+        rx.await.unwrap().remove(0)
+    }
+
+    async fn mempool_count(node: &mut Node) -> usize {
+        let (reply, rx) = oneshot::channel();
+        node.on_command(NodeCommand::MempoolInfo { reply }).await.unwrap();
+        rx.await.unwrap().count
+    }
+
+    fn served(node: &mut Node, h: Hash) -> Vec<Transaction> {
+        let SyncResponse::Transactions(v) = node.serve_sync(SyncRequest::Transactions(vec![h])) else { panic!("served") };
+        v
+    }
+
+    /// The mempool-probing attack the chain-21 experiment ran, closed: a transaction held on the
+    /// stem is in no answer this node gives anyone — `rand_getTransactionStatus` says `unknown`,
+    /// `rand_getMempoolInfo` counts nothing, `SyncRequest::Transactions` serves nothing, and no
+    /// gossip goes out. Its embargo then fluffs it: pooled, published, and visible everywhere.
+    #[tokio::test]
+    async fn a_stem_transaction_is_invisible_until_its_embargo_fluffs_it() {
+        let (_d, mut node, mut seen, succ) = stem_node(0.0, Duration::from_millis(5));
+        let tx = next_tx(node.hs.tip_ledger(), 1);
+        let h = tx.hash();
+        let pred = PeerId::random();
+        node.on_verdict(Verdict { tx: tx.clone(), result: Ok(()), source: VerifySource::Stem(pred), proof_key: None, busy: false })
+            .await
+            .unwrap();
+        let out = drain(&mut seen).await;
+        assert_eq!(stems(&out), vec![(succ, h)], "stemmed on to the successor");
+        assert_eq!(broadcast_txs(&out), vec![], "not published");
+        assert!(node.dandelion.stempool.contains(&h) && !node.mempool.contains(&h));
+        assert_eq!(tx_status(&mut node, h).await, rpc::PoolStatus::Unknown, "rand_getTransactionStatus");
+        assert_eq!(mempool_count(&mut node).await, 0, "rand_getMempoolInfo");
+        assert!(served(&mut node, h).is_empty(), "SyncRequest::Transactions");
+        assert_eq!(node.status.read().unwrap().mempool_size, 0);
+
+        // The embargo: b + min(Exp(b/4), b) at a relay, at most 10 ms here.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        node.on_embargo().await;
+        let out = drain(&mut seen).await;
+        assert_eq!(broadcast_txs(&out), vec![h], "fluffed by its embargo");
+        assert!(node.mempool.contains(&h) && !node.dandelion.stempool.contains(&h));
+        assert_eq!(tx_status(&mut node, h).await, rpc::PoolStatus::Pending);
+        assert_eq!(served(&mut node, h), vec![tx]);
+        assert_eq!(node.dandelion_stats.get(|s| &s.fluff_embargo), 1);
+    }
+
+    /// The node's own RPC submission takes the stem: the caller hears `Ok`, the successor gets
+    /// the transaction, nothing is published. The same bytes submitted again are answered alike
+    /// and neither verified nor stemmed a second time.
+    #[tokio::test]
+    async fn an_rpc_submission_is_stemmed_once_and_a_resubmission_answered_alike() {
+        let (_d, mut node, mut seen, succ) = stem_node(1.0, Duration::from_secs(60));
+        let tx = next_tx(node.hs.tip_ledger(), 2);
+        let h = tx.hash();
+        let (reply, answer) = oneshot::channel();
+        node.on_verdict(Verdict { tx: tx.clone(), result: Ok(()), source: VerifySource::Rpc(reply), proof_key: None, busy: false })
+            .await
+            .unwrap();
+        assert_eq!(answer.await.unwrap(), Ok(h));
+        let out = drain(&mut seen).await;
+        assert_eq!(stems(&out), vec![(succ, h)], "q = 1 still stems the submitter's own transaction");
+        assert_eq!(broadcast_txs(&out), vec![]);
+        assert_eq!(tx_status(&mut node, h).await, rpc::PoolStatus::Unknown);
+
+        let (reply, answer) = oneshot::channel();
+        node.submit_tx(tx.clone(), reply).await;
+        assert_eq!(answer.await.unwrap(), Ok(h), "a resubmission hears what the first submission heard");
+        assert!(node.verify_queue.is_empty() && node.verify_in_flight == 0, "not verified again");
+        assert!(drain(&mut seen).await.is_empty(), "not stemmed again");
+        assert_eq!(node.dandelion_stats.get(|s| &s.stem_sent), 1);
+    }
+
+    /// With no stem-capable peer (a fleet of older nodes) or Dandelion off, a submission is
+    /// pooled and published at once, as before v0.8.3.
+    #[tokio::test]
+    async fn with_no_stem_peer_or_dandelion_off_a_submission_is_published_at_once() {
+        for cfg in [DandelionConfig { seed: Some(1), ..DandelionConfig::default() }, DandelionConfig::off()] {
+            let (_d, storage, gs, hs) = replica_past_a_boundary();
+            let (mut node, mut seen) = bare_node(storage, gs, hs);
+            node.dandelion = Dandelion::new(cfg.clone());
+            if !cfg.enabled {
+                // A capable peer is ignored when Dandelion is off.
+                node.on_network_event(NetworkEvent::StemPeer { peer: PeerId::random(), outbound: true }).await.unwrap();
+            }
+            let tx = next_tx(node.hs.tip_ledger(), 3);
+            let h = tx.hash();
+            let (reply, answer) = oneshot::channel();
+            node.on_verdict(Verdict { tx, result: Ok(()), source: VerifySource::Rpc(reply), proof_key: None, busy: false }).await.unwrap();
+            assert_eq!(answer.await.unwrap(), Ok(h));
+            let out = drain(&mut seen).await;
+            assert_eq!(broadcast_txs(&out), vec![h], "enabled = {}", cfg.enabled);
+            assert!(stems(&out).is_empty());
+            assert_eq!(tx_status(&mut node, h).await, rpc::PoolStatus::Pending);
+            assert_eq!(node.dandelion_stats.get(|s| &s.fluff_no_route), 1);
+        }
+    }
+
+    /// A relay fluffs on the coin: at q = 1 a peer's stem is pooled and published by the first
+    /// node it reaches.
+    #[tokio::test]
+    async fn at_q_one_a_relay_fluffs_what_it_was_stemmed() {
+        let (_d, mut node, mut seen, _succ) = stem_node(1.0, Duration::from_secs(60));
+        let tx = next_tx(node.hs.tip_ledger(), 4);
+        let h = tx.hash();
+        node.on_verdict(Verdict { tx, result: Ok(()), source: VerifySource::Stem(PeerId::random()), proof_key: None, busy: false })
+            .await
+            .unwrap();
+        let out = drain(&mut seen).await;
+        assert_eq!(broadcast_txs(&out), vec![h]);
+        assert!(stems(&out).is_empty());
+        assert!(node.mempool.contains(&h) && node.dandelion.stempool.is_empty());
+        assert_eq!(node.dandelion_stats.get(|s| &s.fluff_coin), 1);
+    }
+
+    /// A transaction held on the stem that comes back fluffed over gossip is pooled from the
+    /// stempool — accepted, so relayed, without a second verification — and its embargo is off.
+    #[tokio::test]
+    async fn a_held_transaction_seen_on_gossip_is_pooled_without_verifying_again() {
+        let (_d, mut node, mut seen, _succ) = stem_node(0.0, Duration::from_secs(60));
+        let tx = next_tx(node.hs.tip_ledger(), 5);
+        let h = tx.hash();
+        node.on_verdict(Verdict { tx: tx.clone(), result: Ok(()), source: VerifySource::Stem(PeerId::random()), proof_key: None, busy: false })
+            .await
+            .unwrap();
+        drain(&mut seen).await;
+        node.on_gossiped_tx(tx, gossip_id()).await.unwrap();
+        let out = drain(&mut seen).await;
+        assert!(out.iter().any(|s| matches!(s, Seen::Report(libp2p::gossipsub::MessageAcceptance::Accept))), "accepted: relayed on");
+        assert!(node.mempool.contains(&h));
+        assert!(node.dandelion.stempool.is_empty() && node.dandelion.stempool.next_deadline().is_none(), "no embargo left");
+        assert!(node.verify_queue.is_empty() && node.verify_in_flight == 0, "not verified again");
+    }
+
+    /// A stem that comes back to the node holding it is sent on by the edge's route without a
+    /// second verification; a peer that leaves stops being a successor; a failed send moves the
+    /// transaction to the next successor.
+    #[tokio::test]
+    async fn a_looping_stem_goes_on_and_a_failed_send_moves_to_the_next_successor() {
+        let (_d, mut node, mut seen, succ) = stem_node(0.0, Duration::from_secs(60));
+        let second = PeerId::random();
+        node.on_network_event(NetworkEvent::StemPeer { peer: second, outbound: true }).await.unwrap();
+        assert_eq!(node.dandelion.router.successors().len(), 2);
+        let tx = next_tx(node.hs.tip_ledger(), 6);
+        let h = tx.hash();
+        let (reply, _answer) = oneshot::channel();
+        node.on_verdict(Verdict { tx: tx.clone(), result: Ok(()), source: VerifySource::Rpc(reply), proof_key: None, busy: false })
+            .await
+            .unwrap();
+        let first = stems(&drain(&mut seen).await);
+        assert_eq!(first.len(), 1);
+        let to = first[0].0;
+        // It comes back from the successor it went to: on to the other one, unverified.
+        node.on_network_event(NetworkEvent::StemTx { from: to, tx: tx.clone() }).await.unwrap();
+        let other = if to == succ { second } else { succ };
+        assert_eq!(stems(&drain(&mut seen).await), vec![(other, h)]);
+        assert!(node.verify_queue.is_empty() && node.verify_in_flight == 0);
+        assert_eq!(node.dandelion_stats.get(|s| &s.loop_restem), 1);
+        // The send to `other` failed: it is dropped and nothing is left to send to but `to`,
+        // which already has it — the embargo covers the rest.
+        node.on_network_event(NetworkEvent::StemFailed { peer: other, hash: h }).await.unwrap();
+        assert!(!node.dandelion.router.successors().contains(&other));
+        assert!(stems(&drain(&mut seen).await).is_empty());
+        assert!(node.dandelion.stempool.contains(&h), "still held for its embargo");
+        // A departed peer leaves the successors.
+        node.on_network_event(NetworkEvent::PeerDisconnected(to)).await.unwrap();
+        assert!(node.dandelion.router.successors().is_empty());
+        assert_eq!(node.dandelion_stats.stem_peers.load(Ordering::Relaxed), 0);
+    }
+
+    /// A peer's stem is pre-screened like gossip — over its allowance it is dropped unverified —
+    /// and an accepted one is queued for verification, not pooled.
+    #[tokio::test]
+    async fn a_peers_stem_is_metered_and_queued_for_verification() {
+        let (_d, mut node, mut seen, _succ) = stem_node(0.0, Duration::from_secs(60));
+        let pred = PeerId::random();
+        let tx = next_tx(node.hs.tip_ledger(), 7);
+        node.on_network_event(NetworkEvent::StemTx { from: pred, tx: tx.clone() }).await.unwrap();
+        assert_eq!(node.verify_in_flight + node.verify_queue.len(), 1, "queued for the verifier");
+        assert!(!node.mempool.contains(&tx.hash()));
+        assert!(drain(&mut seen).await.is_empty(), "nothing sent before the verdict");
+        // Spend the forwarder's allowance: its next stem is dropped before any work.
+        let mut spent = admission::TokenBucket::default();
+        let now = Instant::now();
+        while node.stem_limiter.allow(&mut spent, now) {}
+        node.peers.entry(pred).or_default().stem_bucket = spent;
+        let before = node.verify_in_flight + node.verify_queue.len();
+        node.on_network_event(NetworkEvent::StemTx { from: pred, tx: next_tx(node.hs.tip_ledger(), 8) }).await.unwrap();
+        assert_eq!(node.verify_in_flight + node.verify_queue.len(), before, "over its allowance: not verified");
+        assert_eq!(node.dandelion_stats.get(|s| &s.stem_received), 2);
     }
 
     /// A delivery id from a fresh forwarder.

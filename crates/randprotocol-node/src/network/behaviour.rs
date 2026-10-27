@@ -1,5 +1,5 @@
 use super::codec::Codec;
-use super::wire::{SyncRequest, SyncResponse};
+use super::wire::{StemRequest, StemResponse, SyncRequest, SyncResponse};
 use libp2p::swarm::behaviour::toggle::Toggle;
 use libp2p::swarm::NetworkBehaviour;
 use libp2p::{connection_limits, gossipsub, identify, kad, mdns, ping, request_response};
@@ -33,6 +33,10 @@ pub struct RandBehaviour {
     /// Our own CBOR codec, not `request_response::cbor::Behaviour`: that one's size limits are
     /// private constants and it truncates rather than rejects (see [`super::codec`]).
     pub sync: request_response::Behaviour<Codec<SyncRequest, SyncResponse>>,
+    /// Dandelion++'s stem (issue #145): `/rand/{chain}/stem/1`, one transaction to one peer.
+    /// Absent under `--dandelion off`, so such a node advertises no stem protocol through identify
+    /// and no peer ever stems to it.
+    pub stem: Toggle<request_response::Behaviour<Codec<StemRequest, StemResponse>>>,
     /// Keeps connections from idling out and surfaces dead links quickly.
     pub ping: ping::Behaviour,
 }
@@ -45,6 +49,7 @@ pub enum RandEvent {
     Kademlia(kad::Event),
     Mdns(mdns::Event),
     Sync(request_response::Event<SyncRequest, SyncResponse>),
+    Stem(request_response::Event<StemRequest, StemResponse>),
     Ping(ping::Event),
 }
 
@@ -78,6 +83,12 @@ impl From<mdns::Event> for RandEvent {
 impl From<request_response::Event<SyncRequest, SyncResponse>> for RandEvent {
     fn from(e: request_response::Event<SyncRequest, SyncResponse>) -> Self {
         RandEvent::Sync(e)
+    }
+}
+
+impl From<request_response::Event<StemRequest, StemResponse>> for RandEvent {
+    fn from(e: request_response::Event<StemRequest, StemResponse>) -> Self {
+        RandEvent::Stem(e)
     }
 }
 

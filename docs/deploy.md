@@ -202,7 +202,56 @@ The two lanes cannot share a topic or a protocol, so the roll runs both, then dr
 3. The next release can make `--anonymous-tx-only` the default and drop the legacy topic.
 
 The lane does not hide timing: the first node to relay a transaction is still the likeliest
-author to a well-connected observer. That is the Dandelion++ issue's to close.
+author to a well-connected observer. That is the Dandelion++ issue's to close (next section).
+
+### Dandelion++ (v0.8.3, issue #145)
+
+The chain-21 experiment watched every validator's mempool and found the node that first held a
+transaction was the node it was submitted to in 27 of 27 traces: a node published what its RPC
+accepted at once, to every peer (`flood_publish`). From v0.8.3 a transaction submitted over RPC
+first takes a **stem**: it is sent to one peer over `/rand/<chain>/stem/1`, each relay passes it on
+to one peer of its own or, with probability q, **fluffs** it (pools it and publishes it on gossip),
+and every holder fluffs it itself if it has not seen it on gossip within its embargo. Until the
+fluff no node shows it over RPC, serves it to a peer or proposes it (`docs/architecture.md` §8).
+
+| flag | default | |
+|---|---|---|
+| `--dandelion on\|off` | `on` | stem at all; `off` neither sends nor accepts stems and does not advertise the protocol |
+| `--dandelion-fluff-prob` | `0.1` | q; a stem runs about 1/q relays |
+| `--dandelion-embargo-ms` | `3000` | b; a relay waits b + min(Exp(b/4), b), the submitter 2b + Exp(b/4) |
+
+**Rollout.** Nothing to coordinate: it is on by default and rolls with the binary, in any order.
+A node sends a stem only to a peer whose identify lists the stem protocol, so a node that predates
+v0.8.3 is never sent one and sees exactly what it saw before. A v0.8.3 node with no v0.8.3 peer
+publishes at once, as before. While the fleet is mixed the stem runs over the v0.8.3 nodes only,
+so the cover grows as the roll proceeds; nothing breaks at any point. To back it out on one node,
+restart it with `--dandelion off`: its peers stop stemming to it when identify next runs (the
+connection is re-established at the restart).
+
+**With the anonymous lane's phases (issue #146).** The two are independent and compose:
+
+1. *Phase 1, both lanes* (the v0.8.3 roll). The fluffing node publishes on `tx/2` and, signed, on
+   the legacy `tx` topic. The legacy copy names its publisher, which is now the fluffing relay,
+   not the submitter: Dandelion already moves what the signature gives away off the submitter in
+   this phase.
+2. *Phase 2, `--anonymous-tx-only`.* Nothing names a publisher at all; what remains is timing,
+   which the stem moves a random walk away from the submitter.
+3. The legacy topic gone, the transaction lane is anonymous gossip without `flood_publish`, fed
+   only by fluffs.
+
+**What it costs.** Each stem hop is a one-way delay between two nodes plus, at a node seeing the
+transaction for the first time, its verification. With q = 0.1 a stem runs ten hops on average
+(22 at the 90th percentile in a 25-node simulation), so on the fleet's links expect about one to
+two seconds more before a transaction is first published, against a block time of about a second
+and an eight-second finality. A stem whose successor drops it waits for the embargo: 3–6 s (about
+3.75 s on average) when a relay's fires, 6 s or more when only the submitter's does. `wait_for_transaction` and the
+wallets see `unknown`, then `pending`, then `committed`, as before, only later.
+
+**What it does not hide.** Dandelion++ protects against an observer of the gossip; it does not
+protect against an adversary that runs many of a node's stem successors (it sees the stem
+directly), nor against the operator of the RPC endpoint a wallet submits to, who sees the
+wallet's IP whatever the network does next (issue #148: pair it with Tor or a relay). Each hop is
+a direct connection, so its two ends know each other, as on any peer-to-peer link.
 
 ## Rolling out a new commit
 
