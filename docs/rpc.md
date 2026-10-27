@@ -1646,9 +1646,9 @@ transaction paying more above its floor per KiB displaces the cheapest, and one 
 refused `mempool full`; governance actions pass both caps. Fee-less perp actions (orders, cancels,
 withdrawal requests; audit v10, PERP-1) have two caps of their own, 16 per account and 1 024 in
 all, refused `mempool holds 16 fee-less perp actions of account … already` and `mempool full of
-fee-less perp actions (1024)`; and while four `max_window_blocks` of recorded digests wait for a
+fee-less perp actions (1024)`; and, on a chain whose genesis sets `sparse_windows`, while four `max_window_blocks` of recorded digests wait for a
 state proof a new order is refused `the exchange has N unproved block digests …` (`docs/perps.md`,
-"The node"); under genesis `sparse_windows` (PERP-101) also while the head is four
+"The node"); and there also while the head is four
 `max_window_heights` or more past the proved height, refused `the exchange is N heights past its
 proved height …`. All of them are `mempool full`'s class: about this node, retryable, never cached. A
 `PerpStateProof` of a proof shape this node has not verified is refused `state-proof verification

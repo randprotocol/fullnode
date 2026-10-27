@@ -510,7 +510,9 @@ bridged one.
   buys no place. The rank-0 orders and cancels are offered **round-robin by account** — every
   account's first pooled input, then every second — so a block's `max_block_inputs` go to distinct
   accounts before any account's second input: three accounts flooding chain 21's 24-input blocks
-  hold three slots while the others wait. And **back-pressure**: while
+  hold three slots while the others wait. And **back-pressure**, only on a chain whose genesis sets `sparse_windows` (chain 22 on; a
+  dense chain records a digest every block, so on chain 21 it would hold every order for good once
+  proving fell behind): while
   `PERP_BACKPRESSURE_WINDOWS` (4) × `max_window_blocks` recorded digests wait for a proof, the node
   admits no new order (deposits, cancels, withdrawals, oracle prices and proofs are unaffected),
   so a lagging prover is not buried further. None of this returns collateral without a proof: the
@@ -538,7 +540,7 @@ not the chain's `proved_root`, which is how the prover learns to roll back.
   per-account and pool-wide counts of fee-less perp actions (PERP-1, "The node").
 - **Provers versus 1 s blocks (I7, PERP-101).** `MAX_WINDOW_BLOCKS` is 64, and a tier-16 proof
   takes 76 to 400 s, so on 1 s blocks a single prover falls behind the digests it must cover on a
-  dense chain (chain 21). Back-pressure holds new orders while proofs lag (PERP-1); genesis
+  dense chain (chain 21). Under genesis `sparse_windows` back-pressure holds new orders while proofs lag (PERP-1), and
   `sparse_windows` (from the next cut) elides input-less blocks so a window covers up to
   `max_window_heights` heights. A busy exchange (inputs in most blocks) still needs proving at the
   input rate: sparse windows bound the lag by activity, not by block count.

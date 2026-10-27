@@ -627,21 +627,22 @@ impl Mempool {
         if self.perp_pooled >= self.perp_pool_cap {
             return Err(MempoolError::PerpPoolFull);
         }
-        if let (Action::PerpOrder { .. }, Some(p)) = (&tx.action, ledger.perps()) {
+        // PERP-1 (e) / I-3: only on a chain whose genesis sets `sparse_windows` (chain 22 on). A
+        // dense chain records a digest every block, so with proving slower than the block rate
+        // the limit would hold every new order for good; chain 21 keeps accepting them.
+        if let (Action::PerpOrder { .. }, Some(p)) = (&tx.action, ledger.perps().filter(|p| p.config.sparse_windows)) {
             let max = (p.config.max_window_blocks as usize).saturating_mul(PERP_BACKPRESSURE_WINDOWS);
             let unproved = p.pending_digests();
             if unproved >= max {
                 return Err(MempoolError::PerpBackpressure { unproved, max });
             }
-            // PERP-101: under `sparse_windows` a window is bounded by heights too, so the prover
-            // is as far behind when the tip is that many windows' heights past the proved one,
-            // however few digests those heights recorded.
-            if p.config.sparse_windows {
-                let max = p.config.max_window_heights.saturating_mul(PERP_BACKPRESSURE_WINDOWS as u64);
-                let behind = ledger.height().saturating_sub(p.proved_height);
-                if behind >= max {
-                    return Err(MempoolError::PerpHeightBackpressure { behind, max });
-                }
+            // PERP-101: a sparse window is bounded by heights too, so the prover is as far behind
+            // when the tip is that many windows' heights past the proved one, however few digests
+            // those heights recorded.
+            let max = p.config.max_window_heights.saturating_mul(PERP_BACKPRESSURE_WINDOWS as u64);
+            let behind = ledger.height().saturating_sub(p.proved_height);
+            if behind >= max {
+                return Err(MempoolError::PerpHeightBackpressure { behind, max });
             }
         }
         Ok(())
@@ -4432,31 +4433,42 @@ mod tests {
         assert_eq!((count(0), count(1), count(2)), (3, 2, 2), "the deposit took one of the eight slots; the rest went round");
     }
 
-    /// Audit v10, PERP-1 (e): once four windows of recorded digests wait for a proof
-    /// (`PERP_BACKPRESSURE_WINDOWS` × `max_window_blocks`, 32 on the fixture chain) this node
-    /// admits no new order — a `Full`-class verdict — while a deposit, a cancel, a withdrawal and
-    /// an oracle price pass; a state proof that covers a window lifts it.
+    /// PERP-1 (e), gated on `sparse_windows` (I-3): once four windows of recorded digests wait
+    /// for a proof (`PERP_BACKPRESSURE_WINDOWS` × `max_window_blocks`, 32 on the fixture chain)
+    /// this node admits no new order — a `Full`-class verdict — while a deposit, a withdrawal and
+    /// an oracle price pass; a state proof that covers a window lifts it. A dense chain (chain
+    /// 21's rule) never holds an order back, however many digests wait.
     #[test]
     fn new_orders_are_refused_while_four_windows_of_digests_wait_for_a_proof() {
         use fixtures::{key, make_perps_block, perp_deposit_tx, perp_oracle_tx, perp_state_proof_tx, perp_withdraw_tx};
         let a = key(50);
-        let gs = fixtures::perps_genesis(7);
-        let mut l = gs.ledger.clone();
-        let max = l.perps().unwrap().config.max_window_blocks as usize * PERP_BACKPRESSURE_WINDOWS;
-        // Block 1 opens the account; blocks 2..=32 are empty. Every close records a digest, so
-        // 32 wait for a proof.
-        let deposit = perp_deposit_tx(&l, &a, 300, 5_000_000);
-        let mut parent = make_perps_block(&gs.block, &mut l, vec![deposit], &key(1));
-        for _ in 2..=max {
-            parent = make_perps_block(&parent, &mut l, vec![], &key(1));
-        }
-        assert_eq!(l.perps().unwrap().pending_digests(), max);
+        let chain = |sparse: bool| {
+            let mut file = fixtures::perps_genesis_file(7);
+            let c = file.perps.as_mut().unwrap();
+            c.sparse_windows = sparse;
+            c.max_window_heights = if sparse { 16 } else { 0 };
+            let gs = file.build(&StubExecutor).unwrap();
+            let mut l = gs.ledger.clone();
+            let max = l.perps().unwrap().config.max_window_blocks as usize * PERP_BACKPRESSURE_WINDOWS;
+            // Every block carries an input (a deposit), so every close records a digest on
+            // either kind of chain: `max` wait for a proof.
+            let d = perp_deposit_tx(&l, &a, 300, 5_000_000);
+            let mut parent = make_perps_block(&gs.block, &mut l, vec![d], &key(1));
+            for i in 2..=max {
+                let d = perp_deposit_tx(&l, &a, 300 + 10 * i as u32, 5_000_000);
+                parent = make_perps_block(&parent, &mut l, vec![d], &key(1));
+            }
+            assert_eq!(l.perps().unwrap().pending_digests(), max);
+            (l, max)
+        };
         let m = Mempool::new(100);
         let order = perp_order_tx(&a, 1);
+        let (dense, _) = chain(false);
+        assert!(m.precheck(&order, &dense, &StubExecutor).is_ok(), "chain 21's rule: orders are never held");
+        let (l, max) = chain(true);
         let held = MempoolError::PerpBackpressure { unproved: max, max };
         assert_eq!(m.precheck(&order, &l, &StubExecutor).unwrap_err(), held);
         assert!(held.is_retryable());
-        assert!(m.precheck(&perp_cancel_tx(&a, 2, 1), &l, &StubExecutor).is_ok(), "a cancel passes");
         assert!(m.precheck(&perp_withdraw_tx(7, &a, 3, 1_000, l.height() as u32), &l, &StubExecutor).is_ok(), "a request passes");
         assert!(m.precheck(&perp_deposit_tx(&l, &a, 900, 5_000_000), &l, &StubExecutor).is_ok(), "a deposit passes");
         assert!(m.precheck(&perp_oracle_tx(7, &key(1), 100, 1), &l, &StubExecutor).is_ok(), "an oracle passes");
@@ -4473,7 +4485,7 @@ mod tests {
     /// PERP-101: under `sparse_windows` few digests may wait while many heights do, so a new
     /// order is also held back once the tip is four windows' heights (`PERP_BACKPRESSURE_WINDOWS`
     /// × `max_window_heights`, 64 here) past the proved height; a dense chain (chain 21's rule)
-    /// counts digests alone, the same tip included.
+    /// holds none back, the same tip included.
     #[test]
     fn under_sparse_windows_new_orders_are_held_once_four_windows_of_heights_pass() {
         use fixtures::{key, make_perps_block, perp_deposit_tx};
@@ -4502,9 +4514,10 @@ mod tests {
         let held = MempoolError::PerpHeightBackpressure { behind: 64, max: 64 };
         assert_eq!(m.precheck(&order, &at_64, &StubExecutor).unwrap_err(), held);
         assert!(held.is_retryable());
-        // Dense: 64 digests wait, which is the digest limit (32) twice over — that rule, unchanged.
+        // Dense (chain 21's rule): 64 digests wait and the head is 64 past the proved height, and
+        // the order still passes — back-pressure is a sparse-chain policy (I-3).
         let (_, dense) = run(false);
-        assert!(matches!(m.precheck(&order, &dense, &StubExecutor).unwrap_err(), MempoolError::PerpBackpressure { .. }));
+        assert!(m.precheck(&order, &dense, &StubExecutor).is_ok());
     }
 
     /// CON-60 (b): one state proof of a shape this node has never verified may be in flight at a
