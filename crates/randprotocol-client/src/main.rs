@@ -799,6 +799,10 @@ enum PerpCmd {
         /// Return once the node accepts the proof instead of waiting for it to commit.
         #[arg(long)]
         no_wait: bool,
+        /// Prove at the smallest tier the window fits, unpadded, instead of the chain's canonical
+        /// shape (tier max_tier, witness padded; the shape every node keeps a key for, CON-60).
+        #[arg(long)]
+        smallest: bool,
     },
     /// Print the engine state root (hex) of a JSON array of u32 state words.
     GenesisRoot {
@@ -1993,6 +1997,7 @@ async fn perp(
             fri,
             no_submit,
             no_wait,
+            smallest,
         } => {
             let job = perps::ProveJob::load(&job)?;
             let profile = match fri {
@@ -2001,8 +2006,8 @@ async fn perp(
                 None => profile_of(rpc).await?,
             };
             let chain_id = rpc.chain_id().await?;
-            let (hash, tier, bytes) = perps::prove_and_submit_state_proof(
-                rpc, chain_id, &image, &job, tier, profile, !no_submit, !no_wait,
+            let (hash, tier, bytes) = perps::prove_and_submit_state_proof_shaped(
+                rpc, chain_id, &image, &job, tier, profile, !no_submit, !no_wait, !smallest,
             )
             .await?;
             println!("tier {tier}\nproof {bytes} bytes");

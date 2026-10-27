@@ -28,6 +28,7 @@ use randprotocol_core::ledger::perps::{
     account_id, domain, payouts_digest, perp_digest, state_proof_segment, PerpOrderBody,
     PerpPayout, PerpPrice, MAX_PERP_PAYOUTS, PERP_FROM,
 };
+pub use randprotocol_core::ledger::perps::{canonical_input_log_height, canonical_witness_words, segment_public_log_height};
 use randprotocol_core::notes::{word8_from_hex, EnvelopeFormat, Word8};
 use randprotocol_core::{Action, BindingDomain, Hash, Keypair, PublicKey, Signature, Transaction};
 use randprotocol_zkvm::address::seal_note_as;
@@ -608,6 +609,40 @@ pub async fn prove_and_submit_state_proof(
     submit: bool,
     wait: bool,
 ) -> Result<(Hash, u8, usize)> {
+    prove_and_submit_state_proof_shaped(rpc, chain_id, image, job, tier, profile, submit, wait, false).await
+}
+
+/// CON-60: `witness` padded with zero words to [`canonical_witness_words`]`(max_tier)`, the
+/// length that gives the canonical input height ([`canonical_input_log_height`]). The guest reads
+/// only the words its counts name, so the padding changes nothing it computes. Refused when the
+/// window's own witness is already longer (prove a shorter window).
+pub fn pad_witness_canonical(witness: &mut Vec<u32>, max_tier: u8) -> Result<()> {
+    let want = canonical_witness_words(max_tier);
+    if witness.len() > want {
+        bail!(
+            "the window's witness is {} words, past the {want} the canonical shape at tier {max_tier} holds; prove a shorter window",
+            witness.len()
+        );
+    }
+    witness.resize(want, 0);
+    Ok(())
+}
+
+/// [`prove_and_submit_state_proof`], and with `canonical` the chain's canonical state-proof shape
+/// (CON-60, `docs/perps.md`): tier `max_tier` and the witness padded by [`pad_witness_canonical`],
+/// the shape every node keeps a key for. A `--tier` other than `max_tier` is refused then.
+#[allow(clippy::too_many_arguments)]
+pub async fn prove_and_submit_state_proof_shaped(
+    rpc: &RpcClient,
+    chain_id: u64,
+    image: &Path,
+    job: &ProveJob,
+    tier: Option<u8>,
+    profile: FriProfile,
+    submit: bool,
+    wait: bool,
+    canonical: bool,
+) -> Result<(Hash, u8, usize)> {
     let state = PerpsState::fetch(rpc).await?;
     job.check_for(state.sparse_windows)?;
     let executor = ZkExecutor::new(profile);
@@ -656,7 +691,16 @@ pub async fn prove_and_submit_state_proof(
     let program = randprotocol_zkvm::codec::program_from_bytes(&bytes)
         .map_err(|e| anyhow!("{} is not a program image: {e}", image.display()))?;
     check_image_hc(&program, &state.engine_hc)?;
-    let witness = job_witness(job);
+    let mut witness = job_witness(job);
+    let tier = if canonical {
+        if tier.is_some_and(|t| t != state.max_tier) {
+            bail!("--tier {}: the canonical shape proves at the chain's max_tier {}", tier.unwrap_or(0), state.max_tier);
+        }
+        pad_witness_canonical(&mut witness, state.max_tier)?;
+        Some(state.max_tier)
+    } else {
+        tier
+    };
     // A dry run first: seconds against a proof's minutes, and the engine's own verdict on the
     // window before anything is spent on it.
     let exec = randprotocol_zkvm::emulator::execute(
@@ -1024,6 +1068,25 @@ mod tests {
             engine_program_log_height(&program),
             randprotocol_zkvm::tables::program::program_log_height(program.words.len())
         );
+    }
+
+    /// CON-60: canonical padding fills the witness to `2^h − 1` words, whose input height is the
+    /// canonical one, and refuses a longer witness.
+    #[test]
+    fn canonical_padding_reaches_the_canonical_input_height() {
+        let mut w = job_witness(&job());
+        let n = w.len();
+        pad_witness_canonical(&mut w, 18).unwrap();
+        assert_eq!(w.len(), 65_535);
+        assert_eq!(&w[n..n + 3], &[0, 0, 0]);
+        assert_eq!(randprotocol_zkvm::tables::input::input_log_height(w.len()), canonical_input_log_height(18));
+        assert_eq!(randprotocol_zkvm::tables::input::input_log_height(canonical_witness_words(16)), canonical_input_log_height(16));
+        let mut long = vec![1u32; 70_000];
+        assert!(pad_witness_canonical(&mut long, 18).unwrap_err().to_string().contains("shorter window"));
+        // The public heights the ledger rule restates are the zkVM's.
+        for n in 1..=64usize {
+            assert_eq!(segment_public_log_height(32 + 8 * n), randprotocol_zkvm::tables::public::public_log_height(32 + 8 * n));
+        }
     }
 
     /// M2: the tier is the dry run's unless `--tier` raises it, and a window that needs more than

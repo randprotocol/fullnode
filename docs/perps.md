@@ -505,30 +505,46 @@ bridged one.
 - **State-proof verifier keys (CON-60).** The executor builds the key a proof's header declares
   before it verifies anything, and a state proof is fee-less, so junk of ever new shapes would
   each cost a key build (a tier-18 key is over a minute in a debug build). Node policy, on every
-  chain, never a validity rule:
-  - state-proof keys live in the executor's own machine (an LRU no call, bundle or auth shape
-    shares), so junk of one shape costs at most one build while it is cached;
-  - a shape whose proof verified here, or that a committed block carried, is **pinned** (never
-    evicted; at most 32) and recorded in the node's database (`perp-proof-shapes`);
-  - at startup, off the node loop and after the bundle key, the node builds and pins the most
-    recent 8 distinct shapes, newest first, from those it recorded and those of the state proofs
-    in its last 4 096 blocks, so the honest prover's shape is warm even right after a roll;
-  - a proof of a shape with **no key built** costs a token — but only once it passes every rule
-    the ledger and the executor apply before a key is touched (the ledger's window and payout
-    rules over the tip, then the canonical body, the tier at most `max_tier`, the caps, the public
-    height of the tip's segment, and the genesis pin): a proof refused for free never spends one;
-  - tokens come from two buckets of 2, each refilled one per 30 s (`COLD_KEY_BUILD_BURST`/
-    `_INTERVAL`): a **lineage reserve** for shapes of the engine's lineage — sharing program,
-    keccak and sha256 heights with a verified shape, or matching the genesis
-    `engine_program_log_height` with no hash table — and a general bucket for every other shape.
-    Lineage keys are built in their own LRU (128), which foreign shapes never reach. With its
-    bucket spent a proof is refused `this node is at its limit of verifier-key builds for new
-    state-proof shapes; retry later` (`StateProofBusy`, retryable, never cached, no peer
-    penalised, no timing). No refusal moves a bucket, a proof of a warm shape never needs a
-    token, and foreign junk cannot touch the reserve; lineage junk spends it only by building
-    shapes the honest prover may use, which then stay warm.
-  From the next cut the genesis `engine_program_log_height` pin also narrows the shapes a proof
-  may declare at all, and marks the engine's lineage from genesis on.
+  chain, never a validity rule — chain 21's verdicts are unchanged:
+  - **the canonical shape.** The honest prover proves every window at the chain's canonical
+    shape (below); a node reserves, caches and keeps exactly those keys;
+  - a proof costs a cold-build token only if its shape has no key built **and** it passes every
+    rule applied before a key is touched: the ledger's window and payout rules over the tip, the
+    executor's header rules (canonical body, tier at most `max_tier`, declared caps, the public
+    height of the tip's segment), the verifier's own pre-key prefix (`Machine::check_pre_key`,
+    the function `Machine::verify` runs first: the public values against the genesis
+    `engine_hc`, canonical values, `TIER`, `GAS`, the pc window, the commit PoW witnesses, the
+    degree bits), the segment's public digest, and the genesis pin. A proof refused for free
+    never spends a token;
+  - tokens come from two buckets of 2, each refilled one per 30 s: a **reserve** for the chain's
+    canonical shapes, and a general bucket for every other shape. Canonical keys live in their
+    own cache of 8 (a chain has at most four canonical shapes); other shapes share a cache of 2
+    (a tier-14 key is ~60 MB retained and a tier-18 key is estimated at a few hundred MB, so this
+    keeps the worst case well under 1 GB beside the canonical cache). With its bucket spent a
+    proof is refused `this node is at its limit of verifier-key builds for new state-proof
+    shapes; retry later` (`StateProofBusy`, retryable, never cached, no peer penalised, no
+    timing). No refusal moves a bucket. An attacker can force at most one build per canonical
+    shape before every honest shape is warm;
+  - a shape whose proof verified here, or that a committed block carried, is pinned (never
+    evicted, at most 8) and recorded in the node's database; at startup, off the node loop and
+    after the bundle key, the node builds and pins the 8 newest recorded or recently committed
+    shapes.
+
+  **The canonical state-proof shape** (`ledger::perps::canonical_input_log_height`,
+  `canonical_witness_words`, `segment_public_log_height`; `rand perp prove` proves at it unless
+  `--smallest`): for genesis `max_tier` = T and a window of n recorded blocks,
+
+  | component | value |
+  |---|---|
+  | tier | T |
+  | input height | h = clamp(T − 2, 7, 16): the witness is padded with zero words to 2^h − 1 words (65 535 at T = 18, 16 383 at T = 16); a longer witness is refused (prove a shorter window) |
+  | public height | log2(next_pow2(max(32 + 8n + 1, 4))), at least 7: 7 for n = 1..=11, 8 for 12..=27, 9 for 28..=59, 10 for 60..=64 |
+  | program height | the engine image's (genesis `engine_program_log_height` when set, else the shape a verified proof showed) |
+  | keccak, sha256 | none |
+
+  T − 2 keeps the input digest (one Poseidon2 row per four words) at a quarter of the tier's
+  2^(T−3) budget; 16 is the input height of the most words a proof may carry. The guest reads only
+  the words its counts name, so the padding changes nothing it computes.
 - **Fee-less perp actions in the pool (audit v10, PERP-1).** An order, a cancel or a withdrawal
   request pays no fee, so the pool bounds them by count rather than by price — node policies,
   never validity rules, each a `mempool full`-class refusal (retryable, never cached, no peer

@@ -216,21 +216,33 @@ pub trait ConfidentialExecutor: Send + Sync {
     /// its chain's committed state proofs). A no-op by default.
     fn warm_perp(&self, _shape: &ProofShape) {}
     /// CON-60: whether a state proof's bytes pass every rule the executor applies before a
-    /// verifier key is touched — canonical body, tier in range and at most `max_tier`, the
-    /// declared caps, the public height of a `segment_len`-word segment, and the genesis
-    /// `engine_program_log_height` pin when non-zero. A proof that fails is refused for free, so
-    /// a node's pool never spends a cold-build token on it. `true` by default.
-    fn perp_proof_admissible(&self, _proof: &[u8], _max_tier: u8, _segment_len: usize, _engine_program_log_height: u8) -> bool {
+    /// verifier key is touched — the header rules (canonical body, tier in range and at most
+    /// `max_tier`, the declared caps, the public height of `segment`), then the verifier's own
+    /// pre-key prefix against `engine_hc` (the public values, pc window, PoW witnesses, degree
+    /// bits), then `segment`'s public digest, and the genesis `engine_program_log_height` pin when
+    /// non-zero. A proof that fails is refused without a key build, so a node's pool never spends
+    /// a cold-build token on it. `true` by default.
+    fn perp_proof_admissible(
+        &self,
+        _proof: &[u8],
+        _engine_hc: &Word8,
+        _max_tier: u8,
+        _segment: &[u32],
+        _engine_program_log_height: u8,
+    ) -> bool {
         true
     }
-    /// CON-60: whether `shape` is of the engine's lineage (shares program, keccak and sha256
-    /// heights with a verified shape, or matches the genesis pin): its cold builds draw on a
-    /// reserve foreign junk cannot drain. `false` by default.
-    fn perp_shape_lineage(&self, _shape: &ProofShape) -> bool {
+    /// CON-60: whether `shape` is the canonical state-proof shape of this chain
+    /// (`ledger::perps::canonical_input_log_height` and the rest): tier `max_tier`, the canonical
+    /// input height, the engine's program height (the genesis pin, or a verified shape's), no hash
+    /// table. Only these draw on the pool's reserve and live in the reserved key cache. `false`
+    /// by default.
+    fn perp_shape_canonical(&self, _shape: &ProofShape) -> bool {
         false
     }
-    /// CON-60: the genesis `engine_program_log_height` (non-zero), told once at genesis load.
-    fn set_perp_engine_pin(&self, _program_log_height: u8) {}
+    /// CON-60: the genesis perps section's `max_tier` and `engine_program_log_height` (0 = none),
+    /// told once at genesis load.
+    fn set_perp_config(&self, _max_tier: u8, _engine_program_log_height: u8) {}
     /// [`Self::decode_invoke`]'s twin for [`Self::verify_perp`]: everything but the STARK
     /// verification, the segment's digest still compared. The ledger never calls this; kept as
     /// `verify_perp`'s header twin (no production caller). Defaults to the full verify.
@@ -871,19 +883,33 @@ impl ConfidentialExecutor for StubExecutor {
         })
     }
 
-    /// CON-60: the stub's header rules — a stub proof, its tier in `perps::TIERS` and at most
-    /// `max_tier`, and the pin when set.
-    fn perp_proof_admissible(&self, proof: &[u8], max_tier: u8, _segment_len: usize, engine_program_log_height: u8) -> bool {
+    /// CON-60: the stub's pre-key rules — a stub proof bound to `engine_hc`, its tier in
+    /// `perps::TIERS` and at most `max_tier`, its public digest `segment`'s, and the pin when set.
+    fn perp_proof_admissible(
+        &self,
+        proof: &[u8],
+        engine_hc: &Word8,
+        max_tier: u8,
+        segment: &[u32],
+        engine_program_log_height: u8,
+    ) -> bool {
         let Some(shape) = self.perp_proof_shape(proof) else { return false };
-        crate::ledger::perps::TIERS.contains(&shape.tier)
+        proof[STUB_PROGRAM_BINDING..STUB_LEN - 8] == Self::perp_binding(engine_hc)
+            && word8_from_bytes(&proof[69..101]).is_some_and(|d| d == self.public_digest(segment))
+            && crate::ledger::perps::TIERS.contains(&shape.tier)
             && shape.tier <= max_tier
             && (engine_program_log_height == 0
                 || (shape.program_log_height == engine_program_log_height && shape.keccak_log_height == 0 && shape.sha256_log_height == 0))
     }
 
-    /// CON-60: the stub's lineage: the engine's program height with no hash table.
-    fn perp_shape_lineage(&self, shape: &ProofShape) -> bool {
-        shape.program_log_height == STUB_PERP_PROGRAM_LOG_HEIGHT && shape.keccak_log_height == 0 && shape.sha256_log_height == 0
+    /// CON-60: the stub's canonical shape — tier 16 (the test chains' `max_tier`), the engine's
+    /// program height, input height 1 (a stub proof's `[0, 1, 0, 0]` heights), no hash table.
+    fn perp_shape_canonical(&self, shape: &ProofShape) -> bool {
+        shape.tier == 16
+            && shape.program_log_height == STUB_PERP_PROGRAM_LOG_HEIGHT
+            && shape.input_log_height == 1
+            && shape.keccak_log_height == 0
+            && shape.sha256_log_height == 0
     }
 
     /// CON-60: the stub holds a key for the engine's honest shape only — an unshaped

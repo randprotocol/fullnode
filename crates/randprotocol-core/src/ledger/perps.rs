@@ -62,6 +62,39 @@ pub const PERP_FROM: Word8 = [u32::from_le_bytes(*b"rpl3"), u32::from_le_bytes(*
 const _: () = assert!(MAX_PERP_PAYOUTS as u64 <= super::MAX_LEAVES_PER_TX);
 /// The most blocks `max_window_blocks` may set one state proof to cover.
 pub const MAX_WINDOW_BLOCKS: u64 = 64;
+/// CON-60: the canonical state-proof shape (pool policy, never a validity rule). The honest
+/// prover pads every proof to it, so a node can warm, reserve and keep exactly these keys: for a
+/// chain whose genesis `max_tier` is `T` and a window of `n` recorded blocks,
+///
+/// - tier `T` (prove at the cap, whatever the window needs);
+/// - input height [`canonical_input_log_height`]`(T) = clamp(T − 2, 7, 16)`, reached by appending
+///   zero words to the guest's witness until it is [`canonical_witness_words`]`(T) =
+///   2^h − 1` words long (the guest reads only the words it counts; the padding is never read).
+///   `T − 2` keeps the input digest's Poseidon2 rows (one per four words) at a quarter of the
+///   tier's 2^(T−3) budget; 16 is the input table's height for the most words a proof may carry
+///   (`u16::MAX`). At `T` = 18 that is 65 535 words, past the longest 64-block window at 24
+///   inputs a block (≈ 33 000 words with the state); at `T` = 16, 16 383 words — a prover
+///   shortens a window that does not fit;
+/// - public height [`segment_public_log_height`]`(32 + 8n)` — 7 for 1..=11 blocks, 8 for 12..=27,
+///   9 for 28..=59, 10 for 60..=64: at most four shapes per chain;
+/// - the engine's program height, and no keccak or sha256 table.
+pub fn canonical_input_log_height(max_tier: u8) -> u8 {
+    max_tier.saturating_sub(2).clamp(7, 16)
+}
+
+/// CON-60: the length the honest prover pads its witness to — the longest witness of
+/// [`canonical_input_log_height`]: `2^h − 1` words (the input table holds `n + 1` rows).
+pub fn canonical_witness_words(max_tier: u8) -> usize {
+    (1usize << canonical_input_log_height(max_tier)) - 1
+}
+
+/// The public-table height a segment of `words` words declares — `randprotocol-zkvm`'s
+/// `tables::public::public_log_height` restated (core cannot name the zkvm crate; a test there
+/// pins the two): `log2(next_pow2(max(words + 1, 4)))`, at least 7.
+pub fn segment_public_log_height(words: usize) -> u8 {
+    ((words + 1).max(4).next_power_of_two().trailing_zeros() as u8).max(7)
+}
+
 /// The highest `engine_program_log_height` a genesis may pin (CON-60): a program table of 2^24
 /// rows is far past any image a tier-20 proof can hold.
 pub const MAX_ENGINE_PROGRAM_LOG_HEIGHT: u8 = 24;
@@ -3825,6 +3858,18 @@ pub(crate) mod tests {
         let mut json = serde_json::to_value(&c).unwrap();
         assert!(json.as_object_mut().unwrap().remove("engine_program_log_height").is_some());
         assert_eq!(serde_json::from_value::<PerpsConfig>(json).unwrap(), c, "absent means unpinned");
+    }
+
+    /// CON-60: the canonical shape's formula, and its four public heights over 1..=64 blocks.
+    #[test]
+    fn the_canonical_shape_is_the_documented_formula() {
+        assert_eq!([10, 12, 14, 16, 18, 20].map(canonical_input_log_height), [8, 10, 12, 14, 16, 16]);
+        assert_eq!(canonical_witness_words(18), 65_535);
+        assert_eq!(canonical_witness_words(16), 16_383);
+        let heights: std::collections::BTreeSet<u8> = (1..=64).map(|n| segment_public_log_height(32 + 8 * n)).collect();
+        assert_eq!(heights.into_iter().collect::<Vec<_>>(), vec![7, 8, 9, 10]);
+        assert_eq!((segment_public_log_height(32 + 8 * 11), segment_public_log_height(32 + 8 * 12)), (7, 8));
+        assert_eq!((segment_public_log_height(32 + 8 * 59), segment_public_log_height(32 + 8 * 60)), (9, 10));
     }
 
     #[test]

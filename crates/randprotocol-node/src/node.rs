@@ -162,10 +162,10 @@ pub fn load_genesis(datadir: &std::path::Path) -> Result<(GenesisState, Arc<dyn 
     if gs.ledger.hc_auth_multisig().is_some() {
         executor.enable_auth_multisig();
     }
-    // CON-60: the genesis engine pin, so the executor knows the engine's lineage before any
-    // committed proof shows it.
-    if let Some(pin) = gs.ledger.perps().map(|p| p.config.engine_program_log_height).filter(|h| *h != 0) {
-        executor.set_perp_engine_pin(pin);
+    // CON-60: the perps section's `max_tier` and engine pin, so the executor knows the chain's
+    // canonical state-proof shapes before any committed proof shows them.
+    if let Some(c) = gs.ledger.perps().map(|p| &p.config) {
+        executor.set_perp_config(c.max_tier, c.engine_program_log_height);
     }
     Ok((gs, executor))
 }
