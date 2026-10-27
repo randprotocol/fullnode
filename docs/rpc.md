@@ -1983,18 +1983,6 @@ the proof's published digest against the one it computed before it submits anyth
 
 What changed for clients, in one place. Newest first.
 
-### v0.8.0 — private multisig: `hc_auth_multisig` (genesis-gated; chain 21 onward)
-
-- `rand_status`, `rand_getLimits`: `hc_auth_multisig` (hex, `null` without it).
-- `rand_status`: `msauth_key` (`"loaded"`, `"built"` or `"absent"`), where the node's tier-18
-  multisig verifier key came from.
-- `rand_sendTransaction`: on a genesis with `hc_auth_multisig` the request-body cap counts three
-  proofs at `max_proof_bytes`. No wire, txid or binding change: a multisig-authorised bundle has
-  the same fields as any v3 bundle, and only its auth proof's declared shape differs
-  (`docs/shielded.md` §2). A multisig-shaped auth proof on a chain without the field is refused
-  `InvalidAuthProof`, permanently; one sent while the node's key is still cold is deferred with a
-  retryable refusal.
-
 ### v0.8.2 — perps fields in `rand_getPerps` and `rand_getSupply` (node-only on chain 21; the rules they report are genesis-gated)
 
 - `rand_getPerps`: `bound_payouts`, `initial_collateral`, `collateral_in`, `collateral_out`,
@@ -2011,7 +1999,19 @@ the leaves its keys opened (which told the node which leaves were the wallet's):
 aligned chunk of `--scan-chunk` leaves (256 by default, 0 = every envelope, 2..1000) around each.
 No RPC method changes; the scan-heads section above has the trade-off.
 
-### Unreleased — `rand_getScanLeaves` (node-only)
+### v0.8.0 — private multisig: `hc_auth_multisig` (genesis-gated; chain 21 onward)
+
+- `rand_status`, `rand_getLimits`: `hc_auth_multisig` (hex, `null` without it).
+- `rand_status`: `msauth_key` (`"loaded"`, `"built"` or `"absent"`), where the node's tier-18
+  multisig verifier key came from.
+- `rand_sendTransaction`: on a genesis with `hc_auth_multisig` the request-body cap counts three
+  proofs at `max_proof_bytes`. No wire, txid or binding change: a multisig-authorised bundle has
+  the same fields as any v3 bundle, and only its auth proof's declared shape differs
+  (`docs/shielded.md` §2). A multisig-shaped auth proof on a chain without the field is refused
+  `InvalidAuthProof`, permanently; one sent while the node's key is still cold is deferred with a
+  retryable refusal.
+
+### v0.8.0 — `rand_getScanLeaves` (node-only)
 
 New public read `rand_getScanLeaves(from_index, limit)`: `rand_getCommitments`' rows with
 `envelope` replaced by `scan`, the base64 of `kem_ct ‖ to_receiver ‖ to_sender` (above). Nothing
@@ -2019,7 +2019,7 @@ on chain changes. `rand` scans with it and falls back to `rand_getCommitments` a
 answers `-32601`. The randprotocol.org relay forwards only the methods on its own list, so a
 browser wallet behind it keeps the full pages until the relay lists this one.
 
-### Unreleased — tree aggregation: `Aggregate.layout` (genesis-gated; no chain carries it yet)
+### v0.8.0 — tree aggregation: `Aggregate.layout` (genesis-gated; chain 21 does not carry it)
 
 **Wire change for aggregates (on every chain, though none has carried one):** `Action::Aggregate`
 gains a last field, `layout` (`Flat` or `Tree`, a trailing 4-byte enum index), so its encoding and
@@ -2038,7 +2038,7 @@ rebuilds its tree from (`rpc::TreeStatus::to_config` reads it back exactly). A `
 `CoveredPublicValues` and `TreeRootDigest` as permanent; `TreeKeyPin` and `TreeRebuild` (this
 build cannot rebuild the section) are not cached.
 
-### Unreleased — dollar-indexed prover pay: `rand_getRandPrice`, `fee_rules.usd_subsidy`, `SetRandPrice` (tag 44) (genesis-gated; no chain carries it yet)
+### v0.8.0 — dollar-indexed prover pay: `rand_getRandPrice`, `fee_rules.usd_subsidy`, `SetRandPrice` (tag 44) (genesis-gated; chain 21 does not carry it)
 
 Additive. A genesis `fees.usd_subsidy` section (`docs/fees.md` §1.3; aggregating chains only)
 pays a sealed aggregate a dollar target converted at a RAND/USD price the validator set votes —
@@ -2056,7 +2056,7 @@ pool at the next tip. The action is tag 44, after multisig's 40–43, bundle-les
 and fee-less; refused `UnsupportedAction` on a chain without the section. `rand_getAggregate`'s
 `subsidy` and `rand_getSupply`'s `subsidised` move by what the ledger minted, as before.
 
-### Unreleased — multisig accounts: `rand_getMultisig`, four actions (tags 40–43) (genesis-gated; no chain carries it yet)
+### v0.8.0 — multisig accounts: `rand_getMultisig`, four actions (tags 40–43) (genesis-gated; chain 21 onward)
 
 Additive. A genesis `multisig` section (`docs/multisig.md`) switches on M-of-N accounts: public
 per-asset balances spent by `threshold` of `n` Dilithium2 keys. New: `rand_getMultisig [id]`
@@ -2071,7 +2071,7 @@ renders four kinds: `create_multisig` (`salt`, `threshold`, `signer_count`), `mu
 notes in `public_notes`. The four actions are tags 40–43, after the perps actions (34–39) — an encoder must derive tags
 from the enum. All four are refused (`UnsupportedAction("multisig")`) on a chain without the section.
 
-### Unreleased — the proposer/aggregator split: `fee_rules.proposer_share_bps` and `prove_base` (genesis-gated; no chain carries it yet)
+### v0.8.0 — the proposer/aggregator split: `fee_rules.proposer_share_bps` and `prove_base` (genesis-gated; chain 21 does not carry it)
 
 Additive. `rand_getLimits.fee_rules` gains `proposer_share_bps` (a number) and `prove_base` (a
 decimal string), each `null` when the genesis `fees` section leaves it out; either set makes
@@ -2084,7 +2084,7 @@ inclusion by its share of the base only, and `rand_getUnsealed`'s `excess` (and 
 `rand_getAggregate`'s `proving_share`) carries the rest of the base beside the tip and
 `prove_base`. `rand_getSupply` is unchanged: nothing new crosses the pool boundary.
 
-### Unreleased — fee feedback: the genesis `fees` section and the burned base (genesis-gated; no chain carries it yet)
+### v0.8.0 — fee feedback: the genesis `fees` section and the burned base (genesis-gated; chain 21 onward)
 
 Additive. `rand_getSupply` gains `base_fees_burned` (a decimal string, `"0"` on every chain without
 the flag): the bundle bases destroyed under the genesis `fees.burn_base` (`docs/fees.md` §1.3), on
