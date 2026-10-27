@@ -13,6 +13,13 @@ wallet ──https──> nginx (web droplet, TLS, per-address limit, no access 
                           └─ …
 ```
 
+**Status, 2026-10-22 — two members.** The pool is `a` (4SK4-P64N-XWEN-ZSZZ) and `b`
+(0XZX-NZ1J-SPMB-GWZN), each with a key made on its own host, both running the signed `v0.8.0`
+rand-prover (`TAG=v0.8.0 MEMBER=… install-host.sh`, then `install-web.sh a:8611=… b:8612=…`). One
+real chain-21 transfer proved through each. Clients pin them from wallet 0.8.1 and
+`rand prover pair --trusted` from the next release; older wallets and CLIs refuse both. The
+history below is kept for the retired members.
+
 **Status, 2026-10-01 13:00 UTC — per-member keys only.** Four members, each with its own key made
 on its host and never copied: `a` (rand-node-a, ZEXQ-1JHV-ZT60-KFB5), `archive2` (rand-archive-2,
 D2XV-WXVT-PZRC-D7G8), `nyc3` (SR28-MYT0-GR6A-03DE), `sfo3` (GMNX-Q1QD-FEXG-JHJM), at

@@ -663,7 +663,7 @@ mod tests {
     #[test]
     fn the_trusted_provers_are_the_pools_members_each_with_its_own_key() {
         let members = trusted_provers().expect("the built-in list parses");
-        assert_eq!(members.iter().map(|m| m.name.as_str()).collect::<Vec<_>>(), ["a", "archive2", "nyc3", "sfo3"]);
+        assert_eq!(members.iter().map(|m| m.name.as_str()).collect::<Vec<_>>(), ["a", "b"]);
         let mut keys = std::collections::HashSet::new();
         for m in &members {
             assert!(!m.link.own, "{}: the pool is nobody's own prover", m.name);

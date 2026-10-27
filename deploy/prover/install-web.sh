@@ -3,8 +3,8 @@
 # prover host, the router, the nginx vhost, the pairing document. Run after install-host.sh has
 # run on every host named here, and after the DNS record exists (certbot needs it).
 #
-#   WEB=root@159.65.138.161 PUBLIC_DIR=~/rand-prover-trusted/public \
-#     deploy/prover/install-web.sh a:8611=139.59.238.151 nyc3:8613=138.197.113.180 8603=138.197.113.180 …
+#   WEB=root@<web-host> PUBLIC_DIR=~/rand-prover-trusted/public \
+#     deploy/prover/install-web.sh a:8611=<host-a> b:8612=<host-b>
 #
 # An argument <name>:<local port>=<ip> is a MEMBER with its own key (audit v7, VK-9): its tunnel
 # reaches the host's rand-prover-member on 8610 and https://prover.randprotocol.org/m/<name> goes
@@ -16,7 +16,7 @@
 # tunnel's public key, which install-host.sh needs first.
 set -euo pipefail
 
-WEB=${WEB:?WEB: the web droplet, e.g. root@159.65.138.161}
+WEB=${WEB:?WEB: the web droplet, e.g. root@<web-host>}
 if [ "${1:-}" = "--key" ]; then
     ssh -o BatchMode=yes -o ConnectTimeout=20 "$WEB" 'set -e
         install -d -m 0700 /etc/rand-prover-pool
