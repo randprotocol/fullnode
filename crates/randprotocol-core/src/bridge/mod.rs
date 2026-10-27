@@ -74,9 +74,17 @@ pub enum VerifyError {
 
 /// Recovers the guardian address (last 20 bytes of
 /// `keccak256(uncompressed_pubkey[1..])`) that produced `sig` over
-/// `digest`, or `None` if the signature is malformed or unrecoverable.
+/// `digest`, or `None` if the signature is malformed, high-s or
+/// unrecoverable.
+///
+/// The high-s refusal is explicit: k256 0.13 refused a high-s signature
+/// inside `recover_from_prehash` (it verified the recovered key, and k256
+/// verification is low-s only); 0.14 recovers without that check. The
+/// refusal keeps this function's accepted set what it was before the 0.14
+/// upgrade (RUSTSEC-2026-0387); [`verify_decoded`] also refuses high-s
+/// before it recovers.
 pub fn recover_address(digest: &[u8; 32], sig: &Signature) -> Option<GuardianKey> {
-    if sig.v > 1 {
+    if sig.v > 1 || !is_low_s(&sig.s) {
         return None;
     }
     let ecdsa_sig = EcdsaSignature::from_scalars(sig.r, sig.s).ok()?;
@@ -89,16 +97,16 @@ pub fn recover_address(digest: &[u8; 32], sig: &Signature) -> Option<GuardianKey
 /// low-s [`Signature`] tagged with guardian `index` and recovery id 0 or 1.
 pub fn sign_digest(secret: &[u8; 32], index: u8, digest: &[u8; 32]) -> Signature {
     let signing_key = SigningKey::from_bytes(secret.into()).expect("valid secp256k1 secret key");
-    let (sig, recid) = signing_key
-        .sign_prehash_recoverable(digest)
-        .expect("prehash signing cannot fail for a valid key and 32-byte digest");
-    let (sig, recid) = match sig.normalize_s() {
-        Some(normalized) => {
-            let flipped = RecoveryId::from_byte(recid.to_byte() ^ 1)
-                .expect("flipping bit 0 of a valid recovery id stays valid");
-            (normalized, flipped)
-        }
-        None => (sig, recid),
+    let (sig, recid) = signing_key.sign_prehash_recoverable(digest);
+    // k256 already signs low-s; normalizing again is a guard, and a
+    // normalized (negated) s flips the parity of R as recovery sees it.
+    let normalized = sig.normalize_s();
+    let (sig, recid) = if normalized != sig {
+        let flipped = RecoveryId::from_byte(recid.to_byte() ^ 1)
+            .expect("flipping bit 0 of a valid recovery id stays valid");
+        (normalized, flipped)
+    } else {
+        (sig, recid)
     };
     let (r, s) = sig.split_bytes();
     Signature {
@@ -119,7 +127,7 @@ pub fn guardian_address(secret: &[u8; 32]) -> GuardianKey {
 /// The last 20 bytes of `keccak256(uncompressed_pubkey[1..])`, i.e. the
 /// guardian address for `key`.
 fn address_from_verifying_key(key: &VerifyingKey) -> GuardianKey {
-    let encoded = key.to_encoded_point(false);
+    let encoded = key.to_sec1_point(false);
     let hash = keccak256(&encoded.as_bytes()[1..]);
     let mut out = [0u8; 20];
     out.copy_from_slice(&hash[12..]);
@@ -274,6 +282,23 @@ mod tests {
         buf.extend(2u16.to_be_bytes());
         buf.extend([5u8; 32]);
         assert_eq!(asset_id(2, &[5; 32]), Hash(*blake3::hash(&buf).as_bytes()));
+    }
+
+    /// k256 0.14 recovers a key from a high-s signature where 0.13 refused it;
+    /// `recover_address` keeps 0.13's answer (RUSTSEC-2026-0387 upgrade).
+    #[test]
+    fn recover_address_refuses_the_high_s_twin() {
+        let secret = [0x42u8; 32];
+        let d = [0x17u8; 32];
+        let sig = sign_digest(&secret, 0, &d);
+        assert_eq!(recover_address(&d, &sig), Some(guardian_address(&secret)));
+        let ecdsa = EcdsaSignature::from_scalars(sig.r, sig.s).unwrap();
+        let negated = -*ecdsa.s();
+        let high: [u8; 32] = negated.to_bytes().into();
+        assert!(!is_low_s(&high));
+        for v in 0..=1 {
+            assert_eq!(recover_address(&d, &Signature { s: high, v, ..sig }), None);
+        }
     }
 
     #[test]
