@@ -654,6 +654,18 @@ impl ConfidentialExecutor for AggExecutor {
         self.inner.perp_proof_shape(proof)
     }
 
+    fn perp_key_ready(&self, shape: &randprotocol_core::confidential::ProofShape) -> bool {
+        self.inner.perp_key_ready(shape)
+    }
+
+    fn keep_perp_key(&self, shape: &randprotocol_core::confidential::ProofShape) {
+        self.inner.keep_perp_key(shape)
+    }
+
+    fn warm_perp(&self, shape: &randprotocol_core::confidential::ProofShape) {
+        self.inner.warm_perp(shape)
+    }
+
     /// The keys an `Invoke` verifies under are these too: its segment sits in the hardened
     /// call's public table (`program_state::segment_fits`), so it declares no shape a call to
     /// the same program does not.

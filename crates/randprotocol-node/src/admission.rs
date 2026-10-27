@@ -1175,7 +1175,7 @@ pub fn acceptance_for_pool(e: &MempoolError, hash: Hash, refused: &mut RefusedCa
         | MempoolError::PerpBackpressure { .. }
         | MempoolError::PerpHeightBackpressure { .. }
         | MempoolError::PerpCancelUnknownOrder(_)
-        | MempoolError::StateProofBackoff { .. } => Acceptance::Ignore,
+        | MempoolError::StateProofBusy => Acceptance::Ignore,
     }
 }
 

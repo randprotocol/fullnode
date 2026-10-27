@@ -87,12 +87,11 @@ pub enum MempoolError {
     /// its nonce window nor pooled here. Retryable (the order may yet arrive), never cached.
     #[error("the cancel names order nonce {0}, which no order of this account has taken")]
     PerpCancelUnknownOrder(u64),
-    /// CON-60 (b): this node is verifying, or a moment ago refused, a state proof of a shape it
-    /// had never verified, and verifies no other such proof for about `remaining_ms` (a proof of
-    /// a shape it has verified passes). Retryable, never cached, no peer penalised for a proof
-    /// the node did not look at.
-    #[error("state-proof verification of a new proof shape is backing off for {remaining_ms} ms; retry then")]
-    StateProofBackoff { remaining_ms: u64 },
+    /// CON-60 (b): a state proof whose shape this node holds no verifier key for, while the
+    /// [`ColdKeyBudget`] is spent. Retryable, never cached, no peer penalised; a proof of a shape
+    /// the node has a key for always passes.
+    #[error("this node is at its limit of verifier-key builds for new state-proof shapes; retry later")]
+    StateProofBusy,
 }
 
 /// The refusal a `Warming` deferral carries, as `rand_sendTransaction` reports it.
@@ -117,7 +116,7 @@ pub const PERP_BACKPRESSURE_WINDOWS: usize = 4;
 
 impl MempoolError {
     /// Whether the same transaction may succeed if sent again later, unchanged: a deferral
-    /// (`Warming`, `StateProofBackoff`) or a full pool (`Full` and the perp caps). Everything
+    /// (`Warming`, `StateProofBusy`) or a full pool (`Full` and the perp caps). Everything
     /// else is a verdict on the transaction or its conflicts.
     pub fn is_retryable(&self) -> bool {
         matches!(
@@ -129,7 +128,7 @@ impl MempoolError {
                 | MempoolError::PerpBackpressure { .. }
                 | MempoolError::PerpHeightBackpressure { .. }
                 | MempoolError::PerpCancelUnknownOrder(_)
-                | MempoolError::StateProofBackoff { .. }
+                | MempoolError::StateProofBusy
         )
     }
 }
@@ -426,67 +425,57 @@ pub struct Mempool {
     perp_pool_cap: usize,
     /// PERP-1 (c): the next [`Pooled::seq`].
     next_seq: u64,
-    /// CON-60 (b): the state-proof shapes this node has verified, and the one cold verification
-    /// it allows at a time ([`StateProofShapes`]).
-    state_proof_shapes: StateProofShapes,
+    /// CON-60 (b): the bucket over cold state-proof key builds ([`ColdKeyBudget`]).
+    cold_keys: ColdKeyBudget,
 }
 
-/// CON-60 (b): how many state-proof shapes a node remembers as verified. An honest prover uses
-/// one or two (its tier and input height move with the window), so this is generous.
-pub const STATE_PROOF_KNOWN_SHAPES: usize = 16;
-/// CON-60 (b): after a state proof of a shape this node had never verified is refused, no other
-/// unverified shape is verified for this long. Each such proof makes the executor build a
-/// verifier key first (a tier-18 key is over a minute in a debug build, ~3 GB), so junk proofs
-/// of fresh shapes cost the node one build per interval at most.
-pub const STATE_PROOF_COLD_BACKOFF: std::time::Duration = std::time::Duration::from_secs(60);
-/// CON-60 (b): a cold verification whose verdict never came back (its job dropped) stops
-/// holding the slot after this long — past the slowest key build a tier-20 proof can ask for.
-pub const STATE_PROOF_COLD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+/// CON-60 (b): the burst of verifier-key builds for state-proof shapes this node has no key for
+/// ("cold" shapes) — and one more every [`COLD_KEY_BUILD_INTERVAL`] after. A tier-18 key build is
+/// over a minute in a debug build and gigabytes, so this bounds what junk proofs of fresh shapes
+/// cost a node: at most `burst + elapsed / interval` builds, whatever is sent.
+pub const COLD_KEY_BUILD_BURST: u32 = 2;
+/// CON-60 (b): the refill interval of [`COLD_KEY_BUILD_BURST`]'s bucket.
+pub const COLD_KEY_BUILD_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// CON-60 (b), node policy (never a validity rule; chain-agnostic): a `PerpStateProof` is
-/// bundle-less and fee-less, and the executor builds a verifier key for whatever shape its
-/// header declares before it verifies anything, so every junk proof of a new shape cost a key
-/// build. The pool lets a proof of a shape this node has verified before through at once (its
-/// key is built), and allows **one** proof of an unverified ("cold") shape in flight at a time,
-/// and none for [`STATE_PROOF_COLD_BACKOFF`] after one was refused: the others are
-/// `StateProofBackoff`, retryable, never cached, no peer penalised. A verified proof's shape, and
-/// the shape of every state proof in a committed block, is remembered.
-#[derive(Debug, Default)]
-pub struct StateProofShapes {
-    known: std::collections::VecDeque<randprotocol_core::confidential::ProofShape>,
-    /// The transaction whose cold-shape verification is queued or running, and since when.
-    cold: Option<(Hash, Instant)>,
-    backoff_until: Option<Instant>,
+/// CON-60 (b), node policy (never a validity rule): a token bucket over the verifier-key builds
+/// state proofs make this node do. A proof whose shape's key is built — the engine's, which the
+/// node pins once a proof of it verifies, warms at startup from its chain's committed proofs, and
+/// keeps when a committed block carries one — never needs a token, so junk of any shape cannot
+/// delay it. A proof of a cold shape takes a token when it is queued; with none left it is
+/// `StateProofBusy` (retryable, never cached, no peer penalised, no timing in the message).
+/// Nothing a refusal does moves the bucket: a junk proof costs one token, its own build.
+#[derive(Debug)]
+pub struct ColdKeyBudget {
+    tokens: f64,
+    at: Option<Instant>,
 }
 
-impl StateProofShapes {
-    pub fn is_known(&self, shape: &randprotocol_core::confidential::ProofShape) -> bool {
-        self.known.contains(shape)
+impl Default for ColdKeyBudget {
+    fn default() -> ColdKeyBudget {
+        ColdKeyBudget { tokens: COLD_KEY_BUILD_BURST as f64, at: None }
+    }
+}
+
+impl ColdKeyBudget {
+    fn level(&self, now: Instant) -> f64 {
+        let gained = self.at.map_or(0.0, |at| now.saturating_duration_since(at).as_secs_f64() / COLD_KEY_BUILD_INTERVAL.as_secs_f64());
+        (self.tokens + gained).min(COLD_KEY_BUILD_BURST as f64)
     }
 
-    fn learn(&mut self, shape: randprotocol_core::confidential::ProofShape) {
-        if self.is_known(&shape) {
-            return;
-        }
-        self.known.push_back(shape);
-        while self.known.len() > STATE_PROOF_KNOWN_SHAPES {
-            self.known.pop_front();
-        }
+    /// Whether a cold build may be queued at `now` (no token taken).
+    pub fn available(&self, now: Instant) -> bool {
+        self.level(now) >= 1.0
     }
 
-    /// The refusal for a proof `hash` of `shape` at `now`, if the pool cannot verify it now.
-    fn check(&self, hash: &Hash, shape: &randprotocol_core::confidential::ProofShape, now: Instant) -> Result<(), MempoolError> {
-        if self.is_known(shape) {
-            return Ok(());
-        }
-        if let Some(until) = self.backoff_until.filter(|u| *u > now) {
-            return Err(MempoolError::StateProofBackoff { remaining_ms: until.duration_since(now).as_millis() as u64 });
-        }
-        match self.cold {
-            Some((h, since)) if h != *hash && now.duration_since(since) < STATE_PROOF_COLD_TIMEOUT => {
-                Err(MempoolError::StateProofBackoff { remaining_ms: STATE_PROOF_COLD_BACKOFF.as_millis() as u64 })
-            }
-            _ => Ok(()),
+    /// Take a token at `now`; `false` (nothing taken) when there is none.
+    pub fn take(&mut self, now: Instant) -> bool {
+        self.tokens = self.level(now);
+        self.at = Some(now);
+        if self.tokens >= 1.0 {
+            self.tokens -= 1.0;
+            true
+        } else {
+            false
         }
     }
 }
@@ -533,7 +522,7 @@ impl Mempool {
             perp_pooled: 0,
             perp_pool_cap: MAX_PERP_POOLED,
             next_seq: 0,
-            state_proof_shapes: StateProofShapes::default(),
+            cold_keys: ColdKeyBudget::default(),
         }
     }
 
@@ -548,54 +537,30 @@ impl Mempool {
         }
     }
 
-    /// CON-60 (b): [`StateProofShapes`]' verdict on `tx` — `Ok` for anything but a state proof
-    /// whose header decodes (a header that does not decode is the executor's cheap refusal, no
-    /// key built).
+    /// CON-60 (b): `Ok` for anything but a state proof of a cold shape (no key built) when the
+    /// [`ColdKeyBudget`] has no token. A header that does not decode is the executor's cheap
+    /// refusal (no key built), so it passes here.
     fn state_proof_gate(&self, tx: &Transaction, executor: &dyn ConfidentialExecutor) -> Result<(), MempoolError> {
         let Some(shape) = Self::state_proof_shape(tx, executor) else { return Ok(()) };
-        self.state_proof_shapes.check(&tx.hash(), &shape, Instant::now())
+        if executor.perp_key_ready(&shape) || self.cold_keys.available(Instant::now()) {
+            return Ok(());
+        }
+        Err(MempoolError::StateProofBusy)
     }
 
     /// CON-60 (b): `tx` passed [`Mempool::precheck`] and is queued for verification; a state proof
-    /// of a shape this node has not verified takes the one cold slot.
+    /// of a cold shape takes a token (it will cost a key build).
     pub fn state_proof_queued(&mut self, tx: &Transaction, executor: &dyn ConfidentialExecutor) {
         if let Some(shape) = Self::state_proof_shape(tx, executor) {
-            if !self.state_proof_shapes.is_known(&shape) {
-                self.state_proof_shapes.cold = Some((tx.hash(), Instant::now()));
+            if !executor.perp_key_ready(&shape) {
+                self.cold_keys.take(Instant::now());
             }
-        }
-    }
-
-    /// CON-60 (b): `tx`'s verification came back `result` — before it is pooled. A verified state
-    /// proof's shape is remembered; the cold slot it held is freed; a cold proof the STARK check
-    /// refused starts the backoff.
-    pub fn state_proof_verified(&mut self, tx: &Transaction, executor: &dyn ConfidentialExecutor, result: &Result<(), TxError>) {
-        let Some(shape) = Self::state_proof_shape(tx, executor) else { return };
-        let s = &mut self.state_proof_shapes;
-        let was_cold = s.cold.is_some_and(|(h, _)| h == tx.hash());
-        if was_cold {
-            s.cold = None;
-        }
-        match result {
-            Ok(()) => s.learn(shape),
-            Err(TxError::Perps(randprotocol_core::ledger::perps::PerpError::ProofRefused(_))) if was_cold => {
-                s.backoff_until = Some(Instant::now() + STATE_PROOF_COLD_BACKOFF);
-            }
-            Err(_) => {}
-        }
-    }
-
-    /// CON-60 (b): a state proof in a block this node committed — its shape's key is built here
-    /// now (the block's apply verified it), so it is no longer cold.
-    pub fn state_proof_committed(&mut self, tx: &Transaction, executor: &dyn ConfidentialExecutor) {
-        if let Some(shape) = Self::state_proof_shape(tx, executor) {
-            self.state_proof_shapes.learn(shape);
         }
     }
 
     #[cfg(test)]
-    pub(crate) fn state_proof_shapes(&self) -> &StateProofShapes {
-        &self.state_proof_shapes
+    pub(crate) fn cold_keys_mut(&mut self) -> &mut ColdKeyBudget {
+        &mut self.cold_keys
     }
 
     /// [`MAX_PERP_POOLED`] lowered, so a test reaches the pool-wide cap before the account cap
@@ -4573,64 +4538,64 @@ mod tests {
         assert!(m.precheck(&order, &dense, &StubExecutor).is_ok());
     }
 
-    /// CON-60 (b): one state proof of a shape this node has never verified may be in flight at a
-    /// time; while it is, and for `STATE_PROOF_COLD_BACKOFF` after the STARK check refused it,
-    /// another proof of an unverified shape is `StateProofBackoff` (retryable, `Ignore` to
-    /// gossip) — while a proof of a shape the node has verified, or seen committed, passes.
+    /// CON-60 (b): junk state proofs — of fresh shapes and of the engine's own — never delay an
+    /// honest proof of the engine's shape (its key is built: the stub's honest shape is warm), and
+    /// a refusal moves nothing. Proofs of cold shapes take a token each from the cold-build bucket;
+    /// with none left they are `StateProofBusy` (retryable, `Ignore` to gossip, no timing in it).
     #[test]
-    fn state_proofs_of_unverified_shapes_take_one_cold_slot_and_back_off_after_a_refusal() {
+    fn junk_state_proofs_never_delay_a_proof_of_a_warm_shape() {
         use fixtures::{key, make_perps_block, perp_deposit_tx, perp_state_proof_tx};
-        use randprotocol_core::ledger::perps::PerpError;
         let gs = fixtures::perps_genesis(7);
         let mut l = gs.ledger.clone();
         let deposit = perp_deposit_tx(&l, &key(50), 300, 5_000_000);
         let b1 = make_perps_block(&gs.block, &mut l, vec![deposit], &key(1));
         make_perps_block(&b1, &mut l, vec![], &key(1));
         let honest = perp_state_proof_tx(&l, 2, [7; 8], vec![], 0);
-        let shaped = |h: [u8; 4]| {
+        let shaped = |h: [u8; 4], salt: u8| {
             let mut tx = honest.clone();
-            let Action::PerpStateProof { proof, .. } = &mut tx.action else { unreachable!() };
+            let Action::PerpStateProof { proof, fees, .. } = &mut tx.action else { unreachable!() };
             proof[37..41].copy_from_slice(&h);
+            *fees = salt as u64; // a distinct transaction per salt
             tx
         };
-        let (a, b, c) = (shaped([15, 0, 0, 0]), shaped([16, 0, 0, 0]), shaped([17, 0, 0, 0]));
         let mut m = Mempool::new(100);
         let ex = &StubExecutor;
-        assert!(m.precheck(&a, &l, ex).is_ok(), "nothing in flight: a cold shape may go");
-        m.state_proof_queued(&a, ex);
-        let busy = m.precheck(&b, &l, ex).unwrap_err();
-        assert!(matches!(busy, MempoolError::StateProofBackoff { .. }), "{busy:?}");
-        assert!(busy.is_retryable());
-        let mut refused = crate::admission::RefusedCache::new(8);
-        assert_eq!(crate::admission::acceptance_for_pool(&busy, a.hash(), &mut refused), crate::admission::Acceptance::Ignore);
-        assert!(m.precheck(&a, &l, ex).is_ok(), "the proof holding the slot is not refused by it");
-        // `a`'s STARK is refused: the slot frees and the backoff starts.
-        m.state_proof_verified(&a, ex, &Err(TxError::Perps(PerpError::ProofRefused("x".into()))));
-        match m.precheck(&b, &l, ex).unwrap_err() {
-            MempoolError::StateProofBackoff { remaining_ms } => assert!(remaining_ms <= STATE_PROOF_COLD_BACKOFF.as_millis() as u64),
-            e => panic!("{e:?}"),
+        // Spam of fresh shapes: the bucket's burst, then busy.
+        for i in 0..COLD_KEY_BUILD_BURST as u8 {
+            let junk = shaped([15 + i, 0, 0, 0], i);
+            assert!(m.precheck(&junk, &l, ex).is_ok(), "cold #{i} within the burst");
+            m.state_proof_queued(&junk, ex);
         }
-        // A shape this node saw committed passes, backoff or not.
-        m.state_proof_committed(&c, ex);
-        assert!(m.precheck(&c, &l, ex).is_ok());
-        // A verified shape is known for good: a fresh pool verifies `b`, then any proof of that shape
-        // passes while another cold one holds the slot.
-        let mut m = Mempool::new(100);
-        m.state_proof_queued(&b, ex);
-        m.state_proof_verified(&b, ex, &Ok(()));
-        assert!(m.state_proof_shapes().is_known(&ex.perp_proof_shape(&match &b.action { Action::PerpStateProof { proof, .. } => proof.clone(), _ => unreachable!() }).unwrap()));
-        m.state_proof_queued(&a, ex);
-        assert!(m.precheck(&b, &l, ex).is_ok(), "known");
-        assert!(matches!(m.precheck(&c, &l, ex), Err(MempoolError::StateProofBackoff { .. })), "cold, slot taken");
-        // A refusal before the STARK (not ProofRefused) of the cold proof frees the slot, no backoff.
-        m.state_proof_verified(&a, ex, &Err(TxError::Perps(PerpError::MissingDigest(9))));
-        assert!(m.precheck(&c, &l, ex).is_ok());
-        // Bytes that are not a proof's header are left to the executor's cheap refusal.
+        let busy = m.precheck(&shaped([40, 0, 0, 0], 9), &l, ex).unwrap_err();
+        assert_eq!(busy, MempoolError::StateProofBusy);
+        assert!(busy.is_retryable());
+        assert!(!busy.to_string().chars().any(|c| c.is_ascii_digit()), "no timing: {busy}");
+        let mut refused = crate::admission::RefusedCache::new(8);
+        assert_eq!(crate::admission::acceptance_for_pool(&busy, honest.hash(), &mut refused), crate::admission::Acceptance::Ignore);
+        // Junk of the engine's own shape costs no token and is not held; nor is the honest proof.
+        for salt in 20..40u8 {
+            let junk = shaped([0; 4], salt);
+            assert!(m.precheck(&junk, &l, ex).is_ok());
+            m.state_proof_queued(&junk, ex);
+        }
+        assert!(m.precheck(&honest, &l, ex).is_ok(), "the honest proof of the warm shape passes, spam or not");
+        assert_eq!(m.precheck(&shaped([41, 0, 0, 0], 10), &l, ex).unwrap_err(), MempoolError::StateProofBusy, "the warm spam took no token");
+        // Bytes that are not a proof's header are the executor's cheap refusal: not held either.
         let mut junk = honest.clone();
         let Action::PerpStateProof { proof, .. } = &mut junk.action else { unreachable!() };
         *proof = b"junk".to_vec();
-        m.state_proof_queued(&c, ex);
-        assert!(!matches!(m.precheck(&junk, &l, ex), Err(MempoolError::StateProofBackoff { .. })));
+        assert!(m.precheck(&junk, &l, ex).is_ok());
+        // The bucket refills one token per interval, and the builds it allows are bounded.
+        let budget = m.cold_keys_mut();
+        let t0 = Instant::now();
+        assert!(!budget.available(t0));
+        assert!(budget.available(t0 + COLD_KEY_BUILD_INTERVAL + std::time::Duration::from_millis(5)));
+        let mut fresh = ColdKeyBudget::default();
+        let ten_minutes = 600u64;
+        let builds = (0..=ten_minutes * 10).filter(|ds| fresh.take(t0 + std::time::Duration::from_millis(ds * 100))).count();
+        let bound = COLD_KEY_BUILD_BURST as u64 + ten_minutes / COLD_KEY_BUILD_INTERVAL.as_secs();
+        assert!(builds as u64 <= bound, "{builds} builds in ten minutes, bound {bound}");
+        assert!(builds as u64 >= bound - 1);
     }
 
     /// An invoke's payout notes are leaves like any other: the pool claims them (through

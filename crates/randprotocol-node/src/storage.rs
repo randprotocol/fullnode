@@ -279,6 +279,12 @@ const META_PROGRAM_STATE: &str = "program_state";
 /// replay-audited, bincode (the transient per-block fields are `#[serde(skip)]`). Absent on
 /// every chain without a `perps` section.
 const META_PERPS: &str = "perps";
+/// CON-60: `bincode(Vec<ProofShape>)`, the state-proof shapes this node has seen verify or
+/// commit, most recent last — what the startup warm builds and pins. A node cache, never
+/// consensus; a build that does not know the key ignores it.
+const META_PERP_SHAPES: &str = "perp-proof-shapes";
+/// CON-60: how many shapes [`META_PERP_SHAPES`] keeps.
+pub const PERP_SHAPES_KEPT: usize = 32;
 /// `bincode(MultisigRegister)`: every multisig account (signers, threshold, nonce, vault) as of
 /// the head, with the genesis `create_fee` and the four RAND audit counters
 /// (`ledger::multisig::MultisigRegister`). Consensus state — hashed into the state root under
@@ -1802,6 +1808,52 @@ impl Storage {
             None => batch.delete_cf(self.cf(CF_META), META_PERPS),
         }
         Ok(())
+    }
+
+    /// CON-60: the state-proof shapes this node recorded ([`Self::note_perp_proof_shape`]),
+    /// oldest first; empty when none (or the row does not decode: it is only a cache).
+    pub fn perp_proof_shapes(&self) -> Result<Vec<randprotocol_core::confidential::ProofShape>> {
+        Ok(self.get_meta_raw(META_PERP_SHAPES)?.and_then(|b| bincode::deserialize(&b).ok()).unwrap_or_default())
+    }
+
+    /// CON-60: record `shape` (a state proof of it verified here, or a committed block carried
+    /// one), keeping the last [`PERP_SHAPES_KEPT`]. Written only when it is new.
+    pub fn note_perp_proof_shape(&self, shape: randprotocol_core::confidential::ProofShape) -> Result<()> {
+        let mut shapes = self.perp_proof_shapes()?;
+        if shapes.contains(&shape) {
+            return Ok(());
+        }
+        shapes.push(shape);
+        if shapes.len() > PERP_SHAPES_KEPT {
+            shapes.drain(..shapes.len() - PERP_SHAPES_KEPT);
+        }
+        self.db.put_cf(self.cf(CF_META), META_PERP_SHAPES, bincode::serialize(&shapes)?)?;
+        Ok(())
+    }
+
+    /// CON-60: the shapes of the state proofs in the last `blocks` committed blocks, newest
+    /// first, deduplicated — the startup warm's second source, for a node that predates
+    /// [`META_PERP_SHAPES`].
+    pub fn recent_perp_proof_shapes(
+        &self,
+        blocks: u64,
+        executor: &dyn randprotocol_core::confidential::ConfidentialExecutor,
+    ) -> Result<Vec<randprotocol_core::confidential::ProofShape>> {
+        let head = self.head()?.height;
+        let mut out = Vec::new();
+        for h in (head.saturating_sub(blocks)..=head).rev() {
+            let Some(b) = self.block_by_height(h)? else { continue };
+            for tx in &b.transactions {
+                if let Action::PerpStateProof { proof, .. } = &tx.action {
+                    if let Some(shape) = executor.perp_proof_shape(proof) {
+                        if !out.contains(&shape) {
+                            out.push(shape);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(out)
     }
 
     /// The perp input words block `height` closed with (RPL-3), `None` for a height this store

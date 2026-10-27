@@ -73,7 +73,7 @@ pub enum ConfidentialError {
 /// (`ConfidentialExecutor::perp_proof_shape`). Two proofs of one shape verify under one key, so a
 /// node that has built it once verifies the next for milliseconds; a proof of a new shape costs a
 /// key build first (seconds to minutes at the high tiers).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 pub struct ProofShape {
     pub tier: u8,
     pub program_log_height: u8,
@@ -203,6 +203,18 @@ pub trait ConfidentialExecutor: Send + Sync {
     fn perp_proof_shape(&self, _proof: &[u8]) -> Option<ProofShape> {
         None
     }
+    /// CON-60: whether a state proof of `shape` would verify under a key already built — so its
+    /// verification costs milliseconds, not a key build. `true` by default (an executor without
+    /// a key cache has nothing to build).
+    fn perp_key_ready(&self, _shape: &ProofShape) -> bool {
+        true
+    }
+    /// CON-60: keep `shape`'s already-built key for good (a proof of it verified, or a committed
+    /// block carried one). Never builds. A no-op by default.
+    fn keep_perp_key(&self, _shape: &ProofShape) {}
+    /// CON-60: build and keep `shape`'s key ahead of any proof of it (a node's startup warm from
+    /// its chain's committed state proofs). A no-op by default.
+    fn warm_perp(&self, _shape: &ProofShape) {}
     /// [`Self::decode_invoke`]'s twin for [`Self::verify_perp`]: everything but the STARK
     /// verification, the segment's digest still compared. The ledger never calls this; kept as
     /// `verify_perp`'s header twin (no production caller). Defaults to the full verify.
@@ -841,6 +853,15 @@ impl ConfidentialExecutor for StubExecutor {
             sha256_log_height: h[3],
             public_log_height: 0,
         })
+    }
+
+    /// CON-60: the stub holds a key for the engine's honest shape only — an unshaped
+    /// [`Self::make_perp_proof`] proof's — so a test can tell warm from cold.
+    fn perp_key_ready(&self, shape: &ProofShape) -> bool {
+        shape.program_log_height == STUB_PERP_PROGRAM_LOG_HEIGHT
+            && shape.input_log_height == 0
+            && shape.keccak_log_height == 0
+            && shape.sha256_log_height == 0
     }
 
     /// A blake3 stand-in for `H_PUB`, length-prefixed like the real one's header, so the empty

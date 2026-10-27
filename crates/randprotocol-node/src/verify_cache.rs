@@ -340,6 +340,18 @@ impl ConfidentialExecutor for CachingExecutor {
         self.inner.perp_proof_shape(proof)
     }
 
+    fn perp_key_ready(&self, shape: &randprotocol_core::confidential::ProofShape) -> bool {
+        self.inner.perp_key_ready(shape)
+    }
+
+    fn keep_perp_key(&self, shape: &randprotocol_core::confidential::ProofShape) {
+        self.inner.keep_perp_key(shape)
+    }
+
+    fn warm_perp(&self, shape: &randprotocol_core::confidential::ProofShape) {
+        self.inner.warm_perp(shape)
+    }
+
     fn warm(&self, program: &ProgramRecord) {
         self.inner.warm(program)
     }

@@ -729,6 +729,13 @@ pub struct ZkExecutor {
     /// before it asks, so its cache only ever holds the one tier-18 key, which neither a deploy,
     /// a bundle nor a single-key auth proof can evict.
     msauth_machine: Machine,
+    /// CON-60: the perps engine's state proofs' own `Machine`, so no call, bundle or auth shape
+    /// evicts an engine key and no junk state-proof shape evicts theirs. Its LRU bounds what junk
+    /// can hold (each shape is built once while cached); a shape whose proof verified is pinned
+    /// here ([`ZkExecutor::keep_perp_key`], at most [`PERP_PINNED_SHAPES`]) and never evicted.
+    perp_machine: Machine,
+    /// CON-60: the shapes pinned in `perp_machine`.
+    perp_pinned: std::sync::Mutex<std::collections::BTreeSet<randprotocol_core::confidential::ProofShape>>,
     /// The tier-18 msauth verifier key, built once (spec §3.5, pre-flight finding 3): measured at
     /// Production on the 48 GB laptop at 78.6 s and ~4.0 GB peak (and resident after, on macOS's
     /// allocator — the key itself is a commitment and lookups), on 2–4 GB validators, so four
@@ -773,6 +780,8 @@ impl ZkExecutor {
             bundle_machine: Machine::new(profile),
             auth_machine: Machine::new(profile),
             msauth_machine: Machine::new(profile),
+            perp_machine: Machine::new(profile),
+            perp_pinned: std::sync::Mutex::new(std::collections::BTreeSet::new()),
             msauth_key: std::sync::OnceLock::new(),
             msauth_key_builds: std::sync::atomic::AtomicUsize::new(0),
             msauth_key_source: std::sync::OnceLock::new(),
@@ -781,6 +790,19 @@ impl ZkExecutor {
             warms_in_flight: std::sync::atomic::AtomicUsize::new(0),
             peak_warms: std::sync::atomic::AtomicUsize::new(0),
         }
+    }
+
+    /// CON-60, a test instrument: [`ZkExecutor::new`] with a `capacity`-key perp machine, so
+    /// eviction (and pinning against it) is observable in a few builds.
+    #[doc(hidden)]
+    pub fn with_perp_key_capacity(profile: FriProfile, capacity: usize) -> ZkExecutor {
+        ZkExecutor { perp_machine: Machine::with_key_cache_capacity(profile, capacity), ..ZkExecutor::new(profile) }
+    }
+
+    /// CON-60, a test instrument: how many state-proof verifier keys this executor has built.
+    #[doc(hidden)]
+    pub fn perp_key_builds(&self) -> usize {
+        self.perp_machine.key_builds()
     }
 
     /// The most `warm`/`warm_bundle` bodies this executor ever ran at the same time.
@@ -1746,7 +1768,8 @@ impl ZkExecutor {
             return Err(public_values());
         }
         if verify {
-            self.machine
+            // CON-60: the engine's own machine (`perp_machine`), never the calls' cache.
+            self.perp_machine
                 .verify_public(engine_hc, segment, &proof)
                 .map_err(|e| ConfidentialError::InvalidProof(format!("{e:?}")))?;
         } else {
@@ -1860,17 +1883,10 @@ fn pinned_heights(program: &Program, input_words: usize) -> (u8, u8, u8) {
     )
 }
 
-/// Decode a proof and refuse it unless its bytes are the *canonical* postcard encoding of what
-/// they decode to — `decode(bytes).to_bytes() == bytes`. `postcard::from_bytes` alone ignores
-/// trailing bytes and accepts overlong varints, so without this a proof could be padded (riding
-/// free under a byte-priced fee, since the fee is charged on the bytes the chain stores) or
-/// re-encoded into a different transaction id for the same statement. Every proof the chain
-/// decodes — fee bundle, burn bundle and call, all through `decode_and_check` — passes here
-/// first; a non-canonical one is the same `MalformedProof` as an undecodable one. The re-encode
-/// costs a linear pass over bytes that are about to be verified anyway.
-///
-/// A consensus tightening: a chain-12 block holding a non-canonical proof would be refused by
-/// this build, which is one more reason the build is chain-13-only (CHANGELOG, v0.4).
+/// CON-60: the most state-proof shapes a node pins (an honest prover's tier, input and public
+/// heights move with the window, so a handful; each key is tens of MB at most at tier 18).
+pub const PERP_PINNED_SHAPES: usize = 32;
+
 /// CON-60: the leading header of a postcard-encoded [`Proof`], field for field in its order —
 /// `tier`, then the declared table heights — so [`proof_shape`] reads them without decoding the
 /// batch proof behind them. `tests` pins it against `decode_canonical`.
@@ -1900,6 +1916,17 @@ pub fn proof_shape(bytes: &[u8]) -> Option<randprotocol_core::confidential::Proo
     })
 }
 
+/// Decode a proof and refuse it unless its bytes are the *canonical* postcard encoding of what
+/// they decode to — `decode(bytes).to_bytes() == bytes`. `postcard::from_bytes` alone ignores
+/// trailing bytes and accepts overlong varints, so without this a proof could be padded (riding
+/// free under a byte-priced fee, since the fee is charged on the bytes the chain stores) or
+/// re-encoded into a different transaction id for the same statement. Every proof the chain
+/// decodes — fee bundle, burn bundle and call, all through `decode_and_check` — passes here
+/// first; a non-canonical one is the same `MalformedProof` as an undecodable one. The re-encode
+/// costs a linear pass over bytes that are about to be verified anyway.
+///
+/// A consensus tightening: a chain-12 block holding a non-canonical proof would be refused by
+/// this build, which is one more reason the build is chain-13-only (CHANGELOG, v0.4).
 pub fn decode_canonical(bytes: &[u8]) -> Result<Proof, ConfidentialError> {
     let proof: Proof = postcard::from_bytes(bytes).map_err(|_| ConfidentialError::MalformedProof)?;
     if proof.to_bytes() != bytes {
@@ -2060,6 +2087,75 @@ impl ConfidentialExecutor for ZkExecutor {
     /// CON-60: the declared shape, from the header ([`proof_shape`]).
     fn perp_proof_shape(&self, proof: &[u8]) -> Option<randprotocol_core::confidential::ProofShape> {
         proof_shape(proof)
+    }
+
+    /// CON-60: whether `perp_machine` holds `shape`'s key built (a lookup, not a use).
+    fn perp_key_ready(&self, shape: &randprotocol_core::confidential::ProofShape) -> bool {
+        self.perp_machine.has_cached_key(
+            Tier(shape.tier as usize),
+            shape.program_log_height,
+            shape.input_log_height,
+            shape.keccak_log_height,
+            shape.sha256_log_height,
+            shape.public_log_height,
+        )
+    }
+
+    /// CON-60: pin `shape`'s key in `perp_machine` once a proof of it verified — only when the
+    /// key is built already (this never builds) and while fewer than [`PERP_PINNED_SHAPES`] are.
+    /// Pinning is the vendored install of the machine's own key, which marks the slot never
+    /// evictable.
+    fn keep_perp_key(&self, shape: &randprotocol_core::confidential::ProofShape) {
+        if !self.perp_key_ready(shape) {
+            return;
+        }
+        let mut pinned = self.perp_pinned.lock().unwrap();
+        if pinned.contains(shape) || pinned.len() >= PERP_PINNED_SHAPES {
+            return;
+        }
+        let blob = self.perp_machine.export_verifier_key_with_modq(
+            Tier(shape.tier as usize),
+            shape.program_log_height,
+            shape.input_log_height,
+            shape.keccak_log_height,
+            shape.sha256_log_height,
+            0,
+            shape.public_log_height,
+        );
+        if self.perp_machine.install_verifier_key(&blob).is_ok() {
+            pinned.insert(*shape);
+        }
+    }
+
+    /// CON-60: build `shape`'s key (a node's startup warm, from the shapes its chain's state
+    /// proofs used) and pin it. A shape the header rules refuse — a tier outside `TIERS`, a
+    /// modq table, heights out of range — is skipped, never built.
+    fn warm_perp(&self, shape: &randprotocol_core::confidential::ProofShape) {
+        if !TIERS.contains(&(shape.tier as usize))
+            || check_declared_heights(
+                Tier(shape.tier as usize),
+                shape.program_log_height,
+                shape.input_log_height,
+                shape.keccak_log_height,
+                shape.sha256_log_height,
+                shape.public_log_height,
+                Tier(shape.tier as usize).min_mem_log_height(),
+            )
+            .is_err()
+        {
+            return;
+        }
+        self.warming(|| {
+            self.perp_machine.verifier_key(
+                Tier(shape.tier as usize),
+                shape.program_log_height,
+                shape.input_log_height,
+                shape.keccak_log_height,
+                shape.sha256_log_height,
+                shape.public_log_height,
+            );
+        });
+        self.keep_perp_key(shape);
     }
 
     /// Every check of [`Self::verify_perp`] but `Machine::verify` itself (B5).
@@ -3482,6 +3578,41 @@ mod tests {
         assert_eq!(ZkExecutor::new(FriProfile::Test).perp_proof_shape(&bytes), Some(shape));
         assert_eq!(proof_shape(b""), None);
         assert_eq!(proof_shape(&[0xff; 3]), None);
+    }
+
+    /// CON-60: state-proof keys live in their own machine; a warmed (or verified-and-kept)
+    /// shape is pinned there and survives eviction, `keep_perp_key` never builds, and repeating a
+    /// shape costs no second build.
+    #[test]
+    fn a_kept_state_proof_key_is_pinned_and_keeping_never_builds() {
+        use super::*;
+        use crate::machine::FriProfile;
+        use randprotocol_core::confidential::ProofShape;
+        let program = crate::guests::fib(10);
+        let binding = [9u32; TX_BINDING_WORDS];
+        let (bytes, _, _) = prove_call_hardened(FriProfile::Test, &program, &[], &[], &binding, [0; 4], None, None).unwrap();
+        let base = proof_shape(&bytes).unwrap();
+        let with_input = |h: u8| ProofShape { input_log_height: h, ..base };
+        let (s, t, u) = (with_input(7), with_input(8), with_input(9));
+        let zk = ZkExecutor::with_perp_key_capacity(FriProfile::Test, 2);
+        zk.keep_perp_key(&s);
+        assert_eq!(zk.perp_key_builds(), 0, "keeping a cold shape builds nothing");
+        assert!(!zk.perp_key_ready(&s));
+        zk.warm_perp(&s);
+        assert!(zk.perp_key_ready(&s));
+        zk.warm_perp(&s);
+        assert_eq!(zk.perp_key_builds(), 1, "one build per shape");
+        // Two more shapes through a two-key cache: the pinned one stays, the unpinned LRU goes.
+        zk.perp_machine.verifier_key(Tier(t.tier as usize), t.program_log_height, t.input_log_height, 0, 0, t.public_log_height);
+        zk.perp_machine.verifier_key(Tier(u.tier as usize), u.program_log_height, u.input_log_height, 0, 0, u.public_log_height);
+        assert!(zk.perp_key_ready(&s), "pinned");
+        assert!(zk.perp_key_ready(&u));
+        assert!(!zk.perp_key_ready(&t), "evicted");
+        // A shape the header rules refuse is never built by the warm.
+        zk.warm_perp(&ProofShape { tier: 11, ..base });
+        assert_eq!(zk.perp_key_builds(), 3);
+        // Call keys live elsewhere: the calls' machine holds none of these.
+        assert!(!zk.machine.has_cached_key(Tier(s.tier as usize), s.program_log_height, s.input_log_height, 0, 0, s.public_log_height));
     }
 
     /// ZKG-1: an output word past 32 bits is refused, never narrowed. `x as u32` of

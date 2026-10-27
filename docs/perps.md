@@ -500,15 +500,24 @@ bridged one.
   and not a pooled order — `the cancel names order nonce N, which no order of this account has
   taken` (retryable, never cached). A target older than the window remembers is let through.
   Cancels share the account's 16 fee-less slots with orders and withdrawals.
-- **State-proof shapes (CON-60).** The executor builds the verifier key a proof's header
-  declares before it verifies anything, so junk state proofs of ever new shapes each cost a key
-  build (a tier-18 key is over a minute in a debug build). Node policy, on every chain: a proof of
-  a shape this node has verified (or seen in a committed block) is verified at once; of an
-  unverified shape, **one** may be queued or verifying at a time, and none for 60 s
-  (`STATE_PROOF_COLD_BACKOFF`) after one was refused by its STARK check. The others are refused
-  `state-proof verification of a new proof shape is backing off …` (`StateProofBackoff`,
-  retryable, never cached, no peer penalised). From the next cut the genesis
-  `engine_program_log_height` pin also narrows the shapes a proof may declare at all.
+- **State-proof verifier keys (CON-60).** The executor builds the key a proof's header declares
+  before it verifies anything, and a state proof is fee-less, so junk of ever new shapes would
+  each cost a key build (a tier-18 key is over a minute in a debug build). Node policy, on every
+  chain, never a validity rule:
+  - state-proof keys live in the executor's own machine (an LRU no call, bundle or auth shape
+    shares), so junk of one shape costs at most one build while it is cached;
+  - a shape whose proof verified here, or that a committed block carried, is **pinned** (never
+    evicted; at most 32) and recorded in the node's database (`perp-proof-shapes`);
+  - at startup the node builds and pins the recorded shapes and those of the state proofs in its
+    last 4 096 blocks, so the honest prover's shape is warm even right after a roll;
+  - a proof of a shape with **no key built** takes a token from a bucket of 2, refilled one per
+    30 s (`COLD_KEY_BUILD_BURST`/`_INTERVAL`); with none left it is refused `this node is at its
+    limit of verifier-key builds for new state-proof shapes; retry later` (`StateProofBusy`,
+    retryable, never cached, no peer penalised, no timing). Nothing a refusal does moves the
+    bucket, and a proof of a warm shape never needs a token, so no junk delays it.
+  From the next cut the genesis `engine_program_log_height` pin also narrows the shapes a proof
+  may declare at all. The genesis names no engine image, so the startup warm takes the engine's
+  shapes from the chain's own committed proofs rather than from the image.
 - **Fee-less perp actions in the pool (audit v10, PERP-1).** An order, a cancel or a withdrawal
   request pays no fee, so the pool bounds them by count rather than by price — node policies,
   never validity rules, each a `mempool full`-class refusal (retryable, never cached, no peer
