@@ -43,7 +43,7 @@ pub type Config = StarkConfig<Pcs, Challenge, Challenger>;
 #[cfg_attr(not(any(feature = "reference-backend", feature = "cuda", feature = "mock-cuda")), allow(dead_code))]
 pub(crate) const PERM_SEED: u64 = crate::poseidon2_constants::PERM_SEED; // "RandZK"
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum FriProfile {
     /// 16 queries, 4 PoW bits — for `cargo test`. 3·16+4 = 52 conjectured bits; not a
     /// production target, only fast enough for the suite.
@@ -226,6 +226,14 @@ mod cuda_cfg {
         let dft = rand_zkvm_cuda::dft::Dft(std::sync::Arc::new(rand_zkvm_cuda::gpu::ntt::CudaNttEngine { gpu }));
         super::generic_config(profile, dft, mmcs, pcs_rng)
     }
+}
+
+/// A test instrument (fullnode #151): a `Config` over explicit generators — a seeded pair makes a
+/// proof reproducible (`tests/counter_rng.rs`). Never a production path: `make_config` (fresh
+/// entropy) proves, `key_config` (label streams) keys.
+#[doc(hidden)]
+pub fn config_with_rngs(profile: FriProfile, mmcs_rng: SaltRng, pcs_rng: SaltRng) -> Config {
+    build_config(profile, mmcs_rng, pcs_rng)
 }
 
 pub fn make_config(profile: FriProfile) -> Config {
@@ -1724,6 +1732,84 @@ fn common_from_bytes(bytes: &[u8]) -> Result<CommonData<Config>, InstallKeyError
     Ok(CommonData { preprocessed, lookups: wire.lookups })
 }
 
+/// Fullnode #151 (v0.8.3): the proving side's preprocessed data — `ProverData`, the
+/// preprocessed commitment and the Merkle tree `prove_batch` opens it from — cached once per
+/// process for every [`Machine`] (the wallet and `rand-prover` build a `Machine` per proof).
+///
+/// **Why caching is sound.** `prove_traces` builds it as `ProverData::from_airs_and_degrees(
+/// &key_config(profile), airs, degrees)`, and every input is fixed by the cache key: `key_config`
+/// salts the preprocessed commit from `key_derivation_v2`'s *label* streams (deterministic and
+/// public — not the proving config's OS entropy; the hiding PCS pads preprocessed columns with
+/// zero columns, not random ones, and `key_derivation_v2::KeyRngV2` hands those streams no
+/// counter-mode key), the AIRs are `chips_with_modq(tier, keccak, sha256, modq)`, and the degrees
+/// are the declared heights. So the build is a pure function of `(profile, tier, keccak, sha256,
+/// modq, degrees)`: two builds are identical, and identical to the commitment `verifier_key`
+/// recomputes (`tests/prover_data_cache.rs` checks both, and that proofs from the cached data
+/// verify). The preprocessed columns are public (the verifier key), so sharing them between
+/// proofs reveals nothing a proof's own randomness hides.
+///
+/// Bounded: [`PROVER_DATA_CACHE_CAPACITY`] shapes, least recently used out, and only at tiers up
+/// to [`PROVER_DATA_CACHE_MAX_TIER`] — a tier-18 preprocessed tree is GBs, built once per rare
+/// multisig proof, and must not stay resident in a wallet after it. Concurrent first provers of
+/// one shape wait for one build (a `OnceLock` slot, as `KeyCache`).
+pub const PROVER_DATA_CACHE_CAPACITY: usize = 4;
+/// The highest tier whose `ProverData` the process-wide cache keeps (the bundle guest is 14, the
+/// auth guest 10).
+pub const PROVER_DATA_CACHE_MAX_TIER: usize = 16;
+
+/// `(profile, tier, keccak, sha256, modq, extended degree bits per instance)`.
+type ProverDataKey = (FriProfile, usize, u8, u8, u8, Vec<usize>);
+type ProverDataSlot = Arc<std::sync::OnceLock<Arc<ProverData<Config>>>>;
+
+#[derive(Default)]
+struct ProverDataCache {
+    map: HashMap<ProverDataKey, (ProverDataSlot, u64)>,
+    tick: u64,
+}
+
+static PROVER_DATA_CACHE: std::sync::OnceLock<Mutex<ProverDataCache>> = std::sync::OnceLock::new();
+static PROVER_DATA_BUILDS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// A test instrument: how many preprocessed builds `prove_traces` ran in this process (cache
+/// misses, and every build past [`PROVER_DATA_CACHE_MAX_TIER`]).
+#[doc(hidden)]
+pub fn prover_data_builds() -> usize { PROVER_DATA_BUILDS.load(std::sync::atomic::Ordering::SeqCst) }
+
+/// The `ProverData` for one proving shape, from the process-wide cache or built (see
+/// [`PROVER_DATA_CACHE_CAPACITY`]).
+fn cached_prover_data(profile: FriProfile, tier: Tier, keccak: u8, sha256: u8, modq: u8, airs: &[Chip], degrees: Vec<usize>) -> Arc<ProverData<Config>> {
+    let build = |degrees: &[usize]| {
+        PROVER_DATA_BUILDS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Arc::new(ProverData::from_airs_and_degrees(&key_config(profile), airs, degrees))
+    };
+    if tier.0 > PROVER_DATA_CACHE_MAX_TIER {
+        return build(&degrees);
+    }
+    let key: ProverDataKey = (profile, tier.0, keccak, sha256, modq, degrees);
+    let slot = {
+        let mut cache = PROVER_DATA_CACHE.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner());
+        cache.tick += 1;
+        let now = cache.tick;
+        match cache.map.get_mut(&key) {
+            Some((slot, used)) => {
+                *used = now;
+                slot.clone()
+            }
+            None => {
+                while cache.map.len() >= PROVER_DATA_CACHE_CAPACITY {
+                    let Some(lru) = cache.map.iter().min_by_key(|(_, (_, used))| *used).map(|(k, _)| k.clone()) else { break };
+                    cache.map.remove(&lru);
+                }
+                let slot = ProverDataSlot::default();
+                cache.map.insert(key.clone(), (slot.clone(), now));
+                slot
+            }
+        }
+    };
+    // Built outside the cache lock: a prover of another shape is never held up by this build.
+    slot.get_or_init(|| build(&key.5)).clone()
+}
+
 pub struct Machine { pub config: Config, pub profile: FriProfile, keys: Mutex<KeyCache>, key_builds: std::sync::atomic::AtomicUsize, build_gate: std::sync::OnceLock<KeyBuildGate> }
 
 /// A wrapper every verifier-key build of a machine runs inside ([`Machine::set_key_build_gate`]):
@@ -2096,8 +2182,11 @@ impl Machine {
         // `prover_data` only need to be *structurally* compatible (same hash/compress/Dft/FRI
         // parameters, which `key_config` and `make_config` share via `build_config`); their
         // RNG state can differ freely.
-        let key_cfg = key_config(self.profile);
-        let prover_data = ProverData::from_airs_and_degrees(&key_cfg, &airs, &self.log_ext_degrees_with_modq(tier, traces.program_log_height, traces.input_log_height, traces.keccak_log_height, traces.sha256_log_height, traces.modq_log_height, traces.public_log_height, traces.mem_log_height));
+        //
+        // Fullnode #151: that build is a pure function of the shape, so it comes from the
+        // process-wide cache (`cached_prover_data`) instead of being rebuilt for every proof.
+        let degrees = self.log_ext_degrees_with_modq(tier, traces.program_log_height, traces.input_log_height, traces.keccak_log_height, traces.sha256_log_height, traces.modq_log_height, traces.public_log_height, traces.mem_log_height);
+        let prover_data = cached_prover_data(self.profile, tier, traces.keccak_log_height, traces.sha256_log_height, traces.modq_log_height, &airs, degrees);
         let batch = prove_batch(&self.config, &instances, &prover_data);
         Proof { tier, program_log_height: traces.program_log_height, input_log_height: traces.input_log_height, keccak_log_height: traces.keccak_log_height, sha256_log_height: traces.sha256_log_height, modq_log_height: traces.modq_log_height, public_log_height: traces.public_log_height, mem_log_height: traces.mem_log_height, public_values: traces.public_values.iter().map(|x| x.as_canonical_u64()).collect(), batch }
     }

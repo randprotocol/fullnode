@@ -5,12 +5,15 @@ use p3_challenger::{CanObserve, FieldChallenger, GrindingChallenger};
 use p3_commit::{Mmcs, OpenedValues, Pcs, PolynomialSpace};
 use p3_dft::TwoAdicSubgroupDft;
 use p3_field::coset::TwoAdicMultiplicativeCoset;
-use p3_field::{ExtensionField, TwoAdicField, batch_multiplicative_inverse};
+use p3_field::{ExtensionField, Field, TwoAdicField, batch_multiplicative_inverse};
 use p3_matrix::Matrix;
 use p3_matrix::bitrev::{BitReversalPerm, BitReversibleMatrix};
 use p3_matrix::dense::{DenseMatrix, RowMajorMatrix, RowMajorMatrixCow};
 use p3_matrix::horizontally_truncated::HorizontallyTruncated;
 use p3_matrix::row_index_mapped::RowIndexMappedView;
+use p3_maybe_rayon::prelude::*;
+use p3_merkle_tree::CounterModeRng;
+use p3_merkle_tree::counter_rng::{self, CHUNK_ROWS};
 use rand::distr::{Distribution, StandardUniform};
 use rand::{CryptoRng, RngExt, SeedableRng};
 use spin::Mutex;
@@ -44,6 +47,53 @@ where
     fn fork_rng(&self) -> R {
         R::from_rng(&mut *self.rng.lock())
     }
+}
+
+impl<Val, Dft, InputMmcs, FriMmcs, R> HidingFriPcs<Val, Dft, InputMmcs, FriMmcs, R>
+where
+    R: CounterModeRng,
+{
+    /// RandProtocol patch (fullnode #151, v0.8.3): one call's 256-bit counter-mode key
+    /// (`p3_merkle_tree::counter_rng`), drawn under the lock and used outside it; `None` keeps the
+    /// serial path (a generator whose own stream must not move).
+    fn counter_key(&self) -> Option<[u8; 32]> {
+        self.rng.lock().counter_mode_key()
+    }
+}
+
+/// RandProtocol patch (fullnode #151, v0.8.3): `RowMajorMatrix::with_random_cols` with the new
+/// columns drawn from counter-mode streams (`p3_merkle_tree::counter_rng`, lane `lane`) and the
+/// rows copied and filled in parallel, a chunk of `CHUNK_ROWS` rows per stream. Same layout as
+/// `with_random_cols`: each row is the old row followed by `num_cols` uniform elements.
+fn with_random_cols_counter<F: Field>(
+    mat: &RowMajorMatrix<F>,
+    num_cols: usize,
+    key: &[u8; 32],
+    lane: u32,
+) -> RowMajorMatrix<F>
+where
+    StandardUniform: Distribution<F>,
+{
+    let old_w = mat.width();
+    let new_w = old_w + num_cols;
+    let h = mat.height();
+    let mut values = F::zero_vec(new_w * h);
+    if new_w > 0 {
+        values
+            .par_chunks_mut(CHUNK_ROWS * new_w)
+            .enumerate()
+            .for_each(|(c, dst)| {
+                let mut rng = counter_rng::stream(key, lane, c);
+                let src = &mat.values[c * CHUNK_ROWS * old_w..];
+                for (r, row) in dst.chunks_exact_mut(new_w).enumerate() {
+                    row[..old_w].copy_from_slice(&src[r * old_w..(r + 1) * old_w]);
+                    for v in &mut row[old_w..] {
+                        *v = rng.random();
+                    }
+                }
+            });
+    }
+    RowMajorMatrix::new(values, new_w)
 }
 
 impl<Val, Dft, InputMmcs, FriMmcs, R> Clone for HidingFriPcs<Val, Dft, InputMmcs, FriMmcs, R>
@@ -91,7 +141,7 @@ where
     Challenge: TwoAdicField + ExtensionField<Val>,
     Challenger:
         FieldChallenger<Val> + CanObserve<FriMmcs::Commitment> + GrindingChallenger<Witness = Val>,
-    R: CryptoRng + SeedableRng + Send + Sync,
+    R: CryptoRng + SeedableRng + CounterModeRng + Send + Sync,
 {
     type Domain = TwoAdicMultiplicativeCoset<Val>;
     type Commitment = InputMmcs::Commitment;
@@ -122,11 +172,15 @@ where
         &self,
         evaluations: impl IntoIterator<Item = (Self::Domain, RowMajorMatrix<Val>)>,
     ) -> (Self::Commitment, Self::ProverData) {
+        // RandProtocol patch (fullnode #151, v0.8.3): one counter-mode key per commit, matrix `m`
+        // on lane `m`, its random columns filled in parallel (`with_random_cols_counter`).
+        let key = self.counter_key();
         let randomized_evaluations: Vec<(Self::Domain, RowMajorMatrix<Val>)> =
             info_span!("randomize polys").in_scope(|| {
                 evaluations
                     .into_iter()
-                    .map(|(domain, mat)| {
+                    .enumerate()
+                    .map(|(m, (domain, mat))| {
                         let mat_width = mat.width();
                         // Let `w` and `h` be the width and height of the original matrix. The randomized matrix should have height `2h` and width `w + num_random_codewords`.
                         // To generate it, we add `w + 2 * num_random_codewords` columns to the original matrix, then reshape it by setting the width to `w + num_random_codewords`.
@@ -137,11 +191,11 @@ where
                         // stolen half would steal another instance's `commit` and spin on its own
                         // lock for ever (seen on a prover host: three workers spinning for hours).
                         // So the lock is held only to fork a child RNG, never across rayon work.
-                        let mut child = self.fork_rng();
-                        let mut random_evaluation = mat.with_random_cols(
-                            mat_width + 2 * self.num_random_codewords,
-                            &mut child,
-                        );
+                        let num_cols = mat_width + 2 * self.num_random_codewords;
+                        let mut random_evaluation = match &key {
+                            Some(key) => with_random_cols_counter(&mat, num_cols, key, lane(m)),
+                            None => mat.with_random_cols(num_cols, &mut self.fork_rng()),
+                        };
                         random_evaluation.width = mat_width + self.num_random_codewords;
 
                         (domain, random_evaluation)
@@ -204,20 +258,48 @@ where
             .map(|i| cis[i] * last_chunk_ci_inv)
             .collect_vec();
 
-        let mut rng = self.fork_rng(); // RandProtocol patch: see `commit`
-        let randomized_evaluations: Vec<RowMajorMatrix<Val>> = evaluations
-            .into_iter()
-            .map(|mat| mat.with_random_cols(self.num_random_codewords, &mut rng))
-            .collect();
+        // RandProtocol patch (fullnode #151, v0.8.3): with a counter-mode key, chunk `i`'s random
+        // columns are lane `i` and the random polynomial `t_j` is lane `n + j` (`n` chunks), each
+        // filled in parallel. Without one, the serial draw below, unchanged.
+        let n = evaluations.len();
+        let (randomized_evaluations, mut all_random_values): (Vec<RowMajorMatrix<Val>>, Vec<Val>) =
+            match self.counter_key() {
+                Some(key) => {
+                    let randomized_evaluations: Vec<RowMajorMatrix<Val>> = evaluations
+                        .iter()
+                        .enumerate()
+                        .map(|(i, mat)| with_random_cols_counter(mat, self.num_random_codewords, &key, lane(i)))
+                        .collect();
+                    let h = randomized_evaluations[0].height();
+                    let w = randomized_evaluations[0].width();
+                    let mut all = Val::zero_vec(n * h * w);
+                    if h * w > 0 {
+                        for (j, block) in all.chunks_exact_mut(h * w).take(n - 1).enumerate() {
+                            counter_rng::fill(block, w, &key, lane(n + j));
+                        }
+                    }
+                    (randomized_evaluations, all)
+                }
+                None => {
+                    let mut rng = self.fork_rng(); // RandProtocol patch: see `commit`
+                    let randomized_evaluations: Vec<RowMajorMatrix<Val>> = evaluations
+                        .into_iter()
+                        .map(|mat| mat.with_random_cols(self.num_random_codewords, &mut rng))
+                        .collect();
+                    let h = randomized_evaluations[0].height();
+                    let w = randomized_evaluations[0].width();
+                    let all = (0..(randomized_evaluations.len() - 1) * h * w)
+                        .map(|_| rng.random())
+                        .chain(core::iter::repeat_n(Val::ZERO, h * w))
+                        .collect::<Vec<_>>();
+                    (randomized_evaluations, all)
+                }
+            };
         // Add random values to the LDE evaluations as described in https://eprint.iacr.org/2024/1037.pdf.
         // If we have `d` chunks, let q'_i(X) = q_i(X) + v_H_i(X) * t_i(X) where t(X) is random, for 1 <= i < d.
         // q'_d(X) = q_d(X) - v_H_d(X) c_i \sum t_i(X) where c_i is a Lagrange normalization constant.
         let h = randomized_evaluations[0].height();
         let w = randomized_evaluations[0].width();
-        let mut all_random_values = (0..(randomized_evaluations.len() - 1) * h * w)
-            .map(|_| rng.random())
-            .chain(core::iter::repeat_n(Val::ZERO, h * w))
-            .collect::<Vec<_>>();
 
         // Set the random values for the final chunk accordingly
         for j in 0..last_chunk {
@@ -461,14 +543,21 @@ where
         &self,
         ext_trace_domains: impl IntoIterator<Item = Self::Domain>,
     ) -> Option<(Self::Commitment, Self::ProverData)> {
+        // RandProtocol patch (fullnode #151, v0.8.3): domain `i` on counter-mode lane `i`.
+        let key = self.counter_key();
+        let width = self.num_random_codewords + Challenge::DIMENSION;
         let random_input_vals = ext_trace_domains
             .into_iter()
-            .map(|domain| {
-                let m = DenseMatrix::rand(
-                    &mut self.fork_rng(), // RandProtocol patch: see `commit`
-                    domain.size(),
-                    self.num_random_codewords + Challenge::DIMENSION,
-                );
+            .enumerate()
+            .map(|(i, domain)| {
+                let m = match &key {
+                    Some(key) => counter_rng::random_matrix(domain.size(), width, key, lane(i)),
+                    None => DenseMatrix::rand(
+                        &mut self.fork_rng(), // RandProtocol patch: see `commit`
+                        domain.size(),
+                        width,
+                    ),
+                };
 
                 (domain, m)
             })
@@ -492,6 +581,11 @@ where
             quotient_domain,
         )
     }
+}
+
+/// A matrix index as a counter-mode lane (`p3_merkle_tree::counter_rng`).
+fn lane(i: usize) -> u32 {
+    u32::try_from(i).expect("fewer than 2^32 matrices in one call")
 }
 
 /// Compute the normalizing constants for the Langrange selectors of the provided domains.

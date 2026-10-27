@@ -4563,6 +4563,7 @@ dependencies = [
  "p3-field",
  "p3-matrix",
  "p3-maybe-rayon",
+ "p3-merkle-tree",
  "p3-security",
  "p3-util",
  "rand 0.10.2",
