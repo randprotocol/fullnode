@@ -19,6 +19,15 @@
 //!   everyone else (the number libp2p already holds them to; checked here too so the rule is in
 //!   one place for both kinds).
 //!
+//! - **a node-wide pending cap with slots reserved for validators** (audit v10, NET-1:
+//!   [`super::MAX_PENDING_INCOMING`], of which [`super::RESERVED_PENDING_INCOMING`] only a
+//!   reserved peer's source may take). libp2p's own pending cap is identity-blind, so sixteen
+//!   hosts with four stalled handshakes each filled it and a validator reconnecting after a
+//!   restart was refused with them; the guard now holds the node-wide count itself (libp2p's is
+//!   off). A handshake's identity is unknown until it finishes, so "a reserved peer's source" is
+//!   the source address of a reserved peer's bootstrap address, of an address it was learned at,
+//!   or of a connection it held ([`ReservedSources`]).
+//!
 //! Modelled on libp2p-connection-limits 0.7.0: a behaviour with a dummy handler that emits
 //! nothing and only ever says yes or no to a connection. The counting is in plain types
 //! ([`PendingBySource`], [`EstablishedByPeer`]) so it is tested without a socket.
@@ -82,33 +91,112 @@ pub fn source_of(addr: &Multiaddr) -> Source {
     Source::Unknown
 }
 
-/// The inbound connections still in their handshake, by where they come from.
+/// The most source addresses one reserved peer is remembered at ([`ReservedSources`]): a host
+/// with an IPv4 and an IPv6 address, plus a move or two. Past it, new ones are ignored until the
+/// peer is unreserved, so the set stays bounded by the reserved peers themselves.
+pub const MAX_SOURCES_PER_RESERVED_PEER: usize = 4;
+
+/// The source addresses reserved peers are known at (audit v10, NET-1): what lets a handshake
+/// whose identity is not yet known take one of the pending slots reserved for validators. Only
+/// IP sources count — [`Source::Unknown`] names no host and is never trusted.
 #[derive(Default)]
-pub struct PendingBySource {
-    by_conn: HashMap<ConnectionId, Source>,
+pub struct ReservedSources {
+    by_peer: HashMap<PeerId, Vec<Source>>,
     count: HashMap<Source, u32>,
 }
 
+impl ReservedSources {
+    /// Remember that reserved `peer` is reachable from `source`.
+    pub fn add(&mut self, peer: PeerId, source: Source) {
+        if source == Source::Unknown {
+            return;
+        }
+        let list = self.by_peer.entry(peer).or_default();
+        if list.contains(&source) || list.len() >= MAX_SOURCES_PER_RESERVED_PEER {
+            return;
+        }
+        list.push(source);
+        *self.count.entry(source).or_insert(0) += 1;
+    }
+
+    /// Forget every source of `peer` (it stopped being reserved).
+    pub fn remove_peer(&mut self, peer: &PeerId) {
+        for s in self.by_peer.remove(peer).unwrap_or_default() {
+            if let Some(n) = self.count.get_mut(&s) {
+                *n -= 1;
+                if *n == 0 {
+                    self.count.remove(&s);
+                }
+            }
+        }
+    }
+
+    pub fn contains(&self, source: &Source) -> bool {
+        self.count.contains_key(source)
+    }
+}
+
+/// The node-wide pending caps (audit v10, NET-1): `total` handshakes at once, of which
+/// `reserved` are held back for sources of reserved peers — anyone else gets `total − reserved`.
+/// `per_addr` is [`MAX_PENDING_INCOMING_PER_ADDR`], for reserved sources too.
+#[derive(Clone, Copy, Debug)]
+pub struct PendingCaps {
+    pub per_addr: u32,
+    pub total: u32,
+    pub reserved: u32,
+}
+
+/// The inbound connections still in their handshake, by where they come from.
+#[derive(Default)]
+pub struct PendingBySource {
+    /// Each pending connection's source, and whether it was admitted as a reserved peer's.
+    by_conn: HashMap<ConnectionId, (Source, bool)>,
+    count: HashMap<Source, u32>,
+    /// How many of `by_conn` were admitted from an unreserved source.
+    unreserved: u32,
+}
+
 impl PendingBySource {
-    /// Count `id` against `source`, or refuse it: `false` when `source` already holds `max`.
-    /// A refused connection is not recorded, so it needs no release.
+    /// Count `id` against `source` under the per-address cap alone, or refuse it: `false` when
+    /// `source` already holds `max`. A refused connection is not recorded, so it needs no release.
     pub fn admit(&mut self, id: ConnectionId, source: Source, max: u32) -> bool {
+        self.admit_with(id, source, false, PendingCaps { per_addr: max, total: u32::MAX, reserved: 0 }).is_ok()
+    }
+
+    /// Count `id` against `source` under every pending cap, or say which one refuses it: the
+    /// node-wide `total` first (no one past it), then — for a source that is not a reserved
+    /// peer's — `total − reserved`, then the per-address cap. A refused connection is not
+    /// recorded, so it needs no release.
+    pub fn admit_with(&mut self, id: ConnectionId, source: Source, reserved_source: bool, caps: PendingCaps) -> Result<(), Denied> {
+        if self.by_conn.len() as u64 >= u64::from(caps.total) {
+            return Err(Denied { limit: caps.total, kind: Kind::PendingIncoming });
+        }
+        let open = caps.total.saturating_sub(caps.reserved);
+        if !reserved_source && self.unreserved >= open {
+            return Err(Denied { limit: open, kind: Kind::PendingIncomingUnreserved });
+        }
         let n = self.count.entry(source).or_insert(0);
-        if *n >= max {
+        if *n >= caps.per_addr {
             if *n == 0 {
                 self.count.remove(&source);
             }
-            return false;
+            return Err(Denied { limit: caps.per_addr, kind: Kind::PendingIncomingPerAddr });
         }
         *n += 1;
-        self.by_conn.insert(id, source);
-        true
+        self.by_conn.insert(id, (source, reserved_source));
+        if !reserved_source {
+            self.unreserved += 1;
+        }
+        Ok(())
     }
 
     /// The handshake of `id` ended — established, failed or refused by another behaviour. A no-op
     /// for a connection never admitted here, and for a second release of one that was.
     pub fn release(&mut self, id: ConnectionId) {
-        let Some(source) = self.by_conn.remove(&id) else { return };
+        let Some((source, reserved_source)) = self.by_conn.remove(&id) else { return };
+        if !reserved_source {
+            self.unreserved -= 1;
+        }
         if let Some(n) = self.count.get_mut(&source) {
             *n = n.saturating_sub(1);
             if *n == 0 {
@@ -197,6 +285,10 @@ pub struct Denied {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
     PendingIncomingPerAddr,
+    /// The node-wide pending cap (audit v10, NET-1).
+    PendingIncoming,
+    /// The share of the pending cap a source that is no reserved peer's may hold.
+    PendingIncomingUnreserved,
     EstablishedPerPeer,
     EstablishedPerReservedPeer,
 }
@@ -205,6 +297,8 @@ impl fmt::Display for Denied {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let what = match self.kind {
             Kind::PendingIncomingPerAddr => "pending incoming connections from one source address",
+            Kind::PendingIncoming => "pending incoming connections",
+            Kind::PendingIncomingUnreserved => "pending incoming connections from sources that are no reserved peer's",
             Kind::EstablishedPerPeer => "established connections per peer",
             Kind::EstablishedPerReservedPeer => "established connections per reserved peer",
         };
@@ -218,6 +312,10 @@ impl std::error::Error for Denied {}
 #[derive(Clone, Copy, Debug)]
 pub struct GuardLimits {
     pub max_pending_incoming_per_addr: u32,
+    /// The node-wide pending cap (libp2p's is off; audit v10, NET-1).
+    pub max_pending_incoming: u32,
+    /// Of `max_pending_incoming`, the slots only a reserved peer's source may take.
+    pub reserved_pending_incoming: u32,
     pub max_established_per_peer: u32,
     pub max_established_per_reserved_peer: u32,
 }
@@ -230,19 +328,38 @@ pub struct Guard {
     limits: GuardLimits,
     pending: PendingBySource,
     established: EstablishedByPeer,
+    sources: ReservedSources,
 }
 
 impl Guard {
     pub fn new(limits: GuardLimits) -> Guard {
-        Guard { limits, pending: PendingBySource::default(), established: EstablishedByPeer::default() }
+        Guard { limits, pending: PendingBySource::default(), established: EstablishedByPeer::default(), sources: ReservedSources::default() }
     }
 
+    /// Reserve `peer` (its sources are learned from its connections).
     pub fn reserve(&mut self, peer: PeerId) {
         self.established.reserve(peer);
     }
 
+    /// [`Guard::reserve`] plus the sources of `addrs`, for a peer known at those addresses.
+    pub fn reserve_at<'a>(&mut self, peer: PeerId, addrs: impl IntoIterator<Item = &'a Multiaddr>) {
+        self.established.reserve(peer);
+        for a in addrs {
+            self.sources.add(peer, source_of(a));
+        }
+    }
+
     pub fn unreserve(&mut self, peer: &PeerId) {
         self.established.unreserve(peer);
+        self.sources.remove_peer(peer);
+    }
+
+    fn pending_caps(&self) -> PendingCaps {
+        PendingCaps {
+            per_addr: self.limits.max_pending_incoming_per_addr,
+            total: self.limits.max_pending_incoming,
+            reserved: self.limits.reserved_pending_incoming,
+        }
     }
 
     fn check_peer(&self, peer: &PeerId) -> Result<(), ConnectionDenied> {
@@ -262,11 +379,9 @@ impl NetworkBehaviour for Guard {
         _local_addr: &Multiaddr,
         remote_addr: &Multiaddr,
     ) -> Result<(), ConnectionDenied> {
-        let limit = self.limits.max_pending_incoming_per_addr;
-        if !self.pending.admit(connection_id, source_of(remote_addr), limit) {
-            return Err(ConnectionDenied::new(Denied { limit, kind: Kind::PendingIncomingPerAddr }));
-        }
-        Ok(())
+        let source = source_of(remote_addr);
+        let reserved_source = self.sources.contains(&source);
+        self.pending.admit_with(connection_id, source, reserved_source, self.pending_caps()).map_err(ConnectionDenied::new)
     }
 
     fn handle_established_inbound_connection(
@@ -295,9 +410,14 @@ impl NetworkBehaviour for Guard {
 
     fn on_swarm_event(&mut self, event: FromSwarm) {
         match event {
-            FromSwarm::ConnectionEstablished(ConnectionEstablished { peer_id, connection_id, .. }) => {
+            FromSwarm::ConnectionEstablished(ConnectionEstablished { peer_id, connection_id, endpoint, .. }) => {
                 self.pending.release(connection_id);
                 self.established.opened(peer_id, connection_id);
+                // A reserved peer seen at an address: its source takes reserved pending slots
+                // from now on (its next reconnect after a restart, say).
+                if self.established.is_reserved(&peer_id) {
+                    self.sources.add(peer_id, source_of(endpoint.get_remote_address()));
+                }
             }
             FromSwarm::ConnectionClosed(ConnectionClosed { peer_id, connection_id, .. }) => {
                 self.established.closed(&peer_id, connection_id);
@@ -428,6 +548,8 @@ mod tests {
     fn guard() -> Guard {
         Guard::new(GuardLimits {
             max_pending_incoming_per_addr: MAX_PENDING_INCOMING_PER_ADDR,
+            max_pending_incoming: super::super::MAX_PENDING_INCOMING,
+            reserved_pending_incoming: super::super::RESERVED_PENDING_INCOMING,
             max_established_per_peer: PER_PEER,
             max_established_per_reserved_peer: MAX_ESTABLISHED_PER_RESERVED_PEER,
         })
@@ -640,13 +762,103 @@ mod tests {
     /// trace in the map.
     #[test]
     fn a_zero_pending_cap_refuses_everything_and_records_nothing() {
-        let mut g = Guard::new(GuardLimits { max_pending_incoming_per_addr: 0, max_established_per_peer: PER_PEER, max_established_per_reserved_peer: 4 });
+        let mut g = Guard::new(GuardLimits { max_pending_incoming_per_addr: 0, max_pending_incoming: 96, reserved_pending_incoming: 32, max_established_per_peer: PER_PEER, max_established_per_reserved_peer: 4 });
         assert_eq!(denied(pending(&mut g, 0, "/ip4/203.0.113.7/tcp/1")), Denied { limit: 0, kind: Kind::PendingIncomingPerAddr });
         assert!(g.pending.is_empty());
         assert!(g.pending.count.is_empty(), "a refused-only source leaves no counter behind");
         let mut p = PendingBySource::default();
         assert!(!p.admit(conn(1), Source::Unknown, 0));
         assert!(p.count.is_empty());
+    }
+
+    /// Audit v10, NET-1: strangers stalling handshakes from as many hosts as it takes fill only
+    /// the unreserved share of the node-wide pending cap; a validator — a reserved peer, its
+    /// source known from a connection it held or an address it was reserved at — still gets a
+    /// slot, up to the node-wide total. Before, 64 stalled strangers locked every validator out.
+    /// An unreserved validator's source is a stranger's again.
+    #[test]
+    fn strangers_cannot_fill_the_pending_slots_reserved_for_validators() {
+        use super::super::{MAX_PENDING_INCOMING, RESERVED_PENDING_INCOMING};
+        let mut g = guard();
+        let validator = PeerId::random();
+        let validator_host = "/ip4/198.51.100.20/tcp/30303";
+        g.reserve(validator);
+        // The validator was connected once (before this node's restart, say): its source is learned.
+        let point = listener_point(validator_host);
+        connection_established(&mut g, 9_000, validator, &point, 0);
+        connection_closed(&mut g, 9_000, validator, &point, 0);
+        // A second validator known only by the address it was reserved at (a bootstrap).
+        let bootstrap = PeerId::random();
+        g.reserve_at(bootstrap, [&addr("/ip4/198.51.100.21/tcp/30303")]);
+
+        // Strangers from 16+ hosts, four stalled handshakes each, until they are refused.
+        let open = MAX_PENDING_INCOMING - RESERVED_PENDING_INCOMING;
+        let mut id = 0usize;
+        'fill: for host in 0..255u32 {
+            for _ in 0..MAX_PENDING_INCOMING_PER_ADDR {
+                match pending(&mut g, id, &format!("/ip4/203.0.{}.{}/tcp/40001", host / 250, host % 250 + 1)) {
+                    Ok(()) => id += 1,
+                    Err(e) => {
+                        let d = e.downcast::<Denied>().unwrap();
+                        assert_eq!(d, Denied { limit: open, kind: Kind::PendingIncomingUnreserved });
+                        break 'fill;
+                    }
+                }
+            }
+        }
+        assert_eq!(id as u32, open, "strangers hold exactly the unreserved share");
+        assert!(denied(pending(&mut g, 50_000, "/ip4/192.0.2.99/tcp/1")).kind == Kind::PendingIncomingUnreserved, "and another host is refused");
+
+        // Both validators are admitted past them, each up to its per-address cap.
+        for i in 0..MAX_PENDING_INCOMING_PER_ADDR as usize {
+            pending(&mut g, 60_000 + i, "/ip4/198.51.100.20/tcp/50000").unwrap_or_else(|e| panic!("validator handshake {i}: {e}"));
+        }
+        assert_eq!(denied(pending(&mut g, 60_100, "/ip4/198.51.100.20/tcp/50001")).kind, Kind::PendingIncomingPerAddr, "still one host's cap");
+        pending(&mut g, 61_000, "/ip4/198.51.100.21/tcp/50000").expect("the bootstrap's host too");
+        // One stranger's handshake ends: its slot is a stranger's again, not a reserved one.
+        listen_failure(&mut g, 0, "/ip4/203.0.0.1/tcp/40001");
+        pending(&mut g, 70_000, "/ip4/192.0.2.99/tcp/1").expect("a freed stranger slot");
+        assert_eq!(denied(pending(&mut g, 70_001, "/ip4/192.0.2.98/tcp/1")).kind, Kind::PendingIncomingUnreserved);
+
+        // Unreserved: the validator's host is a stranger's again.
+        g.unreserve(&validator);
+        assert_eq!(denied(pending(&mut g, 80_000, "/ip4/198.51.100.20/tcp/50002")).kind, Kind::PendingIncomingUnreserved);
+    }
+
+    /// The node-wide total binds reserved sources too, and an address naming no host is never
+    /// trusted however it was learned.
+    #[test]
+    fn the_pending_total_binds_reserved_sources_and_an_unknown_source_is_never_reserved() {
+        let caps = PendingCaps { per_addr: 4, total: 6, reserved: 4 };
+        let mut p = PendingBySource::default();
+        let host = |n: u8| Source::V4(std::net::Ipv4Addr::new(198, 51, 100, n));
+        for i in 0..2 {
+            p.admit_with(conn(i), host(1), false, caps).unwrap();
+        }
+        assert_eq!(p.admit_with(conn(2), host(2), false, caps), Err(Denied { limit: 2, kind: Kind::PendingIncomingUnreserved }));
+        for i in 10..14 {
+            p.admit_with(conn(i), host(3 + (i as u8 % 2)), true, caps).unwrap();
+        }
+        assert_eq!(p.admit_with(conn(20), host(5), true, caps), Err(Denied { limit: 6, kind: Kind::PendingIncoming }));
+        p.release(conn(10));
+        p.admit_with(conn(21), host(5), true, caps).expect("a released slot");
+        p.release(conn(0));
+        p.admit_with(conn(22), host(2), false, caps).expect("the stranger's share back");
+        for i in [1, 11, 12, 13, 21, 22] {
+            p.release(conn(i));
+        }
+        assert!(p.is_empty() && p.unreserved == 0);
+
+        let mut r = ReservedSources::default();
+        let peer = PeerId::random();
+        r.add(peer, Source::Unknown);
+        assert!(!r.contains(&Source::Unknown));
+        for n in 0..10 {
+            r.add(peer, host(n));
+        }
+        assert!(r.contains(&host(3)) && !r.contains(&host(MAX_SOURCES_PER_RESERVED_PEER as u8)), "bounded per peer");
+        r.remove_peer(&peer);
+        assert!(r.count.is_empty() && r.by_peer.is_empty());
     }
 
     /// The guard's handler is the dummy that does nothing, and it never asks the swarm for
@@ -669,6 +881,8 @@ mod tests {
     fn a_denial_names_its_limit_and_kind() {
         let cases = [
             (Kind::PendingIncomingPerAddr, 4, "at most 4 pending incoming connections from one source address"),
+            (Kind::PendingIncoming, 96, "at most 96 pending incoming connections are allowed"),
+            (Kind::PendingIncomingUnreserved, 64, "at most 64 pending incoming connections from sources that are no reserved peer's"),
             (Kind::EstablishedPerPeer, 2, "at most 2 established connections per peer"),
             (Kind::EstablishedPerReservedPeer, 4, "at most 4 established connections per reserved peer"),
         ];

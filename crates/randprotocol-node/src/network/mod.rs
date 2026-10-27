@@ -149,6 +149,9 @@ pub struct WireLimits {
     pub max_established_per_peer: u32,
     /// Inbound connections still in their handshake at once ([`MAX_PENDING_INCOMING`]).
     pub max_pending_incoming: u32,
+    /// Of those, how many only a reserved peer's source may take ([`RESERVED_PENDING_INCOMING`];
+    /// audit v10, NET-1).
+    pub reserved_pending_incoming: u32,
     /// Of those, how many one source address may hold ([`MAX_PENDING_INCOMING_PER_ADDR`]; audit
     /// v6, NET-1): without it the 64 above were one host's to fill.
     pub max_pending_incoming_per_addr: u32,
@@ -164,8 +167,14 @@ pub struct WireLimits {
 pub const MAX_ESTABLISHED_INCOMING: u32 = 256;
 /// The default per-peer connection cap (see [`WireLimits::max_established_per_peer`]).
 pub const MAX_ESTABLISHED_PER_PEER: u32 = 2;
-/// The default cap on inbound connections mid-handshake.
-pub const MAX_PENDING_INCOMING: u32 = 64;
+/// The default cap on inbound connections mid-handshake: enforced by the guard
+/// (`edge::Guard`), not libp2p's identity-blind limiter (audit v10, NET-1).
+pub const MAX_PENDING_INCOMING: u32 = 96;
+/// Of [`MAX_PENDING_INCOMING`], the handshakes held back for reserved peers' sources (the
+/// validators' and the bootstraps' hosts; audit v10, NET-1): anyone else shares the other 64 —
+/// the whole cap before — so strangers stalling handshakes from any number of hosts can no longer
+/// keep a validator out. 32 covers every validator of a 26-member set reconnecting at once.
+pub const RESERVED_PENDING_INCOMING: u32 = 32;
 
 /// How long a connection may take to set up, in either direction, before the transport drops it
 /// (audit v6, NET-1): the TCP connect of a dial, then the whole upgrade — multistream-select,
@@ -189,6 +198,7 @@ impl WireLimits {
             max_established_incoming: MAX_ESTABLISHED_INCOMING,
             max_established_per_peer: MAX_ESTABLISHED_PER_PEER,
             max_pending_incoming: MAX_PENDING_INCOMING,
+            reserved_pending_incoming: RESERVED_PENDING_INCOMING,
             max_pending_incoming_per_addr: MAX_PENDING_INCOMING_PER_ADDR,
             max_established_per_reserved_peer: MAX_ESTABLISHED_PER_RESERVED_PEER,
         }
@@ -585,11 +595,15 @@ pub async fn start_with(
     let mut limits = libp2p::connection_limits::Behaviour::new(
         libp2p::connection_limits::ConnectionLimits::default()
             .with_max_established_incoming(Some(cfg.limits.max_established_incoming))
-            .with_max_established_per_peer(Some(cfg.limits.max_established_per_peer))
-            .with_max_pending_incoming(Some(cfg.limits.max_pending_incoming)),
+            .with_max_established_per_peer(Some(cfg.limits.max_established_per_peer)),
+        // No pending cap here (audit v10, NET-1): libp2p's counts every handshake alike, so
+        // strangers could fill it ahead of a validator; the guard holds the same total with
+        // slots reserved for reserved peers' sources.
     );
     let mut guard = edge::Guard::new(edge::GuardLimits {
         max_pending_incoming_per_addr: cfg.limits.max_pending_incoming_per_addr,
+        max_pending_incoming: cfg.limits.max_pending_incoming,
+        reserved_pending_incoming: cfg.limits.reserved_pending_incoming,
         max_established_per_peer: cfg.limits.max_established_per_peer,
         max_established_per_reserved_peer: cfg.limits.max_established_per_reserved_peer,
     });
@@ -603,6 +617,13 @@ pub async fn start_with(
     for id in pinned.iter().chain(edge.bound.iter()) {
         limits.bypass_peer_id(id);
         guard.reserve(*id);
+    }
+    // A bootstrap's own address is its host's source: trusted for the reserved pending slots
+    // before its first connection (NET-1).
+    for a in &cfg.bootstrap {
+        if let Some(id) = peer_id_of(a) {
+            guard.reserve_at(id, [a]);
+        }
     }
     let behaviour = RandBehaviour { limits, guard, gossipsub, identify, kademlia, mdns: Toggle::from(mdns), sync, ping };
 
@@ -792,7 +813,8 @@ async fn run(
                     NetworkCommand::Reserve(id) => {
                         let b = swarm.behaviour_mut();
                         b.limits.bypass_peer_id(&id);
-                        b.guard.reserve(id);
+                        // Every address it was learned at is its host's source (NET-1).
+                        b.guard.reserve_at(id, known.get(&id).into_iter().flatten());
                     }
                     NetworkCommand::Unreserve(id) => {
                         if !pinned.contains(&id) {
@@ -1658,12 +1680,13 @@ mod tests {
             assert!(2 * l.sync_max_wire_bytes <= l.sync_response_wire_limit, "budget over half the limit at {cap}");
             // The connection caps are not a function of the block cap.
             assert_eq!(
-                (l.max_established_incoming, l.max_established_per_peer, l.max_pending_incoming, l.max_pending_incoming_per_addr, l.max_established_per_reserved_peer),
-                (MAX_ESTABLISHED_INCOMING, MAX_ESTABLISHED_PER_PEER, MAX_PENDING_INCOMING, MAX_PENDING_INCOMING_PER_ADDR, MAX_ESTABLISHED_PER_RESERVED_PEER)
+                (l.max_established_incoming, l.max_established_per_peer, l.max_pending_incoming, l.max_pending_incoming_per_addr, l.max_established_per_reserved_peer, l.reserved_pending_incoming),
+                (MAX_ESTABLISHED_INCOMING, MAX_ESTABLISHED_PER_PEER, MAX_PENDING_INCOMING, MAX_PENDING_INCOMING_PER_ADDR, MAX_ESTABLISHED_PER_RESERVED_PEER, RESERVED_PENDING_INCOMING)
             );
             prev = l;
         }
-        assert_eq!((MAX_ESTABLISHED_INCOMING, MAX_ESTABLISHED_PER_PEER, MAX_PENDING_INCOMING), (256, 2, 64));
+        assert_eq!((MAX_ESTABLISHED_INCOMING, MAX_ESTABLISHED_PER_PEER, MAX_PENDING_INCOMING, RESERVED_PENDING_INCOMING), (256, 2, 96, 32));
+        assert_eq!(MAX_PENDING_INCOMING - RESERVED_PENDING_INCOMING, 64, "strangers keep the 64 they had");
         assert_eq!(HANDSHAKE_TIMEOUT, Duration::from_secs(5));
     }
 

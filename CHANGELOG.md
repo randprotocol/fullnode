@@ -58,6 +58,12 @@ Audit v10 fixes (node and client policies, no chain change unless a genesis fiel
   and replays as before. Every node's pool refuses such an invoke on every chain (node policy,
   never cached). A trapping run has no execution and so no proof; tests cover panic, trap and a
   normal exit on the real executor.
+- **NET-1** (node-only): the node-wide cap on inbound handshakes is the connection guard's, not
+  libp2p's identity-blind one, and holds slots back for reserved peers (validators and
+  bootstraps): 96 pending in all, 32 of them only for a source address a reserved peer is known
+  at (its bootstrap address, an address it was learned at, or a connection it held). Strangers
+  keep the 64 they had and can no longer lock a validator out by stalling handshakes from many
+  hosts. The per-address cap (4) still applies to everyone.
 
 ## v0.8.0 — 2026-10-12 (chain 21 onward)
 
