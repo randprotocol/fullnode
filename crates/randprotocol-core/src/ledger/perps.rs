@@ -562,6 +562,12 @@ impl Perps {
         self.digests.keys().copied().collect()
     }
 
+    /// How many recorded digests no state proof has covered yet — [`Self::pending_heights`]'s
+    /// length without the allocation, for a node's back-pressure policy.
+    pub fn pending_digests(&self) -> usize {
+        self.digests.len()
+    }
+
     /// The market's median as the last block close computed it; 0 ("no price") before any close
     /// had a quorum of fresh stake behind a price, and after one that had none.
     pub fn median(&self, market: u32) -> u64 {

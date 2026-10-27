@@ -109,7 +109,9 @@ against the inputs the block has recorded so far; neither is permanent (the next
 A pool does not refuse on them: its ledger is the tip's, whose block inputs every close empties,
 so `still_applies` never reads them and an input a full block left out stays pooled for the next.
 A block carrying more is refused whole; the proposer's trial apply packs exactly the first
-`max_block_inputs` that apply.
+`max_block_inputs` that apply — and the pool offers the fee-less inputs account by account,
+round-robin (audit v10, PERP-1 (d), "The node" below), so those slots go to distinct accounts
+before any account's second input.
 
 With at most 15 accounts, the per-account cap also bounds a block's words whatever
 `max_block_inputs` says: 15 × 8 inputs × 21 words (a withdrawal's, the longest) + one `Close`
@@ -431,6 +433,22 @@ bridged one.
   evicted to make room, and offered to a block after governance and ahead of fee order, so a pool
   full of free orders cannot keep out the proof that settles them. A second proof while the slot
   is held is pooled like anything else.
+- **Fee-less perp actions in the pool (audit v10, PERP-1).** An order, a cancel or a withdrawal
+  request pays no fee, so the pool bounds them by count rather than by price — node policies,
+  never validity rules, each a `mempool full`-class refusal (retryable, never cached, no peer
+  penalised): **16 per account** (`MAX_PERP_ACCOUNT_POOLED`; two blocks' worth of one account's
+  inputs in flight) and **1 024 in all** (`MAX_PERP_POOLED`, the backstop that keeps them off the
+  fee-paying bundles' space; with 15 accounts the account cap binds first). Among candidates the
+  pool ranks governance, then the state proof, then **withdrawal requests**, then everything else
+  by fee; ties break by **arrival order** first and by hash last, so grinding a transaction's hash
+  buys no place. The rank-0 orders and cancels are offered **round-robin by account** — every
+  account's first pooled input, then every second — so a block's `max_block_inputs` go to distinct
+  accounts before any account's second input: three accounts flooding chain 21's 24-input blocks
+  hold three slots while the others wait. And **back-pressure**: while
+  `PERP_BACKPRESSURE_WINDOWS` (4) × `max_window_blocks` recorded digests wait for a proof, the node
+  admits no new order (deposits, cancels, withdrawals, oracle prices and proofs are unaffected),
+  so a lagging prover is not buried further. None of this returns collateral without a proof: the
+  "no forced exit" limit below stands.
 - **Transport.** `rand_getPerps`, `rand_getPerpAccount`, `rand_getPerpAccounts` and
   `rand_getPerpInputs` are on the public listener; `rand_getLimits` gains `perps`; `rand_getSupply`
   gains `perps_rand_out` and `perps_rand_held` (`docs/rpc.md`). Every perp action renders in
@@ -450,7 +468,8 @@ not the chain's `proved_root`, which is how the prover learns to roll back.
   cache and the reserved pool slot above are the minimum. A prover register with a bond, so junk
   proofs cost their sender, is a follow-up.
 - **No withdrawal fee (I2).** The spec's bundled withdrawal is deferred: a request is bundle-less
-  and fee-less, bounded only by one pending per account and 8 in all.
+  and fee-less, bounded by one pending per account and 8 in all at the ledger, and by the pool's
+  per-account and pool-wide counts of fee-less perp actions (PERP-1, "The node").
 - **Provers versus 1 s blocks (I7).** `MAX_WINDOW_BLOCKS` is 64, and a tier-16 proof takes 76 to
   400 s, so on 1 s blocks a single prover falls behind the digests it must cover. A demo chain
   runs 2 s blocks; back-pressure on inputs while proofs lag, and eliding empty blocks from a

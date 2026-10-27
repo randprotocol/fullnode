@@ -1158,11 +1158,17 @@ pub fn acceptance_for_pool(e: &MempoolError, hash: Hash, refused: &mut RefusedCa
         // `Warming` (private multisig phase 4): a multisig auth proof before this node's key is
         // ready. "Try again later" — not forwarded, not cached, no peer penalised; the RPC
         // submitter hears `mempool::MSAUTH_WARMING`.
+        // Audit v10: the fee-less perp caps, the order back-pressure and the state-proof backoff
+        // are statements about this node's pool and its verifier, never about the message.
         MempoolError::Duplicate
         | MempoolError::Conflict(_)
         | MempoolError::AttestationConflict(_)
         | MempoolError::Full
-        | MempoolError::Warming(_) => Acceptance::Ignore,
+        | MempoolError::Warming(_)
+        | MempoolError::PerpAccountFull(_)
+        | MempoolError::PerpPoolFull
+        | MempoolError::PerpBackpressure { .. }
+        | MempoolError::StateProofBackoff { .. } => Acceptance::Ignore,
     }
 }
 

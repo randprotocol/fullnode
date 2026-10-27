@@ -1621,7 +1621,12 @@ Params: `[]`. Result:
 longest-pooled transaction has waited, `null` when the pool is empty. Beside `max_count` the pool
 is capped at eight times the genesis `max_block_bytes` in `bytes` (audit v6, CH-7): past it a
 transaction paying more above its floor per KiB displaces the cheapest, and one paying less is
-refused `mempool full`; governance actions pass both caps.
+refused `mempool full`; governance actions pass both caps. Fee-less perp actions (orders, cancels,
+withdrawal requests; audit v10, PERP-1) have two caps of their own, 16 per account and 1 024 in
+all, refused `mempool holds 16 fee-less perp actions of account … already` and `mempool full of
+fee-less perp actions (1024)`; and while four `max_window_blocks` of recorded digests wait for a
+state proof a new order is refused `the exchange has N unproved block digests …` (`docs/perps.md`,
+"The node"). All three are `mempool full`'s class: about this node, retryable, never cached.
 
 ### `rand_getEmission`
 Params: `[]`. Result:
