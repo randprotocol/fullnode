@@ -544,8 +544,8 @@ bridged one.
     building it.
 
   **The canonical state-proof shape** (`ledger::perps::canonical_input_log_height`,
-  `canonical_witness_words`, `segment_public_log_height`; `rand perp prove` proves at it unless
-  `--smallest`): for genesis `max_tier` = T and a window of n recorded blocks,
+  `canonical_witness_words`, `segment_public_log_height`; `rand perp prove` proves at it by default
+  only on a chain whose genesis sets `engine_program_log_height`, chain 22 on): for genesis `max_tier` = T and a window of n recorded blocks,
 
   | component | value |
   |---|---|
@@ -558,6 +558,14 @@ bridged one.
   T − 2 keeps the input digest (one Poseidon2 row per four words, so 2^(T−4) rows) at half the
   tier's 2^(T−3) budget (16 384 of 32 768 rows at T = 18); 16 is the input height of the most words a proof may carry. The guest reads only
   the words its counts name, so the padding changes nothing it computes.
+
+  **Which shape `rand perp prove` proves at.** On a chain whose genesis pins the engine's program
+  height (`engine_program_log_height`, served as `rand_getPerps.engine_program_log_height`;
+  chain 22 on), the canonical shape above by default. On a chain without the pin (chain 21) the
+  smallest shape the window fits, unpadded, as before: chain 21's `max_tier` is 18, so canonical
+  padding would put every proof at tier 18 (unmeasured, and likely past the prover host), and
+  without a pin a node has no lineage for its reserve anyway. `--canonical` and `--smallest`
+  force either; the pool's policy is the same whichever a prover picks.
 - **Fee-less perp actions in the pool (audit v10, PERP-1).** An order, a cancel or a withdrawal
   request pays no fee, so the pool bounds them by count rather than by price — node policies,
   never validity rules, each a `mempool full`-class refusal (retryable, never cached, no peer

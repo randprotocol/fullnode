@@ -135,6 +135,9 @@ pub struct PerpsState {
     /// predates the field), and the most heights one window spans then (0 without).
     pub sparse_windows: bool,
     pub max_window_heights: u64,
+    /// CON-60: the genesis engine program-height pin, 0 when unset (chain 21) or from a node that
+    /// predates the field (absent or `null`).
+    pub engine_program_log_height: u8,
     /// The recorded heights no state proof has covered, ascending: the blocks the next window
     /// runs the engine over.
     pub pending_heights: Vec<u64>,
@@ -158,6 +161,10 @@ impl PerpsState {
             max_window_heights: match &v["max_window_heights"] {
                 Value::Null => 0,
                 h => u64_of(h, "max_window_heights")?,
+            },
+            engine_program_log_height: match &v["engine_program_log_height"] {
+                Value::Null => 0,
+                h => u8::try_from(u64_of(h, "engine_program_log_height")?)?,
             },
             pending_heights: match v["pending_heights"].as_array() {
                 Some(a) => a.iter().map(|h| u64_of(h, "pending_heights")).collect::<Result<_>>()?,
@@ -609,7 +616,16 @@ pub async fn prove_and_submit_state_proof(
     submit: bool,
     wait: bool,
 ) -> Result<(Hash, u8, usize)> {
-    prove_and_submit_state_proof_shaped(rpc, chain_id, image, job, tier, profile, submit, wait, false).await
+    prove_and_submit_state_proof_shaped(rpc, chain_id, image, job, tier, profile, submit, wait, Some(false)).await
+}
+
+/// CON-60: whether `rand perp prove` proves at the canonical state-proof shape — `canonical` when
+/// the caller chose (`--canonical` / `--smallest`), else only on a chain whose genesis pins the
+/// engine's program height (chain 22 on). On a chain without the pin (chain 21) the default is
+/// the smallest shape: canonical padding there would put every proof at `max_tier` (18 on chain
+/// 21), and without a pin the node has no lineage to reserve keys for anyway.
+pub fn proves_canonical(canonical: Option<bool>, state: &PerpsState) -> bool {
+    canonical.unwrap_or(state.engine_program_log_height != 0)
 }
 
 /// CON-60: `witness` padded with zero words to [`canonical_witness_words`]`(max_tier)`, the
@@ -628,9 +644,10 @@ pub fn pad_witness_canonical(witness: &mut Vec<u32>, max_tier: u8) -> Result<()>
     Ok(())
 }
 
-/// [`prove_and_submit_state_proof`], and with `canonical` the chain's canonical state-proof shape
-/// (CON-60, `docs/perps.md`): tier `max_tier` and the witness padded by [`pad_witness_canonical`],
-/// the shape every node keeps a key for. A `--tier` other than `max_tier` is refused then.
+/// [`prove_and_submit_state_proof`], and at the chain's canonical state-proof shape when
+/// [`proves_canonical`]`(canonical, ..)` (CON-60, `docs/perps.md`): tier `max_tier` and the
+/// witness padded by [`pad_witness_canonical`], the shape every node keeps a key for. A `--tier`
+/// other than `max_tier` is refused then. `canonical` is `None` for the chain's default.
 #[allow(clippy::too_many_arguments)]
 pub async fn prove_and_submit_state_proof_shaped(
     rpc: &RpcClient,
@@ -641,9 +658,10 @@ pub async fn prove_and_submit_state_proof_shaped(
     profile: FriProfile,
     submit: bool,
     wait: bool,
-    canonical: bool,
+    canonical: Option<bool>,
 ) -> Result<(Hash, u8, usize)> {
     let state = PerpsState::fetch(rpc).await?;
+    let canonical = proves_canonical(canonical, &state);
     job.check_for(state.sparse_windows)?;
     let executor = ZkExecutor::new(profile);
     let (segment, r_from, r_to) = job_segment(job, &executor);
@@ -993,8 +1011,41 @@ mod tests {
             proved_height: proved,
             sparse_windows: true,
             max_window_heights: 16,
+            engine_program_log_height: 0,
             pending_heights: pending,
         }
+    }
+
+    /// CON-60 (round 5 ruling): `rand_getPerps.engine_program_log_height` decodes (absent, `null`
+    /// and 0 are unpinned), and `rand perp prove` proves at the canonical shape by default only on
+    /// a pinned chain — the smallest shape on chain 21 — while `--canonical` / `--smallest` force
+    /// either.
+    #[test]
+    fn the_canonical_shape_is_the_default_only_on_a_pinned_chain() {
+        let mut v = json!({
+            "enabled": true, "collateral_asset": 1, "max_tier": 18, "max_window_blocks": 64,
+            "engine_hc": word8_to_hex(&[9; 8]), "proved_root": word8_to_hex(&[0; 8]),
+            "proved_height": 5,
+        });
+        let absent = PerpsState::from_json(&v).unwrap();
+        v["engine_program_log_height"] = Value::Null;
+        let null = PerpsState::from_json(&v).unwrap();
+        v["engine_program_log_height"] = json!(0);
+        let zero = PerpsState::from_json(&v).unwrap();
+        for unpinned in [&absent, &null, &zero] {
+            assert_eq!(unpinned.engine_program_log_height, 0);
+            assert!(!proves_canonical(None, unpinned), "chain 21: the smallest shape by default");
+            assert!(proves_canonical(Some(true), unpinned), "--canonical");
+            assert!(!proves_canonical(Some(false), unpinned), "--smallest");
+        }
+        v["engine_program_log_height"] = json!(14);
+        let pinned = PerpsState::from_json(&v).unwrap();
+        assert_eq!(pinned.engine_program_log_height, 14);
+        assert!(proves_canonical(None, &pinned), "chain 22 on: the canonical shape by default");
+        assert!(!proves_canonical(Some(false), &pinned), "--smallest");
+        assert!(proves_canonical(Some(true), &pinned), "--canonical");
+        v["engine_program_log_height"] = json!(300);
+        assert!(PerpsState::from_json(&v).is_err(), "past a u8");
     }
 
     /// PERP-101: `rand_getPerps`' two new fields and its pending heights decode, and a node that
