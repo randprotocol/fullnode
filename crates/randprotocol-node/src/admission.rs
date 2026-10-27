@@ -662,6 +662,10 @@ pub struct Verdict {
     /// of the segment it was verified over ([`state_proof_key`]) — what a `ProofRefused` verdict
     /// is keyed by in the [`ProofRefusedCache`]; `None` for every other transaction.
     pub proof_key: Option<StateProofKey>,
+    /// CON-60 (review): the verification did not run — a state proof whose key is not built
+    /// found the state-proof key-build gate taken ([`crate::node::pool_verify_without_waiting`]).
+    /// The answer is `StateProofBusy`, retryable: `result` is unused, nothing is cached.
+    pub busy: bool,
 }
 
 /// How many refused state proofs to remember (RPL-3 final fix wave, I1). Only proofs against the

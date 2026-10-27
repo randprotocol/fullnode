@@ -129,7 +129,9 @@ Perpetual futures (RPL-3):
   verifier-key build. Every check `Machine::verify` makes before its key runs first
   (`Machine::check_pre_key`); engine keys are pinned per cache; the startup warm builds at most the
   8 newest shapes after the bundle key; cold builds take a token from a bucket that foreign proofs
-  cannot drain, one build at a time. `perps.engine_program_log_height` (next cut) pins the engine's
+  cannot drain, one build at a time; a pool verification that would build while another build
+  runs is answered `StateProofBusy` at once instead of waiting for it (a block's application still
+  waits). `perps.engine_program_log_height` (next cut) pins the engine's
   canonical shape, and `rand perp prove` defaults to that shape only on a chain with the pin
   (`--smallest`, `--canonical`).
 

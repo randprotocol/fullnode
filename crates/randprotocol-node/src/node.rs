@@ -778,6 +778,24 @@ fn core_profile(fri_profile: &str) -> randprotocol_core::types::FriProfile {
 /// not the ledger, so its admission pre-flights the byte checks (spec §4 step 1), assembles the
 /// covered records (§3.2's coverability), and takes the covered-carrying path; every other
 /// transaction is the ledger's own `validate`.
+/// CON-60 (review): run `verify`, a pool verification of `tx`, without ever waiting at the
+/// state-proof key-build gate ([`randprotocol_zkvm::executor::PERP_KEY_BUILD_GATE`]). A state
+/// proof whose shape has no key built would build one inside `verify`; it runs only with the gate
+/// taken for the whole verification, and `None` (the caller's `StateProofBusy`) is the answer
+/// while another build holds it. Every other transaction, and a state proof whose key is built,
+/// runs as before. Node policy: a block's application still waits at the gate.
+pub(crate) fn pool_verify_without_waiting<T>(tx: &Transaction, executor: &dyn ConfidentialExecutor, verify: impl FnOnce() -> T) -> Option<T> {
+    let cold = match &tx.action {
+        randprotocol_core::types::Action::PerpStateProof { proof, .. } => executor.perp_proof_shape(proof).is_some_and(|s| !executor.perp_key_ready(&s)),
+        _ => false,
+    };
+    if !cold {
+        return Some(verify());
+    }
+    let _hold = randprotocol_zkvm::executor::PERP_KEY_BUILD_GATE.try_hold()?;
+    Some(verify())
+}
+
 pub(crate) fn validate_for_pool(
     tx: &Transaction,
     ledger: &Ledger,
@@ -3150,13 +3168,22 @@ impl Node {
             tokio::task::spawn_blocking(move || {
                 // I1: what a state proof's verdict is keyed by — this snapshot's proved root and
                 // the segment it builds — taken on the ledger the proof is verified against.
-                let proof_key = admission::state_proof_key(&tx, &ledger, executor.as_ref());
-                // This verify runs through `self.executor`, the `CachingExecutor`: it is what fills
-                // the verify cache that propose and apply then answer from.
-                let result = guard_verify(|| validate_for_pool(&tx, &ledger, &storage, profile, executor.as_ref()));
+                // CON-60 (review): a state proof whose key is not built verifies only with the
+                // key-build gate in hand; while another build has it, the answer is
+                // `StateProofBusy` at once, so verify slots never queue behind a build.
+                let verdict = pool_verify_without_waiting(&tx, executor.as_ref(), || {
+                    let proof_key = admission::state_proof_key(&tx, &ledger, executor.as_ref());
+                    // This verify runs through `self.executor`, the `CachingExecutor`: it is what
+                    // fills the verify cache that propose and apply then answer from.
+                    (guard_verify(|| validate_for_pool(&tx, &ledger, &storage, profile, executor.as_ref())), proof_key)
+                });
+                let (result, proof_key, busy) = match verdict {
+                    Some((result, proof_key)) => (result, proof_key, false),
+                    None => (Ok(()), None, true),
+                };
                 // The loop is the only receiver and outlives every task it spawned, so a send
                 // failure means the node is already shutting down.
-                let _ = out.blocking_send(Verdict { tx, result, source, proof_key });
+                let _ = out.blocking_send(Verdict { tx, result, source, proof_key, busy });
             });
         }
     }
@@ -3165,6 +3192,19 @@ impl Node {
     /// gossiped transaction reaches the pool.
     async fn on_verdict(&mut self, v: Verdict) -> Result<()> {
         self.verify_in_flight = self.verify_in_flight.saturating_sub(1);
+        if v.busy {
+            // CON-60 (review): not verified — the key-build gate was taken. Retryable: nothing
+            // cached, no peer penalised, nothing pooled or kept.
+            self.mempool.verify_done(&v.tx);
+            match v.source {
+                VerifySource::Gossip(id) => self.net.report_validation(id, admission::Acceptance::Ignore.into()).await,
+                VerifySource::Rpc(reply) => {
+                    let _ = reply.send(Err(MempoolError::StateProofBusy));
+                }
+            }
+            self.pump_verify();
+            return Ok(());
+        }
         let hash = v.tx.hash();
         let acceptance = admission::acceptance_for(&v.result, hash, &mut self.refused);
         if let (Some(key), Err(e)) = (v.proof_key, &v.result) {
@@ -7598,7 +7638,7 @@ mod tests {
         assert!(matches!(refused, randprotocol_core::TxError::Perps(PerpError::ProofRefused(_))), "{refused:?}");
         let key = admission::state_proof_key(&junk, &tip, &StubExecutor).expect("a state proof over a closed window");
         let (first, _) = oneshot::channel();
-        node.on_verdict(Verdict { tx: junk.clone(), result: Err(refused.clone()), source: VerifySource::Rpc(first), proof_key: Some(key) })
+        node.on_verdict(Verdict { tx: junk.clone(), result: Err(refused.clone()), source: VerifySource::Rpc(first), proof_key: Some(key), busy: false })
             .await
             .unwrap();
 
@@ -7614,6 +7654,76 @@ mod tests {
         let moved = admission::StateProofKey { proved_root: [9; 8], ..key };
         node.proof_refused.insert(Hash::digest(b"another"), moved, randprotocol_core::TxError::Perps(PerpError::ProofRefused("x".into())));
         assert!(node.cached_proof_refusal(&junk).is_none(), "cleared when the root changed");
+    }
+
+    /// CON-60 (review): a pool verification of a state proof whose key is not built never waits
+    /// at the key-build gate. While another thread holds it the verification does not run and the
+    /// verdict is `StateProofBusy` (retryable, nothing cached, nothing pooled); a warm-shaped
+    /// proof and any other transaction verify as before; with the gate free the cold proof runs.
+    #[tokio::test]
+    async fn a_pool_verify_of_a_cold_state_proof_is_busy_while_a_key_build_holds_the_gate() {
+        use crate::storage::fixtures::{make_perps_block, perp_state_proof_tx, perps_genesis};
+        use randprotocol_zkvm::executor::PERP_KEY_BUILD_GATE;
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
+        let gs = perps_genesis(7);
+        storage.init_genesis(&gs).unwrap();
+        let mut ledger = gs.ledger.clone();
+        let mut b1 = make_perps_block(&gs.block, &mut ledger, vec![], &key(1));
+        b1.qc.votes = vec![Vote::sign(&randprotocol_core::consensus::SigningDomain::v0(Hash::ZERO), b1.qc.view, b1.qc.block_hash, &key(1))];
+        storage.commit(std::slice::from_ref(&b1), &ledger, &[], &StubExecutor).unwrap();
+        let hs = resume_consensus(&storage, &gs, Some(key(1)), Duration::from_secs(1), Duration::from_secs(8), Arc::new(StubExecutor)).unwrap();
+        let (mut node, _seen) = bare_node(storage, gs.clone(), hs);
+
+        let warm = perp_state_proof_tx(&ledger, 1, [7; 8], vec![], 0);
+        let mut cold = warm.clone();
+        let randprotocol_core::Action::PerpStateProof { proof, .. } = &mut cold.action else { unreachable!() };
+        proof[38] = 5; // input height 5: a shape the stub holds no key for
+        let ex = &StubExecutor;
+        assert!(!ex.perp_key_ready(&ex.perp_proof_shape(match &cold.action { randprotocol_core::Action::PerpStateProof { proof, .. } => proof, _ => unreachable!() }).unwrap()));
+
+        // Another thread holds the gate (a build in flight) until told to let go.
+        let (taken_tx, taken_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            let hold = loop {
+                if let Some(h) = PERP_KEY_BUILD_GATE.try_hold() {
+                    break h;
+                }
+                std::thread::yield_now();
+            };
+            taken_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            drop(hold);
+        });
+        taken_rx.recv().unwrap();
+        let mut ran = 0;
+        assert_eq!(pool_verify_without_waiting(&cold, ex, || ran += 1), None, "busy, at once");
+        assert_eq!(ran, 0, "the verification did not run");
+        assert_eq!(pool_verify_without_waiting(&warm, ex, || 7), Some(7), "a warm shape never needs the gate");
+        // The busy verdict: the RPC caller hears `StateProofBusy`; nothing is cached.
+        let (reply, answer) = oneshot::channel();
+        node.verify_in_flight = 1;
+        node.on_verdict(Verdict { tx: cold.clone(), result: Ok(()), source: VerifySource::Rpc(reply), proof_key: None, busy: true }).await.unwrap();
+        let busy = answer.await.unwrap().unwrap_err();
+        assert_eq!(busy, MempoolError::StateProofBusy);
+        assert!(busy.is_retryable());
+        assert_eq!(node.verify_in_flight, 0, "the slot is returned");
+        assert!(node.refused.get(&cold.hash()).is_none(), "not cached as a refusal");
+        assert!(node.mempool.get(&cold.hash()).is_none(), "not pooled");
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
+        // The gate free again: the cold proof's verification runs (other tests may build through
+        // the gate meanwhile, so wait for it rather than assume it).
+        let deadline = Instant::now() + Duration::from_secs(600);
+        loop {
+            if let Some(v) = pool_verify_without_waiting(&cold, ex, || 9) {
+                assert_eq!(v, 9);
+                break;
+            }
+            assert!(Instant::now() < deadline, "the gate never came free");
+            std::thread::yield_now();
+        }
     }
 
     /// The by-hash requests the node has sent so far (its network commands are forwarded on a
