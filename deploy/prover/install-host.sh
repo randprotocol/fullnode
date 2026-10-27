@@ -40,7 +40,7 @@ done
 
 # --- the signed release, verified here before anything reaches the host ------------------------
 REL=$(mktemp -d); trap 'rm -rf "$REL"' EXIT
-gh release download "$TAG" -R randprotocol/fullnode -D "$REL" -p SHA256SUMS -p SHA256SUMS.sig -p rand-prover
+gh release download "$TAG" -R randprotocol/fullnode -D "$REL" -p SHA256SUMS -p 'SHA256SUMS.sig*' -p rand-prover
 bash -c 'source "$1/../lib/verify-release.sh" && verify_release_sums "$2/SHA256SUMS" "$2/SHA256SUMS.sig" && verify_binary "$2/rand-prover" "$2/SHA256SUMS"' _ "$HERE" "$REL"
 WANT_SHA=$(bash -c 'source "$1/../lib/verify-release.sh" && release_sha "$2/SHA256SUMS" rand-prover' _ "$HERE" "$REL")
 

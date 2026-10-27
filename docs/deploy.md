@@ -437,7 +437,33 @@ What a release is from the next tag on, and who is trusted for what:
    `deploy/roll-all.sh` take `RELEASE_SUMS` and `RELEASE_SIG`, verify first, and read the expected
    sha256s from the signed file. Without them they print that the install is unsigned and refuse,
    unless `ALLOW_UNSIGNED=1` says so on purpose. `SELFTEST=1 bash deploy/lib/verify-release.sh`
-   runs the cases on a throwaway key (13 checks).
+   runs the cases on throwaway keys (20 checks).
+
+### Release trust: a threshold of keys (PROC-5)
+
+One signing key is one point of failure. The verifier takes a **threshold**: at least *T* DISTINCT
+keys from `deploy/release-signers` must have signed the release's `SHA256SUMS`, where *T* is the
+number in `deploy/release-threshold` (committed: **1**, because one key is listed; the environment
+may raise it with `RELEASE_THRESHOLD`, never lower it). The signatures are `SHA256SUMS.sig` plus
+`SHA256SUMS.sig2` … `.sig9`, whichever exist; the roll scripts still take only the `.sig` path
+and find its siblings. An unlisted, tampered or duplicate signature counts for nothing, one key
+signing twice counts once, and a *T* above the number of listed keys refuses every release.
+
+`deploy/sign-release.sh SHA256SUMS [key …]` signs with every key it is given (or `$RELEASE_KEYS`,
+or the private keys in `~/.rand-release/`) and then runs the same check. To go to 2-of-N:
+
+1. **Owner:** a second holder generates their own key on their own machine, off any build host,
+   preferably hardware-backed: `ssh-keygen -t ed25519-sk -f ~/.rand-release/release_sk` (or
+   `-t ed25519` with a passphrase). Only the `.pub` leaves that machine.
+2. **Owner:** add it as one more line of `deploy/release-signers`
+   (`<who> namespaces="rand-release" <type> <base64>`), reviewed like any change there.
+3. Each holder signs the same `SHA256SUMS` on their own machine
+   (`ssh-keygen -Y sign -n rand-release -f <key> SHA256SUMS`); upload the first as
+   `SHA256SUMS.sig` and the other as `SHA256SUMS.sig2`
+   (`gh release upload <tag> SHA256SUMS.sig SHA256SUMS.sig2 -R randprotocol/fullnode`).
+4. Only then set `deploy/release-threshold` to `2` (a reviewed change), and check that
+   `SELFTEST=1 bash deploy/lib/verify-release.sh` and a dry `verify_release_sums` on the last
+   release's files behave. Do this before the next release, not during a roll.
 
    ```bash
    gh release download <tag> -R randprotocol/fullnode -D rel     # rand-node, rand, rand-prover, SHA256SUMS, SHA256SUMS.sig

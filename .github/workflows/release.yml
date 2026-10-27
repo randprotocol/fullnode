@@ -243,7 +243,7 @@ jobs:
             echo
             echo "Build provenance: \`gh attestation verify <binary> -R $REPO\`."
             echo
-            echo "**Not signed by this workflow.** The release key holder signs \`SHA256SUMS\` off the build host and attaches \`SHA256SUMS.sig\`; the fleet's roll scripts refuse a release without it (\`docs/deploy.md\`, \"Release trust\")."
+            echo "**Not signed by this workflow.** The release key holder signs \`SHA256SUMS\` off the build host and attaches \`SHA256SUMS.sig\` (and \`SHA256SUMS.sig2\` … when the release threshold is above one); the fleet's roll scripts refuse a release without it (\`docs/deploy.md\`, \"Release trust\")."
           } > notes.md
           prerelease=""
           case "$TAG" in *-rc*|*-alpha*|*-beta*) prerelease="--prerelease" ;; esac
