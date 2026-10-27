@@ -1373,6 +1373,8 @@ const OFFLOOP_APPLIES: usize = 4;
 /// CON-60 (c): how many committed blocks back the startup warm looks for state proofs whose
 /// shapes it builds and pins (beside the shapes the node recorded).
 pub const PERP_WARM_SCAN_BLOCKS: u64 = 4096;
+/// CON-60 (c): the most state-proof shapes the startup warm builds, newest first.
+pub const PERP_WARM_SHAPES: usize = 8;
 
 /// Proposals held back behind an in-flight parent, over every parent (§4.4). Past it a proposal
 /// is delivered on the loop, where the replica orphans it until its parent lands.
@@ -2726,6 +2728,8 @@ pub async fn start_with(cfg: NodeConfig, rpc_options: RpcOptions, net_options: N
         tokio::task::spawn_blocking(move || {
             // Read here, off the startup path: the scan walks up to PERP_WARM_SCAN_BLOCKS blocks.
             let perp_shapes: Vec<randprotocol_core::confidential::ProofShape> = if perps_chain {
+                // Newest first: the recorded shapes (stored oldest first), then the recent
+                // blocks', at most `PERP_WARM_SHAPES` — each build at tier 18 is minutes and GBs.
                 let mut v = perp_store.perp_proof_shapes().unwrap_or_default();
                 v.reverse();
                 for s in perp_store.recent_perp_proof_shapes(PERP_WARM_SCAN_BLOCKS, ex.as_ref()).unwrap_or_default() {
@@ -2733,6 +2737,7 @@ pub async fn start_with(cfg: NodeConfig, rpc_options: RpcOptions, net_options: N
                         v.push(s);
                     }
                 }
+                v.truncate(PERP_WARM_SHAPES);
                 v
             } else {
                 Vec::new()
@@ -2747,16 +2752,15 @@ pub async fn start_with(cfg: NodeConfig, rpc_options: RpcOptions, net_options: N
                 ex.warm_auth_multisig();
                 tracing::info!("multisig auth verifier key warmed");
             }
-            // The engine's keys before the bundle's: a perp settlement waits on them, and the
-            // pool lets a proof of a warm shape through ahead of any cold one.
+            ex.warm_bundle();
+            tracing::info!("bundle verifier key warmed");
+            // Then the engine's keys (after the bundle's, which every block needs).
             for shape in &perp_shapes {
                 ex.warm_perp(shape);
             }
             if !perp_shapes.is_empty() {
                 tracing::info!("{} state-proof verifier keys warmed", perp_shapes.len());
             }
-            ex.warm_bundle();
-            tracing::info!("bundle verifier key warmed");
             if split_auth {
                 ex.warm_auth();
                 tracing::info!("auth verifier key warmed");
@@ -3279,9 +3283,13 @@ impl Node {
         let randprotocol_core::types::Action::PerpStateProof { proof, .. } = &tx.action else { return };
         let Some(shape) = self.executor.perp_proof_shape(proof) else { return };
         self.executor.keep_perp_key(&shape);
-        if let Err(e) = self.storage.note_perp_proof_shape(shape) {
-            tracing::warn!("recording a state-proof shape: {e}");
-        }
+        // The DB read and write off the node loop.
+        let storage = self.storage.clone();
+        tokio::task::spawn_blocking(move || {
+            if let Err(e) = storage.note_perp_proof_shape(shape) {
+                tracing::warn!("recording a state-proof shape: {e}");
+            }
+        });
     }
 
     /// The `ProofRefused` this node already gave `tx`, a state proof, over the segment the tip

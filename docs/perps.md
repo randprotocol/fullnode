@@ -510,8 +510,9 @@ bridged one.
     shares), so junk of one shape costs at most one build while it is cached;
   - a shape whose proof verified here, or that a committed block carried, is **pinned** (never
     evicted; at most 32) and recorded in the node's database (`perp-proof-shapes`);
-  - at startup the node builds and pins the recorded shapes and those of the state proofs in its
-    last 4 096 blocks, so the honest prover's shape is warm even right after a roll;
+  - at startup, off the node loop and after the bundle key, the node builds and pins the most
+    recent 8 distinct shapes, newest first, from those it recorded and those of the state proofs
+    in its last 4 096 blocks, so the honest prover's shape is warm even right after a roll;
   - a proof of a shape with **no key built** costs a token — but only once it passes every rule
     the ledger and the executor apply before a key is touched (the ledger's window and payout
     rules over the tip, then the canonical body, the tier at most `max_tier`, the caps, the public
