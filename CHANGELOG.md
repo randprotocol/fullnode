@@ -25,6 +25,11 @@ v0.8.3 (wallet; client-only, no node or chain change):
   `--decimals 6 --initial 1000000` is now a million tokens, not one. The base-unit form is
   `--initial-units` / `--fixed-supply-units`. Scripts that passed base units must switch to the
   `-units` flags. `token create` echoes the mint as `minted <display> <SYMBOL> (<N> units)`.
+- **Privacy: the scan no longer reveals which leaves are the wallet's** (#147): `rand` pages
+  `rand_getCommitments` over the whole range in fixed 500-row pages and decides ownership locally,
+  so its requests do not depend on what it owns; it no longer reads `rand_getScanLeaves`. Cost: at
+  most ~2.26× the bytes of the v0.8.0–v0.8.2 heads scan (3 885 vs 1 720 bytes of JSON a leaf on
+  chain 21's envelope). `--scan-chunk` is accepted and ignored, with a warning.
 
 ## v0.8.2 — 2026-10-27 (chain 21, node-only; the genesis-gated rules wait for the next cut)
 

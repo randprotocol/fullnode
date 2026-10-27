@@ -205,31 +205,23 @@ a wallet seals, empty for a chain-made note with an empty envelope.
 
 The head is all a scan needs to decide ownership: decapsulating `kem_ct` and opening
 `to_receiver` (or opening `to_sender` under `ovk`) succeeds only for the right key, and yields
-the transaction key. A wallet pages heads, then reads with `rand_getCommitments` the leaves one
-of its keys opened — and any head that is not 1 208 bytes, rather than guessing at its split.
-On chain 20's first 1000 leaves a head row is 1 718 bytes of JSON against a full row's 3 876.
-A node too old to have the method answers `-32601`; `rand` then pages `rand_getCommitments` as
-before.
+the transaction key. On chain 20's first 1000 leaves a head row is 1 718 bytes of JSON against a
+full row's 3 876.
 
-**The privacy trade-off (audit v10, RPC-201).** The node serving the scan sees which leaves a
-wallet reads in full after paging heads, and those are the wallet's own leaves — a node that
-served full pages to everyone learned nothing. `rand` therefore reads envelopes in whole
-**aligned chunks**: a wanted leaf at index `i` is fetched as `rand_getCommitments(i - i mod N, N)`
-with `N` = `--scan-chunk` (256 by default), so the node learns that *some* leaf of the chunk is the
-wallet's, not which one (but see the tip, below), and the leaves between two of the wallet's in one chunk ride in the
-same read. Heads are paged on chunk boundaries too (each page starts at a multiple of `N` and
-spans whole chunks, at least 500 leaves), so a chunk never straddles two pages and is read once
-per scan however many of the wallet's leaves it holds; a read is never one leaf (`--scan-chunk 1`
-is refused). What the node still learns: how many chunks hold a leaf of the wallet's — a *lower*
-bound on its note count (several of its notes can share a chunk), plus every chunk holding a head
-that is not 1 208 bytes, which is read whatever its owner — and the wallet's timing. **The tip is
-the weak spot:** the last chunk is partial while the chain grows, so a wanted leaf in it is hidden
-only among the leaves written so far — right after a new block that can be a single bundle — and
-the chunk is read again on each later scan as it fills, which tells the node a leaf of the wallet's
-is in it. A wallet that cares can scan less often than blocks arrive, or use `--scan-chunk 0`. `--scan-chunk 0` reads every envelope, as a wallet before scan
-heads did: the node learns nothing from the reads, at a full page's bandwidth — the setting for a
-node you do not trust with your note count. Larger `N` (up to the 1000-row cap) hides more at
-more bandwidth per wanted leaf; 256 full rows are ~1 MB of JSON per chunk that holds a note.
+**`rand` no longer scans with it (v0.8.3, issue #147).** From v0.8.0 to v0.8.2 the wallet paged
+heads and then read with `rand_getCommitments` only the envelopes around the leaves its keys
+opened — exactly, and from v0.8.2 by aligned chunk (`--scan-chunk`, audit v10 RPC-201). Either
+way the reads depended on which leaves were the wallet's, so the node serving the scan learned, by
+the caller's IP, which leaves (or which chunks of leaves) it owned; a leaf index and its height
+identify the transaction. A wallet that wants a scan to reveal nothing must read the same thing
+whatever it owns, and only full envelopes can serve every wallet, so `rand` pages
+`rand_getCommitments` over the whole range in fixed pages of 500 rows, decides ownership locally,
+and never calls this method. Measured on chain 21's 1 860-byte envelope (the client's
+`a_scan_reads_the_same_full_pages_for_every_wallet_and_measures_their_cost`): 3 885 bytes of JSON
+a leaf against a head's 1 720, ~2.26× — the whole increase for a wallet whose notes fell in no
+256-leaf chunk, less for one whose did (1.07× with notes in four of eight chunks). The method
+stays on the node for other clients; what a client that uses it reveals by its follow-up reads is
+its own choice.
 
 ### `rand_getNullifiers`
 Params: `[from_height]` or `[from_height, limit]`. Result: every nullifier published from that
@@ -1991,6 +1983,13 @@ What changed for clients, in one place. Newest first.
   counters; a node before v0.8.2 omits them (read absence as off).
 - `rand_getSupply`: `perps_collateral_in`, `perps_collateral_out`, `perps_collateral_held`
   (`"0"` without a `perps` section).
+
+### v0.8.3 — the wallet's scan reads every envelope again (client-only; issue #147)
+
+`rand` pages `rand_getCommitments` over the whole scanned range in fixed 500-row pages and no
+longer calls `rand_getScanLeaves`, so its requests are the same whichever leaves it owns.
+`--scan-chunk` is accepted and ignored, with a warning. No RPC method changes; the cost is in the
+scan-heads section above.
 
 ### v0.8.2 — the wallet's scan reads envelopes by aligned chunk (client-only; RPC-201)
 

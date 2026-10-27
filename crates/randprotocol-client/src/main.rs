@@ -62,13 +62,10 @@ struct Cli {
     /// (`rand-prover run` has the same flag). Without it the proof is refused before any work.
     #[arg(long, global = true, env = "RAND_SKIP_MEMORY_CHECK")]
     skip_memory_check: bool,
-    /// How many leaves wide each envelope read is when a scan over scan heads fetches the leaves
-    /// this wallet's keys opened: the whole aligned chunk is read, so the node learns which
-    /// chunk held one of this wallet's leaves and not which leaf. `0` reads every envelope (what
-    /// a wallet did before scan heads: the node learns nothing, at full bandwidth). At most 1000,
-    /// the node's page cap; `1` is refused — it would name the leaf. `docs/rpc.md`, scan heads.
-    #[arg(long, global = true, value_name = "N", default_value_t = randprotocol_client::DEFAULT_SCAN_CHUNK, value_parser = scan_chunk_value)]
-    scan_chunk: u64,
+    /// Ignored since v0.8.3 (issue #147): every scan reads every envelope, in fixed pages, so the
+    /// node learns nothing about which leaves are this wallet's. Accepted so old scripts still run.
+    #[arg(long, global = true, value_name = "N", hide = true)]
+    scan_chunk: Option<u64>,
     /// How long, in seconds, a command waits for its transaction to commit (or for a call's
     /// receipt) before it gives up — overriding each command's own allowance. A wait that runs
     /// out after the node accepted the transaction exits 4, "submitted, confirmation unknown".
@@ -76,18 +73,6 @@ struct Cli {
     wait_timeout: Option<u64>,
     #[command(subcommand)]
     cmd: Cmd,
-}
-
-/// `--scan-chunk`'s range: `0` (every envelope) or 2..=1000 (the node's page cap); `1` would
-/// fetch exactly the wanted leaf, which is what the chunk exists to avoid (audit v10, RPC-201).
-fn scan_chunk_value(s: &str) -> std::result::Result<u64, String> {
-    let n: u64 = s.parse().map_err(|_| format!("`{s}` is not a number of leaves"))?;
-    match n {
-        0 => Ok(0),
-        1 => Err("a chunk of 1 reads exactly the wanted leaf and hides nothing; use 0 to read every envelope, or 2 or more".into()),
-        n if n > randprotocol_client::MAX_SCAN_CHUNK => Err(format!("at most {} leaves, the node's page cap", randprotocol_client::MAX_SCAN_CHUNK)),
-        n => Ok(n),
-    }
 }
 
 #[derive(Subcommand)]
@@ -2143,8 +2128,10 @@ async fn run() -> Result<()> {
             eprintln!("warning: {e}");
         }
     }
+    if cli.scan_chunk.is_some() {
+        eprintln!("warning: --scan-chunk is ignored since v0.8.3: a scan reads every envelope, in fixed pages, so the node cannot tell which leaves are yours (issue #147)");
+    }
     let rpc = RpcClient::new(cli.rpc.clone())
-        .with_scan_chunk(cli.scan_chunk)
         .with_announce()
         .with_wait_timeout(cli.wait_timeout.map(Duration::from_secs));
     match cli.cmd {
@@ -4176,19 +4163,15 @@ mod tests {
         assert!(e.contains("--expect-to rand1nope"), "{e}");
     }
 
-    /// `--scan-chunk` (audit v10, RPC-201) is global, so every command that scans takes it: 0 or
-    /// 2..=1000, 256 by default; 1 and anything past the node's page cap are refused at parse.
+    /// `--scan-chunk` (audit v10, RPC-201) is still a global flag, hidden: accepted and ignored.
     #[test]
-    fn scan_chunk_is_global_and_bounded() {
+    fn scan_chunk_is_still_accepted_and_ignored() {
+        // Issue #147: an old script's `--scan-chunk N` still parses (and is warned about); it no
+        // longer changes what a scan reads.
         let chunk = |args: &[&str]| Cli::try_parse_from([&["rand"], args].concat()).map(|c| c.scan_chunk);
-        assert_eq!(chunk(&["sync"]).unwrap(), randprotocol_client::DEFAULT_SCAN_CHUNK);
-        assert_eq!(chunk(&["sync", "--scan-chunk", "0"]).unwrap(), 0);
-        assert_eq!(chunk(&["--scan-chunk", "64", "balance"]).unwrap(), 64);
-        assert_eq!(chunk(&["sync", "--scan-chunk", "1000"]).unwrap(), 1000);
-        for bad in ["1", "1001", "many"] {
-            let err = chunk(&["sync", "--scan-chunk", bad]).unwrap_err().to_string();
-            assert!(err.contains("scan-chunk"), "{bad}: {err}");
-        }
+        assert_eq!(chunk(&["sync"]).unwrap(), None);
+        assert_eq!(chunk(&["sync", "--scan-chunk", "0"]).unwrap(), Some(0));
+        assert_eq!(chunk(&["--scan-chunk", "64", "balance"]).unwrap(), Some(64));
     }
 
     /// `rand sync` scans from where the store left off; `--rescan` starts the store over first

@@ -655,9 +655,15 @@ worth naming.
   already reads, and computes every witness itself: a send never calls `rand_getWitness`, and the
   only tree question left is `rand_getAnchor`, which names no leaf (audit v3 PRIV-1). The method
   stays on the node for wallets built before this change.
-- **Scanning.** `rand_getCommitments` hands out everything to everyone, so scanning itself
-  reveals nothing about which leaves are yours — but it does tell the node that *somebody* at
-  your IP is scanning, and how far. Trial decryption is local and, on that path, the node never
+- **Scanning.** `rand` reads the commitment tree in fixed pages of full envelopes
+  (`rand_getCommitments(from, 500)` from its cursor to the tip) and decides which leaves are its
+  own locally, by trial decryption, after the page has arrived. The requests are the same for
+  every wallet scanning the same range, whatever it owns, so the scan reveals nothing about which
+  leaves are yours (v0.8.3, issue #147; from v0.8.0 to v0.8.2 the wallet read full envelopes only
+  around the leaves its keys opened, which told the node which leaves — or which 256-leaf chunks
+  — were its). What the node does learn: that *somebody* at your IP is scanning, when, from which
+  cursor and how far — which bounds when the wallet last synced — and, on a first sync, that it
+  is a fresh store. Trial decryption is local and, on that path, the node never
   sees a viewing key. The exception is the explorer's import below: a node an operator handed a
   viewing key to knows exactly which leaves that key opens — which the key's holder could have
   computed anyway — and the IP of whoever asked it to.
