@@ -426,6 +426,44 @@ grep -q 'pub fn verifier_key(&self, tier: Tier, program_log_height: u8, input_lo
   && grep -q 'pub fn log_ext_degrees_pub' "$DST/src/machine.rs" \
   && echo "anchors: verifier_key 6-arg ok; log_ext_degrees_pub ok" \
   || { echo "sync-zkvm.sh: an anchor moved (verifier_key 6-arg or log_ext_degrees_pub)" >&2; exit 1; }
+# CON-60 (fullnode audit): `Machine::check_pre_key`, every refusal `Machine::verify` makes before
+# it builds a verifier key, factored out so the chain executor's `perp_proof_admissible` (a
+# node's pool, deciding whether a state proof would cost a key build) runs exactly verify's
+# prefix and cannot drift from it. `verify` then calls it first. Asserts its anchors and aborts
+# the sync when upstream's `verify` moved.
+python3 - "$DST/src/machine.rs" <<'PY'
+import sys; p=sys.argv[1]; s=open(p).read()
+if "pub fn check_pre_key" in s:
+    sys.exit(0)
+head = "    pub fn verify(&self, hc: &[u32; 8], proof: &Proof) -> Result<(), VerifyError> {\n"
+start = head + "        check_public_values(hc, proof)?;\n"
+end = "        let airs = chips_with_modq(proof.tier, proof.keccak_log_height, proof.sha256_log_height, proof.modq_log_height);\n"
+assert start in s, "machine.rs: Machine::verify's opening no longer matches the check_pre_key anchor"
+a = s.index(start) + len(head)
+b = s.index(end, a)
+prefix = s[a:b]
+assert "verifier_key_with_modq" not in prefix, "check_pre_key prefix would include the key build"
+s = s[:a] + "        self.check_pre_key(hc, proof)?;\n" + s[b:]
+fn = (
+    "    /// Every refusal [`Self::verify`] makes before it builds or looks up a verifier key — the\n"
+    "    /// public values against `hc`, the declared shape, the pc window, the commit PoW witnesses\n"
+    "    /// and the degree bits — in `verify`'s order. `verify` runs exactly this first, so a caller\n"
+    "    /// that must not spend a key build on a proof `verify` would refuse for free (a node's pool,\n"
+    "    /// fullnode CON-60) asks the same function and cannot drift from it.\n"
+    "    pub fn check_pre_key(&self, hc: &[u32; 8], proof: &Proof) -> Result<(), VerifyError> {\n"
+    + prefix +
+    "        Ok(())\n"
+    "    }\n\n"
+)
+i = s.index(head)
+# place the new fn in front of verify's doc comment block: find the start of the doc comment
+j = s.rfind("\n\n", 0, i) + 2
+s = s[:j] + fn + s[j:]
+open(p, "w").write(s)
+PY
+grep -q 'pub fn check_pre_key' "$DST/src/machine.rs" && grep -q 'self.check_pre_key(hc, proof)?;' "$DST/src/machine.rs" \
+  && echo "anchors: check_pre_key ok" \
+  || { echo "sync-zkvm.sh: Machine::verify moved; update the check_pre_key patch" >&2; exit 1; }
 # M3.4/M4.1: `hash.rs`'s program-digest header and `tables/cpu.rs`'s in-circuit copy of the same
 # constant both read `crate::notes::domain::HC` upstream; M4.1 added a second such pair for the
 # input digest, `crate::notes::domain::IN`. Constraint set 6 added a third: `crate::notes::
