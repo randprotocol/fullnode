@@ -83,6 +83,98 @@ impl std::fmt::Display for SubmitRefused {
 
 impl std::error::Error for SubmitRefused {}
 
+/// The exit code `rand` leaves when a transaction was **submitted** — `rand_sendTransaction`
+/// answered with its hash — but the wait could not see it commit before its deadline (issue #141):
+/// every status poll timed out, was reset or still said pending. The transaction may well commit;
+/// exit 1 stays reserved for a real failure (a refusal, a rejection, a bad argument).
+pub const CONFIRMATION_UNKNOWN_EXIT: i32 = 4;
+
+/// A wait that ended without seeing its submitted transaction commit (issue #141): the
+/// transaction's fate is unknown, which is not the same thing as failed. `rand` exits
+/// [`CONFIRMATION_UNKNOWN_EXIT`] on it; `err.downcast_ref::<ConfirmationUnknown>()` finds it under
+/// any context.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConfirmationUnknown {
+    pub hash: Hash,
+    /// How long the wait ran.
+    pub waited: Duration,
+    /// The last poll's failure, `None` when the last poll answered (pending, or not yet stored).
+    pub last_error: Option<String>,
+}
+
+impl std::fmt::Display for ConfirmationUnknown {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "transaction {} submitted, confirmation unknown: not committed within {:.0?}", self.hash, self.waited)?;
+        if let Some(e) = &self.last_error {
+            write!(f, " (last status poll: {e})")?;
+        }
+        write!(f, "; it may still commit — check with `rand tx {}` before retrying", self.hash)
+    }
+}
+
+impl std::error::Error for ConfirmationUnknown {}
+
+/// The node's name for an action — `rand_getTransaction`'s `action.kind` — except that a plain
+/// bundle (`Action::None`) is a `transfer`, what `rand send` makes. `rand` prints it on the
+/// `submitted <kind> <hash>` line (issue #141).
+pub fn action_kind(action: &randprotocol_core::Action) -> &'static str {
+    use randprotocol_core::Action as A;
+    match action {
+        A::None => "transfer",
+        A::Mint { .. } => "mint",
+        A::Deploy { .. } => "deploy",
+        A::Call { .. } => "call",
+        A::Bond { .. } => "bond",
+        A::Unbond { .. } => "unbond",
+        A::Withdraw { .. } => "withdraw",
+        A::BridgeAttest { .. } => "bridge_attest",
+        A::BridgeBurn { .. } => "bridge_burn",
+        A::RegisterAggregator { .. } => "register_aggregator",
+        A::UnbondAggregator { .. } => "unbond_aggregator",
+        A::WithdrawAggregator { .. } => "withdraw_aggregator",
+        A::SlashAggregator { .. } => "slash_aggregator",
+        A::Aggregate { .. } => "aggregate",
+        A::RegisterToken { .. } => "register_token",
+        A::TokenMint { .. } => "token_mint",
+        A::SetAuthority { .. } => "set_authority",
+        A::TokenBurn { .. } => "token_burn",
+        A::PauseMints { .. } => "pause_mints",
+        A::UnpauseMints { .. } => "unpause_mints",
+        A::RegisterBridgedToken { .. } => "register_bridged_token",
+        A::ListBacking { .. } => "list_backing",
+        A::RotatePqGuardians { .. } => "rotate_pq_guardians",
+        A::RotatePauseKey { .. } => "rotate_pause_key",
+        A::ClaimVested { .. } => "claim_vested",
+        A::RevokeVesting { .. } => "revoke_vesting",
+        A::BondVested { .. } => "bond_vested",
+        A::UnbondVested { .. } => "unbond_vested",
+        A::AdmitValidator { .. } => "admit_validator",
+        A::SlashEquivocation { .. } => "slash_equivocation",
+        A::RotatePqGuardiansV2 { .. } => "rotate_pq_guardians_v2",
+        A::RotatePauseKeyV2 { .. } => "rotate_pause_key_v2",
+        A::CancelRotation { .. } => "cancel_rotation",
+        A::Invoke { .. } => "invoke",
+        A::PerpDeposit { .. } => "perp_deposit",
+        A::PerpOrder { .. } => "perp_order",
+        A::PerpCancel { .. } => "perp_cancel",
+        A::PerpWithdraw { .. } => "perp_withdraw",
+        A::PerpOracle { .. } => "perp_oracle",
+        A::PerpStateProof { .. } => "perp_state_proof",
+        A::CreateMultisig { .. } => "create_multisig",
+        A::MultisigDeposit { .. } => "multisig_deposit",
+        A::MultisigPay { .. } => "multisig_pay",
+        A::MultisigRotate { .. } => "multisig_rotate",
+        A::SetRandPrice { .. } => "set_rand_price",
+    }
+}
+
+/// `submitted <kind> <hash>`: what `rand` prints (to stderr, so no command's stdout changes) the
+/// moment the node accepts a transaction, before any wait — so a wait that is cut short, or a
+/// process that is killed, still leaves the hash behind.
+pub fn submitted_line(tx: &Transaction, hash: &Hash) -> String {
+    format!("submitted {} {hash}", action_kind(&tx.action))
+}
+
 /// A u64 amount off an RPC reply, however the node encoded it: a JSON number or a decimal
 /// string.
 ///
@@ -531,6 +623,12 @@ pub struct RpcClient {
     scan_chunk: u64,
     /// How long a read (anything but a large upload) may take, body included ([`READ_TIMEOUT`]).
     read_timeout: Duration,
+    /// Print [`submitted_line`] to stderr when `rand_sendTransaction` accepts a transaction
+    /// (`rand` sets it; a library caller prints what it likes). Issue #141.
+    announce: bool,
+    /// `rand --wait-timeout`: every commit or receipt wait runs this long instead of its caller's
+    /// own allowance. `None`: each caller's.
+    wait_timeout: Option<Duration>,
 }
 
 /// How many times a call refused for rate limiting is retried, with waits of `rate_limit_wait`
@@ -635,6 +733,57 @@ pub fn upload_timeout(body_bytes: usize) -> Duration {
     (UPLOAD_SETUP + transfer).min(UPLOAD_TIMEOUT_CAP)
 }
 
+/// The pace of a wait for a submitted transaction (issue #141): a poll every 300 ms while the
+/// node answers, and after a failed poll a wait that doubles from 500 ms to 5 s, so a node that is
+/// restarting or a link that is dropping is not hammered — reset by the next answer. Never sleeps
+/// past the deadline.
+struct PollBackoff {
+    /// The next wait after a failure.
+    after_failure: Duration,
+    /// Whether the last poll failed, and how.
+    last_error: Option<String>,
+}
+
+impl Default for PollBackoff {
+    fn default() -> PollBackoff {
+        PollBackoff { after_failure: POLL_RETRY_FIRST, last_error: None }
+    }
+}
+
+const POLL_EVERY: Duration = Duration::from_millis(300);
+const POLL_RETRY_FIRST: Duration = Duration::from_millis(500);
+const POLL_RETRY_MAX: Duration = Duration::from_secs(5);
+
+impl PollBackoff {
+    fn answered(&mut self) {
+        self.after_failure = POLL_RETRY_FIRST;
+        self.last_error = None;
+    }
+
+    fn failed(&mut self, e: anyhow::Error) {
+        self.last_error = Some(format!("{e:#}"));
+    }
+
+    /// Sleep before the next poll, or end the wait as [`ConfirmationUnknown`] once `timeout` has
+    /// run out since `start`.
+    async fn sleep_or_give_up(&mut self, hash: &Hash, start: Instant, timeout: Duration) -> Result<()> {
+        let elapsed = start.elapsed();
+        if elapsed >= timeout {
+            return Err(ConfirmationUnknown { hash: *hash, waited: elapsed, last_error: self.last_error.take() }.into());
+        }
+        let pause = match self.last_error {
+            None => POLL_EVERY,
+            Some(_) => {
+                let p = self.after_failure;
+                self.after_failure = (p * 2).min(POLL_RETRY_MAX);
+                p
+            }
+        };
+        tokio::time::sleep(pause.min(timeout - elapsed)).await;
+        Ok(())
+    }
+}
+
 impl RpcClient {
     pub fn new(url: impl Into<String>) -> RpcClient {
         RpcClient {
@@ -648,7 +797,23 @@ impl RpcClient {
             rate_limit_wait: Duration::from_secs(1),
             scan_chunk: DEFAULT_SCAN_CHUNK,
             read_timeout: READ_TIMEOUT,
+            announce: false,
+            wait_timeout: None,
         }
+    }
+
+    /// This client, printing `submitted <kind> <hash>` to stderr as each transaction is accepted
+    /// ([`submitted_line`], issue #141).
+    pub fn with_announce(mut self) -> RpcClient {
+        self.announce = true;
+        self
+    }
+
+    /// This client with every commit and receipt wait set to `timeout` (`rand --wait-timeout`),
+    /// whatever its caller asks for; `None` leaves each caller's.
+    pub fn with_wait_timeout(mut self, timeout: Option<Duration>) -> RpcClient {
+        self.wait_timeout = timeout;
+        self
     }
 
     /// This client with another envelope-fetch width for a scan over heads (`--scan-chunk`;
@@ -758,7 +923,13 @@ impl RpcClient {
 
     pub async fn send_transaction(&self, tx: &Transaction) -> Result<Hash> {
         let v = self.call("rand_sendTransaction", json!([hex::encode(tx.encode())])).await?;
-        Hash::from_hex(v.as_str().unwrap_or("")).map_err(|e| anyhow!("bad hash in reply: {e}"))
+        let hash = Hash::from_hex(v.as_str().unwrap_or("")).map_err(|e| anyhow!("bad hash in reply: {e}"))?;
+        if self.announce {
+            // Before any wait (issue #141): from here on the transaction may commit whatever a
+            // later poll says, and this line is how the person — or a script — learns its hash.
+            eprintln!("{}", submitted_line(tx, &hash));
+        }
+        Ok(hash)
     }
 
     /// The committed transaction itself, decoded from `rand_getRawTransaction` — what reading its
@@ -807,55 +978,46 @@ impl RpcClient {
     /// v0.3, which has no such method and answers `-32601`, it falls back to the old
     /// `rand_getTransaction` loop for good — `legacy_status` remembers that so later calls do
     /// not pay for the round trip that will only fail again.
+    ///
+    /// Issue #141: the transaction was already accepted when this is called, so a poll that
+    /// fails — a timeout, a reset, a node error mid-restart — says nothing about it. Such a poll is
+    /// retried with backoff ([`PollBackoff`]) until the deadline, and a wait that ends without
+    /// seeing the commit is [`ConfirmationUnknown`], never a plain error. `rand --wait-timeout`
+    /// ([`RpcClient::with_wait_timeout`]) replaces `timeout`.
     pub async fn wait_for_transaction(&self, hash: &Hash, timeout: Duration) -> Result<TxReceipt> {
         use std::sync::atomic::Ordering;
 
-        if self.legacy_status.load(Ordering::Relaxed) {
-            return self.wait_for_transaction_legacy(hash, timeout).await;
-        }
+        let timeout = self.wait_timeout.unwrap_or(timeout);
         let start = Instant::now();
+        let mut backoff = PollBackoff::default();
         loop {
-            let status = match self.transaction_status(std::slice::from_ref(hash)).await {
-                Ok(s) => s,
-                Err(e) if is_method_not_found(&e) => {
-                    self.legacy_status.store(true, Ordering::Relaxed);
-                    return self.wait_for_transaction_legacy(hash, timeout).await;
-                }
-                Err(e) => return Err(e),
-            };
-            match status.first().and_then(|s| s["status"].as_str()) {
-                Some("committed") => {
-                    if let Some(r) = self.transaction(hash).await? {
-                        return Ok(r);
+            let polled: Result<Option<TxReceipt>> = if self.legacy_status.load(Ordering::Relaxed) {
+                // The pre-v0.3 wait: `rand_getTransaction` until it is committed. It never sees a
+                // rejection — that node has nowhere to report one.
+                self.transaction(hash).await
+            } else {
+                match self.transaction_status(std::slice::from_ref(hash)).await {
+                    Err(e) if is_method_not_found(&e) => {
+                        self.legacy_status.store(true, Ordering::Relaxed);
+                        continue;
                     }
+                    Err(e) => Err(e),
+                    Ok(status) => match status.first().and_then(|s| s["status"].as_str()) {
+                        Some("committed") => self.transaction(hash).await,
+                        Some("rejected") => {
+                            let reason = status[0]["reason"].as_str().unwrap_or("refused");
+                            return Err(anyhow!("transaction {hash} rejected: {reason}"));
+                        }
+                        _ => Ok(None),
+                    },
                 }
-                Some("rejected") => {
-                    let reason = status[0]["reason"].as_str().unwrap_or("refused");
-                    return Err(anyhow!("transaction {hash} rejected: {reason}"));
-                }
-                _ => {}
+            };
+            match polled {
+                Ok(Some(r)) => return Ok(r),
+                Ok(None) => backoff.answered(),
+                Err(e) => backoff.failed(e),
             }
-            if start.elapsed() > timeout {
-                return Err(anyhow!("transaction {hash} not committed within {timeout:?}"));
-            }
-            tokio::time::sleep(Duration::from_millis(300)).await;
-        }
-    }
-
-    /// The pre-v0.3 wait: poll `rand_getTransaction` until it is committed or `timeout` elapses.
-    /// It never sees a rejection — that node has nowhere to report one — so it can only time out.
-    /// Shared by [`wait_for_transaction`](Self::wait_for_transaction)'s legacy fallback, so the
-    /// two paths keep one loop body between them.
-    async fn wait_for_transaction_legacy(&self, hash: &Hash, timeout: Duration) -> Result<TxReceipt> {
-        let start = Instant::now();
-        loop {
-            if let Some(r) = self.transaction(hash).await? {
-                return Ok(r);
-            }
-            if start.elapsed() > timeout {
-                return Err(anyhow!("transaction {hash} not committed within {timeout:?}"));
-            }
-            tokio::time::sleep(Duration::from_millis(300)).await;
+            backoff.sleep_or_give_up(hash, start, timeout).await?;
         }
     }
 
@@ -1131,17 +1293,20 @@ impl RpcClient {
         Ok(if v.is_null() { None } else { Some(v) })
     }
 
-    /// Poll until a call's receipt is stored (the tx is committed) or `timeout` elapses.
+    /// Poll until a call's receipt is stored (the tx is committed) or `timeout` elapses. A failed
+    /// poll is retried and a wait that runs out is [`ConfirmationUnknown`], exactly as in
+    /// [`RpcClient::wait_for_transaction`] (issue #141).
     pub async fn wait_for_receipt(&self, tx: &Hash, timeout: Duration) -> Result<Value> {
+        let timeout = self.wait_timeout.unwrap_or(timeout);
         let start = Instant::now();
+        let mut backoff = PollBackoff::default();
         loop {
-            if let Some(r) = self.receipt(tx).await? {
-                return Ok(r);
+            match self.receipt(tx).await {
+                Ok(Some(r)) => return Ok(r),
+                Ok(None) => backoff.answered(),
+                Err(e) => backoff.failed(e),
             }
-            if start.elapsed() > timeout {
-                return Err(anyhow!("no receipt for {tx} within {timeout:?}"));
-            }
-            tokio::time::sleep(Duration::from_millis(300)).await;
+            backoff.sleep_or_give_up(tx, start, timeout).await.map_err(|e| e.context(format!("no receipt for {tx}")))?;
         }
     }
 
@@ -1755,6 +1920,120 @@ mod tests {
 
         assert!(err.to_string().contains("rejected: bad mint signature"), "{err}");
         assert!(waited < timeout, "should fail fast, not wait out the timeout: {waited:?}");
+    }
+
+    // ------------------------------------------- a submitted transaction's wait (issue #141)
+    //
+    // Once `rand_sendTransaction` has answered with a hash, the transaction may commit whatever a
+    // status poll says afterwards. A poll that times out or is reset is retried with backoff until
+    // the wait's deadline, and a wait that ends without seeing the commit is
+    // `ConfirmationUnknown` — exit 4 in `rand` — never the generic failure.
+
+    /// Polls that fail (reset, a node error, a stalled reply) are retried, and the wait still
+    /// returns the receipt once the node reports the commit.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failing_status_poll_is_retried_until_the_commit() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use test_rpc::{rpc_fn, Reply};
+        let polls = std::sync::Arc::new(AtomicUsize::new(0));
+        let seen = polls.clone();
+        let url = rpc_fn(move |m, _| match m {
+            "rand_getTransactionStatus" => match seen.fetch_add(1, Ordering::SeqCst) {
+                0 => Reply::Drop,
+                1 => Reply::Stall,
+                2 => Reply::Err(-32603, "node loop closed"),
+                _ => Reply::Ok(json!([{ "status": "committed" }])),
+            },
+            "rand_getTransaction" => Reply::Ok(json!({ "height": 7, "index": 1, "block_hash": "cc".repeat(32) })),
+            _ => Reply::Err(-32601, "unknown method"),
+        })
+        .await;
+        let client = RpcClient::new(url).with_read_timeout(Duration::from_millis(200));
+        let r = client.wait_for_transaction(&Hash([3; 32]), Duration::from_secs(20)).await.unwrap();
+        assert_eq!((r.height, r.index), (7, 1));
+        assert_eq!(polls.load(Ordering::SeqCst), 4, "three failed polls, then the commit");
+    }
+
+    /// A wait whose every poll fails ends at its deadline as `ConfirmationUnknown`, naming the hash
+    /// and `rand tx`, and carrying the last poll's failure.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_wait_that_never_sees_the_commit_is_confirmation_unknown() {
+        use test_rpc::{rpc_fn, Reply};
+        let hash = Hash([4; 32]);
+        for reply in [|| Reply::Stall, || Reply::Drop, || Reply::Err(-32000, "db down"), || Reply::Ok(json!([{ "status": "pending" }]))] {
+            let url = rpc_fn(move |m, _| match m {
+                "rand_getTransactionStatus" => reply(),
+                _ => Reply::Err(-32601, "unknown method"),
+            })
+            .await;
+            let client = RpcClient::new(url).with_read_timeout(Duration::from_millis(100));
+            let started = Instant::now();
+            let e = client.wait_for_transaction(&hash, Duration::from_millis(800)).await.unwrap_err();
+            assert!(started.elapsed() < Duration::from_secs(5), "the deadline bounds the retries");
+            let unknown = e.downcast_ref::<ConfirmationUnknown>().unwrap_or_else(|| panic!("not ConfirmationUnknown: {e:#}"));
+            assert_eq!(unknown.hash, hash);
+            let text = e.to_string();
+            assert!(text.contains("confirmation unknown") && text.contains(&format!("rand tx {hash}")), "{text}");
+        }
+    }
+
+    /// A rejection is still a failure, not an unknown: the node said the transaction is refused.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_rejection_after_a_failed_poll_is_a_failure() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use test_rpc::{rpc_fn, Reply};
+        let polls = std::sync::Arc::new(AtomicUsize::new(0));
+        let url = rpc_fn(move |m, _| match m {
+            "rand_getTransactionStatus" if polls.fetch_add(1, Ordering::SeqCst) == 0 => Reply::Drop,
+            "rand_getTransactionStatus" => Reply::Ok(json!([{ "status": "rejected", "reason": "bad proof" }])),
+            _ => Reply::Err(-32601, "unknown method"),
+        })
+        .await;
+        let e = RpcClient::new(url).wait_for_transaction(&Hash([5; 32]), Duration::from_secs(20)).await.unwrap_err();
+        assert!(e.downcast_ref::<ConfirmationUnknown>().is_none(), "{e:#}");
+        assert!(e.to_string().contains("rejected: bad proof"), "{e}");
+    }
+
+    /// The receipt wait (`rand call`, `rand program invoke`) retries the same way and ends the same
+    /// way.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_receipt_wait_retries_and_ends_in_confirmation_unknown() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use test_rpc::{rpc_fn, Reply};
+        let polls = std::sync::Arc::new(AtomicUsize::new(0));
+        let url = rpc_fn(move |m, _| match m {
+            "rand_getReceipt" if polls.fetch_add(1, Ordering::SeqCst) < 2 => Reply::Drop,
+            "rand_getReceipt" => Reply::Ok(json!({ "ok": true })),
+            _ => Reply::Err(-32601, "unknown method"),
+        })
+        .await;
+        let r = RpcClient::new(url).wait_for_receipt(&Hash([6; 32]), Duration::from_secs(20)).await.unwrap();
+        assert_eq!(r["ok"], true);
+        let url = rpc_fn(|_, _| Reply::Drop).await;
+        let e = RpcClient::new(url).wait_for_receipt(&Hash([6; 32]), Duration::from_millis(500)).await.unwrap_err();
+        assert!(e.downcast_ref::<ConfirmationUnknown>().is_some(), "{e:#}");
+    }
+
+    /// `with_wait_timeout` (`rand --wait-timeout`) overrides every caller's own wait.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_wait_timeout_override_wins_over_the_callers() {
+        use test_rpc::{rpc_fn, Reply};
+        let url = rpc_fn(|_, _| Reply::Ok(json!([{ "status": "pending" }]))).await;
+        let client = RpcClient::new(url).with_wait_timeout(Some(Duration::from_millis(300)));
+        let started = Instant::now();
+        let e = client.wait_for_transaction(&Hash([7; 32]), Duration::from_secs(600)).await.unwrap_err();
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(e.downcast_ref::<ConfirmationUnknown>().is_some(), "{e:#}");
+    }
+
+    /// The kind `rand` prints on its `submitted <kind> <hash>` line: the node's own name for the
+    /// action (`rand_getTransaction`'s `action.kind`), a plain bundle a transfer.
+    #[test]
+    fn the_submitted_line_names_the_action_as_the_node_does() {
+        assert_eq!(action_kind(&randprotocol_core::Action::None), "transfer");
+        let tx = Transaction { chain_id: 1, bundle: None, action: randprotocol_core::Action::PauseMints { nonce: 1, signature: randprotocol_core::Signature::empty() } };
+        assert_eq!(action_kind(&tx.action), "pause_mints");
+        assert_eq!(submitted_line(&tx, &Hash([1; 32])), format!("submitted pause_mints {}", Hash([1; 32])));
     }
 
     // ---------------------------------------------------- the call limits (Task 5)

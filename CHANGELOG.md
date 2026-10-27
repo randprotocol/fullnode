@@ -12,7 +12,14 @@ stopped at v0.4 until 2026-09-30, when the entries v0.5 to v0.6.7 were written f
 
 ## Unreleased
 
-Nothing yet.
+v0.8.3 (wallet; client-only, no node or chain change):
+
+- **`rand` no longer exits 1 after a successful submit** (#141): `submitted <kind> <hash>` is
+  printed on stderr as soon as the node accepts a transaction; status polls that time out or are
+  reset are retried with backoff until the wait's deadline; a wait that never sees the commit exits
+  **4** ("submitted, confirmation unknown", with a `rand tx <hash>` hint). Exit 1 is a real
+  failure only. New global `--wait-timeout <SECS>` / `RAND_WAIT_TIMEOUT`. Exit codes in
+  `docs/cli.md`.
 
 ## v0.8.2 — 2026-10-27 (chain 21, node-only; the genesis-gated rules wait for the next cut)
 

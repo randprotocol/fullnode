@@ -91,6 +91,8 @@ impl Fake {
 
 pub struct Run {
     pub ok: bool,
+    /// The exit code (`None` if a signal ended it).
+    pub code: Option<i32>,
     pub out: String,
     pub err: String,
 }
@@ -106,6 +108,7 @@ pub fn rand(rpc: &str, key: &std::path::Path, args: &[&str]) -> Run {
         .expect("run rand");
     Run {
         ok: o.status.success(),
+        code: o.status.code(),
         out: String::from_utf8_lossy(&o.stdout).into(),
         err: String::from_utf8_lossy(&o.stderr).into(),
     }

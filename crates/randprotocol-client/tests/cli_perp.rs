@@ -699,3 +699,38 @@ fn perp_prove_refuses_a_bad_fri_name_and_a_missing_job() {
         r.err
     );
 }
+
+/// Issue #141, on a bundle-less submission (`perp order`, the governance path every signed
+/// action shares): `submitted perp_order <hash>` on stderr as soon as the node accepts it — stdout
+/// keeps its `order <hash>` contract — and a wait that never sees the commit exits 4, not 1.
+#[test]
+fn a_perp_order_whose_commit_cannot_be_seen_exits_4_after_naming_its_hash() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = keygen(&dir);
+    let trade = dir.path().join("t.json");
+    assert!(rand(DEAD, &key, &["perp", "keygen", "--out", trade.to_str().unwrap()]).ok);
+    let node = fake(Box::new(|m, _| match m {
+        "rand_chainId" => Ok(json!(14)),
+        "rand_getPerps" => Ok(perps_state()),
+        "rand_getHead" => Ok(json!({ "height": 40 })),
+        "rand_getPerpAccount" => Ok(Value::Null),
+        "rand_sendTransaction" => Ok(json!("ab".repeat(32))),
+        "rand_getTransactionStatus" => Ok(json!([{ "status": "pending" }])),
+        _ => Err((-32601, "method not found".into())),
+    }));
+    let r = rand(
+        &node.url,
+        &key,
+        &[
+            "--wait-timeout", "1", "perp", "order", "--trading-key", trade.to_str().unwrap(), "--market", "2", "--side", "buy",
+            "--size", "1", "--price", "5",
+        ],
+    );
+    let hash = "ab".repeat(32);
+    assert_eq!(r.code, Some(4), "stdout {}\nstderr {}", r.out, r.err);
+    assert!(r.err.contains(&format!("submitted perp_order {hash}")), "{}", r.err);
+    let submitted_at = r.err.find("submitted perp_order").unwrap();
+    let unknown_at = r.err.find("confirmation unknown").expect("the unknown is said");
+    assert!(submitted_at < unknown_at, "the hash is printed before the wait ends: {}", r.err);
+    assert!(r.err.contains(&format!("rand tx {hash}")), "{}", r.err);
+}

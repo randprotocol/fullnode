@@ -69,6 +69,11 @@ struct Cli {
     /// the node's page cap; `1` is refused — it would name the leaf. `docs/rpc.md`, scan heads.
     #[arg(long, global = true, value_name = "N", default_value_t = randprotocol_client::DEFAULT_SCAN_CHUNK, value_parser = scan_chunk_value)]
     scan_chunk: u64,
+    /// How long, in seconds, a command waits for its transaction to commit (or for a call's
+    /// receipt) before it gives up — overriding each command's own allowance. A wait that runs
+    /// out after the node accepted the transaction exits 4, "submitted, confirmation unknown".
+    #[arg(long, global = true, env = "RAND_WAIT_TIMEOUT", value_name = "SECS")]
+    wait_timeout: Option<u64>,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -2089,8 +2094,22 @@ async fn perp(
     Ok(())
 }
 
+/// `rand`'s exit codes: 0 done, 1 failed, 2 a usage error (clap's), [`STALE_READ_EXIT`] (3) a
+/// stale `program invoke`, and [`randprotocol_client::CONFIRMATION_UNKNOWN_EXIT`] (4) a
+/// transaction the node accepted whose commit the wait could not see (issue #141): the hash was
+/// printed (`submitted <kind> <hash>`), and `rand tx <hash>` says what became of it.
 #[tokio::main]
 async fn main() -> Result<()> {
+    match run().await {
+        Err(e) if e.downcast_ref::<randprotocol_client::ConfirmationUnknown>().is_some() => {
+            eprintln!("Error: {e:#}");
+            std::process::exit(randprotocol_client::CONFIRMATION_UNKNOWN_EXIT);
+        }
+        r => r,
+    }
+}
+
+async fn run() -> Result<()> {
     let cli = Cli::parse();
     randprotocol_client::memory::set_skip(cli.skip_memory_check);
     // The thread pool a local proof runs on, sized before anything proves (`--threads`, else
@@ -2103,7 +2122,10 @@ async fn main() -> Result<()> {
             eprintln!("warning: {e}");
         }
     }
-    let rpc = RpcClient::new(cli.rpc.clone()).with_scan_chunk(cli.scan_chunk);
+    let rpc = RpcClient::new(cli.rpc.clone())
+        .with_scan_chunk(cli.scan_chunk)
+        .with_announce()
+        .with_wait_timeout(cli.wait_timeout.map(Duration::from_secs));
     match cli.cmd {
         Cmd::Keygen => {
             let w = Wallet::generate();
@@ -3509,8 +3531,12 @@ async fn main() -> Result<()> {
             report(&result.submission, "token registration");
             println!("index {}, id {} ({})", result.index, result.id.to_hex(), randprotocol_core::token_id::encode(&result.id));
             if !no_wait {
-                let committed = rpc.call("rand_getTransaction", serde_json::json!([result.submission.hash.to_hex()])).await?;
-                println!("committed at height {}", committed["height"]);
+                // The wait above saw the commit; a failed read of its height now is not a failure
+                // of the registration (issue #141).
+                match rpc.call("rand_getTransaction", serde_json::json!([result.submission.hash.to_hex()])).await {
+                    Ok(committed) => println!("committed at height {}", committed["height"]),
+                    Err(e) => eprintln!("warning: committed, but reading its height failed ({e:#}); `rand tx {}` shows it", result.submission.hash),
+                }
             }
         }
         Cmd::Token(TokenCmd::Mint { asset, to, amount, authority_key, fee, no_wait, cuda }) => {

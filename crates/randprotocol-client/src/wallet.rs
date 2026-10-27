@@ -2936,7 +2936,8 @@ async fn settle(
         // notes spendable, where marking them here would strand them until the store is thrown
         // away and rebuilt.
         rpc.wait_for_transaction(hash, COMMIT_TIMEOUT).await?;
-        scan(rpc, w, store).await?;
+        // Committed: a rescan that fails now does not undo it, and says so (issue #141).
+        scan(rpc, w, store).await.with_context(|| format!("{hash} committed, but the rescan after it failed; `rand balance` rescans"))?;
     } else {
         // Nothing will confirm these for the caller, so they are held back rather than declared
         // spent: `pending` keeps them out of coin selection without the one-way write that
@@ -7734,7 +7735,8 @@ pub(crate) mod tests {
             // The send goes through; the wait's very first call does not.
             c.fail = Some("rand_getTransactionStatus");
         }
-        let rpc = serve(&chain).await;
+        // Issue #141: the failing poll is retried until the wait's deadline; a short one here.
+        let rpc = serve(&chain).await.with_wait_timeout(Some(std::time::Duration::from_millis(500)));
         let mut store = NoteStore::default();
         let kp = Keypair::generate();
 
@@ -7757,8 +7759,10 @@ pub(crate) mod tests {
         .await
         .unwrap_err();
 
-        // It is an `RpcError`, exactly as a refusal is — and it is not a `SubmitRefused`.
-        assert!(e.downcast_ref::<crate::RpcError>().is_some(), "{e}");
+        // Issue #141: the failing poll ends the wait as `ConfirmationUnknown` (its `RpcError`
+        // named inside) — and it is not a `SubmitRefused`.
+        assert!(e.downcast_ref::<crate::ConfirmationUnknown>().is_some(), "{e}");
+        assert!(format!("{e:#}").contains("injected failure"), "the poll's failure is named: {e:#}");
         assert!(e.downcast_ref::<crate::SubmitRefused>().is_none(), "a post-send failure is not a refusal: {e}");
         // The registration did reach the node, so the key is kept.
         assert_eq!(chain.lock().unwrap().sent.len(), 1, "the transaction was submitted");

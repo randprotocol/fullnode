@@ -632,6 +632,36 @@ fn faucet_mints_to_the_wallet_address_and_waits_for_the_commit() {
     );
 }
 
+/// Issue #141: the node accepted the mint and every status poll then fails. `rand` must not
+/// exit 1 (a failure the caller would retry): it exits 4, "submitted, confirmation unknown", with
+/// the hash and a `rand tx` hint, after printing the hash before it waited.
+#[test]
+fn a_faucet_mint_whose_status_polls_fail_exits_4_with_the_hash() {
+    let hash = "aa".repeat(32);
+    let node = fake(Box::new(|m, _| match m {
+        "rand_mint" => Ok(json!("aa".repeat(32))),
+        "rand_getTransactionStatus" => Err((-32603, "node loop closed".into())),
+        _ => Err((-32601, "method not found".into())),
+    }));
+    let dir = tempfile::tempdir().unwrap();
+    let key = keygen(&dir);
+    let r = rand(&node.url, &key, &["--wait-timeout", "2", "faucet", "--amount", "1"]);
+    assert_eq!(r.code, Some(4), "stdout {}\nstderr {}", r.out, r.err);
+    assert!(r.out.contains(&format!("submitted mint {hash}")), "{}", r.out);
+    assert!(r.err.contains("confirmation unknown") && r.err.contains(&format!("rand tx {hash}")), "{}", r.err);
+    assert!(r.err.contains("node loop closed"), "the last poll's failure is named: {}", r.err);
+    let polls = node.methods().iter().filter(|m| *m == "rand_getTransactionStatus").count();
+    assert!(polls >= 2, "the failed poll was retried, not fatal: {polls}");
+
+    // A rejection is still exit 1.
+    let rejecting = fake(Box::new(|m, _| match m {
+        "rand_mint" => Ok(json!("aa".repeat(32))),
+        "rand_getTransactionStatus" => Ok(json!([{ "status": "rejected", "reason": "no" }])),
+        _ => Err((-32601, "method not found".into())),
+    }));
+    assert_eq!(rand(&rejecting.url, &key, &["faucet", "--amount", "1"]).code, Some(1));
+}
+
 #[test]
 fn a_rejected_faucet_mint_reports_the_admission_reason() {
     let node = fake(Box::new(|m, _| match m {

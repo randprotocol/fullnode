@@ -538,6 +538,23 @@ Global options, accepted before or after the subcommand:
 | `--threads <N>` | | every core | CPU threads a proof made on this machine uses; `RAYON_NUM_THREADS` when set and no flag; `0` refused. A wallet proves one bundle with a person waiting, so the default is every core (`docs/node-hardware.md` §6: 8 threads 17.1 s, 16 threads 13.9 s on an M4 Max) |
 | `--cpu` | | off | prove on the CPU even when a GPU is visible to a build with the CUDA backend; without `--cpu` or `--cuda` such a build takes the GPU and says so once on stderr |
 | `--scan-chunk <N>` | | `256` | how many leaves wide each envelope read is when a scan over scan heads (`rand_getScanLeaves`) fetches the leaves this wallet's keys opened (audit v10, RPC-201). The whole aligned chunk is read with `rand_getCommitments`, so the node learns which 256-leaf chunk held one of this wallet's leaves, not which leaf; the leaves between two of the wallet's in one chunk ride in the same read. `0` reads every envelope (what a wallet did before scan heads: the node learns nothing, at full bandwidth — the setting for a node you do not trust with your note count). `2`..`1000` (the node's page cap); `1` is refused, since it would read exactly the wanted leaf. Applies to every command that scans (`sync`, `balance`, `send`, …); see `docs/rpc.md`, scan heads, for the trade-off |
+| `--wait-timeout <SECS>` | `RAND_WAIT_TIMEOUT` | each command's own (`send` and the other bundle commands 180 s, `faucet` 60 s, `call`/`invoke` receipts 120 s) | how long a command waits for its transaction to commit, or for a call's receipt, before it gives up. A wait that runs out after the node accepted the transaction exits **4** (below), never 1 |
+
+**Submitting, and exit codes (v0.8.3, issue #141).** The moment the node accepts a transaction
+(`rand_sendTransaction` answers with its hash) `rand` prints `submitted <kind> <hash>` on
+**stderr** — `<kind>` is the node's own name for the action (`rand_getTransaction`'s
+`action.kind`; a plain `send` is `transfer`) — before it waits, so the hash survives a cut-short
+wait or a killed process; stdout is unchanged (`faucet` keeps its own `submitted mint …` line on
+stdout). The wait then polls `rand_getTransactionStatus`: a poll that times out, is reset or gets a
+node error is retried, every 0.5 s doubling to 5 s, until the wait's deadline (`--wait-timeout`).
+
+| exit | meaning |
+|---|---|
+| 0 | done |
+| 1 | failed: a refusal, a rejection, a bad argument, an unreadable file |
+| 2 | a usage error (the argument parser's) |
+| 3 | `program invoke` only: a stale cell read; re-quote and retry |
+| 4 | **submitted, confirmation unknown**: the node accepted the transaction but the wait never saw it commit. stderr names the hash and the last poll's failure, and ends with the hint to check `rand tx <hash>` before retrying. The transaction may well commit, so a script must not resubmit on 4 without checking |
 
 | command | arguments | behaviour |
 |---|---|---|
