@@ -120,6 +120,10 @@ jobs:
       - name: The pinned prover pool is the live pool
         working-directory: fullnode
         run: cargo test -p randprotocol-client --release --lib prover::tests::the_trusted_provers
+      # VK-10: the prover pool router's tests (stdlib only).
+      - name: The prover pool router
+        working-directory: fullnode/deploy/prover
+        run: python3 -m unittest test_router
       - name: Integration suites that do not prove
         working-directory: fullnode
         # Named one by one rather than filtered by a `--skip` pattern: the cluster suite's proving
