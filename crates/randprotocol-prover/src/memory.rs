@@ -16,6 +16,15 @@ pub fn available_bytes() -> u64 {
     sys.available_memory()
 }
 
+/// The machine's total memory in bytes (`0` if the OS does not say): what the node sizes its
+/// admission byte budget from (issue #157), where the available figure at startup — before the
+/// node has grown to its working size — would overstate the room.
+pub fn total_bytes() -> u64 {
+    let mut sys = sysinfo::System::new();
+    sys.refresh_memory();
+    sys.total_memory()
+}
+
 fn gb(b: u64) -> f64 { b as f64 / 1e9 }
 
 /// `Err` names both numbers when `max_parallel` proofs would not fit in available memory.

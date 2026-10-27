@@ -158,6 +158,30 @@ On a genesis with `hc_auth_multisig` the first term counts **three** proofs at t
 (`3 × max_proof_bytes`: bundle, multisig auth, call), since the multisig auth proof is not the
 single-key guest's small fixed shape (`rpc::rpc_max_body_bytes`).
 
+**What a hash means** (issue #157). The hash comes back only after the transaction has passed
+every check above, the proofs included, has been pooled at the current tip, and has been handed
+to this node's gossip for publishing (`Node::on_verdict`). This has been so since admission moved
+off the loop; nothing acknowledges a transaction that is only queued. The hand-off is to the
+node's own network task, so a node killed in the moment after it answers can still lose the
+transaction before the first peer has it. The OOM kills of 2026-10-27 that lost 18 acknowledged
+transactions were that window; the admission budget below is what closes them. Acceptance is
+still not commitment.
+
+**Busy, retry: `-32005`** (issue #157). Every POST body is charged against the node's admission
+byte budget before it is read, and held until the answer; a transaction is charged again, by its
+decoded size, while it waits for verification. A request the budget cannot take now is answered at
+once with HTTP 503, `Retry-After: 1` and
+
+```json
+{ "jsonrpc": "2.0", "id": null, "error": { "code": -32005,
+  "message": "busy: this node's admission memory is full (120 of 123 MiB in use, 5627 KiB wanted); retry shortly",
+  "data": { "wanted": 5761934, "available": 2516582, "limit": 128974848 } } }
+```
+
+Nothing was queued: send the same request again in a moment. `rand` does (it backs off on
+`-32005` five times, about 31 s). A gossiped transaction that does not fit is reported `Ignore`, so
+its forwarder is never penalised.
+
 ### `rand_mint` (testnet faucet)
 Params: `[address]` or `[address, amount]`, where `address` is a `rand1…` shielded address and
 `amount` is a string of units, at most `100000000000` (100 RAND; the default). Result: the mint
@@ -1065,7 +1089,7 @@ Params: `[]`. Result:
   "syncing": false, "sync_target": 1998,
   "sync_inflight_age_ms": null, "sync_failures": 0, "sync_late_batches": 0, "compact_fetched": 0,
   "peer_count": 5, "connected_peers": 5, "reserved_peers": 5, "ws_clients": 3, "refused_cache": 0,
-  "verify_queue": 0, "mempool_size": 0,
+  "verify_queue": 0, "admission_bytes": 0, "admission_budget_bytes": 123000000, "mempool_size": 0,
   "is_validator": true, "active_validator": true, "faucet": true, "confidential": true,
   "testnet": false, "fri_profile": "production", "programs": 2, "viewing_keys": 0,
   "notes": 41, "nullifiers": 12, "tree_root": "6b1d…c4", "hc_bundle": "f07a…19", "hc_auth": null, "hc_auth_multisig": null,
@@ -1119,6 +1143,11 @@ otherwise looks identical to a node that is behind and working:
   off the consensus loop. 64 deep at most; a queue that stays full means verifications are arriving
   faster than ~20 ms apiece drains them, and what does not fit is shed — an honest peer re-gossips
   on its next heartbeat — rather than queued unboundedly.
+- `admission_bytes` / `admission_budget_bytes` (issue #157) — bytes charged right now against the
+  admission budget, and the budget (`--admission-budget-mb`; default 1/16 of the host's RAM within
+  64–256 MiB, never under one largest transaction). The charges are every POST body being served
+  and every transaction waiting for or under verification, gossiped or submitted. At the budget,
+  `rand_sendTransaction` answers `-32005` and gossiped transactions are shed with `Ignore`.
 
 `is_validator` says this node holds a validator key; `active_validator`
 says that key is in the set running the current epoch (spec §8) — a validator that has bonded in

@@ -92,6 +92,11 @@ pub enum MempoolError {
     /// the node has a key for always passes.
     #[error("this node is at its limit of verifier-key builds for new state-proof shapes; retry later")]
     StateProofBusy,
+    /// Issue #157: the admission byte budget ([`crate::admission::AdmissionBudget`]) cannot take
+    /// this transaction now. Retryable, never cached, no peer penalised; `rand_sendTransaction`
+    /// answers it as `-32005`.
+    #[error("{0}")]
+    AdmissionBusy(crate::admission::AdmissionBusy),
 }
 
 /// The refusal a `Warming` deferral carries, as `rand_sendTransaction` reports it.
@@ -129,6 +134,7 @@ impl MempoolError {
                 | MempoolError::PerpHeightBackpressure { .. }
                 | MempoolError::PerpCancelUnknownOrder(_)
                 | MempoolError::StateProofBusy
+                | MempoolError::AdmissionBusy(_)
         )
     }
 }

@@ -12,7 +12,13 @@ stopped at v0.4 until 2026-09-30, when the entries v0.5 to v0.6.7 were written f
 
 ## Unreleased
 
-Nothing yet.
+- **Admission memory is bounded** (issue #157): one byte budget (`--admission-budget-mb`; default
+  1/16 of RAM within 64–256 MiB, never under one largest transaction) over RPC request bodies and
+  the verify queue, gossiped and submitted. Past it `rand_sendTransaction` answers `-32005`
+  (HTTP 503, `Retry-After: 1`) without reading the request into memory, and gossip sheds with
+  `Ignore`. `rand_status` gains `admission_bytes` and `admission_budget_bytes`. The hash
+  `rand_sendTransaction` returns still means verified, pooled and handed to gossip, now
+  documented. The unit templates set `MemoryHigh=85%`; 4 GB is the validator minimum.
 
 ## v0.8.2 — 2026-10-27 (chain 21, node-only; the genesis-gated rules wait for the next cut)
 
