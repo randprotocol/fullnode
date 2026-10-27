@@ -65,6 +65,11 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # librocksdb-sys 0.16 (RocksDB 8.10) uses uint64_t in headers that never include <cstdint>; the
+  # libstdc++ on ubuntu-latest (ubuntu-26.04 since 2026-10) no longer pulls it in transitively, so a
+  # cold build fails with "'uint64_t' has not been declared" (clean-clone, 2026-10-27; jobs with a
+  # warm rust-cache hide it). Force the include until the rocksdb crate moves past 8.10.
+  CXXFLAGS: -include cstdint
   # The circuits commit this tree's vendored crates were synced from (deploy/sync-zkvm.sh). Bump it
   # in the same commit as a re-vendor, or CI builds this workspace against a tree it did not vendor.
   # 56b7061 is circuits branch feat/scan-compact: main c83b1c7 (tree aggregation, 4a244b6) plus
