@@ -162,6 +162,11 @@ pub fn load_genesis(datadir: &std::path::Path) -> Result<(GenesisState, Arc<dyn 
     if gs.ledger.hc_auth_multisig().is_some() {
         executor.enable_auth_multisig();
     }
+    // CON-60: the genesis engine pin, so the executor knows the engine's lineage before any
+    // committed proof shows it.
+    if let Some(pin) = gs.ledger.perps().map(|p| p.config.engine_program_log_height).filter(|h| *h != 0) {
+        executor.set_perp_engine_pin(pin);
+    }
     Ok((gs, executor))
 }
 
@@ -3221,7 +3226,7 @@ impl Node {
             self.note_refusal(hash);
             self.report(id, GossipOutcome::Report(a)).await;
         } else {
-            self.mempool.state_proof_queued(&tx, self.executor.as_ref());
+            self.mempool.state_proof_queued(&tx, self.hs.tip_ledger(), self.executor.as_ref());
             self.mempool.verify_queued(&tx);
             self.verify_queue.push_back((tx, VerifySource::Gossip(id)));
             self.pump_verify();
@@ -3320,7 +3325,7 @@ impl Node {
             let _ = reply.send(Err(e));
             return;
         }
-        self.mempool.state_proof_queued(&tx, self.executor.as_ref());
+        self.mempool.state_proof_queued(&tx, self.hs.tip_ledger(), self.executor.as_ref());
         self.mempool.verify_queued(&tx);
         self.verify_queue.push_back((tx, VerifySource::Rpc(reply)));
         self.pump_verify();

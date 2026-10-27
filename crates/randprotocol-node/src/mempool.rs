@@ -429,8 +429,11 @@ pub struct Mempool {
     perp_orders: HashMap<(randprotocol_core::ledger::perps::AccountId, u64), usize>,
     /// N-1: `PerpOrder`s queued for or in verification on this node ([`Mempool::verify_queued`]).
     queued_perp_orders: HashMap<(randprotocol_core::ledger::perps::AccountId, u64), usize>,
-    /// CON-60 (b): the bucket over cold state-proof key builds ([`ColdKeyBudget`]).
+    /// CON-60 (b): the bucket over cold state-proof key builds of foreign shapes ([`ColdKeyBudget`]).
     cold_keys: ColdKeyBudget,
+    /// CON-60 (b): the separate reserve for cold shapes of the engine's lineage, which foreign
+    /// junk cannot drain.
+    lineage_keys: ColdKeyBudget,
 }
 
 /// CON-60 (b): the burst of verifier-key builds for state-proof shapes this node has no key for
@@ -440,6 +443,17 @@ pub struct Mempool {
 pub const COLD_KEY_BUILD_BURST: u32 = 2;
 /// CON-60 (b): the refill interval of [`COLD_KEY_BUILD_BURST`]'s bucket.
 pub const COLD_KEY_BUILD_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// CON-60 (b): what verifying a transaction costs in verifier-key builds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProofCost {
+    /// No build: not a state proof, its key is built, or it is refused before any key.
+    Free,
+    /// A build of a shape of the engine's lineage (the lineage reserve).
+    Lineage,
+    /// A build of any other shape (the general bucket).
+    Foreign,
+}
 
 /// CON-60 (b), node policy (never a validity rule): a token bucket over the verifier-key builds
 /// state proofs make this node do. A proof whose shape's key is built — the engine's, which the
@@ -529,39 +543,68 @@ impl Mempool {
             perp_orders: HashMap::new(),
             queued_perp_orders: HashMap::new(),
             cold_keys: ColdKeyBudget::default(),
+            lineage_keys: ColdKeyBudget::default(),
         }
     }
 
-    /// CON-60 (b): the shape of `tx`'s proof when it is a `PerpStateProof` whose header decodes.
-    fn state_proof_shape(
-        tx: &Transaction,
-        executor: &dyn ConfidentialExecutor,
-    ) -> Option<randprotocol_core::confidential::ProofShape> {
-        match &tx.action {
-            Action::PerpStateProof { proof, .. } => executor.perp_proof_shape(proof),
-            _ => None,
+    /// CON-60 (b): what verifying `tx` would cost this node in verifier keys ([`ProofCost`]).
+    /// Cold only when the shape has no key built *and* the proof passes every rule the ledger and
+    /// the executor apply before a key is touched — the ledger's cheap state-proof rules (which
+    /// build the tip's segment), then the executor's header rules over that segment's length and
+    /// the genesis pin — so a proof refused for free never spends a token.
+    fn state_proof_cost(tx: &Transaction, ledger: &Ledger, executor: &dyn ConfidentialExecutor) -> ProofCost {
+        let (Action::PerpStateProof { proof, .. }, Some(p)) = (&tx.action, ledger.perps()) else { return ProofCost::Free };
+        let Some(shape) = executor.perp_proof_shape(proof) else { return ProofCost::Free };
+        if executor.perp_key_ready(&shape) {
+            return ProofCost::Free;
+        }
+        let Ok(segment) = randprotocol_core::ledger::perps::state_proof_segment_on(ledger, tx, executor) else {
+            return ProofCost::Free;
+        };
+        if !executor.perp_proof_admissible(proof, p.config.max_tier, segment.len(), p.config.engine_program_log_height) {
+            return ProofCost::Free;
+        }
+        if executor.perp_shape_lineage(&shape) {
+            ProofCost::Lineage
+        } else {
+            ProofCost::Foreign
         }
     }
 
-    /// CON-60 (b): `Ok` for anything but a state proof of a cold shape (no key built) when the
-    /// [`ColdKeyBudget`] has no token. A header that does not decode is the executor's cheap
-    /// refusal (no key built), so it passes here.
-    fn state_proof_gate(&self, tx: &Transaction, executor: &dyn ConfidentialExecutor) -> Result<(), MempoolError> {
-        let Some(shape) = Self::state_proof_shape(tx, executor) else { return Ok(()) };
-        if executor.perp_key_ready(&shape) || self.cold_keys.available(Instant::now()) {
-            return Ok(());
+    /// CON-60 (b): `Ok` unless `tx` is a state proof that would cost a key build and its bucket
+    /// — the lineage reserve for the engine's lineage, the general one otherwise — is spent.
+    fn state_proof_gate(&self, tx: &Transaction, ledger: &Ledger, executor: &dyn ConfidentialExecutor) -> Result<(), MempoolError> {
+        let now = Instant::now();
+        let ok = match Self::state_proof_cost(tx, ledger, executor) {
+            ProofCost::Free => true,
+            ProofCost::Lineage => self.lineage_keys.available(now),
+            ProofCost::Foreign => self.cold_keys.available(now),
+        };
+        if ok {
+            Ok(())
+        } else {
+            Err(MempoolError::StateProofBusy)
         }
-        Err(MempoolError::StateProofBusy)
     }
 
     /// CON-60 (b): `tx` passed [`Mempool::precheck`] and is queued for verification; a state proof
-    /// of a cold shape takes a token (it will cost a key build).
-    pub fn state_proof_queued(&mut self, tx: &Transaction, executor: &dyn ConfidentialExecutor) {
-        if let Some(shape) = Self::state_proof_shape(tx, executor) {
-            if !executor.perp_key_ready(&shape) {
-                self.cold_keys.take(Instant::now());
+    /// that will cost a key build takes a token from its bucket.
+    pub fn state_proof_queued(&mut self, tx: &Transaction, ledger: &Ledger, executor: &dyn ConfidentialExecutor) {
+        let now = Instant::now();
+        match Self::state_proof_cost(tx, ledger, executor) {
+            ProofCost::Free => {}
+            ProofCost::Lineage => {
+                self.lineage_keys.take(now);
+            }
+            ProofCost::Foreign => {
+                self.cold_keys.take(now);
             }
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn lineage_keys_mut(&mut self) -> &mut ColdKeyBudget {
+        &mut self.lineage_keys
     }
 
     #[cfg(test)]
@@ -957,7 +1000,7 @@ impl Mempool {
         let pricing = self.gas_policy_floor(tx, ledger, executor).map_err(MempoolError::Invalid)?;
         (c.floor, c.gas_limit) = (pricing.floor, pricing.gas_limit);
         Self::defer_until_msauth_warm(tx, ledger, executor)?;
-        self.state_proof_gate(tx, executor)?;
+        self.state_proof_gate(tx, ledger, executor)?;
         // Before any proof is verified for it: a transaction the byte cap would refuse costs no
         // verification (audit v6, CH-7).
         c.evict = self.make_room(tx, c.floor, ledger)?;
@@ -4640,7 +4683,7 @@ mod tests {
         for i in 0..COLD_KEY_BUILD_BURST as u8 {
             let junk = shaped([15 + i, 0, 0, 0], i);
             assert!(m.precheck(&junk, &l, ex).is_ok(), "cold #{i} within the burst");
-            m.state_proof_queued(&junk, ex);
+            m.state_proof_queued(&junk, &l, ex);
         }
         let busy = m.precheck(&shaped([40, 0, 0, 0], 9), &l, ex).unwrap_err();
         assert_eq!(busy, MempoolError::StateProofBusy);
@@ -4652,7 +4695,7 @@ mod tests {
         for salt in 20..40u8 {
             let junk = shaped([0; 4], salt);
             assert!(m.precheck(&junk, &l, ex).is_ok());
-            m.state_proof_queued(&junk, ex);
+            m.state_proof_queued(&junk, &l, ex);
         }
         assert!(m.precheck(&honest, &l, ex).is_ok(), "the honest proof of the warm shape passes, spam or not");
         assert_eq!(m.precheck(&shaped([41, 0, 0, 0], 10), &l, ex).unwrap_err(), MempoolError::StateProofBusy, "the warm spam took no token");
@@ -4672,6 +4715,59 @@ mod tests {
         let bound = COLD_KEY_BUILD_BURST as u64 + ten_minutes / COLD_KEY_BUILD_INTERVAL.as_secs();
         assert!(builds as u64 <= bound, "{builds} builds in ten minutes, bound {bound}");
         assert!(builds as u64 >= bound - 1);
+    }
+
+    /// CON-60 (b) fix 1: a proof the ledger or the executor would refuse before touching a key —
+    /// a tier past `max_tier`, a window the ledger refuses — never takes a token, however it is
+    /// re-salted; fix 2: foreign junk with a valid header drains only the general bucket, and an
+    /// honest proof of a cold shape of the engine's lineage still passes on the lineage reserve.
+    #[test]
+    fn junk_refused_for_free_takes_no_token_and_foreign_junk_cannot_drain_the_lineage_reserve() {
+        use fixtures::{key, make_perps_block, perp_deposit_tx, perp_state_proof_tx};
+        let gs = fixtures::perps_genesis(7);
+        let mut l = gs.ledger.clone();
+        let deposit = perp_deposit_tx(&l, &key(50), 300, 5_000_000);
+        let b1 = make_perps_block(&gs.block, &mut l, vec![deposit], &key(1));
+        make_perps_block(&b1, &mut l, vec![], &key(1));
+        let honest = perp_state_proof_tx(&l, 2, [7; 8], vec![], 0);
+        let patched = |tier: u8, h: [u8; 4], salt: u64| {
+            let mut tx = honest.clone();
+            let Action::PerpStateProof { proof, fees, .. } = &mut tx.action else { unreachable!() };
+            proof[4] = tier;
+            proof[37..41].copy_from_slice(&h);
+            *fees = salt;
+            tx
+        };
+        let mut m = Mempool::new(100);
+        let ex = &StubExecutor;
+        // Fix 1: 100 re-salted proofs over max_tier (16), each a fresh cold shape: no token.
+        for salt in 0..100u64 {
+            let junk = patched(20, [15 + (salt % 50) as u8, 0, 0, 0], salt);
+            assert!(m.precheck(&junk, &l, ex).is_ok(), "refused later, for free");
+            m.state_proof_queued(&junk, &l, ex);
+        }
+        // … nor does a window the ledger refuses (it ends at a height not closed).
+        let mut far = patched(16, [30, 0, 0, 0], 1);
+        let Action::PerpStateProof { to_height, .. } = &mut far.action else { unreachable!() };
+        *to_height = 50;
+        for _ in 0..10 {
+            m.state_proof_queued(&far, &l, ex);
+        }
+        let t0 = Instant::now();
+        assert!(m.cold_keys_mut().available(t0) && m.lineage_keys_mut().available(t0), "both buckets untouched");
+        // Fix 2: foreign junk with a valid header (tier 16, program height 15) drains the general bucket …
+        for i in 0..COLD_KEY_BUILD_BURST as u64 {
+            let junk = patched(16, [15, i as u8 + 1, 0, 0], 200 + i);
+            m.state_proof_queued(&junk, &l, ex);
+        }
+        assert_eq!(m.precheck(&patched(16, [15, 9, 0, 0], 300), &l, ex).unwrap_err(), MempoolError::StateProofBusy);
+        // … while an honest proof of a cold lineage shape (the engine's program height, a new
+        // input height) passes on the reserve, which only lineage shapes draw on.
+        let lineage = patched(16, [0, 9, 0, 0], 400);
+        assert!(m.precheck(&lineage, &l, ex).is_ok(), "the lineage reserve is intact");
+        m.state_proof_queued(&lineage, &l, ex);
+        let later = Instant::now() + COLD_KEY_BUILD_INTERVAL + std::time::Duration::from_millis(50);
+        assert!(m.cold_keys_mut().available(later), "and the general bucket refills on its own");
     }
 
     /// An invoke's payout notes are leaves like any other: the pool claims them (through

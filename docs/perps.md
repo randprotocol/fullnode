@@ -512,14 +512,22 @@ bridged one.
     evicted; at most 32) and recorded in the node's database (`perp-proof-shapes`);
   - at startup the node builds and pins the recorded shapes and those of the state proofs in its
     last 4 096 blocks, so the honest prover's shape is warm even right after a roll;
-  - a proof of a shape with **no key built** takes a token from a bucket of 2, refilled one per
-    30 s (`COLD_KEY_BUILD_BURST`/`_INTERVAL`); with none left it is refused `this node is at its
-    limit of verifier-key builds for new state-proof shapes; retry later` (`StateProofBusy`,
-    retryable, never cached, no peer penalised, no timing). Nothing a refusal does moves the
-    bucket, and a proof of a warm shape never needs a token, so no junk delays it.
+  - a proof of a shape with **no key built** costs a token — but only once it passes every rule
+    the ledger and the executor apply before a key is touched (the ledger's window and payout
+    rules over the tip, then the canonical body, the tier at most `max_tier`, the caps, the public
+    height of the tip's segment, and the genesis pin): a proof refused for free never spends one;
+  - tokens come from two buckets of 2, each refilled one per 30 s (`COLD_KEY_BUILD_BURST`/
+    `_INTERVAL`): a **lineage reserve** for shapes of the engine's lineage — sharing program,
+    keccak and sha256 heights with a verified shape, or matching the genesis
+    `engine_program_log_height` with no hash table — and a general bucket for every other shape.
+    Lineage keys are built in their own LRU (128), which foreign shapes never reach. With its
+    bucket spent a proof is refused `this node is at its limit of verifier-key builds for new
+    state-proof shapes; retry later` (`StateProofBusy`, retryable, never cached, no peer
+    penalised, no timing). No refusal moves a bucket, a proof of a warm shape never needs a
+    token, and foreign junk cannot touch the reserve; lineage junk spends it only by building
+    shapes the honest prover may use, which then stay warm.
   From the next cut the genesis `engine_program_log_height` pin also narrows the shapes a proof
-  may declare at all. The genesis names no engine image, so the startup warm takes the engine's
-  shapes from the chain's own committed proofs rather than from the image.
+  may declare at all, and marks the engine's lineage from genesis on.
 - **Fee-less perp actions in the pool (audit v10, PERP-1).** An order, a cancel or a withdrawal
   request pays no fee, so the pool bounds them by count rather than by price — node policies,
   never validity rules, each a `mempool full`-class refusal (retryable, never cached, no peer

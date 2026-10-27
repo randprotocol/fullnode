@@ -666,6 +666,18 @@ impl ConfidentialExecutor for AggExecutor {
         self.inner.warm_perp(shape)
     }
 
+    fn perp_proof_admissible(&self, proof: &[u8], max_tier: u8, segment_len: usize, engine_program_log_height: u8) -> bool {
+        self.inner.perp_proof_admissible(proof, max_tier, segment_len, engine_program_log_height)
+    }
+
+    fn perp_shape_lineage(&self, shape: &randprotocol_core::confidential::ProofShape) -> bool {
+        self.inner.perp_shape_lineage(shape)
+    }
+
+    fn set_perp_engine_pin(&self, program_log_height: u8) {
+        self.inner.set_perp_engine_pin(program_log_height)
+    }
+
     /// The keys an `Invoke` verifies under are these too: its segment sits in the hardened
     /// call's public table (`program_state::segment_fits`), so it declares no shape a call to
     /// the same program does not.
