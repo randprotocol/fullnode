@@ -92,47 +92,115 @@ pub fn source_of(addr: &Multiaddr) -> Source {
 }
 
 /// The most source addresses one reserved peer is remembered at ([`ReservedSources`]): a host
-/// with an IPv4 and an IPv6 address, plus a move or two. Past it, new ones are ignored until the
-/// peer is unreserved, so the set stays bounded by the reserved peers themselves.
+/// with an IPv4 and an IPv6 address, plus a move or two. A new one past it evicts an advertised
+/// source first, then the least recently seen observed one; configured ones are never evicted.
 pub const MAX_SOURCES_PER_RESERVED_PEER: usize = 4;
+
+/// The most pending handshakes one reserved peer may hold as a reserved peer, over all its
+/// sources together (audit v10, NET-1 review). Past it its handshakes are a stranger's, so no
+/// single validator — however many addresses it names — can take the reserved share from the
+/// others: the 32 slots need eight such peers, not two.
+pub const MAX_RESERVED_PENDING_PER_PEER: u32 = 4;
+
+/// How long an advertised or observed reserved source stays trusted without being seen again
+/// (audit v10, NET-1 review): each connection the peer holds from it refreshes it. A configured
+/// (bootstrap) source does not expire.
+pub const RESERVED_SOURCE_TTL: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
+
+/// How a reserved peer's source was learned, weakest first.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum SourceKind {
+    /// An address the peer advertised (identify) when it was reserved: its own claim. At most one
+    /// per peer.
+    Advertised,
+    /// The remote address of a connection the peer held: seen, not claimed.
+    Observed,
+    /// The operator's bootstrap address for it: never evicted, never expires.
+    Configured,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Known {
+    source: Source,
+    kind: SourceKind,
+    seen: std::time::Instant,
+}
 
 /// The source addresses reserved peers are known at (audit v10, NET-1): what lets a handshake
 /// whose identity is not yet known take one of the pending slots reserved for validators. Only
-/// IP sources count — [`Source::Unknown`] names no host and is never trusted.
+/// IP sources count — [`Source::Unknown`] names no host and is never trusted. Bounded per peer
+/// ([`MAX_SOURCES_PER_RESERVED_PEER`], at most one [`SourceKind::Advertised`]), observed sources
+/// preferred over advertised ones, and expiring ([`RESERVED_SOURCE_TTL`]).
 #[derive(Default)]
 pub struct ReservedSources {
-    by_peer: HashMap<PeerId, Vec<Source>>,
-    count: HashMap<Source, u32>,
+    by_peer: HashMap<PeerId, Vec<Known>>,
 }
 
 impl ReservedSources {
-    /// Remember that reserved `peer` is reachable from `source`.
-    pub fn add(&mut self, peer: PeerId, source: Source) {
+    /// Remember that reserved `peer` is reachable from `source`, learned as `kind` at `now`.
+    pub fn add(&mut self, peer: PeerId, source: Source, kind: SourceKind, now: std::time::Instant) {
         if source == Source::Unknown {
             return;
         }
         let list = self.by_peer.entry(peer).or_default();
-        if list.contains(&source) || list.len() >= MAX_SOURCES_PER_RESERVED_PEER {
+        if let Some(k) = list.iter_mut().find(|k| k.source == source) {
+            k.kind = k.kind.max(kind);
+            k.seen = now;
             return;
         }
-        list.push(source);
-        *self.count.entry(source).or_insert(0) += 1;
+        if kind == SourceKind::Advertised && list.iter().any(|k| k.kind == SourceKind::Advertised) {
+            return; // one claimed address per peer
+        }
+        if list.len() >= MAX_SOURCES_PER_RESERVED_PEER {
+            // Evict the weakest, least recently seen, never a configured one or one stronger than
+            // the newcomer.
+            let victim = list
+                .iter()
+                .enumerate()
+                .filter(|(_, k)| k.kind != SourceKind::Configured && k.kind <= kind)
+                .min_by_key(|(_, k)| (k.kind, k.seen))
+                .map(|(i, _)| i);
+            match victim {
+                Some(i) => {
+                    list.swap_remove(i);
+                }
+                None => return,
+            }
+        }
+        list.push(Known { source, kind, seen: now });
     }
 
     /// Forget every source of `peer` (it stopped being reserved).
     pub fn remove_peer(&mut self, peer: &PeerId) {
-        for s in self.by_peer.remove(peer).unwrap_or_default() {
-            if let Some(n) = self.count.get_mut(&s) {
-                *n -= 1;
-                if *n == 0 {
-                    self.count.remove(&s);
-                }
-            }
+        self.by_peer.remove(peer);
+    }
+
+    /// Drop the advertised and observed sources not seen within [`RESERVED_SOURCE_TTL`] of `now`.
+    pub fn expire(&mut self, now: std::time::Instant) {
+        for list in self.by_peer.values_mut() {
+            list.retain(|k| k.kind == SourceKind::Configured || now.saturating_duration_since(k.seen) < RESERVED_SOURCE_TTL);
         }
+        self.by_peer.retain(|_, l| !l.is_empty());
+    }
+
+    /// The reserved peers known at `source` (unexpired at `now`).
+    pub fn peers_at(&self, source: &Source, now: std::time::Instant) -> Vec<PeerId> {
+        self.by_peer
+            .iter()
+            .filter(|(_, l)| {
+                l.iter().any(|k| &k.source == source && (k.kind == SourceKind::Configured || now.saturating_duration_since(k.seen) < RESERVED_SOURCE_TTL))
+            })
+            .map(|(p, _)| *p)
+            .collect()
+    }
+
+    /// `peer`'s sources.
+    pub fn sources_of(&self, peer: &PeerId) -> Vec<Source> {
+        self.by_peer.get(peer).map_or_else(Vec::new, |l| l.iter().map(|k| k.source).collect())
     }
 
     pub fn contains(&self, source: &Source) -> bool {
-        self.count.contains_key(source)
+        self.by_peer.values().any(|l| l.iter().any(|k| &k.source == source))
     }
 }
 
@@ -154,6 +222,8 @@ pub struct PendingBySource {
     count: HashMap<Source, u32>,
     /// How many of `by_conn` were admitted from an unreserved source.
     unreserved: u32,
+    /// The pending connections admitted as a reserved peer's, by source.
+    reserved_count: HashMap<Source, u32>,
 }
 
 impl PendingBySource {
@@ -184,7 +254,9 @@ impl PendingBySource {
         }
         *n += 1;
         self.by_conn.insert(id, (source, reserved_source));
-        if !reserved_source {
+        if reserved_source {
+            *self.reserved_count.entry(source).or_insert(0) += 1;
+        } else {
             self.unreserved += 1;
         }
         Ok(())
@@ -194,7 +266,14 @@ impl PendingBySource {
     /// for a connection never admitted here, and for a second release of one that was.
     pub fn release(&mut self, id: ConnectionId) {
         let Some((source, reserved_source)) = self.by_conn.remove(&id) else { return };
-        if !reserved_source {
+        if reserved_source {
+            if let Some(n) = self.reserved_count.get_mut(&source) {
+                *n -= 1;
+                if *n == 0 {
+                    self.reserved_count.remove(&source);
+                }
+            }
+        } else {
             self.unreserved -= 1;
         }
         if let Some(n) = self.count.get_mut(&source) {
@@ -205,6 +284,11 @@ impl PendingBySource {
                 self.count.remove(&source);
             }
         }
+    }
+
+    /// The pending connections from `source` admitted as a reserved peer's.
+    pub fn reserved_from(&self, source: &Source) -> u32 {
+        self.reserved_count.get(source).copied().unwrap_or(0)
     }
 
     pub fn pending_from(&self, source: &Source) -> u32 {
@@ -341,12 +425,26 @@ impl Guard {
         self.established.reserve(peer);
     }
 
-    /// [`Guard::reserve`] plus the sources of `addrs`, for a peer known at those addresses.
-    pub fn reserve_at<'a>(&mut self, peer: PeerId, addrs: impl IntoIterator<Item = &'a Multiaddr>) {
+    /// [`Guard::reserve`] plus the sources of `addrs`, learned as `kind` (a bootstrap address is
+    /// [`SourceKind::Configured`], an address the peer advertised [`SourceKind::Advertised`] — of
+    /// which only the first is kept).
+    pub fn reserve_at<'a>(&mut self, peer: PeerId, addrs: impl IntoIterator<Item = &'a Multiaddr>, kind: SourceKind) {
         self.established.reserve(peer);
+        let now = std::time::Instant::now();
         for a in addrs {
-            self.sources.add(peer, source_of(a));
+            self.sources.add(peer, source_of(a), kind, now);
         }
+    }
+
+    /// Whether a handshake from `source` may take a reserved slot: some reserved peer is known
+    /// there whose handshakes, over all its sources, hold fewer than
+    /// [`MAX_RESERVED_PENDING_PER_PEER`] reserved slots.
+    fn reserved_for(&mut self, source: &Source) -> bool {
+        let now = std::time::Instant::now();
+        self.sources.expire(now);
+        self.sources.peers_at(source, now).iter().any(|p| {
+            self.sources.sources_of(p).iter().map(|s| self.pending.reserved_from(s)).sum::<u32>() < MAX_RESERVED_PENDING_PER_PEER
+        })
     }
 
     pub fn unreserve(&mut self, peer: &PeerId) {
@@ -380,7 +478,7 @@ impl NetworkBehaviour for Guard {
         remote_addr: &Multiaddr,
     ) -> Result<(), ConnectionDenied> {
         let source = source_of(remote_addr);
-        let reserved_source = self.sources.contains(&source);
+        let reserved_source = self.reserved_for(&source);
         self.pending.admit_with(connection_id, source, reserved_source, self.pending_caps()).map_err(ConnectionDenied::new)
     }
 
@@ -416,7 +514,7 @@ impl NetworkBehaviour for Guard {
                 // A reserved peer seen at an address: its source takes reserved pending slots
                 // from now on (its next reconnect after a restart, say).
                 if self.established.is_reserved(&peer_id) {
-                    self.sources.add(peer_id, source_of(endpoint.get_remote_address()));
+                    self.sources.add(peer_id, source_of(endpoint.get_remote_address()), SourceKind::Observed, std::time::Instant::now());
                 }
             }
             FromSwarm::ConnectionClosed(ConnectionClosed { peer_id, connection_id, .. }) => {
@@ -789,7 +887,7 @@ mod tests {
         connection_closed(&mut g, 9_000, validator, &point, 0);
         // A second validator known only by the address it was reserved at (a bootstrap).
         let bootstrap = PeerId::random();
-        g.reserve_at(bootstrap, [&addr("/ip4/198.51.100.21/tcp/30303")]);
+        g.reserve_at(bootstrap, [&addr("/ip4/198.51.100.21/tcp/30303")], SourceKind::Configured);
 
         // Strangers from 16+ hosts, four stalled handshakes each, until they are refused.
         let open = MAX_PENDING_INCOMING - RESERVED_PENDING_INCOMING;
@@ -813,7 +911,9 @@ mod tests {
         for i in 0..MAX_PENDING_INCOMING_PER_ADDR as usize {
             pending(&mut g, 60_000 + i, "/ip4/198.51.100.20/tcp/50000").unwrap_or_else(|e| panic!("validator handshake {i}: {e}"));
         }
-        assert_eq!(denied(pending(&mut g, 60_100, "/ip4/198.51.100.20/tcp/50001")).kind, Kind::PendingIncomingPerAddr, "still one host's cap");
+        // The fifth: its peer's reserved share (= one host's cap) is used, so it is a stranger's
+        // handshake, and the strangers' share is full.
+        assert_eq!(denied(pending(&mut g, 60_100, "/ip4/198.51.100.20/tcp/50001")).kind, Kind::PendingIncomingUnreserved, "still bounded");
         pending(&mut g, 61_000, "/ip4/198.51.100.21/tcp/50000").expect("the bootstrap's host too");
         // One stranger's handshake ends: its slot is a stranger's again, not a reserved one.
         listen_failure(&mut g, 0, "/ip4/203.0.0.1/tcp/40001");
@@ -851,14 +951,88 @@ mod tests {
 
         let mut r = ReservedSources::default();
         let peer = PeerId::random();
-        r.add(peer, Source::Unknown);
+        let now = std::time::Instant::now();
+        r.add(peer, Source::Unknown, SourceKind::Observed, now);
         assert!(!r.contains(&Source::Unknown));
         for n in 0..10 {
-            r.add(peer, host(n));
+            r.add(peer, host(n), SourceKind::Observed, now);
         }
-        assert!(r.contains(&host(3)) && !r.contains(&host(MAX_SOURCES_PER_RESERVED_PEER as u8)), "bounded per peer");
+        assert_eq!(r.sources_of(&peer).len(), MAX_SOURCES_PER_RESERVED_PEER, "bounded per peer");
         r.remove_peer(&peer);
-        assert!(r.count.is_empty() && r.by_peer.is_empty());
+        assert!(r.by_peer.is_empty());
+    }
+
+    /// NET-1 review: one reserved peer cannot take more than its share of the reserved slots,
+    /// however many sources it is known at — past [`MAX_RESERVED_PENDING_PER_PEER`] over all of
+    /// them its handshakes are a stranger's (refused once strangers hold their share) — while
+    /// another validator still gets in.
+    #[test]
+    fn one_reserved_peer_cannot_take_more_than_its_share_of_the_reserved_slots() {
+        use super::super::{MAX_PENDING_INCOMING, RESERVED_PENDING_INCOMING};
+        let mut g = guard();
+        let greedy = PeerId::random();
+        g.reserve(greedy);
+        // Known at four hosts (each seen on a connection: the strongest kind).
+        for n in 0..4u8 {
+            let point = listener_point(&format!("/ip4/198.51.100.{}/tcp/30303", 30 + n));
+            connection_established(&mut g, 9_000 + n as usize, greedy, &point, 0);
+            connection_closed(&mut g, 9_000 + n as usize, greedy, &point, 0);
+        }
+        assert_eq!(g.sources.sources_of(&greedy).len(), 4);
+        let honest = PeerId::random();
+        g.reserve_at(honest, [&addr("/ip4/198.51.100.50/tcp/30303")], SourceKind::Configured);
+        // Strangers take their whole share.
+        for i in 0..(MAX_PENDING_INCOMING - RESERVED_PENDING_INCOMING) as usize {
+            pending(&mut g, i, &format!("/ip4/203.0.{}.{}/tcp/1", i / 4 / 200, (i / 4) % 200 + 1)).unwrap();
+        }
+        // The greedy peer: four reserved slots in all, then refused, on any of its hosts.
+        let mut got = 0;
+        for n in 0..4u8 {
+            for k in 0..4usize {
+                if pending(&mut g, 20_000 + 10 * n as usize + k, &format!("/ip4/198.51.100.{}/tcp/5{k}", 30 + n)).is_ok() {
+                    got += 1;
+                }
+            }
+        }
+        assert_eq!(got, MAX_RESERVED_PENDING_PER_PEER, "its share, over all its sources together");
+        pending(&mut g, 30_000, "/ip4/198.51.100.50/tcp/1").expect("another validator still gets in");
+        // A handshake of the greedy peer ends: it may take one again.
+        listen_failure(&mut g, 20_000, "/ip4/198.51.100.30/tcp/50");
+        pending(&mut g, 30_001, "/ip4/198.51.100.33/tcp/1").expect("a freed share slot");
+    }
+
+    /// NET-1 review: an advertised address is the peer's own claim — one is kept per peer, and an
+    /// observed source evicts it when the list is full; a configured (bootstrap) source is never
+    /// evicted and never expires; advertised and observed sources expire unless seen again.
+    #[test]
+    fn reserved_sources_prefer_what_was_seen_and_expire() {
+        let mut r = ReservedSources::default();
+        let peer = PeerId::random();
+        let host = |n: u8| Source::V4(std::net::Ipv4Addr::new(198, 51, 100, n));
+        let t0 = std::time::Instant::now();
+        r.add(peer, host(1), SourceKind::Configured, t0);
+        r.add(peer, host(2), SourceKind::Advertised, t0);
+        r.add(peer, host(3), SourceKind::Advertised, t0);
+        assert_eq!(r.sources_of(&peer), vec![host(1), host(2)], "one advertised address per peer");
+        r.add(peer, host(4), SourceKind::Observed, t0);
+        r.add(peer, host(5), SourceKind::Observed, t0);
+        assert_eq!(r.sources_of(&peer).len(), MAX_SOURCES_PER_RESERVED_PEER);
+        r.add(peer, host(6), SourceKind::Observed, t0 + std::time::Duration::from_secs(1));
+        let now = r.sources_of(&peer);
+        assert!(!now.contains(&host(2)) && now.contains(&host(6)), "the advertised one went first: {now:?}");
+        r.add(peer, host(7), SourceKind::Advertised, t0);
+        assert!(!r.sources_of(&peer).contains(&host(7)), "an advertised address never evicts a seen one");
+        // The oldest observed goes for a newer observation; the configured one never.
+        r.add(peer, host(8), SourceKind::Observed, t0 + std::time::Duration::from_secs(2));
+        let now = r.sources_of(&peer);
+        assert!(now.contains(&host(1)) && now.contains(&host(8)) && now.len() == MAX_SOURCES_PER_RESERVED_PEER, "{now:?}");
+        // Expiry: refreshed sources stay, stale ones go, the configured one stays.
+        let later = t0 + RESERVED_SOURCE_TTL + std::time::Duration::from_secs(1);
+        r.add(peer, host(8), SourceKind::Observed, later);
+        r.expire(later);
+        assert_eq!(r.sources_of(&peer), vec![host(1), host(8)]);
+        assert!(r.peers_at(&host(1), later + RESERVED_SOURCE_TTL * 10).contains(&peer), "configured never expires");
+        assert!(r.peers_at(&host(8), later + RESERVED_SOURCE_TTL).is_empty(), "expired at lookup too");
     }
 
     /// The guard's handler is the dummy that does nothing, and it never asks the swarm for

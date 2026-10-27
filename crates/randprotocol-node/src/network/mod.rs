@@ -622,7 +622,7 @@ pub async fn start_with(
     // before its first connection (NET-1).
     for a in &cfg.bootstrap {
         if let Some(id) = peer_id_of(a) {
-            guard.reserve_at(id, [a]);
+            guard.reserve_at(id, [a], edge::SourceKind::Configured);
         }
     }
     let behaviour = RandBehaviour { limits, guard, gossipsub, identify, kademlia, mdns: Toggle::from(mdns), sync, ping };
@@ -814,7 +814,9 @@ async fn run(
                         let b = swarm.behaviour_mut();
                         b.limits.bypass_peer_id(&id);
                         // Every address it was learned at is its host's source (NET-1).
-                        b.guard.reserve_at(id, known.get(&id).into_iter().flatten());
+                        // At most one of them is kept (an advertised address is the peer's own
+                        // claim); its connections add observed ones.
+                        b.guard.reserve_at(id, known.get(&id).into_iter().flatten(), edge::SourceKind::Advertised);
                     }
                     NetworkCommand::Unreserve(id) => {
                         if !pinned.contains(&id) {
