@@ -70,8 +70,8 @@ pub const MAX_WINDOW_BLOCKS: u64 = 64;
 /// - input height [`canonical_input_log_height`]`(T) = clamp(T − 2, 7, 16)`, reached by appending
 ///   zero words to the guest's witness until it is [`canonical_witness_words`]`(T) =
 ///   2^h − 1` words long (the guest reads only the words it counts; the padding is never read).
-///   `T − 2` keeps the input digest's Poseidon2 rows (one per four words) at a quarter of the
-///   tier's 2^(T−3) budget; 16 is the input table's height for the most words a proof may carry
+///   `T − 2` keeps the input digest's Poseidon2 rows (one per four words, so 2^(T−4)) at half
+///   the tier's 2^(T−3) budget (16 384 of 32 768 rows at `T` = 18); 16 is the input table's height for the most words a proof may carry
 ///   (`u16::MAX`). At `T` = 18 that is 65 535 words, past the longest 64-block window at 24
 ///   inputs a block (≈ 33 000 words with the state); at `T` = 16, 16 383 words — a prover
 ///   shortens a window that does not fit;

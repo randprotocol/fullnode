@@ -548,8 +548,8 @@ bridged one.
   | program height | the engine image's (genesis `engine_program_log_height` when set, else the shape a verified proof showed) |
   | keccak, sha256 | none |
 
-  T − 2 keeps the input digest (one Poseidon2 row per four words) at a quarter of the tier's
-  2^(T−3) budget; 16 is the input height of the most words a proof may carry. The guest reads only
+  T − 2 keeps the input digest (one Poseidon2 row per four words, so 2^(T−4) rows) at half the
+  tier's 2^(T−3) budget (16 384 of 32 768 rows at T = 18); 16 is the input height of the most words a proof may carry. The guest reads only
   the words its counts name, so the padding changes nothing it computes.
 - **Fee-less perp actions in the pool (audit v10, PERP-1).** An order, a cancel or a withdrawal
   request pays no fee, so the pool bounds them by count rather than by price — node policies,
