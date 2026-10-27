@@ -45,18 +45,19 @@ bash -c 'source "$1/../lib/verify-release.sh" && verify_release_sums "$2/SHA256S
 WANT_SHA=$(bash -c 'source "$1/../lib/verify-release.sh" && release_sha "$2/SHA256SUMS" rand-prover' _ "$HERE" "$REL")
 
 # --- the host can hold a proof beside whatever else it runs ------------------------------------
-read -r CPUS AVAIL_MB < <("${SSH[@]}" 'echo "$(nproc) $(free -m | awk "/Mem:/{print \$7}")"')
-if [ "$AVAIL_MB" -lt 7000 ] || [ "$CPUS" -lt 2 ]; then
-    echo "$TARGET: $CPUS cpu(s), $AVAIL_MB MB available — a prover needs ~7 GB available and a second core. Resize the host first." >&2
-    exit 1
-fi
-THREADS=$((CPUS - 1)); [ "$THREADS" -le 8 ] || THREADS=8   # rand-prover's own default (docs/node-hardware.md §6)
 # The unit's ceiling follows its slot count: ~7 GB per parallel slot (one bundle proof peaks at 6.2 GB,
 # `PROVER_PEAK_BYTES`) + 1 GB for the process, listener and queue: 8G for one slot, 15G for two.
 # MAX_PARALLEL (default 1) fills the unit's --max-parallel too, so the two cannot disagree.
 MAX_PARALLEL=${MAX_PARALLEL:-1}
 [[ "$MAX_PARALLEL" =~ ^[1-9][0-9]*$ ]] || { echo "MAX_PARALLEL must be a positive integer" >&2; exit 1; }
 MEMORY_MAX="$((7 * MAX_PARALLEL + 1))G"
+NEED_MB=$((6200 * MAX_PARALLEL + 1100))   # rand-prover run refuses to start below this (memory.rs)
+read -r CPUS AVAIL_MB < <("${SSH[@]}" 'echo "$(nproc) $(free -m | awk "/Mem:/{print \$7}")"')
+if [ "$AVAIL_MB" -lt "$NEED_MB" ] || [ "$CPUS" -lt 2 ]; then
+    echo "$TARGET: $CPUS cpu(s), $AVAIL_MB MB available — a prover needs ~$((NEED_MB / 1000)).$(((NEED_MB % 1000) / 100)) GB available (6.2 GB per slot + 1 GiB, as rand-prover run requires) and a second core. Resize the host first." >&2
+    exit 1
+fi
+THREADS=$((CPUS - 1)); [ "$THREADS" -le 8 ] || THREADS=8   # rand-prover's own default (docs/node-hardware.md §6)
 echo "$TARGET ($MEMBER): $CPUS cpus, $AVAIL_MB MB available; $TAG rand-prover ${WANT_SHA:0:16}… (signature verified)"
 
 "${SCP[@]}" "$REL/rand-prover" "$TARGET:/tmp/rand-prover.new"

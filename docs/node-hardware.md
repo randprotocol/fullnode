@@ -190,7 +190,7 @@ profile (`AGENTS.md`, "v0.6.3", measured 2026-09-29). The table below predates t
 
 | proof | tier | time | peak memory |
 |---|---|---|---|
-| bundle (every transfer, deploy and call) | 14 | 92.2 s, 94.3 s and 96.0 s measured (production, chain 13, laptop); 97.0 s measured (test profile) | 6.2 GB for one `rand call` (tier-10 call plus tier-14 bundle), test profile. Production: the bundle alone is not measured yet; one whole production `rand call` (tier-16 call plus tier-14 bundle) peaked at 22.9 GB RSS |
+| bundle (every transfer, deploy and call) | 14 | 92.2 s, 94.3 s and 96.0 s measured (production, chain 13, laptop); 97.0 s measured (test profile) | 5.74 GB for one `rand call` (tier-10 call plus tier-14 bundle), test profile. Production: the bundle alone is not measured yet; one whole production `rand call` (tier-16 call plus tier-14 bundle) peaked at 22.9 GB RSS |
 | a call at tier 16 (ERC-20 `approve`, production) | 16 | 388.7 s for the call proof; 622.8 s for the whole `rand call` (chain 13, 48 GB M-series laptop) | 22.9 GB peak RSS, whole `rand call` |
 | a call at tier 10 | 10 | 6.0 s measured (test profile); 6.05 s for `fib` (production, constraint set 5) | included above |
 | a call at tier 18 or 20 | 18, 20 | see §5 | see §5 |
@@ -309,7 +309,7 @@ figures below were measured on the single-core build.
 | tier | cycles (up to) | workload measured | memory measured | time measured | final |
 |---|---:|---|---|---|---|
 | 10 | 1 023 | `fib` (production, constraint set 5) | not recorded | 6.05 s | — |
-| 14 | 16 383 | the bundle (wallet, test profile) | 6.2 GB whole `rand call` | 97.0 s | production: 92.2–96.0 s and 1 418 406–1 420 423-byte proofs (chain 13, laptop); memory of the bundle alone not measured yet |
+| 14 | 16 383 | the bundle (wallet, test profile) | 5.74 GB whole `rand call` (live provers: 6.2 GB per bundle, 2026-10-27) | 97.0 s | production: 92.2–96.0 s and 1 418 406–1 420 423-byte proofs (chain 13, laptop); memory of the bundle alone not measured yet |
 | 16 | 65 535 | ERC-20 `approve`, translated | test profile, DigitalOcean: 21.7 GB. Production, laptop: 22.9 GB peak RSS for the whole `rand call` | test profile: 786.7 s (13.1 min). Production: 388.7 s | production: proved and committed on chain 13, 3 412 405-byte proof |
 | 18 | 262 143 | ERC-20, about 66 k–162 k cycles | OOM-killed on a 48 GB laptop at 24.7 GB. On a 64 GB droplet: above 47 GB at 25 min, still running | killed after 1 016 s on the laptop | translated `transfer`: 85.0 GB, 3 230.5 s (53.8 min), 811 600 B proof. Interpreter `evm.bin`: 85.5 GB, 3 143.3 s (52.4 min), 805 108 B proof. Verify: 101.4 s (droplet), 50.2 s at 3.66 GB RSS (laptop). Measured on m-16vcpu-128gb, 2026-09-19 |
 | 19 (rVM) | — | rVM aggregate, N=1, test profile (constraint set 8) | **94.5 GB peak RSS** (Linux, 503 GB droplet). The "about 30 GB" quoted before was macOS RSS, which excludes compressed pages | 1568.2 s (loaded shared box); 2 034.6 s (droplet, whole test binary) | after the phase-2 row cuts the same proof is tier 18; after the quotient layout it proved at 33.27 GB peak live heap on the 48 GB laptop (§4) |

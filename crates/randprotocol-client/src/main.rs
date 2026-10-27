@@ -1608,7 +1608,7 @@ fn backend_for(cuda: bool, cpu: bool) -> Result<Backend> {
 fn proving_for(prover: bool, cuda: bool, cpu: bool, key: &Path, max_prover_fee: &str) -> Result<Proving> {
     let cap = parse_amount(max_prover_fee).map_err(|e| anyhow!("--max-prover-fee {max_prover_fee}: {e}"))?;
     if !prover {
-        randprotocol_client::memory::check_local()?;
+        randprotocol_client::memory::check_local(randprotocol_client::memory::Proof::Bundle)?;
         return Ok(Proving::local(backend_for(cuda, cpu)?));
     }
     if cuda {
@@ -2721,7 +2721,9 @@ async fn main() -> Result<()> {
             }
             let chain_id = rpc.chain_id().await?;
             let profile = profile_of(&rpc).await?;
-            let proving = if cli.prover { proving_for(true, false, false, &cli.key, &cli.max_prover_fee)? } else { randprotocol_client::memory::check_local()?; Proving::local(Backend::Cpu) };
+            // The invoke proof is always made here, `--prover` or not, so the memory gate runs either way.
+            randprotocol_client::memory::check_local(randprotocol_client::memory::Proof::AlwaysLocal)?;
+            let proving = if cli.prover { proving_for(true, false, false, &cli.key, &cli.max_prover_fee)? } else { Proving::local(Backend::Cpu) };
             // The dry run over the REAL context words — the guest branches on them — with eight
             // zero words standing in for the binding, which the guest never reads.
             let context = {
@@ -2836,7 +2838,7 @@ async fn main() -> Result<()> {
             }
             let chain_id = rpc.chain_id().await?;
             let profile = profile_of(&rpc).await?;
-            randprotocol_client::memory::check_local()?;
+            randprotocol_client::memory::check_local(randprotocol_client::memory::Proof::AlwaysLocal)?;
             let backend = backend_for(cuda, cli.cpu)?;
             // The call proof is always made here, on `--cuda`'s backend; `--prover` moves only the
             // paying bundle.
