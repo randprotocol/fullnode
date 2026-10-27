@@ -244,27 +244,31 @@ pub struct PendingCaps {
 /// The inbound connections still in their handshake, by where they come from.
 #[derive(Default)]
 pub struct PendingBySource {
-    /// Each pending connection's source, and whether it was admitted as a reserved peer's.
-    by_conn: HashMap<ConnectionId, (Source, bool)>,
+    /// Each pending connection's source, and the reserved peer it was admitted for, if any.
+    by_conn: HashMap<ConnectionId, (Source, Option<PeerId>)>,
     count: HashMap<Source, u32>,
     /// How many of `by_conn` were admitted from an unreserved source.
     unreserved: u32,
-    /// The pending connections admitted as a reserved peer's, by source.
-    reserved_count: HashMap<Source, u32>,
+    /// The pending connections admitted as a reserved peer's, by that peer (re-review N2: by
+    /// peer, not by source, so a source leaving the peer's list does not free its share).
+    reserved_count: HashMap<PeerId, u32>,
 }
 
 impl PendingBySource {
     /// Count `id` against `source` under the per-address cap alone, or refuse it: `false` when
     /// `source` already holds `max`. A refused connection is not recorded, so it needs no release.
     pub fn admit(&mut self, id: ConnectionId, source: Source, max: u32) -> bool {
-        self.admit_with(id, source, false, PendingCaps { per_addr: max, total: u32::MAX, reserved: 0 }).is_ok()
+        self.admit_with(id, source, None, PendingCaps { per_addr: max, total: u32::MAX, reserved: 0 }).is_ok()
     }
 
     /// Count `id` against `source` under every pending cap, or say which one refuses it: the
     /// node-wide `total` first (no one past it), then — for a source that is not a reserved
     /// peer's — `total − reserved`, then the per-address cap. A refused connection is not
     /// recorded, so it needs no release.
-    pub fn admit_with(&mut self, id: ConnectionId, source: Source, reserved_source: bool, caps: PendingCaps) -> Result<(), Denied> {
+    /// `reserved_for` is the reserved peer the handshake takes a reserved slot for, `None` for a
+    /// stranger's.
+    pub fn admit_with(&mut self, id: ConnectionId, source: Source, reserved_for: Option<PeerId>, caps: PendingCaps) -> Result<(), Denied> {
+        let reserved_source = reserved_for.is_some();
         if self.by_conn.len() as u64 >= u64::from(caps.total) {
             return Err(Denied { limit: caps.total, kind: Kind::PendingIncoming });
         }
@@ -280,9 +284,9 @@ impl PendingBySource {
             return Err(Denied { limit: caps.per_addr, kind: Kind::PendingIncomingPerAddr });
         }
         *n += 1;
-        self.by_conn.insert(id, (source, reserved_source));
-        if reserved_source {
-            *self.reserved_count.entry(source).or_insert(0) += 1;
+        self.by_conn.insert(id, (source, reserved_for));
+        if let Some(peer) = reserved_for {
+            *self.reserved_count.entry(peer).or_insert(0) += 1;
         } else {
             self.unreserved += 1;
         }
@@ -292,12 +296,12 @@ impl PendingBySource {
     /// The handshake of `id` ended — established, failed or refused by another behaviour. A no-op
     /// for a connection never admitted here, and for a second release of one that was.
     pub fn release(&mut self, id: ConnectionId) {
-        let Some((source, reserved_source)) = self.by_conn.remove(&id) else { return };
-        if reserved_source {
-            if let Some(n) = self.reserved_count.get_mut(&source) {
+        let Some((source, reserved_for)) = self.by_conn.remove(&id) else { return };
+        if let Some(peer) = reserved_for {
+            if let Some(n) = self.reserved_count.get_mut(&peer) {
                 *n -= 1;
                 if *n == 0 {
-                    self.reserved_count.remove(&source);
+                    self.reserved_count.remove(&peer);
                 }
             }
         } else {
@@ -313,9 +317,9 @@ impl PendingBySource {
         }
     }
 
-    /// The pending connections from `source` admitted as a reserved peer's.
-    pub fn reserved_from(&self, source: &Source) -> u32 {
-        self.reserved_count.get(source).copied().unwrap_or(0)
+    /// The pending connections admitted as reserved `peer`'s.
+    pub fn reserved_for(&self, peer: &PeerId) -> u32 {
+        self.reserved_count.get(peer).copied().unwrap_or(0)
     }
 
     pub fn pending_from(&self, source: &Source) -> u32 {
@@ -488,15 +492,13 @@ impl Guard {
         }
     }
 
-    /// Whether a handshake from `source` may take a reserved slot: some reserved peer is known
-    /// there whose handshakes, over all its sources, hold fewer than
-    /// [`MAX_RESERVED_PENDING_PER_PEER`] reserved slots.
-    fn reserved_for(&mut self, source: &Source) -> bool {
+    /// The reserved peer a handshake from `source` may take a reserved slot for: one known there
+    /// whose admitted handshakes — counted by peer, whatever source they came from — hold fewer
+    /// than [`MAX_RESERVED_PENDING_PER_PEER`] reserved slots. `None`: a stranger's handshake.
+    fn reserved_for(&mut self, source: &Source) -> Option<PeerId> {
         let now = self.now();
         self.sources.expire(now);
-        self.sources.peers_at(source, now).iter().any(|p| {
-            self.sources.sources_of(p).iter().map(|s| self.pending.reserved_from(s)).sum::<u32>() < MAX_RESERVED_PENDING_PER_PEER
-        })
+        self.sources.peers_at(source, now).into_iter().find(|p| self.pending.reserved_for(p) < MAX_RESERVED_PENDING_PER_PEER)
     }
 
     pub fn unreserve(&mut self, peer: &PeerId) {
@@ -530,8 +532,8 @@ impl NetworkBehaviour for Guard {
         remote_addr: &Multiaddr,
     ) -> Result<(), ConnectionDenied> {
         let source = source_of(remote_addr);
-        let reserved_source = self.reserved_for(&source);
-        self.pending.admit_with(connection_id, source, reserved_source, self.pending_caps()).map_err(ConnectionDenied::new)
+        let reserved_for = self.reserved_for(&source);
+        self.pending.admit_with(connection_id, source, reserved_for, self.pending_caps()).map_err(ConnectionDenied::new)
     }
 
     fn handle_established_inbound_connection(
@@ -992,19 +994,20 @@ mod tests {
     fn the_pending_total_binds_reserved_sources_and_an_unknown_source_is_never_reserved() {
         let caps = PendingCaps { per_addr: 4, total: 6, reserved: 4 };
         let mut p = PendingBySource::default();
+        let v = PeerId::random();
         let host = |n: u8| Source::V4(std::net::Ipv4Addr::new(198, 51, 100, n));
         for i in 0..2 {
-            p.admit_with(conn(i), host(1), false, caps).unwrap();
+            p.admit_with(conn(i), host(1), None, caps).unwrap();
         }
-        assert_eq!(p.admit_with(conn(2), host(2), false, caps), Err(Denied { limit: 2, kind: Kind::PendingIncomingUnreserved }));
+        assert_eq!(p.admit_with(conn(2), host(2), None, caps), Err(Denied { limit: 2, kind: Kind::PendingIncomingUnreserved }));
         for i in 10..14 {
-            p.admit_with(conn(i), host(3 + (i as u8 % 2)), true, caps).unwrap();
+            p.admit_with(conn(i), host(3 + (i as u8 % 2)), Some(v), caps).unwrap();
         }
-        assert_eq!(p.admit_with(conn(20), host(5), true, caps), Err(Denied { limit: 6, kind: Kind::PendingIncoming }));
+        assert_eq!(p.admit_with(conn(20), host(5), Some(v), caps), Err(Denied { limit: 6, kind: Kind::PendingIncoming }));
         p.release(conn(10));
-        p.admit_with(conn(21), host(5), true, caps).expect("a released slot");
+        p.admit_with(conn(21), host(5), Some(v), caps).expect("a released slot");
         p.release(conn(0));
-        p.admit_with(conn(22), host(2), false, caps).expect("the stranger's share back");
+        p.admit_with(conn(22), host(2), None, caps).expect("the stranger's share back");
         for i in [1, 11, 12, 13, 21, 22] {
             p.release(conn(i));
         }
@@ -1130,6 +1133,39 @@ mod tests {
         g.reserve(late);
         g.skew += RESERVED_SOURCE_TTL * 2;
         pending(&mut g, 13, "/ip4/198.51.100.61/tcp/1").expect("its live connection keeps the source");
+    }
+
+    /// NET-1 re-review, N2: a reserved peer's in-flight handshakes count against its share by
+    /// peer, so evicting the source they came from (here: four fresh observed sources) does not
+    /// free the share while they are still pending.
+    #[test]
+    fn evicting_a_source_does_not_free_the_reserved_share_its_handshakes_hold() {
+        use super::super::{MAX_PENDING_INCOMING, RESERVED_PENDING_INCOMING};
+        let mut g = guard();
+        let v = PeerId::random();
+        g.reserve(v);
+        let seen = |g: &mut Guard, id: usize, host: &str| {
+            let point = listener_point(host);
+            connection_established(g, id, v, &point, 0);
+            connection_closed(g, id, v, &point, 0);
+        };
+        seen(&mut g, 1, "/ip4/198.51.100.70/tcp/1");
+        for i in 0..(MAX_PENDING_INCOMING - RESERVED_PENDING_INCOMING) as usize {
+            pending(&mut g, 100 + i, &format!("/ip4/203.0.{}.{}/tcp/1", i / 4 / 200, (i / 4) % 200 + 1)).unwrap();
+        }
+        for k in 0..MAX_RESERVED_PENDING_PER_PEER as usize {
+            pending(&mut g, 10 + k, &format!("/ip4/198.51.100.70/tcp/{}", 10 + k)).unwrap();
+        }
+        // Four fresh sources evict the first one from the peer's list; its four handshakes pend on.
+        for (n, id) in (71..75u8).zip(2usize..) {
+            g.skew += std::time::Duration::from_secs(1);
+            seen(&mut g, id, &format!("/ip4/198.51.100.{n}/tcp/1"));
+        }
+        assert!(!g.sources.sources_of(&v).contains(&source_of(&addr("/ip4/198.51.100.70/tcp/1"))), "evicted");
+        assert_eq!(g.pending.reserved_for(&v), MAX_RESERVED_PENDING_PER_PEER);
+        assert_eq!(denied(pending(&mut g, 50, "/ip4/198.51.100.71/tcp/9")).kind, Kind::PendingIncomingUnreserved, "the share is still held");
+        listen_failure(&mut g, 10, "/ip4/198.51.100.70/tcp/10");
+        pending(&mut g, 51, "/ip4/198.51.100.71/tcp/9").expect("one of them finished: one slot back");
     }
 
     /// The guard's handler is the dummy that does nothing, and it never asks the swarm for
