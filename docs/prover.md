@@ -605,7 +605,7 @@ proof over the account's `nk` and may still go to a paired prover (`--prover`), 
 ## 9. The validators' prover pool: `prover.randprotocol.org`
 
 A wallet that cannot make a bundle proof and whose owner runs no prover can use the pool the
-chain's validators run: four machines (two validators and two dedicated droplets), each with its
+chain's validators run: two machines, `a` and `b`, each with its
 own prover key and its own URL, `https://prover.randprotocol.org/m/<member>`. It takes viewing-key
 jobs only, on split-authorisation chains.
 

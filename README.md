@@ -452,8 +452,8 @@ Next:
   validator keys and 6 of 8 guardian keys to three other operators, each on their own hosting
   account, by 2026-11-01 and before any mainnet genesis — is in `docs/deploy.md` and enforced by
   `deploy/lib/cut-policy.sh` (no genesis without `testnet: true` until it is met).
-- **The prover pool's shared key.** Each pool member now has its own key; the old shared key is
-  retired once wallet 0.6.9, which pins the per-member descriptor, is published (fullnode #123).
+- **The prover pool.** Each pool member has its own key; the old shared key is retired. Two
+  members run it now, `a` and `b`, which the next release pins (wallet 0.8.1 already does).
 
 ## License
 

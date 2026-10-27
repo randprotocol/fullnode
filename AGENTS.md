@@ -71,7 +71,7 @@ lost quorum frees the slot. `initial_price_micros` is required. Pinned: a no-sec
 state root (identical to base `3119a29a`). Suites: core lib 810, node lib 623 (1 ignored), node bin
 55, rpc_contract 7, genesis_cli 14, client lib 210, clippy clean for the three crates. Recommended values deferred until aggregation is admitted (`docs/deploy.md`).
 
-### rVM phase 5 re-vendored (2026-10-15; branch `feat/rvm-phase5-revendor`, NOT merged)
+### rVM phase 5 re-vendored (2026-10-15; branch `feat/rvm-phase5-revendor`, MERGED to main 2026-10-17 as eda9d3b3)
 
 The branch's circuits pin is **`b3e21d9`** (circuits main, the merge of `spike/rvm-phase5`;
 `CIRCUITS_PIN` in `.github/workflows/ci.yml`, both PROVENANCE.md files; synced with
@@ -479,6 +479,12 @@ repositories (BR-*), the papers (PA-*, DOC-*), and custody (OPS-6, BR-4, BR-7).
 
 
 ### prover.randprotocol.org — the validators' prover pool (LIVE 2026-10-01 ~05:00 WITA; the `parallel` build)
+
+**Current state (2026-10-22 on): two members, `a` (4SK4-P64N-XWEN-ZSZZ) and `b` (0XZX-NZ1J-SPMB-GWZN),
+each with its own key and URL `/m/a`, `/m/b`; the four earlier members and the shared key
+`RGTF-7HKJ-XZFV-GQ1J` are retired, and `trusted-provers.txt` pins only `a` and `b`.** Everything
+below describes the first (five-host, shared-key) shape and is history; the live runbook is
+`deploy/prover/README.md`. Router default per-address submit limit: see `deploy/prover/README.md` (VK-10).
 
 The user's instruction (2026-09-30, then asleep: "always choose the recommended decision; commit and
 push to origin/main often"): five current validators become delegated provers behind one name like
