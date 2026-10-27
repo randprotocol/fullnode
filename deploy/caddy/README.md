@@ -72,15 +72,22 @@ designed. What remains for the operator is housekeeping, listed at the end.
 ## The node's own public listener (audit v6, VK-2 / RPC-4) — point the tunnel at it
 
 From v0.6.8 the node has a listener made for this hop: `rand-node run --public-rpc 127.0.0.1:8546`.
-It serves a fixed method set (no viewing-key methods, no `rand_mint`, no `rand_getPeers`), takes
-no batch and no WebSocket, meters every caller together, and never counts a caller as loopback —
-so the method gate and the meter are the node's, not only the sale proxy's `RPC_ALLOWED` in
-another repository. **To do on the roll, by the operator** (not yet done; this file records the
-target, not the state):
+It serves a fixed method set (`rpc::PUBLIC_METHODS`: no viewing-key methods, no `rand_mint`, no
+`rand_getPeers`), takes no batch and no WebSocket, meters every caller together, and never counts a
+caller as loopback — so the method gate and the meter are the node's, not only the sale proxy's
+`RPC_ALLOWED` in another repository.
+
+**State (2026-10-28): not recorded.** The last recorded state of this hop is the 2026-09-27 tunnel
+above, to obs1's operator port `:8545`. obs1 was rebuilt on another host in the 2026-10-22
+DigitalOcean migration, and nothing in this repository records whether its new unit carries
+`--public-rpc`. To find out, from the web droplet: `rand_getPeers` through `127.0.0.1:18545`
+answers "not served on this node's public listener" once the hop ends at `:8546`, and answers a
+peer list while it still ends at `:8545`; on obs1, `systemctl cat rand-node | grep -- --public-rpc`.
+Write the answer here. If it is not done, the steps, by the operator, one host at a time:
 
 1. obs1's unit: add `--public-rpc 127.0.0.1:8546` to `ExecStart` — `deploy/enable-public-rpc.sh root@<host>`
    (edits the unit, idempotent; `RESTART=1` restarts it and checks the listener refuses
-   `rand_getPeers`; a new host gets it from `PUBLIC_RPC=1 deploy/vps-setup.sh …`). Roll one host at a time.
+   `rand_getPeers`; a new host gets it from `PUBLIC_RPC=1 deploy/vps-setup.sh …`).
 2. obs1's `rpctunnel` key: `permitopen="127.0.0.1:8546"` in place of `:8545`.
 3. The web droplet's `rpc-tunnel-obs1.service`: `-L 127.0.0.1:18545:127.0.0.1:8546`.
 4. Check from the web droplet: `rand_chainId` answers through `127.0.0.1:18545`;
@@ -89,6 +96,28 @@ target, not the state):
    `127.0.0.1:8546`. randscan's own explorer keeps `127.0.0.1:8545` — it needs the viewing methods.
 
 Until then the section below describes the running chain.
+
+## Which layer gates which method
+
+The proxy's `RPC_ALLOWED` (randprotocol.org `server/sale/src/rpc.rs` at `8cebd54`) and the
+node's `rpc::PUBLIC_METHODS` (since v0.8.0) are **the same 62 methods**; keep them so, and change
+both together. `rand_getUnsealed` is on both: it pages the bundles an aggregator may still cover, a public read
+the aggregate daemon polls.
+
+| Method | Sale proxy (`RPC_ALLOWED`) | Node public listener (`--public-rpc`) | Node operator listener (`--rpc`) |
+|---|---|---|---|
+| the 62 public reads and `rand_sendTransaction` | served; per-IP limits | served; one shared meter | served |
+| `rand_mint` | `-32601` | refused | served — the port binds `127.0.0.1`; the genesis pays only `staking.faucet_recipients` |
+| `rand_importViewingKey`, `rand_getViewingNotes`, `rand_removeViewingKey` | `-32601` | refused | loopback callers; the token's holders under `--rpc-viewing-token-file`; anyone under `--rpc-viewing-open` (VK-3) |
+| `rand_getPeers` | `-32601` | refused | served |
+| a batch (top-level array) | refused | refused | up to 20 requests (`MAX_BATCH`) |
+| anything added to the node later | `-32601` until named | refused until named | served |
+
+While the tunnel ends at `:8545` (see the state above) the node's column that applies is the
+operator listener's, every proxied caller is loopback to it, and the proxy is the only gate. Once
+it ends at `:8546` both gates apply. The sale droplet serves the list its binary was built with,
+and the 2026-10-11 sale deploy was built before `8cebd54`; check that the running sale binary is
+at or past that commit before relying on the table's first column.
 
 ## Why the proxy is security-critical
 
@@ -103,12 +132,13 @@ by the TCP peer address, treating loopback as the operator:
 The node's own per-caller defences are therefore off for public traffic, and the sale service's
 proxy stands where they would. It does, verified 2026-09-26 against the live endpoint:
 
-1. **A method allowlist** (`RPC_ALLOWED`) — `rand_mint`, `rand_importViewingKey`,
-   `rand_getViewingNotes`, `rand_removeViewingKey`, `rand_getUnsealed` and `rand_getPeers` are not
-   on it and answer `-32601 method not allowed here`. An allowlist, so a method added to the node
-   later stays closed until someone opens it there.
+1. **A method allowlist** (`RPC_ALLOWED`, the table above) — `rand_mint`, `rand_importViewingKey`,
+   `rand_getViewingNotes`, `rand_removeViewingKey` and `rand_getPeers` are not on it and answer
+   `-32601 method not allowed here` (`rand_getUnsealed` is on it, as on the node's public list). An
+   allowlist, so a method added to the node later stays closed until someone opens it there.
 2. **No batches** — a top-level array is refused, so a refused method cannot ride inside one.
-3. **Per-IP limits** — 120 reads and 6 `rand_sendTransaction` a minute, keyed on the real client IP
+3. **Per-IP limits** — 1200 reads (`READS_PER_MINUTE`; 120 until a wallet's first sync outgrew it)
+   and 6 `rand_sendTransaction` a minute, keyed on the real client IP
    (`client_ip` reads `X-Real-IP`, set by the web droplet's nginx from `CF-Connecting-IP` for
    Cloudflare's ranges only — a direct connection to the origin is metered as its own TCP peer and
    cannot name an address), and a 12 MiB body cap.
