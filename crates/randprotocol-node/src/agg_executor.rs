@@ -650,6 +650,10 @@ impl ConfidentialExecutor for AggExecutor {
         self.inner.decode_perp(engine_hc, max_tier, segment, proof)
     }
 
+    fn perp_proof_shape(&self, proof: &[u8]) -> Option<randprotocol_core::confidential::ProofShape> {
+        self.inner.perp_proof_shape(proof)
+    }
+
     /// The keys an `Invoke` verifies under are these too: its segment sits in the hardened
     /// call's public table (`program_state::segment_fits`), so it declares no shape a call to
     /// the same program does not.

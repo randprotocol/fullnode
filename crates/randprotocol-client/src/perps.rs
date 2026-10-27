@@ -89,6 +89,13 @@ pub fn image_hc(program: &randprotocol_zkvm::isa::Program) -> Word8 {
     program.digest()
 }
 
+/// CON-60: the program-table height every proof of `program` declares (the prover's own
+/// `program_log_height` of the image's length) — the value of the genesis
+/// `perps.engine_program_log_height` pin for this engine image.
+pub fn engine_program_log_height(program: &randprotocol_zkvm::isa::Program) -> u8 {
+    randprotocol_zkvm::tables::program::program_log_height(program.len())
+}
+
 /// Refuse an image whose `hc` is not the chain's `engine_hc`, before any proving.
 pub fn check_image_hc(program: &randprotocol_zkvm::isa::Program, engine_hc: &Word8) -> Result<()> {
     let hc = image_hc(program);
@@ -1007,6 +1014,16 @@ mod tests {
         let mut unordered = j.clone();
         unordered.blocks.swap(0, 1);
         assert!(unordered.check_for(true).is_err());
+    }
+
+    /// CON-60: the pin `rand perp image-hc` prints is the height the prover declares.
+    #[test]
+    fn the_engine_program_height_is_the_provers() {
+        let program = randprotocol_zkvm::guests::fib(10);
+        assert_eq!(
+            engine_program_log_height(&program),
+            randprotocol_zkvm::tables::program::program_log_height(program.words.len())
+        );
     }
 
     /// M2: the tier is the dry run's unless `--tier` raises it, and a window that needs more than

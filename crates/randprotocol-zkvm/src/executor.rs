@@ -1871,6 +1871,35 @@ fn pinned_heights(program: &Program, input_words: usize) -> (u8, u8, u8) {
 ///
 /// A consensus tightening: a chain-12 block holding a non-canonical proof would be refused by
 /// this build, which is one more reason the build is chain-13-only (CHANGELOG, v0.4).
+/// CON-60: the leading header of a postcard-encoded [`Proof`], field for field in its order —
+/// `tier`, then the declared table heights — so [`proof_shape`] reads them without decoding the
+/// batch proof behind them. `tests` pins it against `decode_canonical`.
+#[derive(serde::Deserialize)]
+struct ProofHeader {
+    tier: Tier,
+    program_log_height: u8,
+    input_log_height: u8,
+    keccak_log_height: u8,
+    sha256_log_height: u8,
+    _modq_log_height: u8,
+    public_log_height: u8,
+}
+
+/// CON-60: the shape `bytes` declares (`ConfidentialExecutor::perp_proof_shape`), from its
+/// header alone: no allocation, no batch decode, no key. `None` when the header does not decode
+/// or names a tier past `u8`.
+pub fn proof_shape(bytes: &[u8]) -> Option<randprotocol_core::confidential::ProofShape> {
+    let (h, _) = postcard::take_from_bytes::<ProofHeader>(bytes).ok()?;
+    Some(randprotocol_core::confidential::ProofShape {
+        tier: u8::try_from(h.tier.0).ok()?,
+        program_log_height: h.program_log_height,
+        input_log_height: h.input_log_height,
+        keccak_log_height: h.keccak_log_height,
+        sha256_log_height: h.sha256_log_height,
+        public_log_height: h.public_log_height,
+    })
+}
+
 pub fn decode_canonical(bytes: &[u8]) -> Result<Proof, ConfidentialError> {
     let proof: Proof = postcard::from_bytes(bytes).map_err(|_| ConfidentialError::MalformedProof)?;
     if proof.to_bytes() != bytes {
@@ -2026,6 +2055,11 @@ impl ConfidentialExecutor for ZkExecutor {
         proof: &[u8],
     ) -> Result<CallOutcome, ConfidentialError> {
         self.check_perp(engine_hc, max_tier, segment, proof, true)
+    }
+
+    /// CON-60: the declared shape, from the header ([`proof_shape`]).
+    fn perp_proof_shape(&self, proof: &[u8]) -> Option<randprotocol_core::confidential::ProofShape> {
+        proof_shape(proof)
     }
 
     /// Every check of [`Self::verify_perp`] but `Machine::verify` itself (B5).
@@ -3419,6 +3453,35 @@ mod tests {
         let (vendored, _) = Machine::new(FriProfile::Test).prove_salted(&program, &[], &binding, [0; 4], None).unwrap();
         assert_eq!(vendored.program_log_height, MIN_PRIVATE_TABLE_LOG_HEIGHT);
         assert!(zk.verify_call_hardened(&record, &vendored.to_bytes(), &binding).is_ok());
+    }
+
+    /// CON-60: `proof_shape` reads exactly the header `decode_canonical` decodes — the tier and
+    /// the declared heights — from the prefix alone (a truncated proof still has its header), and
+    /// nothing from bytes that are not a proof's.
+    #[test]
+    fn the_proof_shape_is_the_decoded_header() {
+        use super::*;
+        use crate::machine::FriProfile;
+        let program = crate::guests::fib(10);
+        let binding = [9u32; TX_BINDING_WORDS];
+        let (bytes, _, _) = prove_call_hardened(FriProfile::Test, &program, &[], &[], &binding, [0; 4], None, None).unwrap();
+        let p = decode_canonical(&bytes).unwrap();
+        let shape = proof_shape(&bytes).expect("a proof's header");
+        assert_eq!(
+            shape,
+            randprotocol_core::confidential::ProofShape {
+                tier: p.tier.0 as u8,
+                program_log_height: p.program_log_height,
+                input_log_height: p.input_log_height,
+                keccak_log_height: p.keccak_log_height,
+                sha256_log_height: p.sha256_log_height,
+                public_log_height: p.public_log_height,
+            }
+        );
+        assert_eq!(proof_shape(&bytes[..16]), Some(shape), "the header alone");
+        assert_eq!(ZkExecutor::new(FriProfile::Test).perp_proof_shape(&bytes), Some(shape));
+        assert_eq!(proof_shape(b""), None);
+        assert_eq!(proof_shape(&[0xff; 3]), None);
     }
 
     /// ZKG-1: an output word past 32 bits is refused, never narrowed. `x as u32` of

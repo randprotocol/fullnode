@@ -3095,6 +3095,9 @@ impl Node {
         if let (Some(key), Err(e)) = (v.proof_key, &v.result) {
             self.proof_refused.insert(hash, key, e.clone());
         }
+        // CON-60 (b): before it is pooled, so a verified proof's shape is known when the pool's
+        // precheck runs again below.
+        self.mempool.state_proof_verified(&v.tx, self.executor.as_ref(), &v.result);
         self.note_refusal(hash);
         // A verified transaction is pooled against the *current* tip, not the snapshot it was
         // verified on: `insert_verified` re-runs `precheck` there, so a nullifier spent or an anchor
@@ -3184,6 +3187,7 @@ impl Node {
             self.note_refusal(hash);
             self.report(id, GossipOutcome::Report(a)).await;
         } else {
+            self.mempool.state_proof_queued(&tx, self.executor.as_ref());
             self.verify_queue.push_back((tx, VerifySource::Gossip(id)));
             self.pump_verify();
         }
@@ -3269,6 +3273,7 @@ impl Node {
             let _ = reply.send(Err(e));
             return;
         }
+        self.mempool.state_proof_queued(&tx, self.executor.as_ref());
         self.verify_queue.push_back((tx, VerifySource::Rpc(reply)));
         self.pump_verify();
     }
@@ -3440,6 +3445,7 @@ impl Node {
                 if let randprotocol_core::types::Action::Aggregate { covers, .. } = &tx.action {
                     newly_sealed.extend_from_slice(covers);
                 }
+                self.mempool.state_proof_committed(tx, self.executor.as_ref());
             }
             tracing::info!(
                 "committed block {} view {} txs {} hash {:?}",

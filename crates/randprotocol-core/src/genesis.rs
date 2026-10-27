@@ -4600,6 +4600,7 @@ mod tests {
             initial_collateral: 0,
             sparse_windows: false,
             max_window_heights: 0,
+            engine_program_log_height: 0,
             markets: vec![MarketSpec {
                 id: 0,
                 symbol: "BTC-PERP".into(),

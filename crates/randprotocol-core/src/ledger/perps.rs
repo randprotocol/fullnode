@@ -62,6 +62,9 @@ pub const PERP_FROM: Word8 = [u32::from_le_bytes(*b"rpl3"), u32::from_le_bytes(*
 const _: () = assert!(MAX_PERP_PAYOUTS as u64 <= super::MAX_LEAVES_PER_TX);
 /// The most blocks `max_window_blocks` may set one state proof to cover.
 pub const MAX_WINDOW_BLOCKS: u64 = 64;
+/// The highest `engine_program_log_height` a genesis may pin (CON-60): a program table of 2^24
+/// rows is far past any image a tier-20 proof can hold.
+pub const MAX_ENGINE_PROGRAM_LOG_HEIGHT: u8 = 24;
 /// The most heights `max_window_heights` may let one sparse-window state proof span (PERP-101),
 /// which is also the longest a sparse chain goes without a recorded `Close`.
 pub const MAX_WINDOW_HEIGHTS: u64 = 4096;
@@ -159,6 +162,15 @@ pub struct PerpsConfig {
     /// without `sparse_windows`.
     #[serde(default)]
     pub max_window_heights: u64,
+    /// CON-60 (genesis-gated, default 0 = unpinned): the program-table height of the engine
+    /// image `engine_hc` names (`program::program_log_height` of its word count; `rand perp
+    /// image-hc` prints it). Set, a state proof must declare exactly this height and no keccak
+    /// or sha256 table — the engine calls neither — or it is refused `ProofRefused` from its
+    /// header, before any verifier key is built; what is left free is the tier (at most
+    /// `max_tier`) and the input height, a handful of keys. Unset (chain 21), the header is
+    /// only ranged, as for any call.
+    #[serde(default)]
+    pub engine_program_log_height: u8,
 }
 
 /// [`PerpsConfig`] as it was bound into the genesis hash before audit v10 (chains up to 21): the
@@ -209,6 +221,10 @@ impl PerpsConfig {
             out.extend_from_slice(b"max_window_heights");
             out.extend_from_slice(&self.max_window_heights.to_be_bytes());
         }
+        if self.engine_program_log_height != 0 {
+            out.extend_from_slice(b"engine_program_log_height");
+            out.push(self.engine_program_log_height);
+        }
         out
     }
 
@@ -239,6 +255,12 @@ impl PerpsConfig {
             return Err(format!(
                 "perps.max_window_heights {} is set without sparse_windows",
                 self.max_window_heights
+            ));
+        }
+        if self.engine_program_log_height > MAX_ENGINE_PROGRAM_LOG_HEIGHT {
+            return Err(format!(
+                "perps.engine_program_log_height {} is above {MAX_ENGINE_PROGRAM_LOG_HEIGHT}",
+                self.engine_program_log_height
             ));
         }
         if !(1..=MAX_BLOCK_INPUTS).contains(&self.max_block_inputs) {
@@ -637,6 +659,7 @@ impl Perps {
                         initial_collateral: 0,
                         sparse_windows: false,
                         max_window_heights: 0,
+                        engine_program_log_height: 0,
                     },
                     accounts: v0.accounts,
                     oracle: v0.oracle,
@@ -1358,6 +1381,23 @@ pub(super) fn verify_state_proof(
         return Err(NOT_PERP);
     };
     let c = &p.config;
+    // CON-60, under the genesis pin: the declared shape, from the header alone, before the
+    // executor builds a verifier key for it — the engine's program height and no hash table.
+    if c.engine_program_log_height != 0 {
+        let shape = executor
+            .perp_proof_shape(proof)
+            .ok_or_else(|| PerpError::ProofRefused("the proof's header does not decode".into()))?;
+        if shape.program_log_height != c.engine_program_log_height
+            || shape.keccak_log_height != 0
+            || shape.sha256_log_height != 0
+        {
+            return Err(PerpError::ProofRefused(format!(
+                "declared shape: program height {} (the engine's is {}), keccak {}, sha256 {}",
+                shape.program_log_height, c.engine_program_log_height, shape.keccak_log_height, shape.sha256_log_height
+            ))
+            .into());
+        }
+    }
     let outcome = executor.verify_perp(&c.engine_hc, c.max_tier, segment, proof).map_err(|e| match e {
         ConfidentialError::CallTierTooHigh { tier, max } => PerpError::TierTooHigh { tier, max },
         e => PerpError::ProofRefused(e.to_string()),
@@ -1928,6 +1968,7 @@ pub(crate) mod tests {
             initial_collateral: 0,
             sparse_windows: false,
             max_window_heights: 0,
+            engine_program_log_height: 0,
             markets: vec![MarketSpec {
                 id: 0,
                 symbol: "X-PERP".into(),
@@ -3582,6 +3623,54 @@ pub(crate) mod tests {
         assert!(o.remove("sparse_windows").is_some() && o.remove("max_window_heights").is_some());
         assert_eq!(serde_json::from_value::<PerpsConfig>(json).unwrap(), c, "absent means off");
         assert_eq!(serde_json::from_str::<PerpsConfig>(&serde_json::to_string(&on).unwrap()).unwrap(), on);
+    }
+
+    /// CON-60: under the genesis `engine_program_log_height` pin a state proof declaring another
+    /// program height, or a keccak or sha256 table, is refused from its header — the stub would
+    /// verify each of them, so the refusal is the ledger's, before the executor (and its key
+    /// build) is reached; a header that does not decode is refused too. Without the pin (chain
+    /// 21's rule) the same proofs are verified as before.
+    #[test]
+    fn under_the_engine_program_height_pin_another_shape_is_refused_from_its_header() {
+        use crate::confidential::STUB_PERP_PROGRAM_LOG_HEIGHT as PLH;
+        let (mut l, request) = withdrawn(5);
+        let payouts = vec![PerpPayout { request, amount: 5 }];
+        let seg = segment_on(&l, 0, 2, &[7; 8], &payouts, 0);
+        let shaped = |h: [u8; 4]| proof_tx(0, 2, [7; 8], payouts.clone(), 0, StubExecutor::make_perp_proof_shaped(&ENGINE, 16, outs(2), &seg, h));
+        let others = [[PLH + 1, 0, 0, 0], [PLH, 0, 5, 0], [PLH, 0, 0, 5]];
+        for h in others {
+            assert_eq!(l.validate(&shaped(h), &StubExecutor), Ok(()), "unpinned: {h:?} verifies");
+        }
+        assert_eq!(l.validate(&shaped([0; 4]), &StubExecutor), Ok(()));
+        l.perps_mut().unwrap().config.engine_program_log_height = PLH;
+        assert_eq!(l.validate(&shaped([0; 4]), &StubExecutor), Ok(()), "the engine's height passes");
+        assert_eq!(l.validate(&shaped([PLH, 9, 0, 0]), &StubExecutor), Ok(()), "the input height stays free");
+        for h in others {
+            match refusal(&l, &shaped(h)) {
+                TxError::Perps(PerpError::ProofRefused(why)) => assert!(why.starts_with("declared shape"), "{why}"),
+                e => panic!("{h:?}: {e:?}"),
+            }
+        }
+        assert_eq!(
+            refusal(&l, &proof_tx(0, 2, [7; 8], payouts.clone(), 0, b"junk".to_vec())),
+            pe(PerpError::ProofRefused("the proof's header does not decode".into()))
+        );
+        // And at apply: nothing is written.
+        l.set_height(3);
+        let before = l.clone();
+        assert!(apply(&mut l, &shaped(others[0])).is_err());
+        assert!(l == before);
+        // The genesis field: checked, and bound only when set.
+        let c = sample_config();
+        let mut pinned = c.clone();
+        pinned.engine_program_log_height = 14;
+        assert_eq!(pinned.check(), Ok(()));
+        assert_eq!(pinned.commit_bytes(), [c.commit_bytes(), b"engine_program_log_height".to_vec(), vec![14]].concat());
+        pinned.engine_program_log_height = MAX_ENGINE_PROGRAM_LOG_HEIGHT + 1;
+        assert!(pinned.check().unwrap_err().contains("engine_program_log_height"));
+        let mut json = serde_json::to_value(&c).unwrap();
+        assert!(json.as_object_mut().unwrap().remove("engine_program_log_height").is_some());
+        assert_eq!(serde_json::from_value::<PerpsConfig>(json).unwrap(), c, "absent means unpinned");
     }
 
     #[test]

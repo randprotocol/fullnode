@@ -62,6 +62,7 @@ proved root and height, the digests not yet proved, and the withdrawals waiting 
 | `bound_payouts` | optional, default `false` (audit v10, PERP-6): a state proof whose payouts total more than the collateral the chain has counted the exchange holding — `initial_collateral + collateral_in − collateral_out` — is refused `PayoutExceedsCollateral`, at validate and at apply. Permanent: an engine that pays what it was never given is an engine fault. Off (chain 21), a payout is bounded by its request alone, and a request only by the note bound 2^63 |
 | `initial_collateral` | optional, default 0: the collateral the genesis engine state already holds (accounts and insurance fund), in collateral units, below 2^63; what the count above starts from |
 | `sparse_windows` | optional, default `false` (PERP-101): blocks without perp inputs record no digest, and a state proof spans up to `max_window_heights` heights over at most `max_window_blocks` recorded blocks ("Sparse windows" below). Off (chain 21), every block records a digest and a window is at most `max_window_blocks` consecutive heights |
+| `engine_program_log_height` | optional, default 0 = unpinned (CON-60): the program-table height of the engine image (`rand perp image-hc` prints it on stderr as `engine_program_log_height N`). Set, a state proof declaring another program height, or any keccak or sha256 table (the engine calls neither), is refused `ProofRefused("declared shape: …")` from its header before any verifier key is built; a header that does not decode is refused the same way. Left free: the tier (at most `max_tier`) and the input height. 1 to 24 |
 | `max_window_heights` | optional, default 0; required with `sparse_windows`, from `max_window_blocks` to `MAX_WINDOW_HEIGHTS` = 4096, and 0 without it: the most heights one sparse window spans, and the heartbeat interval |
 
 The audit-v10 fields (and PERP-101's two) are bound into the genesis hash **only when set** (`PerpsConfig::commit_bytes`:
@@ -489,6 +490,15 @@ bridged one.
   evicted to make room, and offered to a block after governance and ahead of fee order, so a pool
   full of free orders cannot keep out the proof that settles them. A second proof while the slot
   is held is pooled like anything else.
+- **State-proof shapes (CON-60).** The executor builds the verifier key a proof's header
+  declares before it verifies anything, so junk state proofs of ever new shapes each cost a key
+  build (a tier-18 key is over a minute in a debug build). Node policy, on every chain: a proof of
+  a shape this node has verified (or seen in a committed block) is verified at once; of an
+  unverified shape, **one** may be queued or verifying at a time, and none for 60 s
+  (`STATE_PROOF_COLD_BACKOFF`) after one was refused by its STARK check. The others are refused
+  `state-proof verification of a new proof shape is backing off …` (`StateProofBackoff`,
+  retryable, never cached, no peer penalised). From the next cut the genesis
+  `engine_program_log_height` pin also narrows the shapes a proof may declare at all.
 - **Fee-less perp actions in the pool (audit v10, PERP-1).** An order, a cancel or a withdrawal
   request pays no fee, so the pool bounds them by count rather than by price — node policies,
   never validity rules, each a `mempool full`-class refusal (retryable, never cached, no peer

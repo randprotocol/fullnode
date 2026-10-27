@@ -2022,6 +2022,9 @@ async fn perp(
             let program = randprotocol_zkvm::codec::program_from_bytes(&bytes)
                 .map_err(|e| anyhow!("{} is not a program image: {e}", image.display()))?;
             println!("{}", word8_to_hex(&perps::image_hc(&program)));
+            // CON-60: the genesis `engine_program_log_height` for this image, on stderr so the
+            // hc stays the only stdout line.
+            eprintln!("engine_program_log_height {}", perps::engine_program_log_height(&program));
         }
         PerpCmd::State => println!("{}", pretty(&rpc.get_perps().await?)),
         PerpCmd::Account {

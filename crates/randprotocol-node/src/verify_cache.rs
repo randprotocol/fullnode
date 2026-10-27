@@ -336,6 +336,10 @@ impl ConfidentialExecutor for CachingExecutor {
         self.inner.decode_perp(engine_hc, max_tier, segment, proof)
     }
 
+    fn perp_proof_shape(&self, proof: &[u8]) -> Option<randprotocol_core::confidential::ProofShape> {
+        self.inner.perp_proof_shape(proof)
+    }
+
     fn warm(&self, program: &ProgramRecord) {
         self.inner.warm(program)
     }
