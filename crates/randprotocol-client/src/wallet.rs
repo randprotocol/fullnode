@@ -1305,7 +1305,19 @@ async fn leaf_page(rpc: &RpcClient, w: &Wallet, from: u64, rebuilt: &BTreeMap<Wo
     let Some(mut leaves) = rpc.scan_leaves(start, limit).await? else {
         return rpc.commitments(from, PAGE).await;
     };
+    let served = leaves.len();
     leaves.retain(|l| l.index >= from);
+    // N4: a non-empty page with nothing at or past the cursor may be the tip — or a node (or a
+    // relay with a smaller row cap) that stopped short of the cursor, which must not end the pass
+    // silently. Ask once more from the cursor itself: empty, it is the tip; otherwise those rows
+    // are the page (unaligned, against such a node only).
+    if served > 0 && leaves.is_empty() {
+        let Some(rest) = rpc.scan_leaves(from, limit - (from - start) as usize).await? else {
+            return rpc.commitments(from, PAGE).await;
+        };
+        leaves = rest;
+        leaves.retain(|l| l.index >= from);
+    }
     let wanted: Vec<u64> = leaves.iter().filter(|l| !rebuilt.contains_key(&l.cm) && may_be_ours(w, l)).map(|l| l.index).collect();
     let mut full: BTreeMap<u64, CommitmentRow> = BTreeMap::new();
     for (start, span) in fetch_chunks(&wanted, chunk) {
@@ -5507,6 +5519,25 @@ pub(crate) mod tests {
         }
     }
 
+    /// RPC-201 re-review, N4: a node (or relay) whose heads page is capped below the distance
+    /// from the chunk boundary to the cursor answers a page that lies wholly under the cursor.
+    /// That is not the tip: the scan must still reach the end, not stop there silently.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_heads_page_wholly_under_the_cursor_does_not_end_the_scan() {
+        let me = Wallet::from_spend_key(SpendKey([15; 8]));
+        let mut c = every_kind_of_leaf(&me);
+        c.headers_carry_public_notes = true;
+        c.scan_leaves = true;
+        c.scan_leaves_cap = Some(2);
+        let leaves = c.leaves.len() as u64;
+        assert!(leaves > 4, "the cursor passes a chunk boundary + 2");
+        let chain = Arc::new(Mutex::new(c));
+        let rpc = serve(&chain).await.with_scan_chunk(4);
+        let mut store = NoteStore::default();
+        scan(&rpc, &me, &mut store).await.unwrap();
+        assert_eq!(store.scanned_index, leaves, "every leaf, though two of the heads pages lay under the cursor");
+    }
+
     /// Against a node without `rand_getScanLeaves`, the scan falls back to full pages and asks
     /// for the method once per client, not once per page.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -5813,6 +5844,9 @@ pub(crate) mod tests {
         /// Whether this fake serves `rand_getScanLeaves`, as a node since the scan-head change
         /// does; off by default, an older node that answers `-32601`.
         scan_leaves: bool,
+        /// A row cap on `rand_getScanLeaves` smaller than the wallet asks for (a relay's), `None`
+        /// for the request's own limit.
+        scan_leaves_cap: Option<u64>,
         /// How many `rand_getScanLeaves` calls this node has answered, refused ones included.
         scan_leaf_asks: usize,
         /// How many rows (full envelopes) `rand_getCommitments` has served in all.
@@ -5906,6 +5940,7 @@ pub(crate) mod tests {
                 header_pages: Vec::new(),
                 envelope_bytes: None,
                 scan_leaves: false,
+                scan_leaves_cap: None,
                 scan_leaf_asks: 0,
                 full_rows_served: 0,
                 commitment_reads: Vec::new(),
@@ -6046,7 +6081,7 @@ pub(crate) mod tests {
                     .iter()
                     .enumerate()
                     .skip(n(0) as usize)
-                    .take(n(1) as usize)
+                    .take(self.scan_leaves_cap.map_or(n(1), |c| c.min(n(1))) as usize)
                     .map(|(i, (cm, e, h))| {
                         use base64::Engine as _;
                         let head = [&e.kem_ct[..], &e.to_receiver, &e.to_sender].concat();
