@@ -173,12 +173,12 @@ pub struct PerpsConfig {
     /// apply. The engine pays only what it holds, so an honest proof never trips it; a proof that
     /// does is an engine fault, and the chain refuses to mint collateral the exchange was never
     /// given. Off, the payout is bounded by its request alone (the v0 rule; documented as a hole).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub bound_payouts: bool,
     /// PERP-6: the collateral the engine's genesis state already holds (its accounts and
     /// insurance fund), in collateral units — what [`Perps::collateral_held`] starts from. 0 for a
     /// fresh engine.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
     pub initial_collateral: u64,
     /// PERP-101 (genesis-gated, default off): sparse windows. A block that records no perp input
     /// records no digest either — the engine is not run over it — unless `max_window_heights`
@@ -188,12 +188,12 @@ pub struct PerpsConfig {
     /// `max_window_heights` heights, ends at a recorded height and runs the engine over every
     /// digest recorded inside its span — at most `max_window_blocks` of them. Off (chain 21),
     /// every block records a digest and a window is `max_window_blocks` consecutive heights.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub sparse_windows: bool,
     /// PERP-101: the most heights one state proof may span under `sparse_windows`, and the
     /// heartbeat interval above; `max_window_blocks..=MAX_WINDOW_HEIGHTS`. 0 (and only 0)
     /// without `sparse_windows`.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
     pub max_window_heights: u64,
     /// CON-60 (genesis-gated, default 0 = unpinned): the program-table height of the engine
     /// image `engine_hc` names (`program::program_log_height` of its word count; `rand perp
@@ -202,8 +202,19 @@ pub struct PerpsConfig {
     /// header, before any verifier key is built; what is left free is the tier (at most
     /// `max_tier`) and the input height, a handful of keys. Unset (chain 21), the header is
     /// only ranged, as for any call.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_zero_u8")]
     pub engine_program_log_height: u8,
+}
+
+// Audit v10's fields are left out of a written genesis file while at their defaults, so a file this
+// build writes for a chain that sets none of them is the file v0.8.0 wrote and still reads
+// (`PerpsConfig` is `deny_unknown_fields`). JSON only: the section is never bincode-encoded whole
+// (the hash takes `commit_bytes`, the store `Perps::encode_persisted`).
+fn is_zero_u64(v: &u64) -> bool {
+    *v == 0
+}
+fn is_zero_u8(v: &u8) -> bool {
+    *v == 0
 }
 
 /// [`PerpsConfig`] as it was bound into the genesis hash before audit v10 (chains up to 21): the
@@ -3587,10 +3598,25 @@ pub(crate) mod tests {
         seeded.initial_collateral = 7;
         assert_eq!(seeded.commit_bytes(), [legacy.clone(), b"initial_collateral".to_vec(), 7u64.to_be_bytes().to_vec()].concat());
         // JSON: absent means default, round-trips, and the bound is checked.
-        let mut json = serde_json::to_value(&c).unwrap();
-        let o = json.as_object_mut().unwrap();
-        assert!(o.remove("bound_payouts").is_some() && o.remove("initial_collateral").is_some());
+        // A file written for a section at its defaults names none of audit v10's fields, so
+        // v0.8.0 (`deny_unknown_fields`) still reads it; each one set is written.
+        let json = serde_json::to_value(&c).unwrap();
+        let text = serde_json::to_string(&c).unwrap();
+        for f in ["bound_payouts", "initial_collateral", "sparse_windows", "max_window_heights", "engine_program_log_height"] {
+            assert!(!text.contains(f), "{f} is written only when set");
+        }
         assert_eq!(serde_json::from_value::<PerpsConfig>(json).unwrap(), c, "a file without the fields reads as the defaults");
+        let mut all = c.clone();
+        all.bound_payouts = true;
+        all.initial_collateral = 1;
+        all.sparse_windows = true;
+        all.max_window_heights = 2;
+        all.engine_program_log_height = 3;
+        let all_text = serde_json::to_string(&all).unwrap();
+        for f in ["bound_payouts", "initial_collateral", "sparse_windows", "max_window_heights", "engine_program_log_height"] {
+            assert!(all_text.contains(f), "{f} is written when set");
+        }
+        assert_eq!(serde_json::from_str::<PerpsConfig>(&all_text).unwrap(), all);
         assert_eq!(serde_json::from_str::<PerpsConfig>(&serde_json::to_string(&seeded).unwrap()).unwrap(), seeded);
         let mut big = c.clone();
         big.initial_collateral = MAX_NOTE_VALUE;
@@ -3805,9 +3831,9 @@ pub(crate) mod tests {
         assert!(refused(&|b| b.max_window_heights = b.max_window_blocks - 1).contains("max_window_heights"), "below one dense window");
         assert!(refused(&|b| b.max_window_heights = 0).contains("max_window_heights"));
         assert!(refused(&|b| b.sparse_windows = false).contains("without sparse_windows"));
-        let mut json = serde_json::to_value(&c).unwrap();
-        let o = json.as_object_mut().unwrap();
-        assert!(o.remove("sparse_windows").is_some() && o.remove("max_window_heights").is_some());
+        let json = serde_json::to_value(&c).unwrap();
+        let o = json.as_object().unwrap();
+        assert!(!o.contains_key("sparse_windows") && !o.contains_key("max_window_heights"), "written only when set");
         assert_eq!(serde_json::from_value::<PerpsConfig>(json).unwrap(), c, "absent means off");
         assert_eq!(serde_json::from_str::<PerpsConfig>(&serde_json::to_string(&on).unwrap()).unwrap(), on);
     }
@@ -3855,9 +3881,11 @@ pub(crate) mod tests {
         assert_eq!(pinned.commit_bytes(), [c.commit_bytes(), b"engine_program_log_height".to_vec(), vec![14]].concat());
         pinned.engine_program_log_height = MAX_ENGINE_PROGRAM_LOG_HEIGHT + 1;
         assert!(pinned.check().unwrap_err().contains("engine_program_log_height"));
-        let mut json = serde_json::to_value(&c).unwrap();
-        assert!(json.as_object_mut().unwrap().remove("engine_program_log_height").is_some());
+        let json = serde_json::to_value(&c).unwrap();
+        assert!(!json.as_object().unwrap().contains_key("engine_program_log_height"), "written only when set");
         assert_eq!(serde_json::from_value::<PerpsConfig>(json).unwrap(), c, "absent means unpinned");
+        pinned.engine_program_log_height = 14;
+        assert!(serde_json::to_string(&pinned).unwrap().contains("\"engine_program_log_height\":14"));
     }
 
     /// CON-60: the canonical shape's formula, and its four public heights over 1..=64 blocks.

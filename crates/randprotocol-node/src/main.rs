@@ -5017,6 +5017,22 @@ mod tests {
         let state = gen.build(executor.as_ref()).unwrap();
         assert_eq!(state.hash().to_hex(), chain_21_hash, "chain 21's live genesis");
         assert!(node::refuse_chains_this_build_cannot_run(&state).is_ok(), "this build runs chain 21");
+        // Rewriting the file adds none of the audit-v10 fields (v0.8.0 reads its sections with
+        // `deny_unknown_fields`), and the rewrite hashes as cut.
+        let rewrite = gen.to_json();
+        for f in [
+            "bound_payouts",
+            "initial_collateral",
+            "sparse_windows",
+            "max_window_heights",
+            "engine_program_log_height",
+            "refuse_panics",
+            "max_accounts",
+        ] {
+            assert!(!rewrite.contains(f), "a rewrite of chain 21's file adds `{f}`");
+        }
+        let again = Genesis::from_json(&rewrite).unwrap();
+        assert_eq!(again.build(executor.as_ref()).unwrap().hash().to_hex(), chain_21_hash, "the rewrite hashes as cut");
     }
 
     /// This build is constraint set 9 (the MODQ chip; set 8, the gas meter, ran chains 18-20): every verifier key moved again, so
