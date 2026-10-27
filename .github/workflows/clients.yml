@@ -1,0 +1,102 @@
+# The wallet against THIS node: the clients repository's real-node suites, run against the
+# `rand-node` and `rand-prover` this commit builds. Until this job existed, the clients tested only
+# against a published release (their own CI downloads v0.8.0), so a change here that broke the
+# wallet — a renamed field, a new refusal, a shape the wallet's validators do not accept — was found
+# at the next release, by users. Now it fails the fullnode pull request that makes it.
+#
+# What runs (randprotocol/clients, scripts/e2e-node.sh): web/wallet/test/node.e2e.test.mjs — chain
+# identity, every method in the wallet's RPC table against a fresh chain (empty and populated), the
+# faucet → scan → balance → activity → rescan flow, failover and submit rules, a node restart and,
+# with the prover, one real send through a bundle proof — and web/wallet/test/node.sections.e2e.test.mjs,
+# the same contract on a chain with every genesis section the wallet reads (tokens, program state,
+# perps, multisig, vesting, staking, fees). The wallet side is the clients' released code: its own
+# wasm core, built from ITS vendored fullnode, not from this tree.
+#
+# Which clients commit: the branch of the same name as this pull request's, when the clients
+# repository has one, so a deliberate RPC change lands as a pair of branches that go green
+# together; otherwise clients main. `workflow_dispatch` takes any ref.
+#
+# Every `uses:` is a full commit sha with its tag in the trailing comment (ci.yml's rule).
+name: clients
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      clients_ref:
+        description: "randprotocol/clients ref to test (default: the same-named branch, else main)"
+        required: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: clients-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  wallet-e2e:
+    name: wallet-e2e
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          path: fullnode
+      - name: Which clients ref
+        id: ref
+        env:
+          WANT: ${{ inputs.clients_ref || github.head_ref || github.ref_name }}
+        run: |
+          set -euo pipefail
+          ref=main
+          if [ -n "$WANT" ] && git ls-remote --exit-code --heads https://github.com/randprotocol/clients.git "$WANT" >/dev/null; then
+            ref="$WANT"
+          fi
+          echo "clients ref: $ref"
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: randprotocol/clients
+          ref: ${{ steps.ref.outputs.ref }}
+          path: clients
+          submodules: recursive
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable (branch head, 2026-09-30)
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: |
+            fullnode
+            clients/core
+      - name: System dependencies
+        run: sudo apt-get update && sudo apt-get install -y clang libclang-dev
+      # The release build of the two binaries, as release.yml builds them.
+      - name: rand-node and rand-prover from this commit
+        working-directory: fullnode
+        env:
+          RAND_BUILD_SHA: ${{ github.sha }}
+        run: |
+          cargo build --release --locked -p randprotocol-node -p randprotocol-prover
+          target/release/rand-node --version
+          {
+            echo "RAND_NODE_BIN=$PWD/target/release/rand-node"
+            echo "RAND_PROVER_BIN=$PWD/target/release/rand-prover"
+          } >> "$GITHUB_ENV"
+      # The clients' CI builds the core on 1.98.1 (their node-integration.yml); so does this.
+      - name: The wallet's wasm core (from the clients' vendored fullnode)
+        working-directory: clients
+        env:
+          RUSTUP_TOOLCHAIN: 1.98.1
+        run: |
+          rustup toolchain install 1.98.1 --profile minimal --target wasm32-unknown-unknown
+          core/scripts/build-wasm.sh
+      - name: The wallet against this node
+        working-directory: clients
+        run: scripts/e2e-node.sh
