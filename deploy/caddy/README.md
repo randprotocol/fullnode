@@ -78,7 +78,9 @@ so the method gate and the meter are the node's, not only the sale proxy's `RPC_
 another repository. **To do on the roll, by the operator** (not yet done; this file records the
 target, not the state):
 
-1. obs1's unit: add `--public-rpc 127.0.0.1:8546` to `ExecStart`.
+1. obs1's unit: add `--public-rpc 127.0.0.1:8546` to `ExecStart` — `deploy/enable-public-rpc.sh root@<host>`
+   (edits the unit, idempotent; `RESTART=1` restarts it and checks the listener refuses
+   `rand_getPeers`; a new host gets it from `PUBLIC_RPC=1 deploy/vps-setup.sh …`). Roll one host at a time.
 2. obs1's `rpctunnel` key: `permitopen="127.0.0.1:8546"` in place of `:8545`.
 3. The web droplet's `rpc-tunnel-obs1.service`: `-L 127.0.0.1:18545:127.0.0.1:8546`.
 4. Check from the web droplet: `rand_chainId` answers through `127.0.0.1:18545`;
