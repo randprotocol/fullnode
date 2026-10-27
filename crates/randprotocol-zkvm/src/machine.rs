@@ -1910,6 +1910,21 @@ impl Machine {
         }
     }
 
+    /// [`Self::export_verifier_key_with_modq`] for a key that is built and cached now, and
+    /// `None` otherwise: never a build (fullnode CON-60's keep, which runs on the node loop).
+    #[allow(clippy::too_many_arguments)]
+    pub fn export_cached_verifier_key_with_modq(&self, tier: Tier, program_log_height: u8, input_log_height: u8, keccak_log_height: u8, sha256_log_height: u8, modq_log_height: u8, public_log_height: u8) -> Option<VerifierKeyBlob> {
+        let key = (tier.0, program_log_height, input_log_height, keccak_log_height, sha256_log_height, modq_log_height, public_log_height);
+        let common = self.keys.lock().unwrap().map.get(&key).and_then(|(slot, _, _)| slot.get().cloned())?;
+        Some(VerifierKeyBlob {
+            format_version: VERIFIER_KEY_BLOB_FORMAT,
+            profile: self.profile,
+            shape: VerifierKeyShape { tier, program_log_height, input_log_height, keccak_log_height, sha256_log_height, modq_log_height, public_log_height },
+            constraint_set: CONSTRAINT_SET,
+            common: common_to_bytes(&common),
+        })
+    }
+
     /// Installs `blob`'s key into the cache slot for `blob.shape` without building it, so
     /// `verify`/`verify_public` of a proof of that shape use it (and `key_builds` does not move).
     /// Refuses a blob of another format, profile or constraint set, a shape `verify` would refuse,

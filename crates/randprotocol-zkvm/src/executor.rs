@@ -2439,19 +2439,20 @@ impl ConfidentialExecutor for ZkExecutor {
                 None => return,
             }
         }
-        // Still built (never evicted meanwhile), so the export below reads it rather than builds.
-        let installed = Self::perp_cached_in(m, shape) && {
-            let blob = m.export_verifier_key_with_modq(
-            Tier(shape.tier as usize),
-            shape.program_log_height,
-            shape.input_log_height,
-            shape.keccak_log_height,
-            shape.sha256_log_height,
-            0,
-            shape.public_log_height,
-            );
-            m.install_verifier_key(&blob).is_ok()
-        };
+        // The export reads the key only if it is still cached: evicted meanwhile, nothing is
+        // built here (this runs on the node loop) and the shape is kept by a later verify or
+        // commit that finds its key built again.
+        let installed = m
+            .export_cached_verifier_key_with_modq(
+                Tier(shape.tier as usize),
+                shape.program_log_height,
+                shape.input_log_height,
+                shape.keccak_log_height,
+                shape.sha256_log_height,
+                0,
+                shape.public_log_height,
+            )
+            .is_some_and(|blob| m.install_verifier_key(&blob).is_ok());
         let mut pins = self.perp_pinned.lock().unwrap();
         pins.reserved.remove(shape);
         if installed {
@@ -4097,6 +4098,41 @@ mod tests {
         assert_eq!(b.perp_key_builds(), n);
         assert!(b.perp_pinned.lock().unwrap().reserved.is_empty());
         assert!(b.perp_machine.cached_keys() <= PERP_GENERAL_KEYS);
+    }
+
+    /// CON-60 (review): `keep_perp_key` exports only a key that is cached now. The cached export
+    /// is the full export's blob, `None` once the key is evicted — and neither it nor a keep of
+    /// the evicted shape builds anything (the keep runs on the node loop).
+    #[test]
+    fn keeping_a_state_proof_key_never_builds_one() {
+        use super::*;
+        use crate::machine::FriProfile;
+        let program = crate::guests::fib(10);
+        let binding = [9u32; TX_BINDING_WORDS];
+        let (bytes, _, _) = prove_call_hardened(FriProfile::Test, &program, &[], &[], &binding, [0; 4], None, None).unwrap();
+        let base = proof_shape(&bytes).unwrap();
+        let zk = ZkExecutor::new(FriProfile::Test);
+        let m = &zk.perp_machine;
+        let t = Tier(base.tier as usize);
+        let export = |h: u8| m.export_cached_verifier_key_with_modq(t, base.program_log_height, h, 0, 0, 0, base.public_log_height);
+        assert!(export(7).is_none(), "not built: nothing to export");
+        assert_eq!(zk.perp_key_builds(), 0, "and nothing built by asking");
+        m.verifier_key(t, base.program_log_height, 7, 0, 0, base.public_log_height);
+        let cached = export(7).expect("built: exported from the cache");
+        let full = m.export_verifier_key_with_modq(t, base.program_log_height, 7, 0, 0, 0, base.public_log_height);
+        assert_eq!(cached.to_bytes(), full.to_bytes(), "the same blob the full export gives");
+        assert_eq!(zk.perp_key_builds(), 1);
+        // Fill the general cache past its size: the first key is evicted.
+        for h in 8..8 + PERP_GENERAL_KEYS as u8 {
+            m.verifier_key(t, base.program_log_height, h, 0, 0, base.public_log_height);
+        }
+        let builds = zk.perp_key_builds();
+        assert!(export(7).is_none(), "evicted: nothing to export");
+        let evicted = randprotocol_core::confidential::ProofShape { input_log_height: 7, ..base };
+        zk.keep_perp_key(&evicted);
+        assert_eq!(zk.perp_key_builds(), builds, "a keep of an evicted shape builds nothing");
+        assert!(!zk.perp_key_ready(&evicted));
+        assert!(zk.perp_pinned.lock().unwrap().reserved.is_empty());
     }
 
     /// CON-60 (review): the pool's side of the gate. `try_hold` takes the gate or answers `None`

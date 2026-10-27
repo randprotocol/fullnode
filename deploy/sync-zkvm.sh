@@ -503,6 +503,39 @@ PY
 grep -q 'pub fn set_key_build_gate' "$DST/src/machine.rs" && grep -q 'match self.build_gate.get()' "$DST/src/machine.rs" \
   && echo "anchors: key-build gate ok" \
   || { echo "sync-zkvm.sh: Machine or its key build moved; update the key-build gate patch" >&2; exit 1; }
+# CON-60 (fullnode review): `Machine::export_cached_verifier_key_with_modq`, the export of a key
+# that is cached now and `None` otherwise — never a build — so the chain executor's
+# `keep_perp_key`, which runs on the node loop, cannot rebuild a key evicted between its check
+# and its export. Placed in front of `install_verifier_key`'s doc comment; aborts the sync when
+# that anchor moved.
+python3 - "$DST/src/machine.rs" <<'PY'
+import sys; p=sys.argv[1]; s=open(p).read()
+if "pub fn export_cached_verifier_key_with_modq" in s:
+    sys.exit(0)
+anchor = "    /// Installs `blob`'s key into the cache slot for `blob.shape` without building it, so\n"
+assert s.count(anchor) == 1, "machine.rs: install_verifier_key's doc comment moved (export_cached anchor)"
+fn = (
+    "    /// [`Self::export_verifier_key_with_modq`] for a key that is built and cached now, and\n"
+    "    /// `None` otherwise: never a build (fullnode CON-60's keep, which runs on the node loop).\n"
+    "    #[allow(clippy::too_many_arguments)]\n"
+    "    pub fn export_cached_verifier_key_with_modq(&self, tier: Tier, program_log_height: u8, input_log_height: u8, keccak_log_height: u8, sha256_log_height: u8, modq_log_height: u8, public_log_height: u8) -> Option<VerifierKeyBlob> {\n"
+    "        let key = (tier.0, program_log_height, input_log_height, keccak_log_height, sha256_log_height, modq_log_height, public_log_height);\n"
+    "        let common = self.keys.lock().unwrap().map.get(&key).and_then(|(slot, _, _)| slot.get().cloned())?;\n"
+    "        Some(VerifierKeyBlob {\n"
+    "            format_version: VERIFIER_KEY_BLOB_FORMAT,\n"
+    "            profile: self.profile,\n"
+    "            shape: VerifierKeyShape { tier, program_log_height, input_log_height, keccak_log_height, sha256_log_height, modq_log_height, public_log_height },\n"
+    "            constraint_set: CONSTRAINT_SET,\n"
+    "            common: common_to_bytes(&common),\n"
+    "        })\n"
+    "    }\n\n"
+)
+s = s.replace(anchor, fn + anchor)
+open(p, "w").write(s)
+PY
+grep -q 'pub fn export_cached_verifier_key_with_modq' "$DST/src/machine.rs" \
+  && echo "anchors: export_cached ok" \
+  || { echo "sync-zkvm.sh: install_verifier_key moved; update the export_cached patch" >&2; exit 1; }
 # M3.4/M4.1: `hash.rs`'s program-digest header and `tables/cpu.rs`'s in-circuit copy of the same
 # constant both read `crate::notes::domain::HC` upstream; M4.1 added a second such pair for the
 # input digest, `crate::notes::domain::IN`. Constraint set 6 added a third: `crate::notes::
