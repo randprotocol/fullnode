@@ -309,17 +309,23 @@ pub enum MemberOutcome {
 /// The first release whose pinned pool matches the live one (members `a` and `b`).
 pub const POOL_RELEASE: &str = "0.8.2";
 
-/// What `pair --trusted` says when no member could be paired (CLI-301). If any member was merely
-/// busy, trying again is right. Otherwise nothing pinned in this build answers as pinned, which a
-/// build older than the pool's last re-keying (every member unreachable or on another key) cannot
-/// fix by waiting: it must be updated.
+/// What `pair --trusted` says when no member could be paired (CLI-301). A busy member answered
+/// with its pinned key, so the pool is fine: try again. A member answering with another key is
+/// proof this build's pins are stale: update. Only unreachable members prove nothing about the
+/// build, so that is "try later", with a pointer to a newer rand if it persists.
 pub fn trusted_pool_failure(outcomes: &[MemberOutcome]) -> String {
     if outcomes.contains(&MemberOutcome::Busy) {
         return "every RandProtocol prover that answered is busy; try again in a minute, or pair your own".into();
     }
+    if outcomes.contains(&MemberOutcome::WrongKey) {
+        return format!(
+            "a RandProtocol prover answers with a key other than the one this rand build pins — this build is out of date, not the provers down. \
+             Update rand to version {POOL_RELEASE} or later and run `rand prover pair --trusted` again, or pair your own prover"
+        );
+    }
     format!(
-        "none of the RandProtocol provers this rand build pins answers with its pinned key — this build is out of date, not the provers down. \
-         Update rand to version {POOL_RELEASE} or later and run `rand prover pair --trusted` again, or pair your own prover"
+        "the RandProtocol provers cannot be reached right now; try again later, or pair your own prover. \
+         If this keeps happening, check for a newer rand (version {POOL_RELEASE} or later pins the current provers)"
     )
 }
 
@@ -1230,12 +1236,19 @@ mod pool_failure_tests {
     use super::*;
 
     #[test]
-    fn all_unreachable_or_wrong_key_says_update_and_names_the_version() {
-        for o in [vec![MemberOutcome::Unreachable; 2], vec![MemberOutcome::WrongKey; 2], vec![MemberOutcome::Unreachable, MemberOutcome::WrongKey]] {
+    fn a_key_mismatch_says_update_and_names_the_version() {
+        for o in [vec![MemberOutcome::WrongKey; 2], vec![MemberOutcome::Unreachable, MemberOutcome::WrongKey]] {
             let m = trusted_pool_failure(&o);
             assert!(m.contains("Update rand to version 0.8.2 or later"), "{m}");
-            assert!(!m.contains("try again"), "{m}");
+            assert!(!m.contains("try again later"), "{m}");
         }
+    }
+
+    #[test]
+    fn all_unreachable_says_try_later_not_update() {
+        let m = trusted_pool_failure(&[MemberOutcome::Unreachable; 2]);
+        assert!(m.contains("cannot be reached right now") && m.contains("try again later"), "{m}");
+        assert!(!m.contains("Update rand") && !m.contains("out of date"), "{m}");
     }
 
     #[test]
