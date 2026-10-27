@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # shellcheck disable=SC2016  # single-quoted remote / bash -c scripts expand on the far side, on purpose
 # Cut the fleet over from chain 20 to chain 21 — all-stop, all-start, in phases, over all 26 hosts
-# of the CURRENT droplets (the DigitalOcean account is locked: nothing here creates a host): the 20
+# of the CURRENT droplets (nothing here creates a host): the 20
 # hosts of deploy/nodes.env (A–F, the twelve regional validators, obs1, rand-archive-2) and the six
 # guardian hosts (their own ssh key; their unit takes its ExecStart from a drop-in).
 #

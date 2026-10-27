@@ -501,10 +501,10 @@ push to origin/main often"): five current validators become delegated provers be
   (laptop copy `~/rand-prover-trusted/`, mode 0700 — losing it means a new fingerprint in every
   client), so the pool has one link, served too at `/.well-known/rand-prover.json`. Viewing-key jobs
   only, no `own=1`, no fee. Members (since 2026-10-01 06:00 UTC): **rand-node-a, rand-archive-2 and two dedicated c-8 droplets, rand-prover-nyc3 / rand-prover-sfo3** — the three guardian hosts were members for one night and were removed on the user's decision (bridge keys and prover work never on one host; add capacity elsewhere). Originally five, each
-  resized CPU/RAM-only to `c-8` (8 vCPU / 16 GB, disk untouched, ~$168/mo) with
-  `deploy/prover/resize-host.sh` — the hosts this laptop's DigitalOcean token can resize; **the
-  three guardian hosts are a stopgap** (audit-v6 #112 key separation) until three of the original
-  validators, in the other DO team, can be resized instead.
+  resized CPU/RAM-only (disk untouched) with `deploy/prover/resize-host.sh`; **the three guardian
+  hosts are a stopgap** (audit-v6 #112 key separation) until three of the original validators can
+  be resized instead. The fleet layout (which host is where) lives in the operator's private
+  configuration, not here.
 - **Trap — the prover was single-threaded by build, not by nature.** `p3-maybe-rayon` was built
   without its `parallel` feature. Measured on chain 18 with real transfers: v0.6.7's `rand-prover`
   took 236.8 s (c-8, Xeon 8168), 234.4 s (c2-8vcpu), 217.0 s (premium-Intel c-8, Xeon 8358) and
@@ -1525,10 +1525,8 @@ for rollback — retire them with `deploy/retire-chain-dirs.sh` once chain 15 ha
   (203.0.113.15, sgp1; same key, `--prune-history 24h`); the laptop's launchd job is retired and
   `deploy/run-a.sh` refuses to start (two signers on one key = equivocation); the laptop keeps
   only an SSH tunnel on 127.0.0.1:8545 → A's RPC for the bridge daemons still there. New second
-  archive `rand-archive-2` (203.0.113.38, fra1, 250 GiB volume `/mnt/rand_archive_2`, full
-  history). Both droplets and the six guardian hosts live in DigitalOcean team "My Team"
-  (dendi@systematictrading.group); the 17 original validator droplets are in another team whose
-  token is not on this machine. Eight nodes were bonded as new validators (1 000 RAND each,
+  archive `rand-archive-2` (203.0.113.38, full history). Where each host runs is kept in the
+  operator's private configuration. Eight nodes were bonded as new validators (1 000 RAND each,
   registration v2, payout wallets `~/.rand-chain15/payout/`, registrations
   `~/.rand-chain15/registrations/`): obs1, rand-archive-2, and guardian hosts 1–6 (their node key
   `/var/lib/randnode/node.key.json`; `--validator --prune-history 24h` in the `chain15.conf`
@@ -1616,7 +1614,7 @@ batch-syncs (it would sit ~700 blocks behind fetching parents one by one). Stage
 binaries as `/root/rand-node.new` on 17 droplets + obs1; stop all 04:23:27, install, start all
 04:23:40 UTC; node A on `bin-089bdd6` (run-a.sh default). The chain paused at 287 354 and committed
 again ~04:55 (13 back); all 17 at head by 04:58. obs1's data moved during the stop onto the
-DigitalOcean volume `randbridge-archive` (250 GiB, sgp1, mounted `/mnt/archive`, the datadir is a
+an attached archive volume (mounted `/mnt/archive`, the datadir is a
 symlink to it); obs1 went v0.5.1 → v0.5.7 (the at-open QC prune dropped 287 354 certificates in
 6 min, then a full verify of 287 356 blocks, done 05:03). obs1 = the archive, no flag.
 **Pruning switched on after the roll, per node:** `--prune-history 24h` appended to each unit's

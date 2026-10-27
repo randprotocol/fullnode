@@ -22,7 +22,7 @@ client → Cloudflare (proxied DNS) → web droplet 203.0.113.20, nginx vhost rp
          rpctunnel@203.0.113.29 (key /root/.ssh/obs1_rpc_tunnel, host key pinned in
          /root/.ssh/obs1_rpc_known_hosts)
        → obs1's node on 127.0.0.1:8545 — the archive, no --prune-history, datadir on the
-         250 GiB volume
+         archive volume
 ```
 
 **Why obs1, not E.** Until 2026-09-27 the upstream was randscan's Caddy route on E

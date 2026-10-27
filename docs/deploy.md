@@ -68,8 +68,7 @@ the genesis hash from the node or take `--genesis-hash`, so they need it only to
   keeps the ledger and one day of blocks); the rest is deleted every 16 blocks
   (`docs/superpowers/specs/2026-09-24-history-pruning-design.md`).
   Two nodes keep everything — the archives, `ARCHIVE` in `deploy/nodes.env` (obs1 on
-  randbridge-web, data dir on a volume) and, since 2026-09-27, `ARCHIVE2` (rand-archive-2, fra1,
-  a 250 GiB volume) — and a node that falls more than a day behind must sync from one of them. **Mainnet units never pass the flag.** A pruned node that fails its startup check does
+  randbridge-web, data dir on a volume) and, since 2026-09-27, `ARCHIVE2` (rand-archive-2) — and a node that falls more than a day behind must sync from one of them. **Mainnet units never pass the flag.** A pruned node that fails its startup check does
   not repair itself: re-sync it from the archive. **Rollback:** a pruned data directory opened by
   a build ≤ v0.5.6 with the default `--verify-chain quick` replays from genesis, finds block 1
   missing and truncates the whole ledger to genesis; run an older build on a pruned data

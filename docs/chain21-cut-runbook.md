@@ -10,8 +10,7 @@ What is being cut (the user's decisions, 2026-10-08 to 2026-10-12): chain 21 fro
 chain 20, on fullnode **v0.8.0**, with the `fees` section (burn_base + burn_floor), the `perps`
 section (BTC-PERP on zUSD), the `multisig` section (the treasury, 2 of 3, 100 000 RAND new
 issuance), and **`hc_auth_multisig`** (private multisig, guest `9705f8e2…8247`) at **6 MiB proofs
-/ 19 MiB blocks**. The fleet is the **current 26 droplets** (the DigitalOcean account is locked: no
-host can be created, so there is no spare, no fresh archive and no big prover host to add).
+/ 19 MiB blocks**. The fleet is the **current 26 droplets** (no new host can be created, so there is no spare, no fresh archive and no big prover host to add).
 
 The tools: `deploy/cut-chain21-genesis.sh` (snapshot, balances, the cut, check-limits),
 `deploy/cutover-fleet-chain21.sh` (preflight, stage, push, stop, switch, start, wait, status; for
@@ -31,7 +30,7 @@ follows `push` within minutes.
 
 **The msauth prove has never completed.** A Test-FRI prove of the multisig auth guest peaked at a
 **76.4 GB** footprint and was killed on a 48 GB Mac. No multisig-private spend can be proven on any
-hardware the operator has, and none can be bought while the DigitalOcean account is locked. So:
+hardware the operator has, and none can be added. So:
 
 - `hc_auth_multisig` ships **untested end to end**, by the user's decision. The verifier side is in
   place (the pinned 23 754-byte key on every node, admission tells the two auth guests apart), but
