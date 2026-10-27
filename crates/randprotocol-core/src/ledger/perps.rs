@@ -1522,7 +1522,13 @@ pub(super) fn apply(
                 _ => p.rand_in,
             };
             // PERP-6: whatever the asset, the exchange took `amount` of its collateral in.
-            let collateral_in = p.collateral_in.checked_add(amount).ok_or(PerpError::Overflow)?;
+            // I-1: checked only where the counters bind (`bound_payouts`); elsewhere (chain 21)
+            // they are reporting only and saturate, so they add no failure path.
+            let collateral_in = if p.config.bound_payouts {
+                p.collateral_in.checked_add(amount).ok_or(PerpError::Overflow)?
+            } else {
+                p.collateral_in.saturating_add(amount)
+            };
             let p = ledger.perps_mut().ok_or(PerpError::Disabled)?;
             p.rand_in = rand_in;
             p.collateral_in = collateral_in;
@@ -1595,8 +1601,14 @@ pub(super) fn apply(
             // engine deducted it from the account either way — so the collateral count (what
             // `bound_payouts` holds the next proof to) is over the listed amounts, where the
             // RAND audit counter above is over what re-entered the pool.
-            let listed = payouts.iter().try_fold(0u64, |acc, po| acc.checked_add(po.amount)).ok_or(PerpError::Overflow)?;
-            let collateral_out = p.collateral_out.checked_add(listed).ok_or(PerpError::Overflow)?;
+            // I-1: checked under `bound_payouts` (where `check_state_proof` has already held the
+            // sum to what was counted in, so it cannot overflow), saturating otherwise.
+            let collateral_out = if p.config.bound_payouts {
+                let listed = payouts.iter().try_fold(0u64, |acc, po| acc.checked_add(po.amount)).ok_or(PerpError::Overflow)?;
+                p.collateral_out.checked_add(listed).ok_or(PerpError::Overflow)?
+            } else {
+                payouts.iter().fold(p.collateral_out, |acc, po| acc.saturating_add(po.amount))
+            };
             let p = ledger.perps_mut().ok_or(PerpError::Disabled)?;
             p.collateral_out = collateral_out;
             p.proved_root = *new_root;
@@ -3415,6 +3427,29 @@ pub(crate) mod tests {
         assert_eq!(l3.perps().unwrap().collateral_held(), RAND as u128 + 5);
         let over = state_proof(&l3, 0, 2, [7; 8], vec![PerpPayout { request: request3, amount: RAND }], 0);
         assert_eq!(l3.validate(&over, &StubExecutor), Ok(()));
+    }
+
+    /// I-1: without `bound_payouts` (chain 21) the collateral counters saturate — a deposit or a
+    /// payout that would carry one past `u64::MAX` applies as it did before the counters existed —
+    /// while under the flag the same overflow is refused.
+    #[test]
+    fn the_collateral_counters_saturate_unless_bound_payouts_is_set() {
+        let (l, request) = withdrawn(5);
+        let payouts = vec![PerpPayout { request, amount: 5 }];
+        let tx = state_proof(&l, 0, 2, [7; 8], payouts, 0);
+        let mut off = l.clone();
+        off.perps_mut().unwrap().collateral_out = u64::MAX - 1;
+        off.set_height(3);
+        apply(&mut off, &tx).expect("chain 21: applies, the counter saturates");
+        assert_eq!(off.perps().unwrap().collateral_out, u64::MAX);
+        let mut dep_off = ledger_with(true);
+        dep_off.perps_mut().unwrap().collateral_in = u64::MAX;
+        dep(&mut dep_off, &kp(50), 10, RAND).expect("chain 21: a deposit past the counter applies");
+        assert_eq!(dep_off.perps().unwrap().collateral_in, u64::MAX);
+        let mut dep_on = ledger_with(true);
+        dep_on.perps_mut().unwrap().config.bound_payouts = true;
+        dep_on.perps_mut().unwrap().collateral_in = u64::MAX;
+        assert_eq!(dep(&mut dep_on, &kp(50), 10, RAND), Err(pe(PerpError::Overflow)), "under the flag: refused");
     }
 
     /// PERP-6: the genesis commitment of a section that sets none of the audit-v10 fields is the
