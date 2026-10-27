@@ -43,6 +43,10 @@ Audit v10 fixes (node and client policies, no chain change unless a genesis fiel
   completed or verified by a node; ≈ 76 GB is a lower bound from a stopped Test-profile attempt,
   not a measured footprint; the end-to-end test is ignored and has not run to completion; funds
   sent to a private-multisig address may not be spendable yet.
+- **DOC-32** (docs): README, `docs/deploy.md` and `docs/multisig.md` name chain 21 (v0.8.0,
+  constraint set 9) as the running chain and chain 20 as retired; the chain-18 gas pages no longer
+  say "not yet cut"; `docs/tokens.md` no longer says RPL is uncut; the README release table gains
+  v0.8.0.
 
 ## v0.8.0 — 2026-10-12 (chain 21 onward)
 

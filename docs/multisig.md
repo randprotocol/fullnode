@@ -1,9 +1,9 @@
 # Multisig accounts: M-of-N controlled public balances
 
-> **Status: on `main` (fullnode 3119a29a), not yet on any chain.** The section is genesis-gated: a
-> chain without it refuses all four actions (`UnsupportedAction("multisig")`) and runs byte for
-> byte as before, so the build changes no live chain. It reaches one with the genesis cut that
-> carries the treasury. Design: `docs/superpowers/specs/2026-10-08-multisig-design.md`.
+> **Status: live on chain 21 (v0.8.0, cut 2026-10-12), which carries the foundation treasury
+> (2 of 3) in its `multisig` section.** The section is genesis-gated: a chain without it refuses
+> all four actions (`UnsupportedAction("multisig")`). Private multisig (`hc_auth_multisig`, below)
+> is enabled on chain 21 too, but has no completed auth proof yet ("Status: not yet proved"). Design: `docs/superpowers/specs/2026-10-08-multisig-design.md`.
 
 This page explains how RandProtocol holds RAND (and RPL tokens) under the control of **`threshold`
 of `n` keys**, what the foundation does at the genesis cut to seed its treasury this way, and what

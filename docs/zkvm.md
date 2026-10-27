@@ -32,7 +32,7 @@ One relation, for every program:
 The program is identified by its in-circuit digest `hc` (public values `HC0..7`), the inputs by
 the salted digest `H_IN` (`IN0..7`), the public segment by the unsalted digest `H_PUB` (`PUB0..7`,
 constraint set 6 — empty on this chain), the outputs by `OUT0..7`, the gas tier by `TIER`, and
-(constraint set 8, built on `feat/gas-chain18`, not yet cut — `docs/confidential.md`'s
+(constraint set 8, live since chain 18 — `docs/confidential.md`'s
 "Constraint set 8") a declared gas ceiling by `GAS_LIMIT` (`pv::GAS`), the prover's own chosen
 bound on the run's weighted row count (`docs/fees.md` §1.1). That is the whole public interface:
 35 field elements once constraint set 8 ships (`pv::NUM = 35`; 34 before it). Everything else —
@@ -122,7 +122,7 @@ comes from `a1` through the row's memory slot; a value-returning syscall writes 
 
 Every ordinary RV32I/RV32M cpu row (no syscall) costs 1 gas the same way `WRITE_OUTPUT`/etc. do;
 the syscalls above are the only non-uniform costs (`docs/fees.md` §5's constants,
-`randprotocol-zkvm/src/gas.rs`, constraint set 8, not yet cut).
+`randprotocol-zkvm/src/gas.rs`, constraint set 8, live since chain 18).
 
 Rows 0–8 are the whole syscall surface. A guest that issues `ECALL` with `a7 = 4`, `a7 = 5` or
 `a7 = 8` makes its proof declare the matching table (`keccak_log_height` / `sha256_log_height` /
@@ -256,7 +256,7 @@ leaves prove time unchanged within noise:
 | `bundle`, 2-in-2-out | 3 811 | ≈ 9 160 incl. digest rows | 14 | ~300 KB | ~1.3 MB (estimated, not yet re-measured) | ≈ 100 s |
 | `bundle`, 1-in-1-out with dummies | 3 811 | ≈ 6 920 | 14 | ~300 KB | ~1.3 MB (estimated) | ≈ 100 s |
 
-**Gas** (constraint set 8, built on `feat/gas-chain18`, not yet cut — `docs/fees.md` §1.1): for a
+**Gas** (constraint set 8, live since chain 18 — `docs/fees.md` §1.1): for a
 program with no `KECCAK`/`SHA256` rows, gas tracks cycles closely (every ordinary row is 1 gas, a
 `POSEIDON2` absorb row 3), so the cycle counts above are close to what each guest spends: the
 `bundle` guest is 6 920–9 160 gas depending on how many of its four slots are real. Chain 18's

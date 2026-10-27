@@ -1,7 +1,7 @@
 # RPL: the RandProtocol token standard
 
-RPL is RandProtocol's own token standard, built for chain 14 (v0.5) — reviewed and merged on the
-integration branch, not yet cut as a chain (see `AGENTS.md`'s v0.5 entry for the current state).
+RPL is RandProtocol's own token standard, built for chain 14 (v0.5) and carried by every chain
+since (see `AGENTS.md`'s v0.5 entry for its history).
 A token is a **shielded native asset** — an entry in one ledger registry, with balances held as ordinary notes in the same
 commitment tree RAND uses — not a contract. Programs (`docs/confidential.md`) are stateless: a
 `Call` writes only a receipt, so an ERC-20-style contract would have nowhere to keep a balance, and
