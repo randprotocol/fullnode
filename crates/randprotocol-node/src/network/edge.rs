@@ -226,8 +226,10 @@ impl ReservedSources {
         self.by_peer.get(peer).map_or_else(Vec::new, |l| l.iter().map(|k| k.source).collect())
     }
 
-    pub fn contains(&self, source: &Source) -> bool {
-        self.by_peer.values().any(|l| l.iter().any(|k| &k.source == source))
+    /// Whether `source` is a live (unexpired at `now`) source of some reserved peer: the same
+    /// rule [`ReservedSources::peers_at`] applies (re-review N5).
+    pub fn contains(&self, source: &Source, now: std::time::Instant) -> bool {
+        !self.peers_at(source, now).is_empty()
     }
 }
 
@@ -1057,7 +1059,7 @@ mod tests {
         let peer = PeerId::random();
         let now = std::time::Instant::now();
         r.add(peer, Source::Unknown, SourceKind::Observed, now);
-        assert!(!r.contains(&Source::Unknown));
+        assert!(!r.contains(&Source::Unknown, now));
         for n in 0..10 {
             r.add(peer, host(n), SourceKind::Observed, now);
         }
@@ -1135,6 +1137,9 @@ mod tests {
         r.add(peer, host(8), SourceKind::Observed, later);
         r.expire(later);
         assert_eq!(r.sources_of(&peer), vec![host(1), host(8)]);
+        // N5: `contains` honours expiry as `peers_at` does.
+        assert!(r.contains(&host(8), later) && !r.contains(&host(8), later + RESERVED_SOURCE_TTL));
+        assert!(r.contains(&host(1), later + RESERVED_SOURCE_TTL * 10), "configured never expires");
         assert!(r.peers_at(&host(1), later + RESERVED_SOURCE_TTL * 10).contains(&peer), "configured never expires");
         assert!(r.peers_at(&host(8), later + RESERVED_SOURCE_TTL).is_empty(), "expired at lookup too");
     }
