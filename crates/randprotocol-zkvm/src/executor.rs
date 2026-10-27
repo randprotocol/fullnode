@@ -1394,7 +1394,7 @@ impl ZkExecutor {
     /// machine's own ranges, the degree-bits vector of the pinned shape (which is also the
     /// instance-count check), and the public-value layout.
     fn check_msauth_decoded(&self, proof: &Proof) -> Result<(), ConfidentialError> {
-        if let Some(field) = Self::msauth_header_mismatch(&proof) {
+        if let Some(field) = Self::msauth_header_mismatch(proof) {
             return Err(ConfidentialError::InvalidProof(format!("not the multisig auth guest's shape: {field}")));
         }
         let s = Self::msauth_heights();
