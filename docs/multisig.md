@@ -260,6 +260,16 @@ of M signatures and learns nothing about the policy. It needs a chain whose gene
 - `msk` and the policy are a **viewing** key: every signer can scan the account and read its whole
   history. Neither can spend without `T` signatures.
 
+> **Status: not yet proved.** The module is enabled on chain 21, but no tier-18 auth proof has
+> ever been completed, and no node has ever verified one. The only Test-profile attempt was
+> stopped at about 76 GB of memory before it finished, so 76 GB is a lower bound on the
+> footprint, not a measurement, and "≥ 96 GB" below is a guess, not a tested requirement. The
+> end-to-end test (`a_private_multisig_receives_spends_rotates_and_refuses_one_signature_end_to_end`)
+> is `#[ignore]`d and has never run to completion. The Production proof size is estimated from table
+> widths; if a real proof exceeds the chain's proof cap, no private-multisig spend can be admitted
+> until a new cut. **Until a proof has been made and verified, treat funds sent to a private
+> multisig address as possibly unspendable**, and use a public account for anything that matters.
+
 ### Public register or private policy: what each shows
 
 | | public account (`MultisigPay`, this page above) | private account (`hc_auth_multisig`) |
@@ -271,7 +281,7 @@ of M signatures and learns nothing about the policy. It needs a chain whose gene
 | a payment's amounts and recipients | the payouts' amounts (recipients shielded) | hidden |
 | what the chain does see | everything above | that the auth proof has the multisig shape, the bundle's public fields, the transaction size |
 | what a signer signs | a 32-byte blake3 digest, checked natively by the node | `b"rand-msauth-1" ‖ binding`, checked inside the proof |
-| cost | a few KB of keys and signatures | a ≥ 3.4 MB auth proof (estimated; the Production size is not yet measured), proved on a machine with ≥ 96 GB (a ≈ 76 GB peak footprint measured at the Test profile) |
+| cost | a few KB of keys and signatures | an auth proof of ≥ 3.4 MB (estimated; no Production proof has been made), on a machine of unknown size: a Test-profile attempt was stopped at ≈ 76 GB before it finished, so more than that (see the status note above) |
 
 A treasury that must be auditable stays public; M-of-N control with the pool's privacy is the
 private account.
@@ -280,8 +290,8 @@ private account.
 
 A private address receives like any other: a shielded transfer, a mint, a bridge deposit — and a
 **public account's `MultisigPay`**, whose payout is a note like any other. So a public treasury
-moves into a private account with an ordinary `MultisigPay` to the private address (the end-to-end
-test does exactly this); the payment is visible on the public side and nothing after it is.
+moves into a private account with an ordinary `MultisigPay` to the private address (the ignored end-to-end
+test is written to do this; it has not yet run to completion); the payment is visible on the public side and nothing after it is.
 
 ### Rotation is a sweep
 

@@ -38,6 +38,11 @@ Audit v10 fixes (node and client policies, no chain change unless a genesis fiel
   per account (`multisig_accounts` column family) plus a totals row, so a commit writes only the
   accounts its blocks touched; a store's one-blob register is split into rows at the first open
   (a store opened by this build cannot be opened by an older one).
+- **MSA-1 / MSA-2** (docs): `docs/multisig.md`, `docs/cli.md`, `docs/prover.md` and
+  `docs/shielded.md` say plainly that no private-multisig (tier-18) auth proof has yet been
+  completed or verified by a node; ≈ 76 GB is a lower bound from a stopped Test-profile attempt,
+  not a measured footprint; the end-to-end test is ignored and has not run to completion; funds
+  sent to a private-multisig address may not be spendable yet.
 
 ## v0.8.0 — 2026-10-12 (chain 21 onward)
 

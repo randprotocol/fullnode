@@ -1288,7 +1288,8 @@ fn genesis_private_multisig(validator: &Keypair, public_signers: &[Keypair]) -> 
 /// chain naming `hc_auth_multisig` refuses to start without the key. Each phase prints its
 /// elapsed time (`--nocapture`), so a failed run's log shows where it stopped and what it cost.
 ///
-/// Run on a >= 96 GB machine (a Test-profile msauth prove has a ≈ 76 GB footprint):
+/// Not yet run to completion: a Test-profile msauth prove was stopped at ≈ 76 GB before it
+/// finished, so that is a lower bound and >= 96 GB is a guess. Run on the largest machine at hand:
 /// `cargo +1.98.1 test --release -p randprotocol-client --test wallet_flow -- --ignored --nocapture a_private_multisig`
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "real proofs, three of them tier 18: run on a >= 96 GB machine"]

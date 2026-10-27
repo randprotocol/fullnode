@@ -594,9 +594,11 @@ the 4 MiB default included): a 4 MiB block admits transfers but no `Call` at Pro
 **The second auth guest, `hc_auth_multisig` (private multisig, v0.8.0): local only.** On a chain
 whose genesis names `hc_auth_multisig` (`9705f8e2…8247`, `docs/shielded.md` §2), a private multisig
 account's auth proof is the multisig auth guest's, at **tier 18** with the MODQ chip, and it is
-made **on the wallet's own machine only** (`rand multisig-private prove`, `docs/cli.md`): at least
-a peak memory footprint of ≈ 76 GB measured at the Test profile (RSS 22.5 GB; RSS understates it), so a machine with ≥ 96 GB, and minutes per proof (the Production prove time and size are not yet measured; the estimate
-is ≥ 3.4 MB). Its witness holds `msk`, the policy and the signatures — the account's viewing power —
+made **on the wallet's own machine only** (`rand multisig-private prove`, `docs/cli.md`): no such
+proof has yet been completed or verified by a node: a Test-profile attempt was stopped at a
+footprint of ≈ 76 GB (RSS 22.5 GB; RSS understates it) before it finished, so the memory and time it
+needs are unknown and above that (the Production size is estimated at ≥ 3.4 MB, not measured;
+`docs/multisig.md`, "Status: not yet proved"). Its witness holds `msk`, the policy and the signatures — the account's viewing power —
 and no prover advertises the shape. The bundle proof of a multisig spend is an ordinary v3 bundle
 proof over the account's `nk` and may still go to a paired prover (`--prover`), exactly as above. A
 `MultisigAuth` witness kind is specified in the phase-4 spec §6.6
