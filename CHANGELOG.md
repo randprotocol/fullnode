@@ -135,6 +135,25 @@ Perpetual futures (RPL-3):
   canonical shape, and `rand perp prove` defaults to that shape only on a chain with the pin
   (`--smallest`, `--canonical`).
 
+Dependencies:
+
+- **RUSTSEC-2026-0387** (node-only, no consensus change): secp256k1 is k256 0.14 (crypto-bigint
+  0.7) instead of 0.13 (crypto-bigint 0.5.5, whose "constant-time" operations branch on secret
+  values). The node only recovers guardian signatures, so the exposure was the test-only
+  `sign_digest`; the bridge daemons, which sign with real keys, move in the bridge repository.
+  0.14 recovers a key from a high-s signature where 0.13 refused it, so `bridge::recover_address`
+  now refuses high-s itself (`verify_decoded` already did, before recovering): checked against
+  0.13 over 1.8 M valid, high-s, bit-flipped, out-of-range and random signatures, with identical
+  results and byte-identical signatures. crypto-bigint 0.5.5 is left only under `revm` (a zkvm
+  test dependency; revm-precompile still requires k256 0.13), so `deny.toml` and
+  `.cargo/audit.toml` ignore the advisory, and CI's `supply-chain` fails if crypto-bigint 0.5
+  reaches a non-dev dependency graph.
+- **The rest of `supply-chain`** (lockfile only, semver-compatible): quinn-proto 0.11.19
+  (RUSTSEC-2026-0338/0340/0343, remote peers could panic a QUIC connection), rustls 0.23.46
+  (RUSTSEC-2026-0346 to 0349), rustls-webpki 0.103.16 and webpki-roots 1.0.11 (RUSTSEC-2026-0381,
+  0382, distrusted intermediates), tokio 1.54.1 (RUSTSEC-2026-0386, unsound `AsyncFd` constructors;
+  `cargo deny` refuses unsound), and ctutils 0.4.2 → 0.4.6 (RUSTSEC-2026-0385).
+
 ## v0.8.0 — 2026-10-12 (chain 21 onward)
 
 Tagged from fullnode `main` (vendoring circuits `d217252`: constraint set 9 — rVM phase 4's

@@ -319,6 +319,15 @@ jobs:
       - name: cargo audit
         working-directory: fullnode
         run: cargo audit
+      # The RUSTSEC-2026-0387 ignore (deny.toml, .cargo/audit.toml) holds only while crypto-bigint
+      # 0.5 stays a test-only dependency. This fails the job the day it is in a shipped graph again.
+      - name: crypto-bigint 0.5 only in tests (RUSTSEC-2026-0387)
+        working-directory: fullnode
+        run: |
+          if cargo tree --locked -e normal,build --target all --workspace --prefix none | grep '^crypto-bigint v0\.5'; then
+            echo "::error::crypto-bigint 0.5 (RUSTSEC-2026-0387) is in a non-dev dependency graph; see deny.toml"
+            exit 1
+          fi
       - name: cargo deny check
         working-directory: fullnode
         run: cargo deny check

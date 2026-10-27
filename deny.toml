@@ -20,7 +20,15 @@ yanked = "deny"
 # (RUSTSEC-2024-0388), paste (RUSTSEC-2024-0436). cargo-deny has no "warn" level for this class
 # (only a scope), hence "none" here and the warning from cargo audit.
 unmaintained = "none"
-ignore = []
+ignore = [
+  # RUSTSEC-2026-0387 (crypto-bigint < 0.7.6: secret-dependent timing in "constant-time" ops).
+  # v0.8.2 moved our secp256k1 to k256 0.14 (crypto-bigint 0.7), so nothing the node, prover or
+  # client ships links 0.5.5: ci.yml's `supply-chain` fails if `crypto-bigint v0.5` reappears in
+  # the normal/build graph. The one path left is `revm` (=43.0.2, a randprotocol-zkvm
+  # dev-dependency, the EVM oracle of two tests): revm-precompile requires k256 ^0.13.4 up to
+  # 43.0.3, the newest release. It signs nothing secret. Drop this line when revm moves to 0.14.
+  { id = "RUSTSEC-2026-0387", reason = "test-only (revm oracle); shipped graph guarded in ci.yml" },
+]
 
 [bans]
 # Two versions of one crate are reported, not refused: the tree has many (the RustCrypto 0.10 and
