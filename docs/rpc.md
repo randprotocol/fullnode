@@ -2102,10 +2102,11 @@ commit no longer reports a `proving_share` of 0 (and, under the flag, the full s
 `subsidy`) where a live node reports the paid amounts. Records written before the fix keep their
 stored values.
 
-### 2026-10-03 — RPL-3: perps (genesis-gated; on no chain yet)
+### v0.8.0 — RPL-3: perps (genesis-gated; chain 21 onward)
 
-`docs/perps.md`, `docs/superpowers/plans/2026-10-03-rpl3-perps.md`. Inert on every chain whose
-genesis has no `perps` section: every perp action is refused, `rand_getPerps` answers
+`docs/perps.md`, `docs/superpowers/plans/2026-10-03-rpl3-perps.md` (first written 2026-10-03).
+Chain 21 carries the section (BTC-PERP on zUSD). Inert on every chain whose genesis has no
+`perps` section: every perp action is refused, `rand_getPerps` answers
 `{"enabled": false}` and the state root is what it was.
 
 - **Six new actions** (`Action` 34–39, appended after `Invoke`): `perp_deposit` (a bundle's burn
