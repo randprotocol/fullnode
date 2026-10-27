@@ -1819,6 +1819,9 @@ impl Storage {
     /// CON-60: record `shape` (a state proof of it verified here, or a committed block carried
     /// one), keeping the last [`PERP_SHAPES_KEPT`]. Written only when it is new.
     pub fn note_perp_proof_shape(&self, shape: randprotocol_core::confidential::ProofShape) -> Result<()> {
+        // One read-modify-write at a time: verdicts for two new shapes record both.
+        static RECORD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _one = RECORD.lock().unwrap_or_else(|e| e.into_inner());
         let mut shapes = self.perp_proof_shapes()?;
         if shapes.contains(&shape) {
             return Ok(());
@@ -1832,16 +1835,20 @@ impl Storage {
     }
 
     /// CON-60: the shapes of the state proofs in the last `blocks` committed blocks, newest
-    /// first, deduplicated — the startup warm's second source, for a node that predates
-    /// [`META_PERP_SHAPES`].
+    /// first, deduplicated, at most `limit` (the walk stops there) — the startup warm's second
+    /// source, for a node that predates [`META_PERP_SHAPES`].
     pub fn recent_perp_proof_shapes(
         &self,
         blocks: u64,
+        limit: usize,
         executor: &dyn randprotocol_core::confidential::ConfidentialExecutor,
     ) -> Result<Vec<randprotocol_core::confidential::ProofShape>> {
         let head = self.head()?.height;
         let mut out = Vec::new();
         for h in (head.saturating_sub(blocks)..=head).rev() {
+            if out.len() >= limit {
+                break;
+            }
             let Some(b) = self.block_by_height(h)? else { continue };
             for tx in &b.transactions {
                 if let Action::PerpStateProof { proof, .. } = &tx.action {

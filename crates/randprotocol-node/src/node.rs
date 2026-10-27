@@ -2732,7 +2732,14 @@ pub async fn start_with(cfg: NodeConfig, rpc_options: RpcOptions, net_options: N
                 // blocks', at most `PERP_WARM_SHAPES` — each build at tier 18 is minutes and GBs.
                 let mut v = perp_store.perp_proof_shapes().unwrap_or_default();
                 v.reverse();
-                for s in perp_store.recent_perp_proof_shapes(PERP_WARM_SCAN_BLOCKS, ex.as_ref()).unwrap_or_default() {
+                v.truncate(PERP_WARM_SHAPES);
+                let more = PERP_WARM_SHAPES - v.len();
+                let recent = if more == 0 {
+                    Vec::new()
+                } else {
+                    perp_store.recent_perp_proof_shapes(PERP_WARM_SCAN_BLOCKS, PERP_WARM_SHAPES, ex.as_ref()).unwrap_or_default()
+                };
+                for s in recent {
                     if !v.contains(&s) {
                         v.push(s);
                     }
