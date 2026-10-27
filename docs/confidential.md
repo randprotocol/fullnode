@@ -418,7 +418,7 @@ v0.6.3, which adds chain 16), and chains up to 13 by their retired
 `hc_bundle`; keep chain 15 on v0.6.
 
 **Constraint set 8 (2026-09-29, circuits `feat/cs8-gas` `18c2627`: the gas meter, built on
-`feat/gas-chain18`, chain 18, not yet cut).** One new column and one new public value in the cpu
+`feat/gas-chain18`; live since chain 18).** One new column and one new public value in the cpu
 table (`docs/superpowers/specs/2026-09-28-gas-model-design.md` §4.2, `docs/fees.md` §1.1,
 `docs/zkvm.md` §1, §4):
 

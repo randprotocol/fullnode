@@ -1251,32 +1251,79 @@ fn may_be_ours(w: &Wallet, leaf: &ScanLeaf) -> bool {
     }
 }
 
-/// Leaves further apart than this are fetched in separate `rand_getCommitments` reads; closer
-/// ones in one, the few envelopes between them read for nothing.
-const FETCH_GAP: u64 = 8;
+/// The `rand_getCommitments` reads — `(from, limit)` — that fetch the envelopes of `wanted`
+/// (sorted leaf indices) at a fetch width of `chunk` leaves (audit v10, RPC-201). Each read is one
+/// aligned chunk, `from` a multiple of `chunk` and `limit` the whole chunk, so the node learns
+/// which chunk held a leaf of the wallet's, not which leaf (a partial tip chunk narrows that; docs/rpc.md): a read is never one wanted leaf
+/// (for a chunk of at least 2), and the leaves between two wanted ones in a chunk ride in the
+/// same read — the gap merging the scan always did, now inside the chunk. A chunk is read once
+/// however many wanted leaves it holds; a read past the tree's end simply comes back short.
+/// `chunk` is at least 1 here: the caller reads the page in full for `0`.
+pub(crate) fn fetch_chunks(wanted: &[u64], chunk: u64) -> Vec<(u64, usize)> {
+    // (Callers page by `heads_page`, so every wanted leaf of one page lies in chunks wholly inside it.)
+    debug_assert!(chunk >= 1, "a zero chunk reads the page in full");
+    let chunk = chunk.max(1);
+    let mut reads: Vec<(u64, usize)> = Vec::new();
+    for &index in wanted {
+        let start = index - index % chunk;
+        if reads.last().is_none_or(|(from, _)| *from != start) {
+            reads.push((start, chunk as usize));
+        }
+    }
+    reads
+}
+
+/// The heads page [`leaf_page`] reads for a cursor at `from` under a scan chunk of `chunk`
+/// (`chunk >= 1`): `(start, limit)`, `start` the chunk boundary at or below `from` and `limit` the
+/// smallest multiple of `chunk` that is at least [`PAGE`] (audit v10, RPC-201 review). Pages then
+/// begin and end on chunk boundaries, so no chunk straddles two pages — a chunk read during a page
+/// says only "a leaf of this chunk", never "of the part of it this page covers" — and each chunk is
+/// read at most once per pass. Within the 1000-row cap for every legal chunk (≤ 1000).
+pub(crate) fn heads_page(from: u64, chunk: u64) -> (u64, usize) {
+    let chunk = chunk.max(1);
+    let start = from - from % chunk;
+    let limit = (PAGE as u64).div_ceil(chunk) * chunk;
+    (start, limit as usize)
+}
 
 /// One page of leaves from `from`, as [`offer_row`] takes them. Against a node that serves scan
 /// heads, the page is read as heads and only the leaves [`may_be_ours`] — and the ones `rebuilt`
-/// does not already account for — are read again in full; every other row carries an empty
-/// envelope, which [`classify`] skips exactly as it would have skipped the real one. Against an
-/// older node, the page is read in full.
+/// does not already account for — are read again in full, by whole aligned chunks of
+/// [`RpcClient::scan_chunk`] leaves ([`fetch_chunks`]; RPC-201), so the node learns at most
+/// which chunk held one of the wallet's leaves; every other row of the page carries an empty
+/// envelope, which [`classify`] skips exactly as it would have skipped the real one. A scan chunk
+/// of `0`, or an older node, reads the page in full.
 async fn leaf_page(rpc: &RpcClient, w: &Wallet, from: u64, rebuilt: &BTreeMap<Word8, Note>) -> Result<Vec<CommitmentRow>> {
-    let Some(leaves) = rpc.scan_leaves(from, PAGE).await? else {
+    let chunk = rpc.scan_chunk();
+    if chunk == 0 {
+        return rpc.commitments(from, PAGE).await;
+    }
+    // RPC-201: the heads page starts on the chunk boundary at or below the cursor and spans whole
+    // chunks (`heads_page`); the leaves under the cursor were offered by the pass before and are
+    // dropped here, unread in full.
+    let (start, limit) = heads_page(from, chunk);
+    let Some(mut leaves) = rpc.scan_leaves(start, limit).await? else {
         return rpc.commitments(from, PAGE).await;
     };
+    let served = leaves.len();
+    leaves.retain(|l| l.index >= from);
+    // N4: a non-empty page with nothing at or past the cursor may be the tip — or a node (or a
+    // relay with a smaller row cap) that stopped short of the cursor, which must not end the pass
+    // silently. Ask once more from the cursor itself: empty, it is the tip; otherwise those rows
+    // are the page (unaligned, against such a node only).
+    if served > 0 && leaves.is_empty() {
+        let Some(rest) = rpc.scan_leaves(from, limit - (from - start) as usize).await? else {
+            return rpc.commitments(from, PAGE).await;
+        };
+        leaves = rest;
+        leaves.retain(|l| l.index >= from);
+    }
     let wanted: Vec<u64> = leaves.iter().filter(|l| !rebuilt.contains_key(&l.cm) && may_be_ours(w, l)).map(|l| l.index).collect();
     let mut full: BTreeMap<u64, CommitmentRow> = BTreeMap::new();
-    let mut i = 0;
-    while i < wanted.len() {
-        let start = wanted[i];
-        let mut end = start;
-        while i + 1 < wanted.len() && wanted[i + 1] - end <= FETCH_GAP {
-            i += 1;
-            end = wanted[i];
-        }
-        i += 1;
-        let span = (end - start + 1) as usize;
+    for (start, span) in fetch_chunks(&wanted, chunk) {
         for row in rpc.commitments(start, span).await? {
+            // Rows of the chunk outside this page are dropped: the page before read them, or the
+            // page after will — the chunk is read whole for the node's sake, not the wallet's.
             full.insert(row.index, row);
         }
     }
@@ -5379,34 +5426,116 @@ pub(crate) mod tests {
         let chain = Arc::new(Mutex::new(c));
         let mut stores = Vec::new();
         let mut served = Vec::new();
-        for heads in [false, true] {
+        // The full path; heads at the default chunk (wider than this chain: one read of everything);
+        // heads at a 4-leaf chunk; heads with chunk 0 (every envelope, the legacy privacy).
+        for (heads, chunk) in [(false, crate::DEFAULT_SCAN_CHUNK), (true, crate::DEFAULT_SCAN_CHUNK), (true, 4), (true, 0)] {
             {
                 let mut c = chain.lock().unwrap();
                 (c.scan_leaves, c.full_rows_served, c.scan_leaf_asks) = (heads, 0, 0);
+                c.commitment_reads.clear();
             }
             // A client of its own each time: the fallback is remembered per client.
-            let rpc = serve(&chain).await;
+            let rpc = serve(&chain).await.with_scan_chunk(chunk);
             let mut store = NoteStore::default();
             scan(&rpc, &me, &mut store).await.unwrap();
             assert_eq!(store.scanned_index, leaves as u64);
             let c = chain.lock().unwrap();
-            served.push((c.full_rows_served, c.scan_leaf_asks, leaves));
+            served.push((c.full_rows_served, c.scan_leaf_asks, c.commitment_reads.clone()));
             stores.push(serde_json::to_value(&store).unwrap());
         }
-        assert_eq!(stores[0], stores[1], "the same notes, sent rows, cursor and tree either way");
+        assert!(stores.iter().all(|s| *s == stores[0]), "the same notes, sent rows, cursor and tree every way");
         let notes = stores[1]["notes"].as_array().unwrap();
         assert_eq!(notes.len(), 3 + 2 + 1 + 1, "three public notes, two fundings, the change, the odd-head note");
         assert_eq!(stores[1]["sent"].as_array().unwrap().len(), 1);
-        let (legacy_rows, _, leaves) = served[0];
-        let (head_rows, head_asks, _) = served[1];
-        assert!(legacy_rows >= leaves, "the full path reads every envelope");
-        // Read in full: the two fundings, sent, change, dummy, owned-by-another, the odd head —
+        let (legacy_rows, _, _) = &served[0];
+        assert!(*legacy_rows >= leaves, "the full path reads every envelope");
+        // Wanted in full: the two fundings, sent, change, dummy, owned-by-another, the odd head —
         // never a stranger's leaf, a garbage envelope, nor a public note (found from its
-        // transaction, not its envelope). The one extra row is the empty envelope at leaf 29,
-        // inside `FETCH_GAP` of the odd head (28) and the second funding (30), so read in the
-        // same request rather than a request of its own.
-        assert_eq!(head_rows, 7 + 1, "only the leaves a key opens, the head it cannot split, and one gap row");
-        assert!(head_asks >= 1);
+        // transaction, not its envelope). RPC-201: what is *read* is the aligned chunk around each,
+        // so the node learns the chunk and not the leaf.
+        let (default_rows, default_asks, default_reads) = &served[1];
+        assert!(*default_asks >= 1);
+        assert_eq!(default_reads, &vec![(0, crate::DEFAULT_SCAN_CHUNK)], "a chain shorter than one chunk: one read of chunk 0, whole");
+        assert_eq!(*default_rows, leaves, "which is every leaf there is");
+        let (small_rows, _, small_reads) = &served[2];
+        assert!(small_reads.iter().all(|(from, limit)| from % 4 == 0 && *limit == 4), "every read is one aligned 4-leaf chunk: {small_reads:?}");
+        assert!(small_reads.windows(2).all(|w| w[0].0 < w[1].0), "each chunk read once, in order");
+        assert!(*small_rows < leaves && *small_rows > 7, "fewer than every envelope, more than the wanted leaves alone: {small_rows} of {leaves}");
+        let (zero_rows, zero_asks, zero_reads) = &served[3];
+        assert_eq!(*zero_asks, 0, "chunk 0 asks for no heads");
+        assert!(*zero_rows >= leaves && zero_reads.iter().all(|(_, limit)| *limit == PAGE as u64), "chunk 0 pages every envelope: {zero_reads:?}");
+    }
+
+    /// Audit v10, RPC-201: the reads a scan over heads makes for its wanted leaves are whole
+    /// aligned chunks — `from` a multiple of the chunk, `limit` the chunk — one per chunk that
+    /// holds a wanted leaf, in order; never a read of exactly one wanted leaf, however the wanted
+    /// leaves fall. The gap merging stays: wanted leaves of one chunk share its read.
+    #[test]
+    fn envelope_reads_are_aligned_chunks_and_never_a_single_wanted_leaf() {
+        assert_eq!(fetch_chunks(&[], 256), vec![]);
+        assert_eq!(fetch_chunks(&[5], 256), vec![(0, 256)]);
+        assert_eq!(fetch_chunks(&[255, 256], 256), vec![(0, 256), (256, 256)]);
+        assert_eq!(fetch_chunks(&[28, 29, 30, 700, 701], 256), vec![(0, 256), (512, 256)], "a chunk is read once for all its wanted leaves");
+        assert_eq!(fetch_chunks(&[3, 4, 9], 4), vec![(0, 4), (4, 4), (8, 4)]);
+        for chunk in [2u64, 3, 4, 8, 256, 1000] {
+            for wanted in [vec![0u64], vec![1], vec![chunk - 1], vec![chunk], vec![2 * chunk + 1], vec![7, 7 + chunk, 7 + 5 * chunk], (0..40).collect()] {
+                let reads = fetch_chunks(&wanted, chunk);
+                for (from, limit) in &reads {
+                    assert_eq!(from % chunk, 0, "aligned: {reads:?} for {wanted:?} at {chunk}");
+                    assert_eq!(*limit as u64, chunk, "whole: {reads:?}");
+                    assert!(!(wanted.contains(from) && *limit == 1), "never one wanted leaf");
+                }
+                assert!(wanted.iter().all(|w| reads.iter().any(|(from, limit)| *from <= *w && *w < from + *limit as u64)), "every wanted leaf is covered");
+                assert!(reads.windows(2).all(|w| w[0].0 < w[1].0), "once per chunk, in order");
+            }
+        }
+    }
+
+    /// RPC-201 review: heads pages start on the chunk boundary at or below the cursor and span
+    /// whole chunks, at least a [`PAGE`] and within the node's 1000-row cap, so a chunk never
+    /// straddles two pages; a pass that pages from 0 visits each chunk in exactly one page.
+    #[test]
+    fn heads_pages_are_aligned_to_the_chunk_and_no_chunk_straddles_two() {
+        assert_eq!(heads_page(0, 256), (0, 512));
+        assert_eq!(heads_page(512, 256), (512, 512));
+        assert_eq!(heads_page(300, 256), (256, 512), "a mid-chunk cursor pages from its chunk's start");
+        assert_eq!(heads_page(7, 1000), (0, 1000));
+        assert_eq!(heads_page(9, 4), (8, 500));
+        for chunk in [2u64, 3, 4, 7, 256, 333, 500, 501, 1000] {
+            for from in [0u64, 1, chunk - 1, chunk, 5 * chunk + 3, 123_457] {
+                let (start, limit) = heads_page(from, chunk);
+                assert_eq!(start % chunk, 0);
+                assert!(start <= from && from < start + chunk);
+                assert_eq!(limit as u64 % chunk, 0, "whole chunks");
+                assert!(limit >= PAGE && limit <= 1000, "{limit} at chunk {chunk}");
+            }
+            // A pass paging from 0 with full pages: each page starts where the last ended, on a boundary.
+            let mut from = 0u64;
+            for _ in 0..5 {
+                let (start, limit) = heads_page(from, chunk);
+                assert_eq!(start, from, "every page after the first starts at the previous end");
+                from = start + limit as u64;
+            }
+        }
+    }
+
+    /// RPC-201 re-review, N4: a node (or relay) whose heads page is capped below the distance
+    /// from the chunk boundary to the cursor answers a page that lies wholly under the cursor.
+    /// That is not the tip: the scan must still reach the end, not stop there silently.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_heads_page_wholly_under_the_cursor_does_not_end_the_scan() {
+        let me = Wallet::from_spend_key(SpendKey([15; 8]));
+        let mut c = every_kind_of_leaf(&me);
+        c.headers_carry_public_notes = true;
+        c.scan_leaves = true;
+        c.scan_leaves_cap = Some(2);
+        let leaves = c.leaves.len() as u64;
+        assert!(leaves > 4, "the cursor passes a chunk boundary + 2");
+        let chain = Arc::new(Mutex::new(c));
+        let rpc = serve(&chain).await.with_scan_chunk(4);
+        let mut store = NoteStore::default();
+        scan(&rpc, &me, &mut store).await.unwrap();
+        assert_eq!(store.scanned_index, leaves, "every leaf, though two of the heads pages lay under the cursor");
     }
 
     /// Against a node without `rand_getScanLeaves`, the scan falls back to full pages and asks
@@ -5715,10 +5844,15 @@ pub(crate) mod tests {
         /// Whether this fake serves `rand_getScanLeaves`, as a node since the scan-head change
         /// does; off by default, an older node that answers `-32601`.
         scan_leaves: bool,
+        /// A row cap on `rand_getScanLeaves` smaller than the wallet asks for (a relay's), `None`
+        /// for the request's own limit.
+        scan_leaves_cap: Option<u64>,
         /// How many `rand_getScanLeaves` calls this node has answered, refused ones included.
         scan_leaf_asks: usize,
         /// How many rows (full envelopes) `rand_getCommitments` has served in all.
         full_rows_served: usize,
+        /// Every `rand_getCommitments` read this node was asked for, `(from, limit)`, in order.
+        commitment_reads: Vec<(u64, u64)>,
         /// `rand_getLimits`' `envelope_bytes` (task 7): `None` — this fake's default — is a chain
         /// that predates the field, same as a genuinely absent one; `Some(MEMO_ENVELOPE_BYTES)`
         /// is the memo format.
@@ -5806,8 +5940,10 @@ pub(crate) mod tests {
                 header_pages: Vec::new(),
                 envelope_bytes: None,
                 scan_leaves: false,
+                scan_leaves_cap: None,
                 scan_leaf_asks: 0,
                 full_rows_served: 0,
+                commitment_reads: Vec::new(),
                 hc_bundle: ZkExecutor::hc_bundle(),
                 hc_auth: None,
                 hc_auth_multisig: None,
@@ -5892,6 +6028,7 @@ pub(crate) mod tests {
             }
             if method == "rand_getCommitments" {
                 self.full_rows_served += self.leaves.len().saturating_sub(n(0) as usize).min(n(1) as usize);
+                self.commitment_reads.push((n(0), n(1)));
             }
             Reply::Ok(match method {
                 "rand_getHead" => json!({ "height": head }),
@@ -5944,7 +6081,7 @@ pub(crate) mod tests {
                     .iter()
                     .enumerate()
                     .skip(n(0) as usize)
-                    .take(n(1) as usize)
+                    .take(self.scan_leaves_cap.map_or(n(1), |c| c.min(n(1))) as usize)
                     .map(|(i, (cm, e, h))| {
                         use base64::Engine as _;
                         let head = [&e.kem_ct[..], &e.to_receiver, &e.to_sender].concat();

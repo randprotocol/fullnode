@@ -196,7 +196,7 @@ interface = [inner_vk_digest(4) ‖ N ‖ B(8) ‖ 34·N public values]     -- p
 ```
 
 As of constraint set 8 (chain 18's `pv::NUM = 35`, `docs/confidential.md`'s "Constraint set 8",
-built on `feat/gas-chain18`, not yet cut) the width is `35·N` — a chain built after chain 18
+live since chain 18) the width is `35·N` — a chain built after chain 18
 carries `[vk ‖ N ‖ B(8) ‖ 35·N]`, not the `34·N` this section was written against. No live chain
 runs aggregation, and chain 18's genesis rejects `gas.dynamic` beside an `aggregation` section
 (`docs/fees.md` §1.2), so the two have never yet had to coexist.

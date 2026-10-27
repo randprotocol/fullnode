@@ -235,6 +235,33 @@ pub fn private_payment(threshold: u32) -> Program {
 ///
 /// Node-local, like [`private_payment`]: the executor's and the node's `Invoke` tests deploy it.
 pub fn rpl2_counter() -> Program {
+    rpl2_counter_with(|a| a.jal(0, "fail"))
+}
+
+/// PST-1's fixture: [`rpl2_counter`] whose refusal path does what `guest-sdk`'s panic handler
+/// does — writes [`randprotocol_core::ledger::program_state::PANIC_SENTINEL`] to output 7 and
+/// halts — instead of spinning. A run on any transition the counter refuses therefore halts, and
+/// proves: the shape of a Rust guest that panics on a context it should refuse. Never deploy it.
+pub fn rpl2_counter_panicking() -> Program {
+    rpl2_counter_with(|a| {
+        a.extend(li(T0, randprotocol_core::ledger::program_state::PANIC_SENTINEL as i32));
+        a.extend(write_output(randprotocol_core::ledger::program_state::PANIC_SLOT as u32, T0));
+        a.extend(halt());
+    })
+}
+
+/// PST-1's other fixture: [`rpl2_counter`] whose refusal path traps — an `ecall` naming no
+/// syscall (`a7 = 99`), which the machine refuses as `ExecError::BadSyscall` — so a refused
+/// transition has no execution and no proof.
+pub fn rpl2_counter_trapping() -> Program {
+    rpl2_counter_with(|a| {
+        a.extend(li(REG_A7, 99));
+        a.push(ecall());
+    })
+}
+
+/// The counter's body, its refusal path (`fail`) left to `fail`.
+fn rpl2_counter_with(fail: impl FnOnce(&mut Assembler)) -> Program {
     const CTX: u32 = 8;
     let mut a = Assembler::new(0);
     a.extend(li(T1, 1));
@@ -249,7 +276,7 @@ pub fn rpl2_counter() -> Program {
     a.extend(write_output(0, T2));
     a.extend(halt());
     a.label("fail");
-    a.jal(0, "fail");
+    fail(&mut a);
     a.assemble()
 }
 

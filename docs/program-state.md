@@ -99,7 +99,13 @@ Two rules, both without exception:
    word, for every method. durian.market's tests flip every word of every accepted context and
    demand a refusal.
 2. **A refusal must leave no proof.** `guest-sdk`'s panic handler *halts*, and a halted run is a
-   provable run whatever its outputs say. A program must therefore contain no panicking path
+   provable run whatever its outputs say. (PST-1: the handler writes `0xdeadbeef` to output 7
+   first; every node's pool refuses an invoke whose proof publishes it, on every chain, and a
+   chain whose genesis sets `program_state.refuse_panics` refuses it as a validity rule —
+   chain 21 does not. A program that traps — an instruction or `ecall` the machine refuses —
+   has no run and so no proof. Neither replaces this rule: a program that refuses by spinning,
+   by writing its own outputs and halting, or by any path other than the handler's is still
+   accepted.) A program must therefore contain no panicking path
    (no indexing that can be out of bounds, no `unwrap`, no checked arithmetic that panics), and
    end a refused transition in something no run can satisfy — durian reads private input
    `u32::MAX`, an index no caller has committed. Check the linked image for the panic machinery
@@ -126,6 +132,10 @@ Rewriting or deleting a cell is free. `rand_estimateFee {"kind":"invoke", …}` 
 ```json
 "program_state": { "cell_fee": 10000000 }
 ```
+
+`"refuse_panics": true` (optional, `--program-state-refuse-panics`; PST-1) makes an invoke whose
+call proof publishes the panic sentinel in output 7 invalid (`ProgramPanicked`). Absent — chain
+21 and every chain before it — the old rule stands and the hash is unchanged.
 
 `rand-node genesis --program-state-cell-fee 10000000`. The section requires `tokens`, `gas`,
 `hardening_v6`, `hc_auth` and `confidential`; `cell_fee` is at most 1 000 RAND. It is bound into

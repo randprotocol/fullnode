@@ -679,6 +679,11 @@ enum Cmd {
         /// refused by name before any file is written.
         #[arg(long, value_name = "UNITS")]
         program_state_cell_fee: Option<u64>,
+        /// PST-1: write `program_state.refuse_panics: true` — an `Invoke` whose call proof
+        /// publishes the panic sentinel (`0xdeadbeef` in output 7) is refused by the chain. Bound
+        /// into the genesis hash (last) only when given. Needs `--program-state-cell-fee`.
+        #[arg(long)]
+        program_state_refuse_panics: bool,
         /// Fee feedback (`docs/fees.md` §1.3): the `fees` section, as a `FeesConfig` JSON file
         /// (`{"burn_base": true, "subsidy_net_of_fees": true, "burn_floor": true,
         /// "proposer_share_bps": 4000, "prove_base": 600000}`, each optional).
@@ -1085,6 +1090,14 @@ enum DbCmd {
     /// eighteenth. Refused, untouched, on a perps chain's database (no older build can follow
     /// that chain) or when the family holds rows.
     DropPerpInputs {
+        #[arg(long)]
+        datadir: PathBuf,
+    },
+    /// Before rolling back to v0.8.0 (audit v10, MSA-4): write the multisig register's rows back
+    /// as v0.8.0's one blob and drop the `multisig_accounts` column family, which this build
+    /// creates on every database and v0.8.0 cannot open. Refused, untouched, when the register is
+    /// capped by genesis `multisig.max_accounts` (no older build can follow that chain).
+    RestoreMultisigBlob {
         #[arg(long)]
         datadir: PathBuf,
     },
@@ -2564,6 +2577,7 @@ async fn main() -> Result<()> {
             binding_domain,
             proof_window_blocks,
             program_state_cell_fee,
+            program_state_refuse_panics,
             fees,
             perps,
         } => {
@@ -2597,6 +2611,9 @@ async fn main() -> Result<()> {
             )?;
             // RPL-2: the section stands on four others (`Genesis::validate` enforces it; said
             // here, by flag name, before a file is written).
+            if program_state_refuse_panics && program_state_cell_fee.is_none() {
+                anyhow::bail!("--program-state-refuse-panics needs --program-state-cell-fee: it is a field of the program_state section");
+            }
             if program_state_cell_fee.is_some() {
                 for (on, flag) in [
                     (tokens.is_some(), "--tokens"),
@@ -2764,7 +2781,7 @@ async fn main() -> Result<()> {
                 // RPL-2: absent unless `--program-state-cell-fee` is given, so a genesis cut
                 // without it hashes byte-for-byte as before.
                 program_state: program_state_cell_fee
-                    .map(|cell_fee| randprotocol_core::ledger::program_state::ProgramStateConfig { cell_fee }),
+                    .map(|cell_fee| randprotocol_core::ledger::program_state::ProgramStateConfig { cell_fee, refuse_panics: program_state_refuse_panics }),
                 // Fee feedback (`docs/fees.md` §1.3): read from a `FeesConfig` JSON file when
                 // `--fees` is given, so `Genesis::build` validates it (`burn_floor` without
                 // `burn_base`, `subsidy_net_of_fees` without aggregation); omitted entirely
@@ -3159,6 +3176,19 @@ async fn main() -> Result<()> {
                 false => println!("no perp_inputs column family in {}", db.display()),
             }
             println!("a build from before RPL-3 can open this database; a later start re-creates the family, empty");
+        }
+        Cmd::Db { cmd: DbCmd::RestoreMultisigBlob { datadir } } => {
+            let db = datadir.join("db");
+            let r = Storage::restore_multisig_blob(&datadir)?;
+            match r.accounts {
+                Some(n) => println!("wrote the multisig register ({n} accounts) back as one blob in {}", db.display()),
+                None => println!("no row-layout multisig register in {}", db.display()),
+            }
+            match r.family {
+                true => println!("dropped column family multisig_accounts"),
+                false => println!("no multisig_accounts column family"),
+            }
+            println!("v0.8.0 can open this database; a later start of this build splits the register into rows again");
         }
         Cmd::Status { rpc } => {
             let v = RpcClient::new(rpc).status().await?;
@@ -4433,6 +4463,7 @@ mod tests {
             &["verify", "--datadir", "d"][..],
             &["verify", "--datadir", "d", "--repair"],
             &["db", "drop-receipts-index", "--datadir", "d"],
+            &["db", "restore-multisig-blob", "--datadir", "d"],
             &["init", "--datadir", "d", "--genesis", "g.json"],
             &["run", "--datadir", "d", "--key", "k.json"],
         ] {
@@ -4714,6 +4745,23 @@ mod tests {
             assert_eq!(state.validators.get(&v.public_key.address()).unwrap().stake, v.stake);
         }
         assert!(!gen.to_json().contains("staking"), "rewriting the file adds no section");
+    }
+
+    /// Chain 21, the running chain (cut 2026-10-12, v0.8.0), byte for byte, after audit v10's
+    /// `multisig.max_accounts` (MSA-4): the file lists none, so its hash may not move by one
+    /// bit, its register is unbounded as cut, and rewriting the file adds no field.
+    #[test]
+    fn chain_21s_genesis_file_still_builds_chain_21() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../deploy/genesis-chain21.json");
+        let gen = Genesis::from_json(&std::fs::read_to_string(path).unwrap()).unwrap();
+        let m = gen.multisig.as_ref().expect("chain 21 carries the treasury");
+        assert_eq!((m.accounts.len(), m.max_accounts), (1, None), "chain 21 predates max_accounts");
+        let executor = node::executor_for_profile(&gen.fri_profile).unwrap();
+        let state = gen.build(executor.as_ref()).unwrap();
+        assert_eq!(state.hash().to_hex(), "ca76c2766ed6090ac6ba5dad86b724dd5d2b80c0edfaed287cd8b129e663ca9a");
+        let reg = state.ledger.multisig().expect("the register");
+        assert_eq!((reg.len(), reg.max_accounts, reg.is_full()), (1, None, false));
+        assert!(!gen.to_json().contains("max_accounts"), "rewriting the file adds no field");
     }
 
     /// Chain 15, the running chain, byte for byte, after RESCAN-LEDGER-1's
@@ -6678,7 +6726,7 @@ mod tests {
             balance: 10 * UNITS_PER_RAND,
         };
         let id = account.id(ledger.chain_id());
-        ledger.set_multisig(Some(MultisigRegister::from_config(&MultisigConfig { create_fee: 0, accounts: vec![account] }, ledger.chain_id())));
+        ledger.set_multisig(Some(MultisigRegister::from_config(&MultisigConfig { create_fee: 0, accounts: vec![account], max_accounts: None }, ledger.chain_id())));
         (ledger, id, signers)
     }
 

@@ -438,6 +438,14 @@ pub enum BlockError {
     /// pool, which takes a block on its header; an executed block's repeat fails on its own.
     #[error("a transaction appears twice in the block")]
     RepeatedTransaction,
+    /// The block carries a transaction whose proof is the pruned marker form (audit v10,
+    /// CON-101). The marker hashes to the raw transaction's id, so such a block has the honest
+    /// block's root, hash and signature and the apply refused it only after it had taken the
+    /// honest block's place in flight, the honest copy dropped as a duplicate. Refused by the
+    /// precheck and the orphan pool instead, before any proof work, with a verdict that is about
+    /// the body, not the hash — the honest block under the same hash is still taken.
+    #[error("tx {index} carries its proof in the pruned marker form")]
+    MarkerFormInProposal { index: usize },
     #[error("state root mismatch: computed {computed}, header {header}")]
     StateRootMismatch { computed: Hash, header: Hash },
     #[error("bad proposer signature")]
@@ -779,6 +787,11 @@ pub struct Ledger {
     /// parameter lives. A parameter like `hardening_v6`: outside the state root and equality,
     /// restored by `reload_ledger`; `false` on every chain through 18.
     testnet: bool,
+    /// PST-1: genesis `program_state.refuse_panics` — an `Invoke` whose call proof publishes the
+    /// panic sentinel is refused (`program_state::panicked`). A parameter like `hardening_v6`:
+    /// outside the state root and equality, restored by `reload_ledger`; `false` on chain 21 and
+    /// every chain cut before the field.
+    refuse_panicked_invokes: bool,
     /// Issue #118: genesis `proof_window_blocks`, the one window that replaces both
     /// [`ANCHOR_WINDOW`] and [`TIME_WINDOW`] when set — how old a bundle's anchor and its `time`
     /// may be — read through [`Ledger::proof_window`]. `None`, every chain through 19, is today's
@@ -952,6 +965,7 @@ impl Ledger {
             hc_auth: None,
             hc_auth_multisig: None,
             testnet: false,
+            refuse_panicked_invokes: false,
             proof_window_blocks: None,
             aggregators: BTreeMap::new(),
             retired_aggregator_nonces: BTreeMap::new(),
@@ -1025,6 +1039,7 @@ impl Ledger {
             hc_auth: None,
             hc_auth_multisig: None,
             testnet: false,
+            refuse_panicked_invokes: false,
             proof_window_blocks: None,
             aggregators: BTreeMap::new(),
             retired_aggregator_nonces: BTreeMap::new(),
@@ -1852,6 +1867,17 @@ impl Ledger {
 
     pub fn set_testnet(&mut self, on: bool) {
         self.testnet = on;
+    }
+
+    /// PST-1: whether an `Invoke` whose call proof publishes the panic sentinel is refused here
+    /// (genesis `program_state.refuse_panics`).
+    pub fn refuse_panicked_invokes(&self) -> bool {
+        self.refuse_panicked_invokes
+    }
+
+    /// Set by genesis from `program_state.refuse_panics`, and by `reload_ledger` on every restart.
+    pub fn set_refuse_panicked_invokes(&mut self, on: bool) {
+        self.refuse_panicked_invokes = on;
     }
 
     /// Issue #118: the genesis `proof_window_blocks`, `None` on a chain whose file does not set
@@ -2901,6 +2927,16 @@ impl Ledger {
                 None => executor.verify_call(record, proof),
             }
             .map_err(TxError::InvalidProof)?;
+            // PST-1, under genesis `program_state.refuse_panics`: a run that reached `guest-sdk`'s
+            // panic handler halts and so proves; its outputs say the program refused what it was
+            // shown. Such an invoke is not an acceptance of its transition. A plain `Call`'s
+            // outputs are data the chain does nothing with, so only an invoke is judged.
+            if self.refuse_panicked_invokes
+                && matches!(tx.action, Action::Invoke { .. })
+                && program_state::panicked(&outcome.outputs)
+            {
+                return Err(program_state::ProgramStateError::ProgramPanicked.into());
+            }
             // The tier-exact floor (`settled_floor`: the gas rule at the declared limit, or the
             // tier schedule, plus an invoke's cell fee) — the one function `fees.burn_floor`
             // burns by, so the burned amount is always a figure the fee was checked against.

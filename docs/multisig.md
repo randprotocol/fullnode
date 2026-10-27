@@ -1,9 +1,9 @@
 # Multisig accounts: M-of-N controlled public balances
 
-> **Status: on `main` (fullnode 3119a29a), not yet on any chain.** The section is genesis-gated: a
-> chain without it refuses all four actions (`UnsupportedAction("multisig")`) and runs byte for
-> byte as before, so the build changes no live chain. It reaches one with the genesis cut that
-> carries the treasury. Design: `docs/superpowers/specs/2026-10-08-multisig-design.md`.
+> **Status: live on chain 21 (v0.8.0, cut 2026-10-12), which carries the foundation treasury
+> (2 of 3) in its `multisig` section.** The section is genesis-gated: a chain without it refuses
+> all four actions (`UnsupportedAction("multisig")`). Private multisig (`hc_auth_multisig`, below)
+> is enabled on chain 21 too, but has no completed auth proof yet ("Status: not yet proved"). Design: `docs/superpowers/specs/2026-10-08-multisig-design.md`.
 
 This page explains how RandProtocol holds RAND (and RPL tokens) under the control of **`threshold`
 of `n` keys**, what the foundation does at the genesis cut to seed its treasury this way, and what
@@ -57,6 +57,7 @@ number of them with RAND, in its `multisig` section:
 |---|---|
 | `create_fee` | units of RAND a later `CreateMultisig` must pay **above** the bundle's settled floor (the 0.001 RAND base, plus `fees.prove_base` on an aggregating chain) — not burned: it is part of the bundle's fee, which goes to the proposer, or, on a chain with the `aggregation` section, follows the fee split (the proposer keeps the 0.001 RAND `BUNDLE_BASE`, the rest is bucketed). `0` to 1 000 RAND. Spam on a permanent register is what it prices. |
 | `accounts` | may be empty: a section with no accounts switches the module on with an empty register. |
+| `max_accounts` | optional: the most accounts the register will ever hold, the seeded ones included. A `CreateMultisig` that would take the register past it is refused (`the multisig register is full`), permanently — no account is ever removed. Absent (chain 21 and every chain cut before the field), the register is unbounded. Part of the genesis hash only when present, so a file without it hashes as before; `rand_getLimits.multisig.max_accounts` serves it. |
 | `salt` | 32 bytes (64 hex characters), the creator's randomness in the id. The chain never learns a name. |
 | `signers` | 1 to 10 distinct Dilithium2 public keys. **The order matters**: a signature names its signer by position (`0:<hex>`). |
 | `threshold` | `1 ≤ threshold ≤ signers`. **Use 2 of 3 or 3 of 5** for a treasury, so one lost key is survived by a rotation. |
@@ -64,7 +65,7 @@ number of them with RAND, in its `multisig` section:
 
 The example is the foundation treasury: 500 000 000 RAND, 2 of 3. `rand-node genesis` refuses a file
 with more than ten signers, a duplicate key, a threshold outside `1..=signers`, a `create_fee` over
-1 000 RAND, two accounts with the same id, or balances that overflow a u64 (or, with the notes,
+1 000 RAND, more seeded accounts than `max_accounts`, two accounts with the same id, or balances that overflow a u64 (or, with the notes,
 stakes and vesting entries, the supply).
 
 ### The id
@@ -259,6 +260,16 @@ of M signatures and learns nothing about the policy. It needs a chain whose gene
 - `msk` and the policy are a **viewing** key: every signer can scan the account and read its whole
   history. Neither can spend without `T` signatures.
 
+> **Status: not yet proved.** The module is enabled on chain 21, but no tier-18 auth proof has
+> ever been completed, and no node has ever verified one. The only Test-profile attempt was
+> stopped at about 76 GB of memory before it finished, so 76 GB is a lower bound on the
+> footprint, not a measurement, and "≥ 96 GB" below is a guess, not a tested requirement. The
+> end-to-end test (`a_private_multisig_receives_spends_rotates_and_refuses_one_signature_end_to_end`)
+> is `#[ignore]`d and has never run to completion. The Production proof size is estimated from table
+> widths; if a real proof exceeds the chain's proof cap, no private-multisig spend can be admitted
+> until a new cut. **Until a proof has been made and verified, treat funds sent to a private
+> multisig address as possibly unspendable**, and use a public account for anything that matters.
+
 ### Public register or private policy: what each shows
 
 | | public account (`MultisigPay`, this page above) | private account (`hc_auth_multisig`) |
@@ -270,7 +281,7 @@ of M signatures and learns nothing about the policy. It needs a chain whose gene
 | a payment's amounts and recipients | the payouts' amounts (recipients shielded) | hidden |
 | what the chain does see | everything above | that the auth proof has the multisig shape, the bundle's public fields, the transaction size |
 | what a signer signs | a 32-byte blake3 digest, checked natively by the node | `b"rand-msauth-1" ‖ binding`, checked inside the proof |
-| cost | a few KB of keys and signatures | a ≥ 3.4 MB auth proof (estimated; the Production size is not yet measured), proved on a machine with ≥ 96 GB (a ≈ 76 GB peak footprint measured at the Test profile) |
+| cost | a few KB of keys and signatures | an auth proof of ≥ 3.4 MB (estimated; no Production proof has been made), on a machine of unknown size: a Test-profile attempt was stopped at ≈ 76 GB before it finished, so more than that (see the status note above) |
 
 A treasury that must be auditable stays public; M-of-N control with the pool's privacy is the
 private account.
@@ -279,8 +290,8 @@ private account.
 
 A private address receives like any other: a shielded transfer, a mint, a bridge deposit — and a
 **public account's `MultisigPay`**, whose payout is a note like any other. So a public treasury
-moves into a private account with an ordinary `MultisigPay` to the private address (the end-to-end
-test does exactly this); the payment is visible on the public side and nothing after it is.
+moves into a private account with an ordinary `MultisigPay` to the private address (the ignored end-to-end
+test is written to do this; it has not yet run to completion); the payment is visible on the public side and nothing after it is.
 
 ### Rotation is a sweep
 
@@ -362,7 +373,7 @@ core), so a browser signer runs the same code.
 |---|---|
 | `rand_getMultisig [id]` | `{ "enabled", "id", "signers", "threshold", "nonce", "vault": [{ "asset", "amount" }] }`; `null` for an unknown id; `{ "enabled": false }` without the section |
 | `rand_getSupply []` | adds `multisig_issued`, `multisig_rand_in`, `multisig_rand_out`, `multisig_base_out`, `multisig_rand_held`; the identity `total_supply == issued` covers the register (`docs/supply.md`) |
-| `rand_getLimits []` | `multisig`: `{ create_fee, max_signers, max_payouts }`, or `null` |
+| `rand_getLimits []` | `multisig`: `{ create_fee, max_signers, max_payouts }` plus `max_accounts` when the genesis sets it, or `null` |
 
 Every amount is a decimal string. The same account from a shell: `rand-node multisig status <id>`.
 

@@ -249,7 +249,7 @@ pub fn is_permanent(e: &TxError) -> bool {
         use randprotocol_core::ledger::multisig::MultisigError as M;
         return matches!(
             m,
-            M::BadSigners(_) | M::DuplicateSigner(_) | M::NoPayouts | M::TooManyPayouts(_) | M::ZeroPayout | M::EmptyDeposit
+            M::BadSigners(_) | M::DuplicateSigner(_) | M::NoPayouts | M::TooManyPayouts(_) | M::ZeroPayout | M::EmptyDeposit | M::RegisterFull { .. }
         );
     }
     // RPL-2's verdicts, split the same way. Cacheable are the ones `program_state::check_shape`
@@ -990,6 +990,25 @@ pub fn call_reveals_private_inputs(tx: &Transaction) -> Option<TxError> {
         log_height,
         min: randprotocol_zkvm::executor::MIN_PRIVATE_TABLE_LOG_HEIGHT,
     })
+}
+
+/// An RPL-2 `Invoke` whose call proof publishes the panic sentinel in output 7
+/// (`program_state::panicked`, PST-1): the program panicked on the transition it was shown, so
+/// the proof is of a refusal, not an acceptance. Read off the proof header
+/// (`randprotocol_zkvm::executor::call_proof_outputs`), before any verification; a forged header
+/// can only get its own transaction refused. `None` for everything else.
+///
+/// **Node policy on every chain, never permanent** ([`is_permanent`] leaves
+/// `ProgramPanicked` out) — an Ignore, never cached. The ledger refuses the same invoke itself
+/// only on a chain whose genesis sets `program_state.refuse_panics`; on chain 21 a block from a
+/// proposer that carries one still applies.
+pub fn invoke_panicked(tx: &Transaction) -> Option<TxError> {
+    let randprotocol_core::Action::Invoke { proof, .. } = &tx.action else {
+        return None;
+    };
+    let outputs = randprotocol_zkvm::executor::call_proof_outputs(proof)?;
+    randprotocol_core::ledger::program_state::panicked(&outputs)
+        .then_some(TxError::ProgramState(randprotocol_core::ledger::program_state::ProgramStateError::ProgramPanicked))
 }
 
 /// The keys a faucet `Mint` may be signed by, as this node's admission policy: the genesis's
@@ -1744,6 +1763,16 @@ mod tests {
         let got = non_canonical_proofs(&as_invoke(taller.clone())).expect("a taller memory table is not what the honest prover writes");
         assert!(matches!(&got, TxError::NonCanonicalProof(w) if w.starts_with("call proof: memory height")), "{got}");
         assert_eq!(Some(got), non_canonical_proofs(&as_call(taller)));
+        // PST-1: the panic sentinel in output 7 is refused for an invoke, by policy (never
+        // cached), and a `Call`'s outputs are never judged; the honest header passes.
+        use randprotocol_core::ledger::program_state::{ProgramStateError, PANIC_SENTINEL};
+        assert_eq!(invoke_panicked(&as_invoke(bytes.clone())), None, "a normal exit");
+        let sentinel = rewritten(&|p| p.public_values[randprotocol_zkvm::tables::cpu::pv::OUT0 + 7] = PANIC_SENTINEL as u64);
+        let got = invoke_panicked(&as_invoke(sentinel.clone()));
+        assert_eq!(got, Some(TxError::ProgramState(ProgramStateError::ProgramPanicked)));
+        assert!(!is_permanent(&got.unwrap()), "policy, never cached");
+        assert_eq!(invoke_panicked(&as_call(sentinel)), None, "a call's outputs are data");
+        assert_eq!(invoke_panicked(&as_invoke(vec![1, 2, 3])), None, "undecodable bytes are the ledger's");
     }
 
     /// The hidden-asset bundle's burn-shape verdicts are byte verdicts: `UnsupportedAsset`,

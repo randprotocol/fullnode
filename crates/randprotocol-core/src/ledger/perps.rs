@@ -2304,7 +2304,7 @@ pub(crate) mod tests {
         assert_eq!(l.take_perp_block_words(), None);
         let mut ps = ledger_with(false);
         ps.set_program_state(Some(crate::ledger::program_state::ProgramState::from_config(
-            &crate::ledger::program_state::ProgramStateConfig { cell_fee: 10_000_000 },
+            &crate::ledger::program_state::ProgramStateConfig { cell_fee: 10_000_000, refuse_panics: false },
         )));
         assert_eq!(hex::encode(ps.state_root().as_bytes()), ROOT_BEFORE_PSTATE);
     }
@@ -2324,7 +2324,7 @@ pub(crate) mod tests {
         // And beside RPL-2's: the program-state root, then the perps root.
         let pstate = || {
             Some(crate::ledger::program_state::ProgramState::from_config(
-                &crate::ledger::program_state::ProgramStateConfig { cell_fee: 1 },
+                &crate::ledger::program_state::ProgramStateConfig { cell_fee: 1, refuse_panics: false },
             ))
         };
         let (mut bare_ps, mut with_ps) = (bare_l.clone(), with.clone());

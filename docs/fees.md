@@ -68,7 +68,7 @@ call at (`MAX_CALL_TIER`) — goes from ~0.0022 to ~0.0041 RAND (`20 479·100 +
 800·⌈1 350 000/1024⌉ + 1 000 000`), and a tier-10 call pays ~0.0021 (was 0.0020). The schedule
 would charge a tier-20 header ~0.133 RAND, but no such call is admitted today.
 
-**Phase 1 (chain 18's constraint set, built on `feat/gas-chain18`, not yet cut).** The chain
+**Phase 1 (chain 18's constraint set, live since chain 18).** The chain
 learns the exact declared limit instead of the header's ceiling: a call proof carries one new
 public value, `GAS_LIMIT` (`pv::GAS`), and the cpu AIR proves `GAS ≤ GAS_LIMIT` in-circuit
 (`docs/confidential.md`'s "Constraint set 8", `docs/zkvm.md` §1, §4). The ledger rule replaces
@@ -88,7 +88,7 @@ auth prover declares the ceiling by default, so wallets change nothing. On a
 chain without a `gas` section (`rand_getLimits.gas_metering` absent) both rules are absent and
 the ledger's flat tier schedule above applies unchanged.
 
-### 1.2 Dynamic prices (Phase 2, chain 18's genesis `gas.dynamic`, built, not yet cut)
+### 1.2 Dynamic prices (Phase 2, chain 18's genesis `gas.dynamic`, live since chain 18)
 
 Optional inside the same `gas` section (spec §7.1): `gas_price`/`byte_price` become live ledger
 state (`Ledger::gas_prices`, `GasPrices { gas_price, byte_price }`), moved once per block in

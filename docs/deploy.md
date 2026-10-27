@@ -27,13 +27,15 @@ it has been followed are under "Rolling out a new commit"; the rules for the nex
 Since this table was written: **chain 19** (v0.6.7, genesis `a3defc93…228a`, 2026-10-01,
 `deploy/cut-chain19-genesis.sh`) and **chain 20** (v0.6.8, genesis `6210cf07…5135`, live since
 2026-10-01 06:17 UTC, `deploy/cut-chain20-genesis.sh`, `deploy/cut-records/chain20.record`; now on
-v0.7.1), then replaced by **chain 21**, the chain that runs (cut 2026-10-12, v0.8.0, genesis
-`ca76c276…`). The paragraph below is the cut's preparation record:
+v0.7.1; retired at the chain-21 cut). **Chain 21** (v0.8.0, genesis `ca76c276…ca9a`, cut
+2026-10-12, all 26 validators switched at 10:31 UTC, `deploy/cut-records/` and
+`docs/chain21-cut-runbook.md`) is the chain that runs. The paragraph below is the cut's
+preparation record:
 `deploy/cut-chain21-genesis.sh` carries chain 20's shape and value plus three new sections —
 `fees` (`burn_base`, `burn_floor`), `perps` (RPL-3: BTC-PERP on zUSD) and `multisig` (the
 foundation treasury, 2 of 3) — and private multisig's `hc_auth_multisig` field with 6 MiB proofs
-and 19 MiB blocks ("The next cut: the `fees` section (chain 21)", below), and needs a build at
-6f1cd272 or later with `feat/private-multisig` (712c6336 or later) on every node (signers read
+and 19 MiB blocks ("The next cut: the `fees` section (chain 21)", below), and needed a build at
+6f1cd272 or later with `feat/private-multisig` (712c6336 or later) on every node — v0.8.0 (signers read
 the genesis hash from the node or take `--genesis-hash`, so they need it only to know `fee_rules`,
 `perps`, `multisig` and `hc_auth_multisig`).
 
@@ -1107,7 +1109,7 @@ chain-17 scripts).
 ## The next cut: the gas section (chain 18)
 
 Spec `docs/superpowers/specs/2026-09-28-gas-model-design.md` §3.2–§4.3, §7.1. **Built on
-`feat/gas-chain18`, not yet cut** — see the AGENTS.md v0.6.6 entry for the review traps and
+`feat/gas-chain18`; cut as chain 18** — see the AGENTS.md v0.6.6 entry for the review traps and
 gate counts. Chain 18 follows chain 17 (live since 2026-09-29, v0.6.3): it carries chain 17's
 split authorisation (bundle guest v3 + `hc_auth`), its caps (4 MiB proofs, 20 MiB blocks — room for
 three proofs), its validators, bridge state and value, and adds the genesis `gas` section

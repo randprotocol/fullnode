@@ -19,6 +19,62 @@ stopped at v0.4 until 2026-09-30, when the entries v0.5 to v0.6.7 were written f
   production `aggregate_program_digest` `792a66d4…a982` (`8bc2cecb…d8c7` before). No ISA, AIR or
   key change; constraint set 9 and every wallet proof are untouched.
 
+Audit v10 fixes (node and client policies, no chain change unless a genesis field says so):
+
+- **CON-101** (consensus, node-only): a proposal whose bundle proof is the pruned marker form —
+  hash-equal to the leader's honest block — is refused on its body by both prechecks
+  (`MarkerFormInProposal`) and never takes the honest block's place in flight.
+- **CON-102 / NODE-101** (node-only): the recent-transaction cache hashes every body it files; a
+  rebuilt compact block's bodies are remembered only once the precheck accepts it; a startup
+  checkpoint skip still hashes the ledger snapshot against the tip's state root and refuses to
+  start on a mismatch.
+- **RPC-201** (client-only): `rand` reads envelopes by whole aligned chunks of `--scan-chunk`
+  leaves (256; `0` = every envelope) after paging scan heads, so the node learns the chunk and not
+  the leaf (`docs/rpc.md`, scan heads). Heads are paged on chunk boundaries (whole chunks, at
+  least 500 leaves), so no chunk straddles two pages and each is read once per scan; the chunk
+  count is a lower bound on the wallet's notes, and a partial tip chunk hides a leaf only among
+  the leaves written so far (documented).
+- **MSA-4** (genesis-gated, next cut): genesis `multisig.max_accounts` caps the public multisig
+  register; a `CreateMultisig` past it is refused (`RegisterFull`, permanent). Absent — chain 21 —
+  the register is unbounded and the genesis hash is unchanged. Node-only: each account's leaf hash
+  is cached, so a state root rehashes only the accounts that changed, and the store keeps one row
+  per account (`multisig_accounts` column family) plus a totals row, so a commit writes only the
+  accounts its blocks touched; a store's one-blob register is split into rows at the first open
+  (`rand-node db restore-multisig-blob --datadir <dir>`, node stopped, restores v0.8.0's layout
+  before a downgrade). **Upgrade note:** snapshot each datadir (stop the node, copy it) before
+  rolling this build; that rollback needs no tool.
+- **MSA-1 / MSA-2** (docs): `docs/multisig.md`, `docs/cli.md`, `docs/prover.md` and
+  `docs/shielded.md` say plainly that no private-multisig (tier-18) auth proof has yet been
+  completed or verified by a node; ≈ 76 GB is a lower bound from a stopped Test-profile attempt,
+  not a measured footprint; the end-to-end test is ignored and has not run to completion; funds
+  sent to a private-multisig address may not be spendable yet.
+- **DOC-32** (docs): README, `docs/deploy.md` and `docs/multisig.md` name chain 21 (v0.8.0,
+  constraint set 9) as the running chain and chain 20 as retired; the chain-18 gas pages no longer
+  say "not yet cut"; `docs/tokens.md` no longer says RPL is uncut; the README release table gains
+  v0.8.0.
+- **OPS-402** (deploy tooling): with chain 21's genesis committed, `deploy/cut-chain21-genesis.sh`'s
+  `DRY_RUN` (and so its selftest and the 26-host rehearsal, which cuts two dry-run files) scans a
+  copy of the committed genesis files without chain 21's own; the real cut still refuses chain id
+  21. Selftest 237 of 237.
+- **PST-1** (genesis-gated, next cut; pool policy now): an `Invoke` whose call proof publishes
+  `guest-sdk`'s panic sentinel (`0xdeadbeef` in output 7) is refused (`ProgramPanicked`) on a
+  chain whose genesis sets `program_state.refuse_panics: true` (`rand-node genesis
+  --program-state-refuse-panics`); bound into the genesis hash only when set, so chain 21 hashes
+  and replays as before. Every node's pool refuses such an invoke on every chain (node policy,
+  never cached). A trapping run has no execution and so no proof; tests cover panic, trap and a
+  normal exit on the real executor.
+- **NET-1** (node-only): the node-wide cap on inbound handshakes is the connection guard's, not
+  libp2p's identity-blind one, and holds slots back for reserved peers (validators and
+  bootstraps): 96 pending in all, 32 of them only for a source address a reserved peer is known
+  at (its bootstrap address, an address it was learned at, or a connection it held). Strangers
+  keep the 64 they had and can no longer lock a validator out by stalling handshakes from many
+  hosts. The per-address cap (4) still applies to everyone.
+  One reserved peer holds at most 4 reserved slots over all its sources; of the addresses it
+  advertises only one is trusted; observed sources evict advertised ones; advertised and
+  observed sources expire 24 h after they were last in use — a source with a connection open
+  never expires (bootstrap addresses never do). Every validator
+  should be in the fleet's `--bootstrap` lists, since learned sources do not survive a restart.
+
 ## v0.8.0 — 2026-10-12 (chain 21 onward)
 
 Tagged from fullnode `main` (vendoring circuits `d217252`: constraint set 9 — rVM phase 4's

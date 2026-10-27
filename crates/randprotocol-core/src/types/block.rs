@@ -210,6 +210,10 @@ pub struct Block {
     pub signature: Signature,
 }
 
+/// [`Block::transaction_list_fault`]'s verdict on a block carrying a pruned-marker proof outside
+/// sealed-form sync (audit v10, CON-101).
+pub const MARKER_FORM_FAULT: &str = "a transaction carries its proof in the pruned marker form";
+
 impl Block {
     pub fn tx_root(txs: &[Transaction]) -> Hash {
         let leaves: Vec<Hash> = txs.iter().map(|t| t.hash()).collect();
@@ -249,6 +253,18 @@ impl Block {
         Block::tx_root(&self.transactions) == self.header.tx_root
     }
 
+    /// The index of the first transaction carrying its proof in the pruned marker form
+    /// ([`Transaction::is_pruned_form`]), if any (audit v10, CON-101). The marker form hashes to
+    /// the raw transaction's id, so a block whose proofs are replaced by markers has the honest
+    /// block's root, header, hash and signature — a hash-equal variant the apply refuses
+    /// (`PrunedFormOutsideSync`) only after it has taken the honest block's place in flight.
+    /// Checked by [`Block::transaction_list_fault`] before any hashing, so every place that takes
+    /// a full block outside sealed-form sync refuses it up front. Not a rule of the sync path,
+    /// whose side table vouches for the marker.
+    pub fn pruned_form_index(&self) -> Option<usize> {
+        self.transactions.iter().position(Transaction::is_pruned_form)
+    }
+
     /// What is wrong with this block's transaction list against its own header, if anything
     /// (audit v6, GOSSIP-2): a list whose root is not the header's, or one that names the same
     /// transaction twice. The second is not covered by the first — [`crate::crypto::merkle_root`]
@@ -263,6 +279,9 @@ impl Block {
     /// hard fork, and an executed block's repeat is refused by the ledger on its own terms.
     /// One pass of transaction hashes, which is what the root costs anyway.
     pub fn transaction_list_fault(&self) -> Option<&'static str> {
+        if self.pruned_form_index().is_some() {
+            return Some(MARKER_FORM_FAULT);
+        }
         let leaves: Vec<Hash> = self.transactions.iter().map(|t| t.hash()).collect();
         let mut seen = std::collections::HashSet::with_capacity(leaves.len());
         if !leaves.iter().all(|h| seen.insert(*h)) {

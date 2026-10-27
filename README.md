@@ -20,18 +20,19 @@ chain with a proof instead of their inputs.
 | Staking | a public validator register — bond out of a bundle's burn (v2 registrations, a two-epoch activation delay), unbond over two epochs, withdraw into a shielded note — epochs that re-derive the validator set from it, timelocked genesis vesting (`docs/vesting.md`), and a supply audit that adds the register and the pool back up to what the chain issued |
 | Wallet keys | a 256-bit spend key; viewing key, note-owner field, nullifier key, outgoing viewing key, ML-KEM-768 decapsulation key and `rand1…` address all derived from it |
 | Bridged assets | the guardian bridge as notes: a bridged holding is a note whose `asset` word is the registry's index, an attestation deposits one note the chain computes itself, and a burn is a single hidden-asset bundle — the same bundle spends the bridged asset from slots 0–1 and pays the RAND fee from slots 2–3 (`docs/bridge.md`) |
-| Confidential computation | Rand zkVM: RV32I under a Plonky3 batch STARK (Goldilocks, Poseidon2, ZK-hiding FRI, constraint set 8); programs deployed on chain, calls carry a proof + 8 public outputs and a declared gas limit the circuit enforces, priced per gas and per KiB with dynamic prices (chain 18), and pay through a bundle like everything else |
+| Confidential computation | Rand zkVM: RV32I under a Plonky3 batch STARK (Goldilocks, Poseidon2, ZK-hiding FRI, constraint set 9 since chain 21); programs deployed on chain, calls carry a proof + 8 public outputs and a declared gas limit the circuit enforces, priced per gas and per KiB with dynamic prices (chain 18), and pay through a bundle like everything else |
 | Storage | one RocksDB per node with column families for blocks, certificates, indexes, notes, nullifiers, anchors, validators, programs and receipts; fsynced commits; startup integrity check with truncate-and-resync; optional history pruning (`--prune-history 24h`) with archive nodes keeping everything |
 | Interfaces | JSON-RPC 2.0 over HTTP with batch requests, a WebSocket `newHeads` / `receipts` / `transaction` subscription on the same port (`rand-node`), `rand` wallet CLI with a local prover, `rand-prover` delegated prover (`docs/prover.md`), Rust client library |
 
-Status: an experimental testnet runs **chain 20** (live since 2026-10-01 06:17 UTC; genesis
-`6210cf07…5135`, build **v0.6.9** `3f43101b`, v0.7.0 rolling next) on 26 DigitalOcean validators —
-quorum 18 of 26 — including two archive nodes that keep full history; the others keep one day.
-Chain 20 is the first chain whose proofs and signed messages are bound to the genesis hash
-(`binding_domain: 1`), the first with RPL-2 program state and the `Invoke` action, and the first
-whose bridge takes its fees in zUSD (10 bps each way, kept on Rand as treasury notes); it keeps
-gas metering (constraint set 8), split authorisation, the encrypted memo, a 1,024-block proof
-window and the zUSD-backed guardian bridge (≈99 zUSD, audited `supply == locked == custody`).
+Status: an experimental testnet runs **chain 21** (live since 2026-10-12 10:31 UTC; genesis
+`ca76c276…ca9a`, cut on build **v0.8.0** `c0878c3f`) with 26 validators — quorum 18 of 26. Chain 21 carries
+chain 20's rules (proofs and signed messages bound to the genesis hash, RPL-2 program state and
+`Invoke`, the zUSD bridge fees, gas metering, split authorisation, the encrypted memo, the
+1,024-block proof window, the zUSD-backed guardian bridge) and adds constraint set 9 (rVM
+phase 4's Merkle spans and the MODQ chip), the `fees` section (`burn_base`, `burn_floor`), RPL-3
+perps (BTC-PERP on zUSD), public multisig accounts with the foundation treasury, and private
+multisig (`hc_auth_multisig`; no auth proof completed yet, `docs/multisig.md`). Chain 20 (v0.6.8
+→ v0.7.1, 2026-10-01 to 2026-10-12) is retired.
 Public RPC: `https://rpc.randprotocol.org`; explorer `https://randscan.org`. Not audited as a
 whole; not for real value — mainnet is v1.0, and every validator and guardian key is one
 operator's until the key-separation schedule (`docs/deploy.md`) is met.
@@ -356,6 +357,7 @@ a time.
 | v0.6.8 | chain 20's cut build: RPL-2 (program state, program vaults, the `Invoke` action; `docs/program-state.md`), the zUSD bridge fees (`bridge.fees`), and the final audit v6 fixes — the timeout-certificate pacemaker and the durable lock (all-stop/all-start), a public RPC listener, genesis-bound signing, a proof window, admission by vote, vesting revokes by threshold, rotation possession and delay, gas price ceilings | 20 |
 | v0.6.9 | node-only: headers carry invokes in `public_notes`, so a wallet rebuilds RPL-2 payouts from public fields | 20 |
 | v0.7.0 | node-only: the audit v7 addendum (bounded by-hash deferral, header pages capped by reply size, a prover timeout, the wallet's resumable first sync hardened) and the last audit v6 rows (a clean-clone build, an incremental token root, the key-separation schedule); the first workflow-built, signed release | 20 |
+| v0.8.0 | chain 21's cut build: constraint set 9 (rVM phase 4's Merkle spans, the MODQ chip), tree aggregation, scan heads, compact blocks, the `fees` section, RPL-3 perps, public and private multisig | 21 |
 
 ## v0.5: RPL, zUSD and bridge hardening
 

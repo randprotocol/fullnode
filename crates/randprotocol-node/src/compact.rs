@@ -27,7 +27,7 @@ pub fn recent_txs_bytes(max_block_bytes: usize) -> usize {
 /// rebuilt into the block, it makes the block fail and this node not vote. A marker-form body
 /// therefore never enters the compact path: not cached, not looked up, not accepted from a fetch.
 pub fn is_marker_form(tx: &Transaction) -> bool {
-    tx.bundle.as_ref().is_some_and(|b| randprotocol_core::notes::pruned_proof_hash(&b.proof).is_some())
+    tx.is_pruned_form()
 }
 
 /// FIFO of gossiped and proposed transactions by hash, capped by count and by serialized
@@ -46,19 +46,31 @@ impl RecentTxs {
     }
 
     /// Remember a transaction; a held one is left where it is, and a marker-form one
-    /// ([`is_marker_form`]) is not taken. Evicts the oldest entries past either cap.
-    pub fn remember(&mut self, tx: Transaction) {
+    /// ([`is_marker_form`]) is not taken. Evicts the oldest entries past either cap. Returns the
+    /// body's id, hashed here — the one key it is ever filed under (audit v10, CON-102: the cache
+    /// computes every hash it files by; no caller hands it one).
+    pub fn remember(&mut self, tx: Transaction) -> Hash {
         let h = tx.hash();
         self.remember_hashed(h, tx);
+        h
     }
 
-    /// [`RecentTxs::remember`] with the hash already computed — the leader's path has it from
-    /// the compact proposal it just published; `h` must be `tx.hash()`. A hash already held is
+    /// Remember every body in order and return their ids, each hashed once, here. The leader's
+    /// path builds its compact proposal from the hashes this returns, so the wire's hash list and
+    /// the cache's keys come from the same hashing of the same bodies.
+    pub fn remember_all(&mut self, txs: impl IntoIterator<Item = Transaction>) -> Vec<Hash> {
+        txs.into_iter().map(|tx| self.remember(tx)).collect()
+    }
+
+    /// [`RecentTxs::remember`] with the hash just computed by this module: `h` is `tx.hash()`,
+    /// which the two callers ([`RecentTxs::remember`], [`OverflowTxs::settle`]) computed from
+    /// `tx` itself. Private, so no hash arrives from outside (CON-102). A hash already held is
     /// a no-op, the first copy staying where it is: that is also what a list naming one
     /// transaction twice would do, though the pre-screen refuses such a list before any body
     /// is remembered. A single body larger than the byte cap is refused up front, so it cannot
     /// empty the cache on its way through.
-    pub fn remember_hashed(&mut self, h: Hash, tx: Transaction) {
+    fn remember_hashed(&mut self, h: Hash, tx: Transaction) {
+        debug_assert_eq!(h, tx.hash(), "the recent cache files a body under its own hash only");
         if is_marker_form(&tx) || self.by_hash.contains_key(&h) {
             return;
         }
@@ -78,11 +90,9 @@ impl RecentTxs {
 
     /// Remember every transaction of a block: the next leader's proposal often repeats them.
     /// Its list holds no hash twice (the precheck refuses one that does); a repeat would be a
-    /// no-op ([`RecentTxs::remember_hashed`]).
-    pub fn remember_block(&mut self, block: &Block) {
-        for tx in &block.transactions {
-            self.remember(tx.clone());
-        }
+    /// no-op ([`RecentTxs::remember`]). Returns the ids, in the block's order.
+    pub fn remember_block(&mut self, block: &Block) -> Vec<Hash> {
+        self.remember_all(block.transactions.iter().cloned())
     }
 
     pub fn get(&self, h: &Hash) -> Option<&Transaction> {
@@ -431,6 +441,27 @@ pub(crate) mod tests {
         c.remember_block(&block_of(txs.clone()));
         assert!(txs.iter().all(|t| c.get(&t.hash()).is_some()));
         assert!(!c.is_empty());
+    }
+
+    /// Audit v10, CON-102: the cache files a body only under the hash it computed itself, and
+    /// hands that hash back — the leader's compact proposal is built from the returned list, so
+    /// the wire's hashes and the cache's keys are one hashing of one body list. Every returned id
+    /// is the body's own, in order, and `CompactBlock::with_hashes` over them is `CompactBlock::of`.
+    #[test]
+    fn the_recent_cache_hands_back_the_hashes_it_filed_under() {
+        use crate::network::CompactBlock;
+        let txs: Vec<Transaction> = (1..=3u8).map(mint).collect();
+        let block = block_of(txs.clone());
+        let mut c = RecentTxs::new(10, usize::MAX);
+        let hashes = c.remember_all(txs.clone());
+        assert_eq!(hashes, txs.iter().map(Transaction::hash).collect::<Vec<_>>());
+        assert!(hashes.iter().zip(&txs).all(|(h, t)| c.get(h) == Some(t)));
+        assert_eq!(c.remember(txs[0].clone()), txs[0].hash(), "a repeat still answers the id");
+        let mut again = RecentTxs::new(10, usize::MAX);
+        assert_eq!(again.remember_block(&block), hashes);
+        let Block { header, transactions, signature } = block.clone();
+        let compact = CompactBlock::with_hashes(header, signature, again.remember_all(transactions));
+        assert_eq!(compact, CompactBlock::of(&block));
     }
 
     #[test]

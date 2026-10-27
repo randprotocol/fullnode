@@ -888,7 +888,7 @@ fn genesis_rpl2(validator: &Keypair) -> Genesis {
             dynamic: None,
         }),
         hardening_v6: Some(true),
-        program_state: Some(ProgramStateConfig { cell_fee: RPL2_CELL_FEE }),
+        program_state: Some(ProgramStateConfig { cell_fee: RPL2_CELL_FEE, refuse_panics: false }),
         multisig: None,
         // BIND-1, pinned here rather than inherited: chain 20, the first that can carry RPL-2, is
         // cut with `binding_domain: 1`, so the real-proof invoke is proved and verified in the
@@ -1101,7 +1101,7 @@ fn genesis_multisig(validator: &Keypair) -> Genesis {
     use randprotocol_core::genesis::{TokensConfig, MIN_REGISTRATION_FEE};
     let tokens = TokensConfig { registration_fee: MIN_REGISTRATION_FEE, mint_cap_per_day: 0, max_tokens: None, burn_registration_fee: None, bound_note_value: None, incremental_root: None, tokens: vec![] };
     Genesis {
-        multisig: Some(randprotocol_core::ledger::multisig::MultisigConfig { create_fee: MULTISIG_CREATE_FEE, accounts: vec![] }),
+        multisig: Some(randprotocol_core::ledger::multisig::MultisigConfig { create_fee: MULTISIG_CREATE_FEE, accounts: vec![], max_accounts: None }),
         ..genesis_full(validator, None, None, Some(tokens))
     }
 }
@@ -1272,6 +1272,7 @@ fn genesis_private_multisig(validator: &Keypair, public_signers: &[Keypair]) -> 
         multisig: Some(MultisigConfig {
             create_fee: 0,
             accounts: vec![MultisigAccountConfig { salt: [33; 32], signers: public_signers.iter().map(|k| k.public_key().clone()).collect(), threshold: 2, balance: 20 * UNITS_PER_RAND }],
+            max_accounts: None,
         }),
         ..genesis_v3(validator)
     }
@@ -1287,7 +1288,8 @@ fn genesis_private_multisig(validator: &Keypair, public_signers: &[Keypair]) -> 
 /// chain naming `hc_auth_multisig` refuses to start without the key. Each phase prints its
 /// elapsed time (`--nocapture`), so a failed run's log shows where it stopped and what it cost.
 ///
-/// Run on a >= 96 GB machine (a Test-profile msauth prove has a ≈ 76 GB footprint):
+/// Not yet run to completion: a Test-profile msauth prove was stopped at ≈ 76 GB before it
+/// finished, so that is a lower bound and >= 96 GB is a guess. Run on the largest machine at hand:
 /// `cargo +1.98.1 test --release -p randprotocol-client --test wallet_flow -- --ignored --nocapture a_private_multisig`
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "real proofs, three of them tier 18: run on a >= 96 GB machine"]

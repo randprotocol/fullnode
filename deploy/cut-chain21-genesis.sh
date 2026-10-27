@@ -2093,6 +2093,9 @@ a=json.load(open(sys.argv[3])); a["rand_getLimits"]["hc_auth_multisig"] = None; 
   python3 -c 'import json,sys; json.dump({"chain_id": 21}, open(sys.argv[1] + "/genesis-chain21.json", "w"))' "$ST" 2>/dev/null
   mkdir -p "$ST/gendir"; cp "$ST/genesis-chain21.json" "$ST/gendir/"; cp "$CHAIN20_GENESIS" "$ST/gendir/genesis-chain20.json"
   bash_refuses "a chain id a committed genesis already has (OPS-7)" "already used by genesis-chain21.json" CUT_POLICY_GENESIS_DIR="$ST/gendir" CUT_RECORD="$ST/cut-record.txt" CHAIN20_SNAPSHOT="$ST/snap" NODE=/usr/bin/true WALLET=/usr/bin/true --
+  # OPS-402: with chain 21 cut, the real deploy/ holds genesis-chain21.json; the real (non-dry) cut
+  # still refuses chain id 21 against it — only DRY_RUN scans a copy without it.
+  bash_refuses "the real cut against the committed deploy/genesis-chain21.json (OPS-402)" "already used by genesis-chain21.json" CUT_RECORD="$ST/cut-record.txt" CHAIN20_SNAPSHOT="$ST/snap" NODE=/usr/bin/true WALLET=/usr/bin/true --
   bash_refuses "snapshot on a dead tunnel" "is not answering" CHAIN20_RPC=http://127.0.0.1:9 -- snapshot "$ST/snap-new"
   mkdir -p "$ST/wd"; echo '{}' > "$ST/wd/shielded-1.key.json"
   bash_refuses "balances without the relayer's key file" "relayer.key.json is in none of" WALLETS_DIRS="$ST/wd" WALLET=/usr/bin/true ALLOC_ADDRESSES="$ST/none.txt" CHAIN20_RPC=http://127.0.0.1:9 -- balances "$ST/snap-bal"
@@ -2189,6 +2192,16 @@ if [ "${DRY_RUN:-}" = 1 ]; then
     ALLOC_ADDRESSES=$ST/alloc-rand.txt ZUSD_CARRY=$ST/zusd-carry.txt CUT_RECORD=$ST/cut-record.txt
   OUT=${DRY_OUT:-$ST/genesis-chain21.DRY-RUN.json}
   export CHAIN20_SNAPSHOT VALIDATORS_TSV REGISTRATIONS ALLOC_ADDRESSES ZUSD_CARRY
+  # OPS-402: chain 21 is cut and its genesis is committed, so `refuse_reused_chain_id 21` would
+  # stop every dry run (a rehearsal of this script, not a cut). The dry run scans a copy of the
+  # committed genesis files without chain 21's own; the real cut still scans deploy/ and refuses.
+  if [ -z "${CUT_POLICY_GENESIS_DIR:-}" ]; then
+    mkdir -p "$ST/gendir-dry"
+    for g in "$(dirname "$0")"/genesis*.json; do
+      [ "$(basename "$g")" = genesis-chain21.json ] || cp "$g" "$ST/gendir-dry/"
+    done
+    CUT_POLICY_GENESIS_DIR=$ST/gendir-dry; export CUT_POLICY_GENESIS_DIR
+  fi
   if [ ! -f "$TREASURY" ]; then
     # No treasury file: three throwaway signer keys (NODE keygen, under $ST, deleted with it), 2 of 3,
     # 500 000 000 RAND (docs/multisig.md's example). Never what chain 21's signers will be.

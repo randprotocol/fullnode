@@ -699,6 +699,12 @@ impl Mempool {
         if let Some(e) = crate::admission::deploy_uncallable(tx) {
             return Err(e);
         }
+        // PST-1's (`admission::invoke_panicked`): an invoke whose proof publishes the panic
+        // sentinel is not pooled, on every chain; the ledger's own rule only under genesis
+        // `program_state.refuse_panics`.
+        if let Some(e) = crate::admission::invoke_panicked(tx) {
+            return Err(e);
+        }
         // And the canonical-proof rules (INT-5, VERIFIER-1/-2): a header the honest prover would
         // not write, on the bundle's proof or the call's. The ledger's own rule under
         // `hardening_v6`; policy here on every chain.
@@ -1958,7 +1964,7 @@ mod tests {
 
         // The same account (same id, same nonce 0) now holding 5 RAND.
         let mut drained = l.clone();
-        let config = MultisigConfig { create_fee: fixtures::MULTISIG_CREATE_FEE, accounts: vec![fixtures::multisig_account_config(5 * u)] };
+        let config = MultisigConfig { create_fee: fixtures::MULTISIG_CREATE_FEE, accounts: vec![fixtures::multisig_account_config(5 * u)], max_accounts: None };
         drained.set_multisig(Some(MultisigRegister::from_config(&config, drained.chain_id())));
         assert_eq!(drained.multisig().unwrap().get(&id).unwrap().nonce, 0, "the nonce did not move");
         assert!(m.candidates(&drained, 10).is_empty(), "a pay its row cannot cover is not offered");

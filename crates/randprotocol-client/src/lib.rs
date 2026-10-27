@@ -491,6 +491,17 @@ pub fn usd_subsidy_of(v: &Value) -> Option<randprotocol_core::ledger::fees::UsdS
     })
 }
 
+/// The default envelope-fetch width of a scan over heads (audit v10, RPC-201): a wallet that
+/// opened a leaf's head reads the envelopes of the whole aligned 256-leaf chunk around it, so a
+/// node sees "a leaf in this chunk is the wallet's" rather than the leaf. 256 full rows are
+/// ~1 MB of JSON, a cost a scan pays once per chunk that holds one of its notes. The node caps a
+/// read at 1000 rows, so a chunk is at most that; `0` reads every envelope.
+pub const DEFAULT_SCAN_CHUNK: u64 = 256;
+
+/// The largest `--scan-chunk`: the node serves at most this many rows per `rand_getCommitments`
+/// read, so a wider chunk would come back short and fail the scan.
+pub const MAX_SCAN_CHUNK: u64 = 1000;
+
 #[derive(Clone)]
 pub struct RpcClient {
     url: String,
@@ -514,6 +525,10 @@ pub struct RpcClient {
     /// The first wait after a rate-limit refusal (issue #117); doubled per retry up to
     /// [`RATE_LIMIT_RETRIES`] retries. A second in production; tests shorten it.
     rate_limit_wait: Duration,
+    /// How many leaves wide a `rand_getCommitments` read is when a scan over heads fetches the
+    /// envelopes of the leaves its keys opened ([`DEFAULT_SCAN_CHUNK`]; `0` reads every envelope,
+    /// audit v10, RPC-201). A policy of this client, not of the node: `wallet::leaf_page` reads it.
+    scan_chunk: u64,
     /// How long a read (anything but a large upload) may take, body included ([`READ_TIMEOUT`]).
     read_timeout: Duration,
 }
@@ -631,8 +646,23 @@ impl RpcClient {
             legacy_scan: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             envelope_format: std::sync::Arc::new(tokio::sync::OnceCell::new()),
             rate_limit_wait: Duration::from_secs(1),
+            scan_chunk: DEFAULT_SCAN_CHUNK,
             read_timeout: READ_TIMEOUT,
         }
+    }
+
+    /// This client with another envelope-fetch width for a scan over heads (`--scan-chunk`;
+    /// [`DEFAULT_SCAN_CHUNK`] otherwise): the wallet reads envelopes in aligned chunks of `chunk`
+    /// leaves, so the node learns which chunk held a leaf of this wallet's and not which leaf;
+    /// `0` reads every envelope, as a wallet did before scan heads (audit v10, RPC-201).
+    pub fn with_scan_chunk(mut self, chunk: u64) -> RpcClient {
+        self.scan_chunk = chunk;
+        self
+    }
+
+    /// The envelope-fetch width ([`RpcClient::with_scan_chunk`]).
+    pub fn scan_chunk(&self) -> u64 {
+        self.scan_chunk
     }
 
     /// This client with another read timeout (tests: milliseconds instead of [`READ_TIMEOUT`]).

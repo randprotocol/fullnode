@@ -205,11 +205,31 @@ a wallet seals, empty for a chain-made note with an empty envelope.
 
 The head is all a scan needs to decide ownership: decapsulating `kem_ct` and opening
 `to_receiver` (or opening `to_sender` under `ovk`) succeeds only for the right key, and yields
-the transaction key. A wallet pages heads, then reads with `rand_getCommitments` only the leaves
-one of its keys opened — and any head that is not 1 208 bytes, rather than guessing at its split.
+the transaction key. A wallet pages heads, then reads with `rand_getCommitments` the leaves one
+of its keys opened — and any head that is not 1 208 bytes, rather than guessing at its split.
 On chain 20's first 1000 leaves a head row is 1 718 bytes of JSON against a full row's 3 876.
 A node too old to have the method answers `-32601`; `rand` then pages `rand_getCommitments` as
 before.
+
+**The privacy trade-off (audit v10, RPC-201).** The node serving the scan sees which leaves a
+wallet reads in full after paging heads, and those are the wallet's own leaves — a node that
+served full pages to everyone learned nothing. `rand` therefore reads envelopes in whole
+**aligned chunks**: a wanted leaf at index `i` is fetched as `rand_getCommitments(i - i mod N, N)`
+with `N` = `--scan-chunk` (256 by default), so the node learns that *some* leaf of the chunk is the
+wallet's, not which one (but see the tip, below), and the leaves between two of the wallet's in one chunk ride in the
+same read. Heads are paged on chunk boundaries too (each page starts at a multiple of `N` and
+spans whole chunks, at least 500 leaves), so a chunk never straddles two pages and is read once
+per scan however many of the wallet's leaves it holds; a read is never one leaf (`--scan-chunk 1`
+is refused). What the node still learns: how many chunks hold a leaf of the wallet's — a *lower*
+bound on its note count (several of its notes can share a chunk), plus every chunk holding a head
+that is not 1 208 bytes, which is read whatever its owner — and the wallet's timing. **The tip is
+the weak spot:** the last chunk is partial while the chain grows, so a wanted leaf in it is hidden
+only among the leaves written so far — right after a new block that can be a single bundle — and
+the chunk is read again on each later scan as it fills, which tells the node a leaf of the wallet's
+is in it. A wallet that cares can scan less often than blocks arrive, or use `--scan-chunk 0`. `--scan-chunk 0` reads every envelope, as a wallet before scan
+heads did: the node learns nothing from the reads, at a full page's bandwidth — the setting for a
+node you do not trust with your note count. Larger `N` (up to the 1000-row cap) hides more at
+more bandwidth per wanted leaf; 256 full rows are ~1 MB of JSON per chunk that holds a note.
 
 ### `rand_getNullifiers`
 Params: `[from_height]` or `[from_height, limit]`. Result: every nullifier published from that
@@ -1935,6 +1955,13 @@ What changed for clients, in one place. Newest first.
   (`docs/shielded.md` §2). A multisig-shaped auth proof on a chain without the field is refused
   `InvalidAuthProof`, permanently; one sent while the node's key is still cold is deferred with a
   retryable refusal.
+
+### Unreleased — the wallet's scan reads envelopes by aligned chunk (client-only; audit v10, RPC-201)
+
+Against a node with `rand_getScanLeaves`, `rand` no longer reads with `rand_getCommitments` exactly
+the leaves its keys opened (which told the node which leaves were the wallet's): it reads the whole
+aligned chunk of `--scan-chunk` leaves (256 by default, 0 = every envelope, 2..1000) around each.
+No RPC method changes; the scan-heads section above has the trade-off.
 
 ### Unreleased — `rand_getScanLeaves` (node-only)
 

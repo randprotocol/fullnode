@@ -55,6 +55,21 @@ pub const MAX_CELL_FEE: u64 = 1_000 * crate::types::UNITS_PER_RAND;
 /// mint (`"rpl-mint"`), a bridge deposit and a faucet mint (both all-zero).
 pub const PROGRAM_FROM: Word8 = [u32::from_le_bytes(*b"rpl2"), u32::from_le_bytes(*b"-pay"), 0, 0, 0, 0, 0, 0];
 
+/// What `guest-sdk`'s panic handler writes to output slot 7 before it halts (circuits
+/// `guest-sdk/src/lib.rs`): a panicking guest's run halts, so it proves, with this word in
+/// [`PANIC_SLOT`]. An output slot is written at most once (the zkVM refuses a second write), so a
+/// run that reaches the handler either publishes the sentinel there or has no proof at all.
+pub const PANIC_SENTINEL: u32 = 0xdead_beef;
+/// The output slot [`PANIC_SENTINEL`] is written to.
+pub const PANIC_SLOT: usize = 7;
+
+/// Whether a call proof's published outputs carry the panic sentinel (PST-1): the run that made
+/// it reached `guest-sdk`'s panic handler, so the program refused what it was shown — the proof
+/// says the run halted, not that the transition was accepted.
+pub fn panicked(outputs: &[u32; 8]) -> bool {
+    outputs[PANIC_SLOT] == PANIC_SENTINEL
+}
+
 const ZERO: Word8 = [0; 8];
 
 /// One storage cell: an eight-word key and an eight-word value. An absent cell reads as eight
@@ -186,6 +201,14 @@ pub struct ProgramStateConfig {
     /// RAND units added to an invoke's fee floor for each cell it creates.
     #[serde(default)]
     pub cell_fee: u64,
+    /// PST-1: an `Invoke` whose call proof publishes [`PANIC_SENTINEL`] in output slot
+    /// [`PANIC_SLOT`] is refused ([`ProgramStateError::ProgramPanicked`]) — a run that panicked
+    /// halts and proves, so without this the chain applied any transition that made the program
+    /// panic. A validity rule only when `true`; absent or `false` — chain 21 and every chain cut
+    /// before the field — keeps the old rule (every node's pool refuses such an invoke anyway, as
+    /// policy). Bound into the genesis hash only when `true`, so a file without it hashes as before.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub refuse_panics: bool,
 }
 
 impl ProgramStateConfig {
@@ -336,6 +359,10 @@ pub enum ProgramStateError {
     VaultShort { asset: u32, have: u64, want: u64 },
     #[error("arithmetic overflow")]
     Overflow,
+    /// PST-1: the call proof publishes the panic sentinel (`0xdeadbeef` in output 7): the
+    /// program panicked on what it was shown, so the transition was not accepted.
+    #[error("the program panicked: its call proof publishes the panic sentinel 0xdeadbeef in output 7, so the transition was refused, not accepted")]
+    ProgramPanicked,
 }
 
 /// What an action reaching this module that it does not own gets (see `tokens::NOT_TOKENS`).
@@ -701,7 +728,7 @@ pub(crate) mod tests {
         let mut l = Ledger::new(CHAIN, HC, [(k.address(), entry)].into_iter().collect(), &StubExecutor);
         l.set_tokens(Some(TokenRegistry::new(REG_FEE)));
         if section {
-            l.set_program_state(Some(ProgramState::from_config(&ProgramStateConfig { cell_fee: CELL_FEE })));
+            l.set_program_state(Some(ProgramState::from_config(&ProgramStateConfig { cell_fee: CELL_FEE, refuse_panics: false })));
         }
         l.set_genesis_supply(1_000_000_000_000, 10);
         l.set_height(1);
@@ -786,6 +813,55 @@ pub(crate) mod tests {
 
     fn ps(e: ProgramStateError) -> TxError {
         TxError::ProgramState(e)
+    }
+
+    /// An invoke like [`invoke`]'s whose stub call proof publishes `outputs`.
+    fn invoke_publishing(l: &Ledger, seed: u32, t: Transition, outputs: [u32; 8]) -> Transaction {
+        let mut tx = invoke(l, seed, (0, 0, 0), t);
+        let record = l.program(&pid()).expect("deployed");
+        let segment = l.invoke_segment(record, &tx).expect("an invoke with a bundle");
+        let Action::Invoke { proof, .. } = &mut tx.action else { panic!("an invoke") };
+        *proof = StubExecutor::make_proof_with_public(&pid(), 10, outputs, &segment);
+        StubExecutor::bind(&mut tx);
+        tx
+    }
+
+    /// PST-1: under genesis `program_state.refuse_panics` an invoke whose call proof publishes the
+    /// panic sentinel in output 7 is refused at validate and at apply, and writes nothing; a normal
+    /// exit (any other output 7, zero included) applies. Without the rule — chain 21 — the same
+    /// panicked invoke applies exactly as before.
+    #[test]
+    fn a_panicked_invoke_is_refused_under_refuse_panics_and_applies_as_before_without_it() {
+        let t = || Transition { reads: vec![cell(1, 0)], writes: vec![cell(1, 5)], ..empty() };
+        let panicked_out = [9, 8, 7, 6, 5, 4, 3, PANIC_SENTINEL];
+        assert!(panicked(&panicked_out) && !panicked(&[0; 8]) && !panicked(&[PANIC_SENTINEL, 0, 0, 0, 0, 0, 0, 0]));
+
+        // Chain 21's rule: the flag is off, and the panicked proof's transition is applied.
+        let mut old = ledger();
+        assert!(!old.refuse_panicked_invokes());
+        let tx = invoke_publishing(&old, 30, t(), panicked_out);
+        assert_eq!(old.validate(&tx, &StubExecutor), Ok(()), "chain 21 accepts it, unchanged");
+        apply(&mut old, &tx).unwrap();
+        assert_eq!(old.program_state().unwrap().cell(&pid(), &key(1)), cell(1, 5).value);
+
+        // The gated rule.
+        let mut l = ledger();
+        l.set_refuse_panicked_invokes(true);
+        let tx = invoke_publishing(&l, 30, t(), panicked_out);
+        assert_eq!(refusal(&l, &tx), ps(ProgramStateError::ProgramPanicked));
+        let before = l.clone();
+        assert_eq!(apply(&mut l, &tx), Err(ps(ProgramStateError::ProgramPanicked)));
+        assert!(l == before, "nothing written");
+        assert_eq!(l.program_state().unwrap().cell(&pid(), &key(1)), [0; 8]);
+        // A normal exit applies under the rule, output 7 zero or anything but the sentinel.
+        for (seed, out7) in [(31, 0u32), (32, PANIC_SENTINEL - 1)] {
+            let mut l2 = l.clone();
+            let ok = invoke_publishing(&l2, seed, t(), [9, 8, 7, 6, 5, 4, 3, out7]);
+            assert_eq!(l2.validate(&ok, &StubExecutor), Ok(()), "output 7 = {out7:#x}");
+            apply(&mut l2, &ok).unwrap();
+            assert_eq!(l2.program_state().unwrap().cell(&pid(), &key(1)), cell(1, 5).value);
+        }
+        // A plain `Call`'s outputs are data, never judged: the rule names invokes only.
     }
 
     #[test]
