@@ -152,6 +152,7 @@ for i in $(seq 1 6); do
 done
 MKFLEET
 chmod +x "$T"/shim/* "$T"/rshim/* "$T/mkfleet.sh"
+mkdir -p "$T/repo/deploy/lib"; cp deploy/lib/fleet-env.sh "$T/repo/deploy/lib/"
 cp "$SRC" "$T/repo/deploy/cutover-fleet-chain19.sh"
 "$T/mkfleet.sh" "$T" "$BIN"
 export PATH="$T/shim:$PATH" FAKE_HOSTS=$T/hosts FAKE_RSHIM=$T/rshim
