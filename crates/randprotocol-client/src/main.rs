@@ -2112,6 +2112,7 @@ async fn main() -> Result<()> {
                         let len = members.len();
                         members.rotate_left(nanos % len);
                         let mut chosen = None;
+                        let mut outcomes = Vec::new();
                         for m in members {
                             let p = PairedProver::from_link(&m.link, Some(format!("RandProtocol prover {}", m.name)));
                             match RemoteProver::new(p).info().await {
@@ -2119,11 +2120,17 @@ async fn main() -> Result<()> {
                                     chosen = Some(m);
                                     break;
                                 }
-                                Ok(_) => eprintln!("RandProtocol prover {} is busy; trying the next", m.name),
-                                Err(e) => eprintln!("RandProtocol prover {} did not answer ({e:#}); trying the next", m.name),
+                                Ok(_) => {
+                                    outcomes.push(prover::MemberOutcome::Busy);
+                                    eprintln!("RandProtocol prover {} is busy; trying the next", m.name)
+                                }
+                                Err(e) => {
+                                    outcomes.push(prover::classify_info_error(&e));
+                                    eprintln!("RandProtocol prover {} did not answer ({e:#}); trying the next", m.name)
+                                }
                             }
                         }
-                        let m = chosen.ok_or_else(|| anyhow!("every RandProtocol prover is busy or unreachable; try again in a minute, or pair your own"))?;
+                        let m = chosen.ok_or_else(|| anyhow!("{}", prover::trusted_pool_failure(&outcomes)))?;
                         let label = format!("RandProtocol prover {}", m.name);
                         (m.link, name.or(Some(label)))
                     }

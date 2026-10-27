@@ -295,6 +295,39 @@ fn profile_name(p: FriProfile) -> &'static str {
     }
 }
 
+/// How one pinned pool member answered `rand prover pair --trusted`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MemberOutcome {
+    /// Answered with its pinned key, but its queue is full.
+    Busy,
+    /// Did not answer (down, or the URL is gone).
+    Unreachable,
+    /// Answered with a key other than the pinned one.
+    WrongKey,
+}
+
+/// The first release whose pinned pool matches the live one (members `a` and `b`).
+pub const POOL_RELEASE: &str = "0.8.1";
+
+/// What `pair --trusted` says when no member could be paired (CLI-301). If any member was merely
+/// busy, trying again is right. Otherwise nothing pinned in this build answers as pinned, which a
+/// build older than the pool's last re-keying (every member unreachable or on another key) cannot
+/// fix by waiting: it must be updated.
+pub fn trusted_pool_failure(outcomes: &[MemberOutcome]) -> String {
+    if outcomes.contains(&MemberOutcome::Busy) {
+        return "every RandProtocol prover that answered is busy; try again in a minute, or pair your own".into();
+    }
+    format!(
+        "none of the RandProtocol provers this rand build pins answers with its pinned key — this build is out of date, not the provers down. \
+         Update rand to version {POOL_RELEASE} or later and run `rand prover pair --trusted` again, or pair your own prover"
+    )
+}
+
+/// Classify a failed `prover_info` for [`trusted_pool_failure`].
+pub fn classify_info_error(e: &anyhow::Error) -> MemberOutcome {
+    if format!("{e:#}").contains("answers with key fingerprint") { MemberOutcome::WrongKey } else { MemberOutcome::Unreachable }
+}
+
 /// A paired prover, reached over HTTP.
 pub struct RemoteProver {
     paired: PairedProver,
@@ -1179,5 +1212,32 @@ mod tests {
         let link = PairingLink { kem_ek: key.kem_ek().to_vec(), url: "http://prover.example:9000".into(), token: [1; 32], own: false };
         let p = PairedProver::from_link(&link, None);
         assert!(check_prover_url(&p.url).unwrap_err().to_string().contains("https"));
+    }
+}
+
+#[cfg(test)]
+mod pool_failure_tests {
+    use super::*;
+
+    #[test]
+    fn all_unreachable_or_wrong_key_says_update_and_names_the_version() {
+        for o in [vec![MemberOutcome::Unreachable; 2], vec![MemberOutcome::WrongKey; 2], vec![MemberOutcome::Unreachable, MemberOutcome::WrongKey]] {
+            let m = trusted_pool_failure(&o);
+            assert!(m.contains("Update rand to version 0.8.1 or later"), "{m}");
+            assert!(!m.contains("try again"), "{m}");
+        }
+    }
+
+    #[test]
+    fn a_busy_member_means_try_again_not_update() {
+        let m = trusted_pool_failure(&[MemberOutcome::Busy, MemberOutcome::Unreachable]);
+        assert!(m.contains("try again in a minute") && !m.contains("Update rand"), "{m}");
+    }
+
+    #[test]
+    fn a_fingerprint_mismatch_is_told_from_a_dead_host() {
+        let wrong = anyhow!("the prover at https://x answers with key fingerprint \"AAAA\", but this wallet paired with BBBB — not sending it anything");
+        assert_eq!(classify_info_error(&wrong), MemberOutcome::WrongKey);
+        assert_eq!(classify_info_error(&anyhow!("info: reaching the prover at https://x")), MemberOutcome::Unreachable);
     }
 }
