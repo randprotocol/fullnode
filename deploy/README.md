@@ -289,13 +289,26 @@ collide.
    `hc_bundle 4a27356f…`, `active_validator: true`, `notes: 5` at genesis.
 6. **Quorum**: nothing commits until 13 of the 18 are up. Bring the droplets up before declaring a
    stall.
-7. **Explorer** on E re-indexes itself on a chain id change; it must run randscan `ba6fee6` or
-   later (the receivers indexer reverted — the chain-11 explorer polls an RPC this build does
-   not have). The activity loop's two wallets on E are version-2 key files again (the v0.2
+7. **Explorer** on E: since randscan `1363c68` (2026-10-27, migration 015 `chain_meta`) it
+   **stops writing** when its node reports a genesis other than its pin, and re-indexes only
+   when the node moves to the pinned chain. Set `RANDSCAN_EXPECTED_CHAIN_ID` and
+   `RANDSCAN_EXPECTED_GENESIS` in `/etc/randscan/api.secrets.env` (vps-setup.sh rewrites
+   `api.env`) and restart `randscan-api`; until then `/api/v1/chain` answers `wrong_chain`.
+   (Before chain 11 it re-indexed on any chain id change; the chain-11 explorer had to run
+   randscan `ba6fee6` or later, because the receivers indexer reverted.) The activity loop's two wallets on E are version-2 key files again (the v0.2
    client had rewritten them as version 3 with a `kem_version`; the spend key is unchanged).
 8. **Per droplet**, same service and peer ids as chain 11 —
    `deploy/cutover-droplet.sh <ip> 79123fa7 605eb783 deploy/genesis-chain12.json` (old prefix,
    new prefix, then the genesis file; peer ids do not change, so this is the whole cut-over).
+9. **Website chain pins** (since 2026-10-27): every site pins the chain id and genesis hash it
+   expects, shows a red "wrong chain" banner when its data comes from another chain, and the
+   monorepo's `site-sync` workflow (every 15 min) fails while any deployed pin differs from the
+   live genesis. Move each pin, then redeploy that site:
+   - randscan: `frontend/src/lib/chainPin.ts` (and the API's env, item 7)
+   - randbridge.org: `web/lib/chain/expected.ts`
+   - randprotocol.org: `src/scripts/chain-status.js`
+   - zusd.money: `src/consts.ts` (`EXPECTED_CHAIN`)
+   - monorepo: `EXPECTED_CHAIN` in `scripts/site-sync-check/site-sync-check.mjs`
 
 ```bash
 rand-node init --datadir data-c-8c742fc9 --genesis deploy/genesis-chain8.json
