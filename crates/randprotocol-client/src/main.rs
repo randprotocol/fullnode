@@ -3744,10 +3744,13 @@ mod tests {
             fri,
             no_submit,
             no_wait,
+            smallest,
+            canonical,
         }) = cli.cmd
         else {
             panic!("perp prove")
         };
+        assert!(!smallest && !canonical, "neither shape flag by default: the chain's pin decides");
         assert_eq!(
             (image, job),
             (PathBuf::from("e.bin"), PathBuf::from("j.json"))
