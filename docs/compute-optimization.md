@@ -34,7 +34,7 @@ prices block space and proving as two separate goods.
 | validator work per block | 14 warm verifications ≈ 0.25 s of one core | derived |
 | validator RAM | ~650 MiB resident | `docs/node-hardware.md` §2.1 |
 | mempool admission | 4 blocking verification workers, queue 64 deep | `docs/architecture.md` §8 |
-| wallet proof, tier 14 | 107.5 s on 1 thread, 13.9 s on 16 (M4 Max); 5.74 GB | `docs/node-hardware.md` §6 |
+| wallet proof, tier 14 | 107.5 s on 1 thread, 13.9 s on 16 (M4 Max); 6.2 GB | `docs/node-hardware.md` §6 |
 | recursion, N = 1, production | **376.9 GB host memory, 8 131 s** at constraint set 8 (tier 21); N = 2 ≈ 750 GB (estimate). After the phase-2 row cuts (circuits `75b7893`, 2026-10-04): tier 20, projected ≈ 240 GB, not yet proved | `docs/aggregation.md` item 3; `circuits/recursion/docs/04-phase2-row-cuts.md` |
 | aggregate proof | 1 563 226 bytes (N = 1, constraint set 8) | `docs/aggregation.md` §6 |
 | aggregate verify, warm, test profile | ~1–2 s | `docs/aggregation.md` §6 |

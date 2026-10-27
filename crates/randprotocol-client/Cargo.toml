@@ -17,6 +17,8 @@ randprotocol-zkvm = { workspace = true }
 randprotocol-msig = { workspace = true }
 # The delegated-proving wire (sealed job, sealed reply, pairing link) — never the service half.
 randprotocol-prover = { workspace = true, default-features = false, features = ["parallel"] }
+# Available memory for the local-proving gate (`memory.rs`); the same version and features the prover's service build uses.
+sysinfo = { version = "0.33", default-features = false, features = ["system"] }
 reqwest = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }

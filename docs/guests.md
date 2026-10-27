@@ -323,7 +323,7 @@ input transcript published; open it with `rand open-call aeb64e6887a1da21d240377
 ```
 
 The receipt's outputs equal `rand-guest run`'s. The call proof and the bundle proof are both made
-in the wallet. That run's peak memory footprint was 5.74 GB (`/usr/bin/time -l`, test profile).
+in the wallet. That run's peak memory footprint was 6.2 GB (`/usr/bin/time -l`, test profile).
 Call envelopes, auditors and `open-call` are in [`confidential.md`](confidential.md#call-input-envelopes).
 
 ## 5. Deploy a C program, step by step

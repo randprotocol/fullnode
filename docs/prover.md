@@ -1,6 +1,6 @@
 # The delegated prover
 
-A bundle proof is tier 14: about 100 s and 5.74 GB of memory on a laptop CPU
+A bundle proof is tier 14: about 100 s and 6.2 GB of memory on a laptop CPU
 (`docs/node-hardware.md` §3). A browser gives WebAssembly 4 GiB and most phones have less than
 8 GB, so a light wallet cannot make that proof itself. The delegated prover makes it on another
 machine: a separate binary, `rand-prover`, or the same service inside a node, `rand-node run
@@ -148,12 +148,12 @@ A job over the pairing's `--per-token` cap, or one that would push queued plus p
 
 ### 3.3 Memory
 
-Every proving slot needs one tier-14 bundle's peak, 5.74 GB (`PROVER_PEAK_BYTES`), and the
-process keeps 1 GiB of headroom. At start, `run` compares `5.74 GB × --max-parallel + 1 GiB` with
+Every proving slot needs one tier-14 bundle's peak, 6.2 GB (`PROVER_PEAK_BYTES`), and the
+process keeps 1 GiB of headroom. At start, `run` compares `6.2 GB × --max-parallel + 1 GiB` with
 the memory the OS reports available and refuses to serve if it does not fit:
 
 ```
-1 proving slot(s) need 6.8 GB of available memory (5.74 GB each plus 1.1 GB headroom); this machine has 4.2 GB available — lower --max-parallel, or pass --skip-memory-check
+1 proving slot(s) need 7.3 GB of available memory (6.2 GB each plus 1.1 GB headroom); this machine has 4.2 GB available — lower --max-parallel, or pass --skip-memory-check
 ```
 
 `--skip-memory-check` is the escape for a machine whose available-memory figure understates what

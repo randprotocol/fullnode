@@ -1,8 +1,7 @@
 //! The free-memory gate `rand-prover run` passes before it serves: every proving slot needs one
 //! tier-14 bundle's peak, and a prover that swaps or is OOM-killed mid-proof serves no one.
 
-/// One tier-14 hidden-asset bundle proof's peak resident memory (`docs/node-hardware.md`).
-pub const PROVER_PEAK_BYTES: u64 = 5_740_000_000;
+pub use crate::PROVER_PEAK_BYTES;
 /// Left over for the process itself, the listener and the OS.
 pub const HEADROOM_BYTES: u64 = 1 << 30;
 
