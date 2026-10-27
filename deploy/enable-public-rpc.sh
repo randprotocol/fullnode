@@ -18,6 +18,7 @@ SSH=(ssh -o BatchMode=yes -o ConnectTimeout=20 "$TARGET")
   f=/etc/systemd/system/$UNIT.service
   [ -f \$f ] || { echo \"\$f: no such unit\" >&2; exit 1; }
   /usr/local/bin/rand-node run --help 2>&1 | grep -q -- --public-rpc || { echo 'rand-node here has no --public-rpc: roll a newer binary first' >&2; exit 1; }
+  if grep -q '^ExecStart=.*\\\\\$' \$f; then echo \"\$f: ExecStart continues on the next line; add --public-rpc by hand\" >&2; exit 1; fi
   if grep -q -- '--public-rpc' \$f; then echo \"$TARGET: \$f already has --public-rpc\"; else
     sed -i 's|^ExecStart=\(.*\)\$|ExecStart=\1 --public-rpc $ADDR|' \$f
     systemctl daemon-reload
