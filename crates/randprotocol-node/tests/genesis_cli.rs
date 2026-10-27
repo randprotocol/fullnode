@@ -215,6 +215,8 @@ fn the_genesis_command_writes_the_perps_section_when_asked() {
         min_deposit: 0,
         engine_hc: [9; 8],
         genesis_root: [8; 8],
+        bound_payouts: false,
+        initial_collateral: 0,
         markets: vec![MarketSpec {
             id: 0,
             symbol: "BTC-PERP".into(),

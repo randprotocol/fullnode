@@ -128,10 +128,71 @@ pub struct PerpsConfig {
     #[serde(with = "crate::notes::word8_hex")]
     pub genesis_root: Word8,
     pub markets: Vec<MarketSpec>,
+    /// Audit v10, PERP-6 (genesis-gated, default off): a state proof whose payouts total more
+    /// collateral than the exchange holds — `initial_collateral + collateral_in − collateral_out`
+    /// ([`Perps::collateral_held`]) — is refused `PayoutExceedsCollateral`, at validate and at
+    /// apply. The engine pays only what it holds, so an honest proof never trips it; a proof that
+    /// does is an engine fault, and the chain refuses to mint collateral the exchange was never
+    /// given. Off, the payout is bounded by its request alone (the v0 rule; documented as a hole).
+    #[serde(default)]
+    pub bound_payouts: bool,
+    /// PERP-6: the collateral the engine's genesis state already holds (its accounts and
+    /// insurance fund), in collateral units — what [`Perps::collateral_held`] starts from. 0 for a
+    /// fresh engine.
+    #[serde(default)]
+    pub initial_collateral: u64,
+}
+
+/// [`PerpsConfig`] as it was bound into the genesis hash before audit v10 (chains up to 21): the
+/// shape `PerpsConfig::commit_bytes` serializes first, so a genesis that leaves every later field
+/// at its default hashes byte-for-byte as it did.
+#[derive(Serialize)]
+struct PerpsConfigV0<'a> {
+    collateral_asset: u32,
+    max_tier: u8,
+    max_window_blocks: u64,
+    max_block_inputs: u32,
+    min_deposit: u64,
+    engine_hc: &'a Word8,
+    genesis_root: &'a Word8,
+    markets: &'a [MarketSpec],
 }
 
 impl PerpsConfig {
+    /// What the genesis hash binds for this section: the pre-audit-v10 shape's bincode, then
+    /// each later field tagged by name and only when it is not its default — `b"bound_payouts"`
+    /// ‖ `0x01`, `b"initial_collateral"` ‖ be64 — so chain 21's file (which sets none of them)
+    /// commits to exactly the bytes it did at its cut, and any field set is a different chain.
+    pub fn commit_bytes(&self) -> Vec<u8> {
+        let v0 = PerpsConfigV0 {
+            collateral_asset: self.collateral_asset,
+            max_tier: self.max_tier,
+            max_window_blocks: self.max_window_blocks,
+            max_block_inputs: self.max_block_inputs,
+            min_deposit: self.min_deposit,
+            engine_hc: &self.engine_hc,
+            genesis_root: &self.genesis_root,
+            markets: &self.markets,
+        };
+        let mut out = bincode::serialize(&v0).expect("serializes");
+        if self.bound_payouts {
+            out.extend_from_slice(b"bound_payouts");
+            out.push(1);
+        }
+        if self.initial_collateral != 0 {
+            out.extend_from_slice(b"initial_collateral");
+            out.extend_from_slice(&self.initial_collateral.to_be_bytes());
+        }
+        out
+    }
+
     pub fn check(&self) -> Result<(), String> {
+        if self.initial_collateral >= MAX_NOTE_VALUE {
+            return Err(format!(
+                "perps.initial_collateral {} is not below the note bound 2^63",
+                self.initial_collateral
+            ));
+        }
         if !TIERS.contains(&self.max_tier) {
             return Err(format!("perps.max_tier {} is not a proof tier ({TIERS:?})", self.max_tier));
         }
@@ -417,6 +478,16 @@ pub struct Perps {
     /// chain, outside the root. Both 0 on a chain whose collateral is a token.
     pub rand_in: u64,
     pub rand_out: u64,
+    /// Audit v10, PERP-6: Σ collateral ever deposited (every `PerpDeposit`'s burn, RAND or the
+    /// collateral token) and Σ collateral ever paid out by state proofs — the same two counters
+    /// for *any* collateral asset, where `rand_in`/`rand_out` count RAND alone. Derived from the
+    /// chain, outside the root, like the RAND pair; what the `bound_payouts` rule and the supply
+    /// audit's `perps_collateral_*` read. 0 on a row persisted before this field existed
+    /// ([`Perps::decode_persisted`]).
+    #[serde(default)]
+    pub collateral_in: u64,
+    #[serde(default)]
+    pub collateral_out: u64,
     /// The current block's inputs so far. Transient: emptied at every block close.
     #[serde(skip)]
     block_inputs: Vec<PerpInput>,
@@ -426,7 +497,7 @@ pub struct Perps {
     last_block_words: Option<(u64, Vec<u32>)>,
 }
 
-/// Consensus fields only — exactly what the root commits, plus the genesis section and the two
+/// Consensus fields only — exactly what the root commits, plus the genesis section and the four
 /// audit counters (derived from the chain, as `ProgramState`'s are): two ledgers that agree on
 /// them are equal whatever their in-flight transient fields hold.
 impl PartialEq for Perps {
@@ -441,7 +512,39 @@ impl PartialEq for Perps {
             && self.withdrawals == other.withdrawals
             && self.rand_in == other.rand_in
             && self.rand_out == other.rand_out
+            && self.collateral_in == other.collateral_in
+            && self.collateral_out == other.collateral_out
     }
+}
+
+/// [`Perps`] as a node persisted it before audit v10 (`META_PERPS`, bincode — which carries no
+/// field names, so `serde(default)` cannot fill a field the row lacks): the shape
+/// [`Perps::decode_persisted`] falls back to. Its config is the pre-v10 one too.
+#[derive(Serialize, Deserialize)]
+struct PerpsV0 {
+    config: PerpsConfigV0Owned,
+    accounts: BTreeMap<AccountId, PerpAccount>,
+    oracle: BTreeMap<u32, OracleState>,
+    oracle_nonces: BTreeMap<Address, u64>,
+    proved_root: Word8,
+    proved_height: u64,
+    digests: BTreeMap<u64, Word8>,
+    withdrawals: BTreeMap<Word8, PendingWithdrawal>,
+    rand_in: u64,
+    rand_out: u64,
+}
+
+/// The owned twin of [`PerpsConfigV0`], for [`PerpsV0`].
+#[derive(Serialize, Deserialize)]
+struct PerpsConfigV0Owned {
+    collateral_asset: u32,
+    max_tier: u8,
+    max_window_blocks: u64,
+    max_block_inputs: u32,
+    min_deposit: u64,
+    engine_hc: Word8,
+    genesis_root: Word8,
+    markets: Vec<MarketSpec>,
 }
 
 impl Perps {
@@ -458,9 +561,65 @@ impl Perps {
             withdrawals: BTreeMap::new(),
             rand_in: 0,
             rand_out: 0,
+            collateral_in: 0,
+            collateral_out: 0,
             block_inputs: Vec::new(),
             last_block_words: None,
         }
+    }
+
+    /// A persisted `Perps` (bincode, a node's `META_PERPS` row): this build's shape first, then
+    /// the pre-audit-v10 shape ([`PerpsV0`]) with every later field at its default — so a node
+    /// rolled onto this build reads the row it wrote before (chain 21 has one on every host),
+    /// and writes the new shape at its next commit. The collateral counters start at 0 on such a
+    /// row: they count from the roll, as `bound_payouts` is off on that chain.
+    pub fn decode_persisted(bytes: &[u8]) -> Result<Perps, bincode::Error> {
+        use bincode::Options;
+        // The old shape first, and only when it consumes the row exactly: this build's row is the
+        // old shape plus nine config bytes in the middle and sixteen counter bytes at the end, so
+        // it can never be read as the old one whole, while an old row read as the new shape could
+        // take its account count for the `bound_payouts` byte and go on into garbage.
+        let exact = bincode::DefaultOptions::new().with_fixint_encoding().reject_trailing_bytes();
+        match exact.deserialize::<PerpsV0>(bytes) {
+            Err(_) => bincode::deserialize::<Perps>(bytes),
+            Ok(v0) => {
+                let c = v0.config;
+                Ok(Perps {
+                    config: PerpsConfig {
+                        collateral_asset: c.collateral_asset,
+                        max_tier: c.max_tier,
+                        max_window_blocks: c.max_window_blocks,
+                        max_block_inputs: c.max_block_inputs,
+                        min_deposit: c.min_deposit,
+                        engine_hc: c.engine_hc,
+                        genesis_root: c.genesis_root,
+                        markets: c.markets,
+                        bound_payouts: false,
+                        initial_collateral: 0,
+                    },
+                    accounts: v0.accounts,
+                    oracle: v0.oracle,
+                    oracle_nonces: v0.oracle_nonces,
+                    proved_root: v0.proved_root,
+                    proved_height: v0.proved_height,
+                    digests: v0.digests,
+                    withdrawals: v0.withdrawals,
+                    rand_in: v0.rand_in,
+                    rand_out: v0.rand_out,
+                    collateral_in: 0,
+                    collateral_out: 0,
+                    block_inputs: Vec::new(),
+                    last_block_words: None,
+                })
+            }
+        }
+    }
+
+    /// The collateral the exchange holds as the chain counts it (PERP-6): what the genesis
+    /// engine state held, plus every deposit, less every payout. In `u128`, since the three
+    /// terms are each a `u64`.
+    pub fn collateral_held(&self) -> u128 {
+        (self.config.initial_collateral as u128 + self.collateral_in as u128).saturating_sub(self.collateral_out as u128)
     }
 
     /// `blake3("rand-perps-1", proved_root ‖ proved_height ‖ accounts_root ‖ oracle_root ‖
@@ -1000,6 +1159,20 @@ fn check_state_proof(p: &Perps, from: u64, to: u64, payouts: &[PerpPayout]) -> R
             return Err(PerpError::PartialPayout { want: po.amount, have: w.amount });
         }
     }
+    // Audit v10, PERP-6 (under `bound_payouts`): the payouts together never exceed the collateral
+    // the chain has seen the exchange take in. A request is bounded only by the note bound, so
+    // without this a faulty engine (or a proof of one) could mint collateral nobody deposited.
+    // Permanent (`admission::is_permanent`): an honest engine pays at most what it held at `to`,
+    // every unit of it deposited at or before `to` and so already counted here; a proof that
+    // exceeds the count paid what the engine never had, whatever is deposited after it — an
+    // engine fault, which no later state excuses.
+    if p.config.bound_payouts {
+        let want: u128 = payouts.iter().map(|po| po.amount as u128).sum();
+        let have = p.collateral_held();
+        if want > have {
+            return Err(PerpError::PayoutExceedsCollateral { want, have });
+        }
+    }
     Ok(())
 }
 
@@ -1214,8 +1387,11 @@ pub(super) fn apply(
                 0 => p.rand_in.checked_add(amount).ok_or(PerpError::Overflow)?,
                 _ => p.rand_in,
             };
+            // PERP-6: whatever the asset, the exchange took `amount` of its collateral in.
+            let collateral_in = p.collateral_in.checked_add(amount).ok_or(PerpError::Overflow)?;
             let p = ledger.perps_mut().ok_or(PerpError::Disabled)?;
             p.rand_in = rand_in;
+            p.collateral_in = collateral_in;
             p.accounts.entry(id).or_insert_with(|| PerpAccount {
                 trading_key: trading_key.clone(),
                 nonce_high: 0,
@@ -1281,7 +1457,14 @@ pub(super) fn apply(
                 0 => p.rand_out.checked_add(paid).ok_or(PerpError::Overflow)?,
                 _ => p.rand_out,
             };
+            // PERP-6: every payout the proof lists leaves the exchange, minted or not — the
+            // engine deducted it from the account either way — so the collateral count (what
+            // `bound_payouts` holds the next proof to) is over the listed amounts, where the
+            // RAND audit counter above is over what re-entered the pool.
+            let listed = payouts.iter().try_fold(0u64, |acc, po| acc.checked_add(po.amount)).ok_or(PerpError::Overflow)?;
+            let collateral_out = p.collateral_out.checked_add(listed).ok_or(PerpError::Overflow)?;
             let p = ledger.perps_mut().ok_or(PerpError::Disabled)?;
+            p.collateral_out = collateral_out;
             p.proved_root = *new_root;
             p.proved_height = to;
             p.digests.retain(|h, _| *h > to);
@@ -1471,6 +1654,11 @@ pub enum PerpError {
     PartialPayout { want: u64, have: u64 },
     #[error("the request was input at height {height}, outside the proof's window {from}+1..={to}")]
     RequestOutsideWindow { height: u64, from: u64, to: u64 },
+    /// Audit v10, PERP-6, under genesis `bound_payouts`: the proof pays `want` collateral units
+    /// where the chain has counted the exchange holding `have` (the genesis engine state's, plus
+    /// every deposit, less every payout). An engine fault — permanent.
+    #[error("the proof pays {want} collateral units; the exchange holds {have} — an engine that pays more than it was given")]
+    PayoutExceedsCollateral { want: u128, have: u128 },
 }
 
 #[cfg(test)]
@@ -1642,6 +1830,8 @@ pub(crate) mod tests {
             min_deposit: 0,
             engine_hc: [9; 8],
             genesis_root: [8; 8],
+            bound_payouts: false,
+            initial_collateral: 0,
             markets: vec![MarketSpec {
                 id: 0,
                 symbol: "X-PERP".into(),
@@ -3024,6 +3214,131 @@ pub(crate) mod tests {
         };
         assert_eq!(refusal(&l, &bare(signed(CHAIN, &kp(1), o.clone()))), pe(PerpError::BadSignature));
         assert_eq!(l.validate(&bare(signed_in(&g, CHAIN, &kp(1), o)), &StubExecutor), Ok(()));
+    }
+
+    /// Audit v10, PERP-6: a request is bounded by the note bound alone (2^63), so a 2^62
+    /// withdrawal against a 10^9 deposit is admissible, and a proof paying it is bounded only by
+    /// the request — accepted without the gate (the documented v0 hole). Under `bound_payouts`
+    /// the proof is refused `PayoutExceedsCollateral` at validate and at apply, nothing written;
+    /// a payout of exactly what was deposited passes, and the genesis `initial_collateral`
+    /// counts towards what the exchange holds.
+    #[test]
+    fn a_payout_past_the_counted_collateral_is_refused_under_bound_payouts() {
+        let huge = 1u64 << 62;
+        let (mut l, request) = withdrawn(huge);
+        assert_eq!(l.perps().unwrap().collateral_held(), RAND as u128, "the deposit was counted");
+        let tx = state_proof(&l, 0, 2, [7; 8], vec![PerpPayout { request, amount: huge }], 0);
+        // Without the gate (chain 21's rule): accepted, a 2^62 note minted from a 10^9 deposit.
+        assert_eq!(l.validate(&tx, &StubExecutor), Ok(()), "v0: bounded by the request alone");
+        let mut off = l.clone();
+        off.set_height(3);
+        apply(&mut off, &tx).expect("the documented hole: the payout is the full request");
+        assert_eq!(off.perps().unwrap().collateral_out, huge);
+        // With the gate: refused by name, permanent, before any proof is looked at.
+        l.perps_mut().unwrap().config.bound_payouts = true;
+        let refused = pe(PerpError::PayoutExceedsCollateral { want: huge as u128, have: RAND as u128 });
+        assert_eq!(refusal(&l, &tx), refused);
+        assert_eq!(refusal(&l, &proof_tx(0, 2, [7; 8], vec![PerpPayout { request, amount: huge }], 0, b"junk".to_vec())), refused, "before the STARK");
+        l.set_height(3);
+        let before = l.clone();
+        assert_eq!(l.apply_tx(&tx, &kp(1).address(), &StubExecutor).map(|_| ()), Err(refused));
+        assert!(l == before, "nothing written");
+        // What was deposited can be paid …
+        let (mut l2, request2) = withdrawn(RAND);
+        l2.perps_mut().unwrap().config.bound_payouts = true;
+        let exact = state_proof(&l2, 0, 2, [7; 8], vec![PerpPayout { request: request2, amount: RAND }], 0);
+        l2.set_height(3);
+        apply(&mut l2, &exact).expect("exactly the collateral held");
+        let p = l2.perps().unwrap();
+        assert_eq!((p.collateral_in, p.collateral_out, p.collateral_held()), (RAND, RAND, 0));
+        let a = l2.audit();
+        assert_eq!((a.perps_collateral_in, a.perps_collateral_out, a.perps_collateral_held), (RAND, RAND, 0));
+        assert!(a.invariant_holds(), "{a:?}");
+        // … and the genesis engine state's collateral counts too.
+        let (mut l3, request3) = withdrawn(RAND);
+        {
+            let c = &mut l3.perps_mut().unwrap().config;
+            c.bound_payouts = true;
+            c.initial_collateral = 5;
+        }
+        assert_eq!(l3.perps().unwrap().collateral_held(), RAND as u128 + 5);
+        let over = state_proof(&l3, 0, 2, [7; 8], vec![PerpPayout { request: request3, amount: RAND }], 0);
+        assert_eq!(l3.validate(&over, &StubExecutor), Ok(()));
+    }
+
+    /// PERP-6: the genesis commitment of a section that sets none of the audit-v10 fields is the
+    /// pre-v10 bincode, byte for byte; each new field, set, is tagged on after it.
+    #[test]
+    fn the_sections_commit_bytes_are_the_pre_v10_bincode_until_a_new_field_is_set() {
+        let c = sample_config();
+        let v0 = PerpsConfigV0 {
+            collateral_asset: c.collateral_asset,
+            max_tier: c.max_tier,
+            max_window_blocks: c.max_window_blocks,
+            max_block_inputs: c.max_block_inputs,
+            min_deposit: c.min_deposit,
+            engine_hc: &c.engine_hc,
+            genesis_root: &c.genesis_root,
+            markets: &c.markets,
+        };
+        let legacy = bincode::serialize(&v0).unwrap();
+        assert_eq!(c.commit_bytes(), legacy, "defaults add nothing");
+        let mut bound = c.clone();
+        bound.bound_payouts = true;
+        assert_eq!(bound.commit_bytes(), [legacy.clone(), b"bound_payouts".to_vec(), vec![1]].concat());
+        let mut seeded = c.clone();
+        seeded.initial_collateral = 7;
+        assert_eq!(seeded.commit_bytes(), [legacy.clone(), b"initial_collateral".to_vec(), 7u64.to_be_bytes().to_vec()].concat());
+        // JSON: absent means default, round-trips, and the bound is checked.
+        let mut json = serde_json::to_value(&c).unwrap();
+        let o = json.as_object_mut().unwrap();
+        assert!(o.remove("bound_payouts").is_some() && o.remove("initial_collateral").is_some());
+        assert_eq!(serde_json::from_value::<PerpsConfig>(json).unwrap(), c, "a file without the fields reads as the defaults");
+        assert_eq!(serde_json::from_str::<PerpsConfig>(&serde_json::to_string(&seeded).unwrap()).unwrap(), seeded);
+        let mut big = c.clone();
+        big.initial_collateral = MAX_NOTE_VALUE;
+        assert!(big.check().unwrap_err().contains("initial_collateral"));
+        assert_eq!(c.check(), Ok(()));
+    }
+
+    /// PERP-6: a `META_PERPS` row written before audit v10 (bincode of the old shape) decodes,
+    /// its collateral counters at 0; a row of this build's shape round-trips with them.
+    #[test]
+    fn a_pre_v10_persisted_row_decodes_with_zero_collateral_counters() {
+        let (l, _) = withdrawn(5);
+        let p = l.perps().unwrap();
+        let c = &p.config;
+        let legacy = PerpsV0 {
+            config: PerpsConfigV0Owned {
+                collateral_asset: c.collateral_asset,
+                max_tier: c.max_tier,
+                max_window_blocks: c.max_window_blocks,
+                max_block_inputs: c.max_block_inputs,
+                min_deposit: c.min_deposit,
+                engine_hc: c.engine_hc,
+                genesis_root: c.genesis_root,
+                markets: c.markets.clone(),
+            },
+            accounts: p.accounts.clone(),
+            oracle: p.oracle.clone(),
+            oracle_nonces: p.oracle_nonces.clone(),
+            proved_root: p.proved_root,
+            proved_height: p.proved_height,
+            digests: p.digests.clone(),
+            withdrawals: p.withdrawals.clone(),
+            rand_in: p.rand_in,
+            rand_out: p.rand_out,
+        };
+        let old_row = bincode::serialize(&legacy).unwrap();
+        assert!(bincode::deserialize::<Perps>(&old_row).is_err(), "the new shape alone cannot read it");
+        let decoded = Perps::decode_persisted(&old_row).expect("the fallback reads it");
+        assert_eq!((decoded.collateral_in, decoded.collateral_out), (0, 0));
+        assert_eq!((decoded.rand_in, decoded.proved_height, decoded.accounts.len()), (p.rand_in, 0, 1));
+        assert_eq!(decoded.root(), p.root(), "the consensus state is the same");
+        assert_eq!(decoded.digests, p.digests);
+        let new_row = bincode::serialize(p).unwrap();
+        assert_eq!(&Perps::decode_persisted(&new_row).unwrap(), p, "this build's row, counters included");
+        assert!(Perps::decode_persisted(b"junk").is_err());
     }
 
     #[test]

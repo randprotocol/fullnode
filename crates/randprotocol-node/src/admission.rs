@@ -363,7 +363,11 @@ pub fn is_permanent(e: &TxError) -> bool {
             | P::KeyMismatch
             | P::ZeroAmount
             | P::DepositTooSmall(_)
-            | P::PartialPayout { .. } => true,
+            | P::PartialPayout { .. }
+            // Audit v10, PERP-6: an honest engine pays at most what it held at the window's end,
+            // all of it deposited inside or before the window and so counted; a proof that pays
+            // more is an engine fault no later deposit excuses.
+            | P::PayoutExceedsCollateral { .. } => true,
             P::NonceUsed
             | P::WindowMismatch { .. }
             | P::MissingDigest(_)

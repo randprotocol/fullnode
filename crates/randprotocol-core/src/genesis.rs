@@ -1806,9 +1806,12 @@ impl Genesis {
         // RPL-3, after `incremental_nullifier_root` — last — tagged, and only when the file has the
         // section, so every genesis cut before it hashes byte-for-byte as before. The whole
         // section, bincode (length-prefixed wherever it is variable: the symbols, the markets).
+        // Audit v10 added fields to the section (`bound_payouts`, `initial_collateral`, …):
+        // `commit_bytes` writes the pre-v10 shape and then each later field tagged, only when
+        // set, so chain 21's file hashes as it did at its cut.
         if let Some(p) = &self.perps {
             commit.extend_from_slice(b"perps");
-            commit.extend_from_slice(&bincode::serialize(p).expect("serializes"));
+            commit.extend_from_slice(&p.commit_bytes());
         }
         // Multisig accounts, after `perps` (and before `aggregation_tree`), tagged and
         // present-only like the others; accounts in id order, so the file's order is free.
@@ -4593,6 +4596,8 @@ mod tests {
             min_deposit: 0,
             engine_hc: [9; 8],
             genesis_root: [8; 8],
+            bound_payouts: false,
+            initial_collateral: 0,
             markets: vec![MarketSpec {
                 id: 0,
                 symbol: "BTC-PERP".into(),
@@ -4616,6 +4621,21 @@ mod tests {
         other.perps.as_mut().unwrap().markets[0].taker_fee_bps = 6;
         assert_ne!(build(&other).hash(), g.hash(), "every field of the section is bound");
         assert_eq!(Genesis::from_json(&on.to_json()).unwrap(), on, "it round-trips");
+        // Audit v10, PERP-6: the new optional fields are bound only when set (a file without them
+        // hashes as before this build: `PerpsConfig::commit_bytes`), each a different chain, and
+        // they round-trip through the file.
+        let mut bound = on.clone();
+        bound.perps.as_mut().unwrap().bound_payouts = true;
+        assert_ne!(build(&bound).hash(), g.hash(), "bound_payouts is bound");
+        let mut seeded = on.clone();
+        seeded.perps.as_mut().unwrap().initial_collateral = 1_000;
+        assert_ne!(build(&seeded).hash(), g.hash(), "initial_collateral is bound");
+        assert_ne!(build(&seeded).hash(), build(&bound).hash());
+        assert_eq!(Genesis::from_json(&bound.to_json()).unwrap(), bound);
+        assert_eq!(Genesis::from_json(&seeded.to_json()).unwrap(), seeded);
+        let mut too_much = on.clone();
+        too_much.perps.as_mut().unwrap().initial_collateral = 1 << 63;
+        assert!(matches!(too_much.build(&StubExecutor), Err(GenesisError::BadPerps(why)) if why.contains("initial_collateral")));
         let stray = on.to_json().replace("\"max_tier\"", "\"max_tiers\"");
         assert!(Genesis::from_json(&stray).is_err(), "a stray key is refused");
         // Beside RPL-2's section too.

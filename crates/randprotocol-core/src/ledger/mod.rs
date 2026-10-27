@@ -1456,7 +1456,9 @@ impl Ledger {
         // `burn_r` is counted burned by the common bundle path, so what the exchange holds has
         // to be counted back here, and what state proofs paid out is pool value again.
         let audit = match &self.perps {
-            Some(p) => audit.with_perps(p.rand_in, p.rand_out),
+            Some(p) => audit
+                .with_perps(p.rand_in, p.rand_out)
+                .with_perps_collateral(p.config.initial_collateral, p.collateral_in, p.collateral_out),
             None => audit,
         };
         // Last: `with_vesting` rebuilds `pool_value` from the supply, so anything chained
@@ -6205,6 +6207,8 @@ pub(crate) mod tests {
             min_deposit: 0,
             engine_hc: [9; 8],
             genesis_root: [8; 8],
+            bound_payouts: false,
+            initial_collateral: 0,
             markets: vec![perps::MarketSpec {
                 id: 0,
                 symbol: "X-PERP".into(),

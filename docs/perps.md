@@ -59,6 +59,12 @@ proved root and height, the digests not yet proved, and the withdrawals waiting 
 | `engine_hc` | the engine guest's program commitment; a state proof of any other program is refused. Hex byte order: each u32 word of `hc` as 8 little-endian hex characters (`word8_to_hex`); `rand perp image-hc --image <FILE>` prints an image's hc in that format, and `rand perp prove` refuses an image that does not match before proving |
 | `genesis_root` | the engine's state root at height 0: `perp_digest(PERP_STATE, State::genesis(markets).encode())`. `perp-prover genesis-state` writes the words and `rand perp genesis-root --state` hashes them |
 | `markets` | the `MarketSpec` list below |
+| `bound_payouts` | optional, default `false` (audit v10, PERP-6): a state proof whose payouts total more than the collateral the chain has counted the exchange holding — `initial_collateral + collateral_in − collateral_out` — is refused `PayoutExceedsCollateral`, at validate and at apply. Permanent: an engine that pays what it was never given is an engine fault. Off (chain 21), a payout is bounded by its request alone, and a request only by the note bound 2^63 |
+| `initial_collateral` | optional, default 0: the collateral the genesis engine state already holds (accounts and insurance fund), in collateral units, below 2^63; what the count above starts from |
+
+The audit-v10 fields are bound into the genesis hash **only when set** (`PerpsConfig::commit_bytes`:
+the pre-v10 shape's bincode, then each later field tagged by name), so a file that omits them —
+chain 21's — hashes exactly as it did at its cut (`chain_21s_genesis_file_still_hashes_as_cut`).
 
 `MarketSpec`: `id`, `symbol`, `lot` (the size increment in base atomic units), `tick` (the price
 increment, in quote atomic units per `BASE_UNIT` = 10^9 of base), `max_leverage`,
@@ -308,6 +314,16 @@ term, beside RPL-2's vaults. `rand_getSupply` serves `perps_rand_out` and `perps
 (`rand_in - rand_out`). On a chain whose collateral is a token both are `"0"`: **a token's supply
 is not audited by this term**, because a token's total supply does not move on the way in or out.
 
+**Collateral counters (audit v10, PERP-6).** Beside the RAND pair the ledger keeps `collateral_in`
+(Σ every deposit's burn) and `collateral_out` (Σ every payout a state proof listed, minted or not —
+the engine deducted it either way), in the collateral asset whatever it is, outside the root like
+the RAND pair; `collateral_held = initial_collateral + collateral_in − collateral_out`. They are
+what the genesis `bound_payouts` rule holds a proof to, and `rand_getSupply` serves them as
+`perps_collateral_in`, `perps_collateral_out` and `perps_collateral_held` (token collateral
+included; `rand_getPerps` carries the same four numbers). They move no term of the RAND identity.
+A `META_PERPS` row written before this build (chain 21's) decodes with both at 0
+(`Perps::decode_persisted`): on that chain they count from the roll, and `bound_payouts` is off.
+
 ## What the guest sees
 
 The guest is given the proof's public segment above, and a private witness:
@@ -477,8 +493,11 @@ not the chain's `proved_root`, which is how the prover learns to roll back.
 - **The gate's error (M3).** `PerpError::Disabled` is the section gate's refusal. The five
   bundle-less actions are gated at the action step; a state proof is gated before the size caps
   (so a chain without the section answers `Disabled`, not `ProofTooLarge`).
-- **Token collateral (M6).** A token's supply is not audited by the perps term: the audit cannot
-  detect a token deposit and payout imbalance.
+- **Token collateral (M6).** A token's supply is not audited by the perps term of the RAND
+  identity. Since audit v10 (PERP-6) the collateral counters cover any asset and, under genesis
+  `bound_payouts`, refuse a proof that pays more than was deposited; on a chain without the flag
+  (chain 21) the counters are reported but bind nothing, and a payout is bounded by its request
+  alone.
 - **Engine capacities.** The ledger pins `MAX_MARKETS` = 2, the pinned engine's capacity, and
   nothing else of the engine's: `MAX_ACCOUNTS` (15) and `MAX_PERP_PAYOUTS` (8) are ledger rules
   chosen to fit it, not engine constants read from it.

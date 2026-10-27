@@ -189,6 +189,14 @@ pub struct Audit {
     /// … and what the exchange still holds: every RAND `PerpDeposit`'s `burn_r` (inside
     /// [`Supply::burned`] on the pool side) less what was paid out.
     pub perps_rand_held: u64,
+    /// Audit v10, PERP-6 — the exchange's collateral in *its own asset* (RAND or the collateral
+    /// token), the counters `bound_payouts` holds a state proof to: every deposit's burn, every
+    /// payout a proof listed, and what the exchange holds (the genesis engine state's
+    /// `initial_collateral` + in − out). Not a term of the RAND identity (a token's supply does
+    /// not move on the way in or out); reported for the operator. All 0 without a `perps` section.
+    pub perps_collateral_in: u64,
+    pub perps_collateral_out: u64,
+    pub perps_collateral_held: u128,
     /// Multisig accounts, all 0 without a `multisig` section and kept off [`Supply`] for the
     /// same layout reason: what genesis seeded into the accounts (issuance, like
     /// `genesis_staked`) …
@@ -216,6 +224,9 @@ impl Audit {
             program_rand_held: 0,
             perps_rand_out: 0,
             perps_rand_held: 0,
+            perps_collateral_in: 0,
+            perps_collateral_out: 0,
+            perps_collateral_held: 0,
             multisig_issued: 0,
             multisig_rand_out: 0,
             multisig_rand_held: 0,
@@ -249,6 +260,19 @@ impl Audit {
             pool_value: self.pool_value.saturating_add(rand_out),
             perps_rand_out: rand_out,
             perps_rand_held: rand_in.saturating_sub(rand_out),
+            ..self
+        }
+    }
+
+    /// The same audit with the exchange's collateral counters in it (audit v10, PERP-6):
+    /// `initial` is the genesis engine state's collateral, `collateral_in` every deposit's burn
+    /// and `collateral_out` every payout a state proof listed, in the collateral asset. Reported
+    /// beside the RAND pair; it moves no term of the identity.
+    pub fn with_perps_collateral(self, initial: u64, collateral_in: u64, collateral_out: u64) -> Audit {
+        Audit {
+            perps_collateral_in: collateral_in,
+            perps_collateral_out: collateral_out,
+            perps_collateral_held: (initial as u128 + collateral_in as u128).saturating_sub(collateral_out as u128),
             ..self
         }
     }

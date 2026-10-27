@@ -426,8 +426,14 @@ without a `perps` section:
   "proved_root": "<64 hex>", "proved_height": 120, "head_height": 131,
   "pending_heights": [121, 122, …, 131],
   "medians": [{ "market": 0, "price": "64250000000" }],
-  "accounts": 3, "pending_withdrawals": 1 }
+  "accounts": 3, "pending_withdrawals": 1,
+  "bound_payouts": false, "initial_collateral": "0",
+  "collateral_in": "150000000000", "collateral_out": "2000000", "collateral_held": "149998000000" }
 ```
+
+The last five (audit v10, PERP-6) are the genesis `bound_payouts` gate and `initial_collateral`,
+and the ledger's collateral counters in the collateral asset: every deposit, every payout a proof
+listed, and `initial_collateral + in − out`, decimal strings (`docs/perps.md`, "The supply audit").
 
 The three commitments are 64 lowercase hex characters (a `Word8`, its eight words little-endian).
 `pending_heights` are the closed heights no state proof has covered, ascending: the digests the
@@ -1373,7 +1379,14 @@ chain whose collateral is a token): RAND that state proofs have paid out of the 
 (value entering the pool, inside `pool_value`), and what it still holds, `deposited - paid`. A RAND
 deposit entered through a bundle's `burn_r`, so it is inside `burned` on the pool side, and this is
 its twin, as the program vaults' pair is; `invariant_holds` covers it. A token collateral's supply
-does not move on the way in or out, so nothing is counted for it.
+does not move on the way in or out, so nothing is counted for it there.
+
+`perps_collateral_in`, `perps_collateral_out` and `perps_collateral_held` (audit v10, PERP-6;
+`"0"` without a `perps` section): the exchange's collateral in its own asset, RAND or token —
+every deposit's burn, every payout a state proof listed, and what it holds (the genesis
+`initial_collateral` + in − out). These are the counters the genesis `bound_payouts` rule holds a
+proof to (`docs/perps.md`, "The supply audit"); they move no term of the RAND identity. A node
+rolled onto this build from before it counts from the roll.
 
 `multisig_issued`, `multisig_rand_in`, `multisig_rand_out`, `multisig_base_out` and
 `multisig_rand_held` (multisig accounts, `docs/multisig.md`; `"0"` without a `multisig` section):

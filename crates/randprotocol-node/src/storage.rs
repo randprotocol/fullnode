@@ -1783,8 +1783,13 @@ impl Storage {
 
     /// The perps state as of the head (RPL-3), `None` on a chain without the section.
     pub fn perps(&self) -> Result<Option<randprotocol_core::ledger::perps::Perps>> {
+        // `decode_persisted` (audit v10, PERP-6): a row this build wrote, or the pre-v10 shape a
+        // chain-21 node wrote before the roll, its collateral counters starting at 0.
         self.get_meta_raw(META_PERPS)?
-            .map(|b| bincode::deserialize(&b).map_err(|e| StorageError::Corrupt(format!("perps state: {e}"))))
+            .map(|b| {
+                randprotocol_core::ledger::perps::Perps::decode_persisted(&b)
+                    .map_err(|e| StorageError::Corrupt(format!("perps state: {e}")))
+            })
             .transpose()
     }
 
@@ -5212,6 +5217,8 @@ pub(crate) mod fixtures {
             min_deposit: 1_000,
             engine_hc: PERPS_ENGINE,
             genesis_root: [32; 8],
+            bound_payouts: false,
+            initial_collateral: 0,
             markets: vec![randprotocol_core::ledger::perps::MarketSpec {
                 id: 0,
                 symbol: "BTC-PERP".into(),

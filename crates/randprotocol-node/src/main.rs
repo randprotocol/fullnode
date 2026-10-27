@@ -4950,6 +4950,27 @@ mod tests {
         assert_eq!(at_run, e, "run and verify give the same reason");
     }
 
+    /// Chain 21, live 2026-10-12 10:31 UTC on v0.8.0: chain 20's shape plus the `perps` section
+    /// (BTC-PERP on zUSD) and `multisig`. Audit v10 added optional fields to the perps section
+    /// (`bound_payouts`, `initial_collateral`, …) that the committed file does not set, so the
+    /// file must still build to the hash the fleet runs on — `PerpsConfig::commit_bytes` binds
+    /// the new fields only when set — and this build must run it.
+    #[test]
+    fn chain_21s_genesis_file_still_hashes_as_cut() {
+        let chain_21_hash = "ca76c2766ed6090ac6ba5dad86b724dd5d2b80c0edfaed287cd8b129e663ca9a";
+        let committed = concat!(env!("CARGO_MANIFEST_DIR"), "/../../deploy/genesis-chain21.json");
+        let gen = Genesis::from_json(&std::fs::read_to_string(committed).unwrap()).unwrap();
+        assert_eq!(gen.chain_id, 21);
+        let perps = gen.perps.as_ref().expect("the perps section");
+        assert_eq!((perps.max_tier, perps.max_block_inputs, perps.max_window_blocks), (18, 24, 64));
+        assert_eq!(perps.collateral_asset, 1, "zUSD");
+        assert!(!perps.bound_payouts && perps.initial_collateral == 0, "the audit-v10 fields are unset in the file");
+        let executor = node::executor_for_profile(&gen.fri_profile).unwrap();
+        let state = gen.build(executor.as_ref()).unwrap();
+        assert_eq!(state.hash().to_hex(), chain_21_hash, "chain 21's live genesis");
+        assert!(node::refuse_chains_this_build_cannot_run(&state).is_ok(), "this build runs chain 21");
+    }
+
     /// This build is constraint set 9 (the MODQ chip; set 8, the gas meter, ran chains 18-20): every verifier key moved again, so
     /// no proof chain 16 (constraint set 7, v0.6.1) committed verifies here. Chain 16 pins the v2
     /// guest, which this build still carries, so the `hc_bundle` check alone would let this binary
