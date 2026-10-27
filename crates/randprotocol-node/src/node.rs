@@ -241,6 +241,9 @@ pub fn reload_ledger_from(
     // And the testnet marker (audit v6, STAKE-2): served, not judged, but a node that came
     // back without it would tell wallets a testnet is not one.
     ledger.set_testnet(gs.ledger.testnet());
+    // PST-1 (genesis `program_state.refuse_panics`): a node that came back without it would apply
+    // a panicked invoke its peers refuse — a fork at the first one after its restart.
+    ledger.set_refuse_panicked_invokes(gs.ledger.refuse_panicked_invokes());
     // And the proof window (issue #118; genesis `proof_window_blocks`), with the anchor rows past
     // the 256 `load_ledger` reads: a node that came back at 256 would refuse every bundle whose
     // anchor or `time` is older than that and inside the genesis window — applied by its peers,
@@ -6922,6 +6925,23 @@ mod tests {
         assert!(!storage.load_ledger(&StubExecutor).unwrap().testnet(), "storage does not hold the marker");
         let reloaded = reload_ledger(&storage, &gs, &StubExecutor).unwrap();
         assert!(reloaded.testnet(), "restored from the genesis state");
+        assert_eq!(reloaded, gs.ledger, "and it is not state");
+    }
+
+    /// PST-1: genesis `program_state.refuse_panics` survives a restart the same way — a node that
+    /// came back without it would apply a panicked invoke its peers refuse.
+    #[test]
+    fn a_restart_restores_the_refuse_panics_rule() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
+        let mut g = crate::storage::fixtures::rpl2_genesis_file(7);
+        g.program_state.as_mut().unwrap().refuse_panics = true;
+        let gs = g.build(&StubExecutor).unwrap();
+        assert!(gs.ledger.refuse_panicked_invokes());
+        storage.init_genesis(&gs).unwrap();
+        assert!(!storage.load_ledger(&StubExecutor).unwrap().refuse_panicked_invokes(), "storage does not hold the rule");
+        let reloaded = reload_ledger(&storage, &gs, &StubExecutor).unwrap();
+        assert!(reloaded.refuse_panicked_invokes(), "restored from the genesis state");
         assert_eq!(reloaded, gs.ledger, "and it is not state");
     }
 

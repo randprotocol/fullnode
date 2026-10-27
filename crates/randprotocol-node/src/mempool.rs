@@ -699,6 +699,12 @@ impl Mempool {
         if let Some(e) = crate::admission::deploy_uncallable(tx) {
             return Err(e);
         }
+        // PST-1's (`admission::invoke_panicked`): an invoke whose proof publishes the panic
+        // sentinel is not pooled, on every chain; the ledger's own rule only under genesis
+        // `program_state.refuse_panics`.
+        if let Some(e) = crate::admission::invoke_panicked(tx) {
+            return Err(e);
+        }
         // And the canonical-proof rules (INT-5, VERIFIER-1/-2): a header the honest prover would
         // not write, on the bundle's proof or the call's. The ledger's own rule under
         // `hardening_v6`; policy here on every chain.

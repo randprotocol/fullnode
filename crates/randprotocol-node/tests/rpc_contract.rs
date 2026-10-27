@@ -703,7 +703,7 @@ async fn the_wallet_reads_the_limits_it_derives_caps_from() {
             bound_note_value: None,
             incremental_root: None,
         });
-        g.program_state = Some(randprotocol_core::ledger::program_state::ProgramStateConfig { cell_fee: 10_000_000 });
+        g.program_state = Some(randprotocol_core::ledger::program_state::ProgramStateConfig { cell_fee: 10_000_000, refuse_panics: false });
     })
     .await;
     let unknown = "ab".repeat(32);

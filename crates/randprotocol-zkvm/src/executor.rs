@@ -380,6 +380,20 @@ pub fn call_private_table_under_floor(proof: &[u8]) -> Option<(&'static str, u8)
     None
 }
 
+/// The eight outputs a call (or invoke) proof publishes (`pv::OUT0..7`), read off its header —
+/// `None` for bytes that do not decode canonically. Nothing is verified: what a verified proof
+/// publishes is `CallOutcome::outputs`; this is for a pool policy that refuses on an output, where
+/// a forged header can only get its own transaction refused (PST-1:
+/// `program_state::panicked`).
+pub fn call_proof_outputs(proof: &[u8]) -> Option<[u32; 8]> {
+    let proof = decode_canonical(proof).ok()?;
+    let mut out = [0u32; 8];
+    for (i, o) in out.iter_mut().enumerate() {
+        *o = u32::try_from(*proof.public_values.get(pv::OUT0 + i)?).ok()?;
+    }
+    Some(out)
+}
+
 /// The v0.6 canonical-proof rules: the first field of a decoded bundle or call proof that is not
 /// the value the honest prover writes, named — `None` for a proof the honest prover could have
 /// made. Header and transcript fields only; nothing here verifies anything, and every other
@@ -3330,6 +3344,63 @@ mod tests {
         // A transition the program does not accept has no run, so no proof.
         let bad = invoke_segment(&[], &binding, &step(41, 43).context(0, 0, 0));
         assert!(dry_run_call(&program, &[], &bad).is_err(), "41 → 43 is not a step");
+    }
+
+    /// PST-1 on the real executor, the three ways a run can end on a transition the program
+    /// refuses: a guest that **panics** (`guest-sdk`'s handler: output 7 = the sentinel, then halt)
+    /// has a run, so a proof that `verify_invoke` accepts — what the ledger's
+    /// `program_state.refuse_panics` rule and every node's pool refuse on its outputs; a guest that
+    /// **traps** (an `ecall` naming no syscall) has no run and no proof; and a **normal exit** on
+    /// the transition it accepts proves with an ordinary output 7.
+    #[test]
+    fn pst1_a_panicking_invoke_proves_with_the_sentinel_a_trapping_one_has_no_proof() {
+        use super::*;
+        use crate::machine::FriProfile;
+        use randprotocol_core::ledger::program_state::{invoke_segment, panicked, Cell, Inflow, Transition, PANIC_SENTINEL};
+        let zk = ZkExecutor::new(FriProfile::Test);
+        let record_of = |program: &Program| ProgramRecord {
+            id: randprotocol_core::program::program_id(program.base_pc, &program.words),
+            base_pc: program.base_pc,
+            words: program.words.clone(),
+            code_hash: zk.check_program(program.base_pc, &program.words).unwrap(),
+            deployed_at: 0,
+            public_digest: None,
+            public_len: 0,
+        };
+        let step = |from: u32, to: u32| Transition {
+            reads: vec![Cell { key: [1, 0, 0, 0, 0, 0, 0, 0], value: [from, 0, 0, 0, 0, 0, 0, 0] }],
+            writes: vec![Cell { key: [1, 0, 0, 0, 0, 0, 0, 0], value: [to, 0, 0, 0, 0, 0, 0, 0] }],
+            inflow: Inflow::None,
+            pays: vec![],
+            mints: vec![],
+        };
+        let binding = [3u32, 1, 4, 1, 5, 9, 2, 6];
+        let forged = step(41, 1_000_000).context(0, 0, 0);
+        let honest = step(41, 42).context(0, 0, 0);
+
+        // Panic: the forged transition halts through the handler, proves, and verifies.
+        let panicking = crate::guests::rpl2_counter_panicking();
+        let rec = record_of(&panicking);
+        let (proof, outputs, _) =
+            prove_invoke(FriProfile::Test, &panicking, &[], &[], &binding, &forged, [1, 2, 3, 4], None, None).expect("a panicked run proves");
+        assert_eq!(outputs[7], PANIC_SENTINEL);
+        let outcome = zk.verify_invoke(&rec, &proof, &invoke_segment(&[], &binding, &forged)).expect("the STARK alone accepts it");
+        assert!(panicked(&outcome.outputs), "what the ledger's rule reads");
+        assert_eq!(call_proof_outputs(&proof), Some(outcome.outputs), "and the pool's header read agrees");
+        // The same program's normal exit on the transition it accepts.
+        let (ok, ok_out, _) = prove_invoke(FriProfile::Test, &panicking, &[], &[], &binding, &honest, [1, 2, 3, 4], None, None).unwrap();
+        assert_eq!(ok_out[0], 42);
+        let ok_outcome = zk.verify_invoke(&rec, &ok, &invoke_segment(&[], &binding, &honest)).unwrap();
+        assert!(!panicked(&ok_outcome.outputs), "a normal exit publishes no sentinel");
+        assert_eq!(call_proof_outputs(&ok), Some(ok_outcome.outputs));
+        assert_eq!(call_proof_outputs(&[1, 2, 3]), None, "bytes that do not decode");
+
+        // Trap: no run, so the prover has nothing to prove.
+        let trapping = crate::guests::rpl2_counter_trapping();
+        let seg = invoke_segment(&[], &binding, &forged);
+        assert!(matches!(dry_run_call(&trapping, &[], &seg), Err(_)), "a trapping run does not execute");
+        assert!(prove_invoke(FriProfile::Test, &trapping, &[], &[], &binding, &forged, [1, 2, 3, 4], None, None).is_err(), "and has no proof");
+        assert!(prove_invoke(FriProfile::Test, &trapping, &[], &[], &binding, &honest, [1, 2, 3, 4], None, None).is_ok(), "its normal exit proves");
     }
 
     /// RPL-2: `prove_invoke` left to pick the tier itself picks it from a run over the *real*

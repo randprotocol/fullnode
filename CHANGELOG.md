@@ -51,6 +51,13 @@ Audit v10 fixes (node and client policies, no chain change unless a genesis fiel
   `DRY_RUN` (and so its selftest and the 26-host rehearsal, which cuts two dry-run files) scans a
   copy of the committed genesis files without chain 21's own; the real cut still refuses chain id
   21. Selftest 237 of 237.
+- **PST-1** (genesis-gated, next cut; pool policy now): an `Invoke` whose call proof publishes
+  `guest-sdk`'s panic sentinel (`0xdeadbeef` in output 7) is refused (`ProgramPanicked`) on a
+  chain whose genesis sets `program_state.refuse_panics: true` (`rand-node genesis
+  --program-state-refuse-panics`); bound into the genesis hash only when set, so chain 21 hashes
+  and replays as before. Every node's pool refuses such an invoke on every chain (node policy,
+  never cached). A trapping run has no execution and so no proof; tests cover panic, trap and a
+  normal exit on the real executor.
 
 ## v0.8.0 — 2026-10-12 (chain 21 onward)
 

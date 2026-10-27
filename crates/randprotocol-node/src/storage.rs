@@ -5235,7 +5235,7 @@ pub(crate) mod fixtures {
         });
         g.hardening_v6 = Some(true);
         g.hc_auth = Some(word8_to_hex(&HCA));
-        g.program_state = Some(randprotocol_core::ledger::program_state::ProgramStateConfig { cell_fee: CELL_FEE });
+        g.program_state = Some(randprotocol_core::ledger::program_state::ProgramStateConfig { cell_fee: CELL_FEE, refuse_panics: false });
         g
     }
 

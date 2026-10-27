@@ -679,6 +679,11 @@ enum Cmd {
         /// refused by name before any file is written.
         #[arg(long, value_name = "UNITS")]
         program_state_cell_fee: Option<u64>,
+        /// PST-1: write `program_state.refuse_panics: true` — an `Invoke` whose call proof
+        /// publishes the panic sentinel (`0xdeadbeef` in output 7) is refused by the chain. Bound
+        /// into the genesis hash (last) only when given. Needs `--program-state-cell-fee`.
+        #[arg(long)]
+        program_state_refuse_panics: bool,
         /// Fee feedback (`docs/fees.md` §1.3): the `fees` section, as a `FeesConfig` JSON file
         /// (`{"burn_base": true, "subsidy_net_of_fees": true, "burn_floor": true,
         /// "proposer_share_bps": 4000, "prove_base": 600000}`, each optional).
@@ -2564,6 +2569,7 @@ async fn main() -> Result<()> {
             binding_domain,
             proof_window_blocks,
             program_state_cell_fee,
+            program_state_refuse_panics,
             fees,
             perps,
         } => {
@@ -2597,6 +2603,9 @@ async fn main() -> Result<()> {
             )?;
             // RPL-2: the section stands on four others (`Genesis::validate` enforces it; said
             // here, by flag name, before a file is written).
+            if program_state_refuse_panics && program_state_cell_fee.is_none() {
+                anyhow::bail!("--program-state-refuse-panics needs --program-state-cell-fee: it is a field of the program_state section");
+            }
             if program_state_cell_fee.is_some() {
                 for (on, flag) in [
                     (tokens.is_some(), "--tokens"),
@@ -2764,7 +2773,7 @@ async fn main() -> Result<()> {
                 // RPL-2: absent unless `--program-state-cell-fee` is given, so a genesis cut
                 // without it hashes byte-for-byte as before.
                 program_state: program_state_cell_fee
-                    .map(|cell_fee| randprotocol_core::ledger::program_state::ProgramStateConfig { cell_fee }),
+                    .map(|cell_fee| randprotocol_core::ledger::program_state::ProgramStateConfig { cell_fee, refuse_panics: program_state_refuse_panics }),
                 // Fee feedback (`docs/fees.md` §1.3): read from a `FeesConfig` JSON file when
                 // `--fees` is given, so `Genesis::build` validates it (`burn_floor` without
                 // `burn_base`, `subsidy_net_of_fees` without aggregation); omitted entirely

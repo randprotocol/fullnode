@@ -142,7 +142,7 @@ fn the_genesis_command_writes_the_program_state_section_when_asked() {
     let run = genesis(&with, &[all.as_slice(), &["--program-state-cell-fee", "10000000"]].concat());
     assert!(run.status.success(), "{}", String::from_utf8_lossy(&run.stderr));
     let w = read(&with);
-    assert_eq!(w.program_state, Some(ProgramStateConfig { cell_fee: 10_000_000 }));
+    assert_eq!(w.program_state, Some(ProgramStateConfig { cell_fee: 10_000_000, refuse_panics: false }));
     let executor = randprotocol_node::node::executor_for_profile(&w.fri_profile).unwrap();
     let state = w.build(executor.as_ref()).unwrap();
     assert_eq!(state.ledger.program_state().map(|s| s.cell_fee), Some(10_000_000));
@@ -150,6 +150,19 @@ fn the_genesis_command_writes_the_program_state_section_when_asked() {
     assert_ne!(state.hash(), p.build(executor.as_ref()).unwrap().hash(), "the section is bound by the genesis hash");
     assert_eq!(printed_hash(&run, "genesis hash "), state.hash().to_hex());
     assert!(String::from_utf8_lossy(&run.stdout).contains("program_state: cell fee 0.01 RAND"));
+    assert!(!state.ledger.refuse_panicked_invokes(), "PST-1's rule only when asked");
+
+    // PST-1: `--program-state-refuse-panics` writes the field and binds it; alone it is refused.
+    let strict = dir.path().join("strict.json");
+    let run = genesis(&strict, &[all.as_slice(), &["--program-state-cell-fee", "10000000", "--program-state-refuse-panics"]].concat());
+    assert!(run.status.success(), "{}", String::from_utf8_lossy(&run.stderr));
+    let s = read(&strict);
+    assert_eq!(s.program_state, Some(ProgramStateConfig { cell_fee: 10_000_000, refuse_panics: true }));
+    let strict_state = s.build(executor.as_ref()).unwrap();
+    assert!(strict_state.ledger.refuse_panicked_invokes());
+    assert_ne!(strict_state.hash(), state.hash(), "the rule is bound by the genesis hash");
+    let lone = genesis(&dir.path().join("lone.json"), &[all.as_slice(), &["--program-state-refuse-panics"]].concat());
+    assert!(!lone.status.success() && String::from_utf8_lossy(&lone.stderr).contains("needs --program-state-cell-fee"));
 
     // Each flag it stands on, missing one at a time, refused by name; and a fee past the bound.
     let without = |skip: &str| -> Vec<&str> {

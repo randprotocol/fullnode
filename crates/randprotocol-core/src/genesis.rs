@@ -1458,6 +1458,7 @@ impl Genesis {
         // only through an `Invoke`'s bundle — so the supply check above is unaffected.
         if let Some(p) = &self.program_state {
             ledger.set_program_state(Some(crate::ledger::program_state::ProgramState::from_config(p)));
+            ledger.set_refuse_panicked_invokes(p.refuse_panics);
         }
         // The incremental nullifier root (spec 2026-10-05 §4.1): the genesis ledger holds no
         // nullifiers, so the range starts empty and the header's state root already carries it.
@@ -1846,6 +1847,11 @@ impl Genesis {
         if let Some(h) = ledger.hc_auth_multisig() {
             commit.extend_from_slice(b"hc_auth_multisig");
             commit.extend_from_slice(&word8_to_bytes(&h));
+        }
+        // PST-1 (`program_state.refuse_panics`), after `hc_auth_multisig` — last — tagged, and only
+        // when `true`, so chain 21 and every genesis cut before the field hash byte for byte as before.
+        if self.program_state.as_ref().is_some_and(|p| p.refuse_panics) {
+            commit.extend_from_slice(b"program_state_refuse_panics");
         }
         #[cfg(test)]
         tests::LAST_GENESIS_COMMIT.with(|c| *c.borrow_mut() = commit.clone());
@@ -4527,6 +4533,34 @@ mod tests {
         g
     }
 
+    /// PST-1: `program_state.refuse_panics` is absent from the file and the hash when `false` (so
+    /// a section without it — chain 21's — hashes as before), bound when `true`, round-trips, and
+    /// sets the ledger's rule; the state root does not move (a parameter, not state).
+    #[test]
+    fn program_state_refuse_panics_is_committed_only_when_true_and_sets_the_rule() {
+        use crate::ledger::program_state::ProgramStateConfig;
+        let mut off = rpl2_ready();
+        off.program_state = Some(ProgramStateConfig { cell_fee: 10_000_000, refuse_panics: false });
+        let mut on = off.clone();
+        on.program_state.as_mut().unwrap().refuse_panics = true;
+        assert!(!off.to_json().contains("refuse_panics"), "absent from the file when false");
+        assert!(on.to_json().contains("\"refuse_panics\": true"));
+        assert_eq!(Genesis::from_json(&on.to_json()).unwrap(), on, "it round-trips");
+        let (a, b) = (build(&off), build(&on));
+        assert_ne!(a.hash(), b.hash(), "the rule is a different chain");
+        assert_eq!(a.ledger.state_root(), b.ledger.state_root(), "a parameter, not state");
+        assert!(!a.ledger.refuse_panicked_invokes() && b.ledger.refuse_panicked_invokes());
+        // The hash of a section without the field is the hash a pre-field build computed: the
+        // committed bytes end exactly where they did.
+        build(&off);
+        let without = LAST_GENESIS_COMMIT.with(|c| c.borrow().clone());
+        assert!(!without.windows(27).any(|w| w == b"program_state_refuse_panics"));
+        build(&on);
+        let with = LAST_GENESIS_COMMIT.with(|c| c.borrow().clone());
+        assert_eq!(&with[..without.len()], &without[..]);
+        assert_eq!(&with[without.len()..], b"program_state_refuse_panics");
+    }
+
     /// RPL-2: the `program_state` section switches the ledger's program state on, empty, and is
     /// bound into the hash and the state root only when present. It needs the four sections it
     /// stands on, and its one parameter is bounded.
@@ -4539,7 +4573,7 @@ mod tests {
         assert!(bare.ledger.program_state().is_none());
 
         let mut on = plain.clone();
-        on.program_state = Some(ProgramStateConfig { cell_fee: 10_000_000 });
+        on.program_state = Some(ProgramStateConfig { cell_fee: 10_000_000, refuse_panics: false });
         let g = build(&on);
         let state = g.ledger.program_state().expect("the section seeds an empty program state");
         assert_eq!((state.cell_fee, state.cell_count(), state.rand_held()), (10_000_000, 0, 0));
@@ -4547,7 +4581,7 @@ mod tests {
         assert_ne!(g.ledger.state_root(), bare.ledger.state_root(), "and its root is in the state root");
         assert!(g.ledger.audit().invariant_holds() == bare.ledger.audit().invariant_holds(), "no value is seeded");
         let mut dearer = on.clone();
-        dearer.program_state = Some(ProgramStateConfig { cell_fee: 10_000_001 });
+        dearer.program_state = Some(ProgramStateConfig { cell_fee: 10_000_001, refuse_panics: false });
         assert_ne!(build(&dearer).hash(), g.hash(), "the cell fee is bound");
         assert_eq!(build(&dearer).ledger.state_root(), g.ledger.state_root(), "a parameter, not state");
         assert_eq!(Genesis::from_json(&on.to_json()).unwrap(), on, "it round-trips");
@@ -4573,10 +4607,10 @@ mod tests {
         off.confidential = false;
         assert!(matches!(off.build(&StubExecutor), Err(GenesisError::BadProgramState(_))));
         let mut over = on.clone();
-        over.program_state = Some(ProgramStateConfig { cell_fee: MAX_CELL_FEE + 1 });
+        over.program_state = Some(ProgramStateConfig { cell_fee: MAX_CELL_FEE + 1, refuse_panics: false });
         assert!(matches!(over.build(&StubExecutor), Err(GenesisError::BadProgramState(_))));
         let mut edge = on;
-        edge.program_state = Some(ProgramStateConfig { cell_fee: MAX_CELL_FEE });
+        edge.program_state = Some(ProgramStateConfig { cell_fee: MAX_CELL_FEE, refuse_panics: false });
         edge.build(&StubExecutor).unwrap();
     }
 
@@ -4626,7 +4660,7 @@ mod tests {
         assert!(Genesis::from_json(&stray).is_err(), "a stray key is refused");
         // Beside RPL-2's section too.
         let mut both = on.clone();
-        both.program_state = Some(crate::ledger::program_state::ProgramStateConfig { cell_fee: 10_000_000 });
+        both.program_state = Some(crate::ledger::program_state::ProgramStateConfig { cell_fee: 10_000_000, refuse_panics: false });
         assert!(build(&both).ledger.perps().is_some() && build(&both).ledger.program_state().is_some());
 
         // What it stands on, one missing at a time.

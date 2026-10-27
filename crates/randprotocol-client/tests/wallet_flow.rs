@@ -888,7 +888,7 @@ fn genesis_rpl2(validator: &Keypair) -> Genesis {
             dynamic: None,
         }),
         hardening_v6: Some(true),
-        program_state: Some(ProgramStateConfig { cell_fee: RPL2_CELL_FEE }),
+        program_state: Some(ProgramStateConfig { cell_fee: RPL2_CELL_FEE, refuse_panics: false }),
         multisig: None,
         // BIND-1, pinned here rather than inherited: chain 20, the first that can carry RPL-2, is
         // cut with `binding_domain: 1`, so the real-proof invoke is proved and verified in the
