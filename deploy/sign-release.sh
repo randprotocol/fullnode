@@ -22,6 +22,7 @@ if [ "${#KEYS[@]}" -eq 0 ]; then
     for k in "$HOME"/.rand-release/*_ed25519* "$HOME"/.rand-release/*_ecdsa* "$HOME"/.rand-release/*_sk*; do
         [ -f "$k" ] || continue
         case "$k" in *.pub|*.sig) continue;; esac
+        head -1 "$k" 2>/dev/null | grep -q -- '-----BEGIN OPENSSH PRIVATE KEY-----' || continue   # real private keys only
         KEYS+=("$k")
     done
 fi

@@ -439,6 +439,12 @@ What a release is from the next tag on, and who is trusted for what:
    unless `ALLOW_UNSIGNED=1` says so on purpose. `SELFTEST=1 bash deploy/lib/verify-release.sh`
    runs the cases on throwaway keys (20 checks).
 
+   ```bash
+   gh release download <tag> -R randprotocol/fullnode -D rel     # rand-node, rand, rand-prover, SHA256SUMS, SHA256SUMS.sig (and SHA256SUMS.sig2 ... when the threshold is above 1)
+   RELEASE_SUMS=rel/SHA256SUMS RELEASE_SIG=rel/SHA256SUMS.sig \
+     deploy/roll-all.sh rel/rand-node rel/rand "$(awk '$2=="rand-node"{print $1}' rel/SHA256SUMS)" "$(awk '$2=="rand"{print $1}' rel/SHA256SUMS)"
+   ```
+
 ### Release trust: a threshold of keys (PROC-5)
 
 One signing key is one point of failure. The verifier takes a **threshold**: at least *T* DISTINCT
@@ -465,11 +471,6 @@ or the private keys in `~/.rand-release/`) and then runs the same check. To go t
    `SELFTEST=1 bash deploy/lib/verify-release.sh` and a dry `verify_release_sums` on the last
    release's files behave. Do this before the next release, not during a roll.
 
-   ```bash
-   gh release download <tag> -R randprotocol/fullnode -D rel     # rand-node, rand, rand-prover, SHA256SUMS, SHA256SUMS.sig
-   RELEASE_SUMS=rel/SHA256SUMS RELEASE_SIG=rel/SHA256SUMS.sig \
-     deploy/roll-all.sh rel/rand-node rel/rand "$(awk '$2=="rand-node"{print $1}' rel/SHA256SUMS)" "$(awk '$2=="rand"{print $1}' rel/SHA256SUMS)"
-   ```
 
 **What is not in place yet (2026-09-30), stated so nobody reads the above as done:**
 

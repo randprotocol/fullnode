@@ -10,7 +10,8 @@
 #       signatures are <SHA256SUMS.sig> plus its siblings <SHA256SUMS.sig2> ... <SHA256SUMS.sig9>,
 #       whichever exist; a bad or unlisted extra one counts for nothing, and one key signing
 #       twice counts once. T larger than the number of listed keys refuses. The primary .sig is
-#       always required.
+#       must be present (and non-empty); it need not be the valid one. The listed-key count is
+#       non-comment lines, not proven-distinct keys, which only ever fails closed.
 #       returns 1 unless <SHA256SUMS.sig> is an SSH signature (`ssh-keygen -Y sign -n
 #       rand-release`) over exactly the bytes of <SHA256SUMS>, made by a key listed in
 #       <allowed_signers> (default: deploy/release-signers). A missing signature, a signature
@@ -77,6 +78,10 @@ verify_release_sums() {
   if ! command -v ssh-keygen >/dev/null 2>&1; then
     echo "verify-release: refusing — ssh-keygen is not installed, so the signature cannot be checked" >&2; return 1
   fi
+  # A certificate authority line would make one holder many "distinct" keys: not allowed here.
+  if grep -qE 'cert-authority' "$signers"; then
+    echo "verify-release: refusing — $signers has a cert-authority line; release keys are listed one by one" >&2; return 1
+  fi
   threshold=$(_vr_threshold) || return 1
   # Distinct listed keys (one per non-comment line).
   listed=$(grep -cvE '^[[:space:]]*(#|$)' "$signers")
@@ -105,7 +110,7 @@ EOF
     fi
     case " $okset " in *" $ok "*) ;; *) okset="$okset $ok" ;; esac
   done
-  n=$(echo $okset | wc -w | tr -d ' ')
+  set -f; n=$(echo $okset | wc -w | tr -d ' '); set +f   # no glob expansion of principals
   if [ "$n" -lt "$threshold" ]; then
     echo "verify-release: refusing — $n distinct listed key(s) signed $sums, the threshold is $threshold" >&2; return 1
   fi
@@ -215,6 +220,11 @@ if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${SELFTEST:-}" = 1 ]; then
   cp "$ST/stranger-sums.sig" "$ST/t/SHA256SUMS.sig2"
   refuses "2-of-2: an unlisted key's signature does not count" env SELFTEST=0 RELEASE_THRESHOLD=2 bash -c 'source "$0"; verify_release_sums "$1" "$2" "$3"' "$ST/lib/verify-release.sh" "$ST/t/SHA256SUMS" "$ST/t/SHA256SUMS.sig" "$ST/signers2"
   accepts "the environment cannot lower the threshold below the committed one" env SELFTEST=0 RELEASE_THRESHOLD=1 bash -c 'source "$0"; verify_release_sums "$1" "$2" "$3"' "$ST/lib/verify-release.sh" "$ST/t/SHA256SUMS" "$ST/t/SHA256SUMS.sig" "$ST/signers2"
+  mkdir -p "$ST/d2/lib"; cp "$ST/lib/verify-release.sh" "$ST/d2/lib/"; echo 2 > "$ST/d2/release-threshold"
+  cp "$ST/t/SHA256SUMS.sig" "$ST/t/one.sig"; rm -f "$ST/t/SHA256SUMS.sig2"
+  refuses "committed threshold 2, RELEASE_THRESHOLD=1, one valid signature: refused" env SELFTEST=0 RELEASE_THRESHOLD=1 bash -c 'source "$0"; verify_release_sums "$1" "$2" "$3"' "$ST/d2/lib/verify-release.sh" "$ST/t/SHA256SUMS" "$ST/t/SHA256SUMS.sig" "$ST/signers2"
+  printf 'x cert-authority namespaces="rand-release" %s\n' "$(cut -d' ' -f1,2 "$ST/release.pub")" > "$ST/signers-ca"
+  refuses "a cert-authority line is refused" verify_release_sums "$ST/rel/SHA256SUMS" "$ST/rel/SHA256SUMS.sig" "$ST/signers-ca"
   refuses "a threshold above the number of listed keys refuses" env SELFTEST=0 RELEASE_THRESHOLD=3 bash -c 'source "$0"; verify_release_sums "$1" "$2" "$3"' "$ST/lib/verify-release.sh" "$ST/t/SHA256SUMS" "$ST/t/SHA256SUMS.sig" "$ST/signers2"
   refuses "a junk threshold refuses" env SELFTEST=0 RELEASE_THRESHOLD=x bash -c 'source "$0"; verify_release_sums "$1" "$2" "$3"' "$ST/lib/verify-release.sh" "$ST/t/SHA256SUMS" "$ST/t/SHA256SUMS.sig" "$ST/signers2"
 
