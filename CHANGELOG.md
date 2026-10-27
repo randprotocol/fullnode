@@ -37,7 +37,9 @@ Audit v10 fixes (node and client policies, no chain change unless a genesis fiel
   is cached, so a state root rehashes only the accounts that changed, and the store keeps one row
   per account (`multisig_accounts` column family) plus a totals row, so a commit writes only the
   accounts its blocks touched; a store's one-blob register is split into rows at the first open
-  (a store opened by this build cannot be opened by an older one).
+  (`rand-node db restore-multisig-blob --datadir <dir>`, node stopped, restores v0.8.0's layout
+  before a downgrade). **Upgrade note:** snapshot each datadir (stop the node, copy it) before
+  rolling this build; that rollback needs no tool.
 - **MSA-1 / MSA-2** (docs): `docs/multisig.md`, `docs/cli.md`, `docs/prover.md` and
   `docs/shielded.md` say plainly that no private-multisig (tier-18) auth proof has yet been
   completed or verified by a node; ≈ 76 GB is a lower bound from a stopped Test-profile attempt,

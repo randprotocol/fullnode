@@ -514,6 +514,28 @@ pub struct Storage {
     multisig_rows_written: std::sync::atomic::AtomicUsize,
 }
 
+/// The v0.8.0 one-blob multisig register under [`META_MULTISIG`], field for field (bincode is
+/// positional): what the MSA-4 migration reads and `rand-node db restore-multisig-blob` writes.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct LegacyMultisigRegister {
+    accounts: BTreeMap<[u8; 32], randprotocol_core::ledger::multisig::Account>,
+    create_fee: u64,
+    issued: u64,
+    rand_in: u64,
+    rand_out: u64,
+    base_out: u64,
+}
+
+/// What [`Storage::restore_multisig_blob`] did.
+#[derive(Debug, PartialEq, Eq)]
+pub struct RestoredMultisigBlob {
+    /// The accounts written back into the one-blob register, `None` when the store held no
+    /// row-layout register (a chain without the section, or already restored).
+    pub accounts: Option<usize>,
+    /// Whether the `multisig_accounts` family was there to drop.
+    pub family: bool,
+}
+
 /// What [`Storage::stage_multisig`] put in a batch: each row written (with its leaf) or deleted,
 /// recorded in the cache once the batch lands ([`Storage::multisig_landed`]).
 #[derive(Default)]
@@ -1123,6 +1145,69 @@ impl Storage {
         }
         db.drop_cf(CF_PERP_INPUTS)?;
         Ok(true)
+    }
+
+    /// Undo MSA-4's on-disk change so v0.8.0 can open the database again (`rand-node db
+    /// restore-multisig-blob`): the register's totals row and account rows are written back as
+    /// the one bincode blob under `meta/multisig` (the totals row deleted in the same batch), then
+    /// the `multisig_accounts` family — which [`Storage::open`] creates on every database — is
+    /// dropped. [`Storage::drop_perp_inputs`]' twin: it opens raw with whatever families are on
+    /// disk and never through `open`, which would split the blob again.
+    ///
+    /// A register under genesis `multisig.max_accounts` is refused untouched: that is a chain no
+    /// build before the field can follow. Crash-safe and rerunnable: a crash after the batch
+    /// leaves the blob beside the family, which the next `open` splits again and a rerun drops;
+    /// a rerun on a restored store finds nothing to write. Fails while a node holds the lock.
+    pub fn restore_multisig_blob(path: &Path) -> Result<RestoredMultisigBlob> {
+        let db_path = path.join("db");
+        if !db_path.join("CURRENT").exists() {
+            return Err(StorageError::Corrupt(format!("no database at {}", db_path.display())));
+        }
+        let names = DB::list_cf(&Options::default(), &db_path)?;
+        let mut db = DB::open_cf(&Options::default(), &db_path, &names)?;
+        let family = names.iter().any(|n| n == CF_MULTISIG_ACCOUNTS);
+        let mut accounts = None;
+        {
+            let meta = db.cf_handle(CF_META).ok_or_else(|| StorageError::Corrupt("database has no meta family".into()))?;
+            if let Some(raw) = db.get_cf(meta, META_MULTISIG_TOTALS.as_bytes())? {
+                let totals: randprotocol_core::ledger::multisig::RegisterTotals =
+                    bincode::deserialize(&raw).map_err(|e| StorageError::Corrupt(format!("multisig register totals: {e}")))?;
+                if let Some(cap) = totals.max_accounts {
+                    return Err(StorageError::Corrupt(format!(
+                        "this database's multisig register is capped (max_accounts {cap}), a chain no build before the field can follow; nothing restored"
+                    )));
+                }
+                let mut rows = BTreeMap::new();
+                if let Some(cf) = db.cf_handle(CF_MULTISIG_ACCOUNTS) {
+                    for item in db.iterator_cf(cf, IteratorMode::Start) {
+                        let (k, v) = item?;
+                        let id: [u8; 32] = k.as_ref().try_into().map_err(|_| StorageError::Corrupt(format!("multisig account row key of {} bytes", k.len())))?;
+                        let a = bincode::deserialize(&v).map_err(|e| StorageError::Corrupt(format!("multisig account {}: {e}", hex::encode(id))))?;
+                        rows.insert(id, a);
+                    }
+                }
+                if rows.len() as u64 != totals.accounts {
+                    return Err(StorageError::Corrupt(format!("{} account rows, the totals say {}; nothing restored", rows.len(), totals.accounts)));
+                }
+                accounts = Some(rows.len());
+                let legacy = LegacyMultisigRegister {
+                    accounts: rows,
+                    create_fee: totals.create_fee,
+                    issued: totals.issued,
+                    rand_in: totals.rand_in,
+                    rand_out: totals.rand_out,
+                    base_out: totals.base_out,
+                };
+                let mut batch = WriteBatch::default();
+                batch.put_cf(meta, META_MULTISIG.as_bytes(), bincode::serialize(&legacy)?);
+                batch.delete_cf(meta, META_MULTISIG_TOTALS.as_bytes());
+                db.write_opt(batch, &sync_opts())?;
+            }
+        }
+        if family {
+            db.drop_cf(CF_MULTISIG_ACCOUNTS)?;
+        }
+        Ok(RestoredMultisigBlob { accounts, family })
     }
 
     fn cf(&self, name: &str) -> &rocksdb::ColumnFamily {
@@ -1843,17 +1928,7 @@ impl Storage {
     /// the blob (fresh, or already migrated) pays one key read.
     fn migrate_multisig_blob(&self) -> Result<()> {
         let Some(blob) = self.get_meta_raw(META_MULTISIG)? else { return Ok(()) };
-        /// The one-blob layout, field for field (bincode is positional).
-        #[derive(serde::Deserialize)]
-        struct LegacyRegister {
-            accounts: BTreeMap<[u8; 32], randprotocol_core::ledger::multisig::Account>,
-            create_fee: u64,
-            issued: u64,
-            rand_in: u64,
-            rand_out: u64,
-            base_out: u64,
-        }
-        let legacy: LegacyRegister = bincode::deserialize(&blob).map_err(|e| StorageError::Corrupt(format!("pre-v10 multisig register blob: {e}")))?;
+        let legacy: LegacyMultisigRegister = bincode::deserialize(&blob).map_err(|e| StorageError::Corrupt(format!("pre-v10 multisig register blob: {e}")))?;
         let totals = randprotocol_core::ledger::multisig::RegisterTotals {
             create_fee: legacy.create_fee,
             max_accounts: None,
@@ -9616,6 +9691,69 @@ mod tests {
         let err = Storage::drop_perp_inputs(perps_dir.path()).unwrap_err().to_string();
         assert!(err.contains("holds rows"), "{err}");
         assert!(Storage::drop_perp_inputs(&perps_dir.path().join("nowhere")).is_err(), "no database");
+    }
+
+    /// Audit v10, MSA-4's rollback: `restore_multisig_blob` turns a migrated store back into the
+    /// v0.8.0 layout — the eighteen families v0.8.0 lists open it, and its one blob decodes to
+    /// the same register (accounts, fee, totals) — a rerun finds nothing, and this build's next
+    /// open splits it into rows again with the same register. A capped register is refused.
+    #[test]
+    fn restore_multisig_blob_round_trips_to_the_v080_layout_and_back() {
+        let v080: Vec<&str> = ALL_CFS.iter().copied().filter(|c| *c != CF_MULTISIG_ACCOUNTS).collect();
+        assert_eq!(v080.len(), 18);
+        let open_as_v080 = |dir: &Path| {
+            let cfs = v080.iter().map(|n| ColumnFamilyDescriptor::new(*n, Options::default()));
+            DB::open_cf_descriptors(&Options::default(), dir.join("db"), cfs)
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let gs = multisig_genesis(7);
+        let reg = gs.ledger.multisig().unwrap().clone();
+        {
+            let st = Storage::open(dir.path()).unwrap();
+            st.init_genesis(&gs).unwrap();
+            assert!(st.get_meta_raw(META_MULTISIG).unwrap().is_none(), "this build's layout: rows");
+        }
+        assert!(open_as_v080(dir.path()).is_err(), "nineteen families on disk, eighteen listed");
+        let r = Storage::restore_multisig_blob(dir.path()).unwrap();
+        assert_eq!(r, RestoredMultisigBlob { accounts: Some(reg.len()), family: true });
+        {
+            let db = open_as_v080(dir.path()).expect("v0.8.0 opens it again");
+            let meta = db.cf_handle(CF_META).unwrap();
+            assert!(db.get_cf(meta, META_MULTISIG_TOTALS).unwrap().is_none(), "no totals row left");
+            let legacy: LegacyMultisigRegister = bincode::deserialize(&db.get_cf(meta, META_MULTISIG).unwrap().expect("the blob")).unwrap();
+            let back = randprotocol_core::ledger::multisig::MultisigRegister::assemble(
+                randprotocol_core::ledger::multisig::RegisterTotals {
+                    create_fee: legacy.create_fee,
+                    max_accounts: None,
+                    issued: legacy.issued,
+                    rand_in: legacy.rand_in,
+                    rand_out: legacy.rand_out,
+                    base_out: legacy.base_out,
+                    accounts: legacy.accounts.len() as u64,
+                },
+                legacy.accounts,
+            )
+            .unwrap();
+            assert_eq!(back, reg, "the blob is the register v0.8.0 wrote");
+        }
+        assert_eq!(Storage::restore_multisig_blob(dir.path()).unwrap(), RestoredMultisigBlob { accounts: None, family: false }, "a rerun finds nothing");
+        let st = Storage::open(dir.path()).unwrap();
+        assert_eq!(st.multisig().unwrap().as_ref(), Some(&reg), "this build splits it again");
+        assert!(st.get_meta_raw(META_MULTISIG).unwrap().is_none());
+        drop(st);
+
+        // A capped register (a chain v0.8.0 cannot follow): refused, untouched.
+        let capped_dir = tempfile::tempdir().unwrap();
+        {
+            let mut file = multisig_genesis_file(7);
+            file.multisig.as_mut().unwrap().max_accounts = Some(5);
+            let st = Storage::open(capped_dir.path()).unwrap();
+            st.init_genesis(&file.build(&StubExecutor).unwrap()).unwrap();
+        }
+        let err = Storage::restore_multisig_blob(capped_dir.path()).unwrap_err().to_string();
+        assert!(err.contains("max_accounts"), "{err}");
+        assert!(open_as_v080(capped_dir.path()).is_err(), "untouched");
+        assert!(Storage::restore_multisig_blob(&capped_dir.path().join("nowhere")).is_err(), "no database");
     }
 
     /// Task 5 review: a state proof committed in the same batch as blocks it covers (a sync

@@ -1093,6 +1093,14 @@ enum DbCmd {
         #[arg(long)]
         datadir: PathBuf,
     },
+    /// Before rolling back to v0.8.0 (audit v10, MSA-4): write the multisig register's rows back
+    /// as v0.8.0's one blob and drop the `multisig_accounts` column family, which this build
+    /// creates on every database and v0.8.0 cannot open. Refused, untouched, when the register is
+    /// capped by genesis `multisig.max_accounts` (no older build can follow that chain).
+    RestoreMultisigBlob {
+        #[arg(long)]
+        datadir: PathBuf,
+    },
 }
 
 /// `rand-node safety …` (audit v6, CON-4 and CON-5).
@@ -3169,6 +3177,19 @@ async fn main() -> Result<()> {
             }
             println!("a build from before RPL-3 can open this database; a later start re-creates the family, empty");
         }
+        Cmd::Db { cmd: DbCmd::RestoreMultisigBlob { datadir } } => {
+            let db = datadir.join("db");
+            let r = Storage::restore_multisig_blob(&datadir)?;
+            match r.accounts {
+                Some(n) => println!("wrote the multisig register ({n} accounts) back as one blob in {}", db.display()),
+                None => println!("no row-layout multisig register in {}", db.display()),
+            }
+            match r.family {
+                true => println!("dropped column family multisig_accounts"),
+                false => println!("no multisig_accounts column family"),
+            }
+            println!("v0.8.0 can open this database; a later start of this build splits the register into rows again");
+        }
         Cmd::Status { rpc } => {
             let v = RpcClient::new(rpc).status().await?;
             println!("{}", serde_json::to_string_pretty(&v)?);
@@ -4442,6 +4463,7 @@ mod tests {
             &["verify", "--datadir", "d"][..],
             &["verify", "--datadir", "d", "--repair"],
             &["db", "drop-receipts-index", "--datadir", "d"],
+            &["db", "restore-multisig-blob", "--datadir", "d"],
             &["init", "--datadir", "d", "--genesis", "g.json"],
             &["run", "--datadir", "d", "--key", "k.json"],
         ] {

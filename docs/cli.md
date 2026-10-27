@@ -471,6 +471,22 @@ column family in …` on a rerun. It is refused, touching nothing, on a database
 state or any input row: no older build can follow a perps chain, and the rows cannot be rebuilt
 from anything else on disk (`docs/perps.md`).
 
+### `rand-node db restore-multisig-blob`
+
+| argument | default | meaning |
+|---|---|---|
+| `--datadir <DATADIR>` | required | data directory (node must not be running) |
+
+For rolling back to v0.8.0 (MSA-4). This build stores the multisig register as one row per
+account in a `multisig_accounts` column family plus a totals row, and on its first open splits
+v0.8.0's one-blob register into that layout; it creates the family on every database. v0.8.0
+lists eighteen families and refuses a database with a nineteenth, and reads only the blob. The
+command writes the rows back as the blob, deletes the totals row, drops the family, and prints
+what it did; a rerun finds nothing to do. Refused, touching nothing, when the register is capped
+by genesis `multisig.max_accounts` (no older build can follow that chain). **Before rolling this
+build onto a node, snapshot its datadir** (stop the node, copy the directory): that is the
+rollback that needs no tool.
+
 ### `rand-node safety status` / `clear-halt` / `release-lock`
 
 A stopped validator's consensus safety state. Each command opens the data directory itself, so
