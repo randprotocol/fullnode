@@ -618,17 +618,26 @@ enum TokenCmd {
         /// The 32-byte salt the asset id is over, hex. Random if not given.
         #[arg(long)]
         salt: Option<String>,
-        /// Fixed supply: mint exactly this many units at registration, forever — `authority` is
-        /// `none`. Needs `--to`; mutually exclusive with `--authority-key-out`.
-        #[arg(long)]
-        fixed_supply: Option<u64>,
+        /// Fixed supply: mint exactly this much at registration, forever — `authority` is
+        /// `none`. In display units at `--decimals` (`--decimals 6 --fixed-supply 1000000` is a
+        /// million tokens), as `token mint --amount` reads them. Needs `--to`; mutually exclusive
+        /// with `--authority-key-out`.
+        #[arg(long, value_name = "AMOUNT", conflicts_with = "fixed_supply_units")]
+        fixed_supply: Option<String>,
+        /// `--fixed-supply` in base units (`--decimals 6 --fixed-supply-units 1000000` is one token).
+        #[arg(long, value_name = "UNITS")]
+        fixed_supply_units: Option<u64>,
         /// A fresh Dilithium2 key file is written here (0600, refusing to overwrite) and becomes
         /// the token's mint authority. Mutually exclusive with `--fixed-supply`.
         #[arg(long)]
         authority_key_out: Option<PathBuf>,
-        /// With `--authority-key-out`: mint this many units at registration too. Needs `--to`.
-        #[arg(long)]
-        initial: Option<u64>,
+        /// With `--authority-key-out`: mint this much at registration too, in display units at
+        /// `--decimals`, as `token mint --amount` reads them. Needs `--to`.
+        #[arg(long, value_name = "AMOUNT", conflicts_with = "initial_units")]
+        initial: Option<String>,
+        /// `--initial` in base units.
+        #[arg(long, value_name = "UNITS")]
+        initial_units: Option<u64>,
         /// The initial mint's recipient. Required with `--fixed-supply` or `--initial`.
         #[arg(long)]
         to: Option<String>,
@@ -1166,6 +1175,18 @@ struct PayoutFile {
 /// The exit code `rand program invoke` leaves on a stale read — distinct, so a calling tool can
 /// re-quote the cells and retry rather than treat it as a hard refusal.
 const STALE_READ_EXIT: i32 = 3;
+
+/// `token create --initial` / `--fixed-supply` (issue #142): the display form at the token's own
+/// `decimals` — what `token mint --amount` reads — or its `-units` twin in base units (clap keeps
+/// the two apart). `None` when neither is given.
+fn token_create_amount(display: Option<&str>, units: Option<u64>, decimals: u8, flag: &str) -> Result<Option<u64>> {
+    match (display, units) {
+        (Some(text), _) => wallet::parse_decimal(text, decimals)
+            .map(Some)
+            .map_err(|e| anyhow!("{flag}: {e} ({flag} is in display units at --decimals {decimals}; {flag}-units takes base units)")),
+        (None, units) => Ok(units),
+    }
+}
 
 /// A decimal amount in units (never RAND's decimals: a payout may be a token's).
 fn parse_units(s: &str, what: &str) -> Result<u64> {
@@ -3430,7 +3451,26 @@ async fn run() -> Result<()> {
             report(&s, "backing listing");
             println!("listed chain {chain} token {} under asset {asset}, at list_nonce {}", hex::encode(token), state.list_nonce);
         }
-        Cmd::Token(TokenCmd::Create { name, symbol, decimals, salt, fixed_supply, authority_key_out, initial, to, program, fee, no_wait, cuda }) => {
+        Cmd::Token(TokenCmd::Create {
+            name,
+            symbol,
+            decimals,
+            salt,
+            fixed_supply,
+            fixed_supply_units,
+            authority_key_out,
+            initial,
+            initial_units,
+            to,
+            program,
+            fee,
+            no_wait,
+            cuda,
+        }) => {
+            // Issue #142: both amounts in display units at the token's own decimals, like every
+            // other token amount; the `-units` flags are the base-unit form.
+            let fixed_supply = token_create_amount(fixed_supply.as_deref(), fixed_supply_units, decimals, "--fixed-supply")?;
+            let initial = token_create_amount(initial.as_deref(), initial_units, decimals, "--initial")?;
             // Every cheap refusal — the flag combination — before any key file, network read or
             // proof.
             let program = program.as_deref().map(|p| Hash::from_hex(p).context("--program: invalid program id")).transpose()?;
@@ -3530,6 +3570,10 @@ async fn run() -> Result<()> {
             };
             report(&result.submission, "token registration");
             println!("index {}, id {} ({})", result.index, result.id.to_hex(), randprotocol_core::token_id::encode(&result.id));
+            if let (Some(units), Some(to)) = (initial_amount, &recipient) {
+                // Both forms, as `token mint` echoes them (issue #142).
+                println!("minted {} to {to}", memo_display::sanitize(&wallet::display_amount(units, decimals, &symbol)));
+            }
             if !no_wait {
                 // The wait above saw the commit; a failed read of its height now is not a failure
                 // of the registration (issue #141).
@@ -4156,6 +4200,20 @@ mod tests {
         assert!(matches!(parse(&["sync", "--rescan"]), Ok(Cmd::Sync { rescan: true })));
     }
 
+    /// Issue #142: `token create --initial` / `--fixed-supply` read display units at the token's
+    /// own `--decimals`, as `token mint --amount` does; the `-units` twins read base units.
+    #[test]
+    fn token_create_amounts_are_display_units_at_the_tokens_decimals() {
+        assert_eq!(token_create_amount(Some("1000000"), None, 6, "--initial").unwrap(), Some(1_000_000_000_000));
+        assert_eq!(token_create_amount(Some("9.36"), None, 6, "--initial").unwrap(), Some(9_360_000));
+        assert_eq!(token_create_amount(Some("5"), None, 0, "--fixed-supply").unwrap(), Some(5));
+        assert_eq!(token_create_amount(None, Some(1_000_000), 6, "--initial").unwrap(), Some(1_000_000));
+        assert_eq!(token_create_amount(None, None, 6, "--initial").unwrap(), None);
+        let e = token_create_amount(Some("1.5"), None, 0, "--fixed-supply").unwrap_err().to_string();
+        assert!(e.contains("--fixed-supply") && e.contains("at most 0 decimals"), "{e}");
+        assert!(token_create_amount(Some("99999999999"), None, 9, "--initial").is_err(), "past u64 is refused, not wrapped");
+    }
+
     /// The five `rand token` commands (T8b): `create` (both authority branches), `mint`,
     /// `set-authority` (both of `--new-key`/`--renounce`), `info` and `list`.
     #[test]
@@ -4168,7 +4226,7 @@ mod tests {
         else {
             panic!("create --fixed-supply parses")
         };
-        assert_eq!((name.as_str(), symbol.as_str(), decimals, fixed_supply, to_arg.as_deref()), ("Fixed Coin", "FIX", 6, Some(1_000_000), Some(to)));
+        assert_eq!((name.as_str(), symbol.as_str(), decimals, fixed_supply.as_deref(), to_arg.as_deref()), ("Fixed Coin", "FIX", 6, Some("1000000"), Some(to)));
 
         let Ok(Cmd::Token(TokenCmd::Create { authority_key_out, initial, .. })) = parse(&[
             "token", "create", "--name", "Keyed Coin", "--symbol", "KEY", "--decimals", "8",
@@ -4176,7 +4234,26 @@ mod tests {
         ]) else {
             panic!("create --authority-key-out parses")
         };
-        assert_eq!((authority_key_out.as_deref(), initial), (Some(Path::new("authority.key.json")), Some(500)));
+        assert_eq!((authority_key_out.as_deref(), initial.as_deref()), (Some(Path::new("authority.key.json")), Some("500")));
+
+        // Issue #142: the base-unit forms are their own flags, and each excludes its display twin.
+        let Ok(Cmd::Token(TokenCmd::Create { fixed_supply, fixed_supply_units, .. })) =
+            parse(&["token", "create", "--name", "F", "--symbol", "F", "--decimals", "6", "--fixed-supply-units", "1000000", "--to", to])
+        else {
+            panic!("create --fixed-supply-units parses")
+        };
+        assert_eq!((fixed_supply, fixed_supply_units), (None, Some(1_000_000)));
+        let Ok(Cmd::Token(TokenCmd::Create { initial, initial_units, .. })) = parse(&[
+            "token", "create", "--name", "K", "--symbol", "K", "--decimals", "6", "--authority-key-out", "a.json", "--initial-units", "7", "--to", to,
+        ]) else {
+            panic!("create --initial-units parses")
+        };
+        assert_eq!((initial, initial_units), (None, Some(7)));
+        for both in [["--initial", "1", "--initial-units", "1"], ["--fixed-supply", "1", "--fixed-supply-units", "1"]] {
+            let mut args = vec!["token", "create", "--name", "K", "--symbol", "K", "--decimals", "6", "--to", to];
+            args.extend(both);
+            assert!(parse(&args).is_err(), "{both:?} together is refused");
+        }
 
         // Final review B3: `token mint` and `token burn` read AMOUNT in the token's display
         // units, like `send --asset` — one convention across the CLI.

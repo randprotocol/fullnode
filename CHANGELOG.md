@@ -20,6 +20,11 @@ v0.8.3 (wallet; client-only, no node or chain change):
   **4** ("submitted, confirmation unknown", with a `rand tx <hash>` hint). Exit 1 is a real
   failure only. New global `--wait-timeout <SECS>` / `RAND_WAIT_TIMEOUT`. Exit codes in
   `docs/cli.md`.
+- **Behaviour change: `rand token create --initial` and `--fixed-supply` read display units** at
+  `--decimals` (#142), as `token mint --amount`, `token burn` and `send --asset` always have:
+  `--decimals 6 --initial 1000000` is now a million tokens, not one. The base-unit form is
+  `--initial-units` / `--fixed-supply-units`. Scripts that passed base units must switch to the
+  `-units` flags. `token create` echoes the mint as `minted <display> <SYMBOL> (<N> units)`.
 
 ## v0.8.2 — 2026-10-27 (chain 21, node-only; the genesis-gated rules wait for the next cut)
 
