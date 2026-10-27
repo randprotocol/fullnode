@@ -33,6 +33,12 @@ meters submits per address. Verified: one real chain-20 transfer through each me
 router (a `e89e2cc4…`, archive2 `7c404236…`, nyc3 `bdc88a53…`, sfo3 `f925b4cd…`), and `--trusted`
 `9042a402…`. Window: #118.
 
+**Submit limit (VK-10).** The router meters `prover_submit` per client address: burst
+`SUBMIT_BURST` (default 2), refill `SUBMIT_PER_MIN` (default 1) — sized for two members, which clear
+about 1.2 bundles a minute between them, so one address cannot hold the pool. Set both in
+`/etc/rand-prover-pool/router.env` and restart `rand-prover-router` when members are added
+(the old defaults, 6 and 3, fitted four members).
+
 ## What the pool is
 
 - **One key per member (current: `a` and `b`; the shared-key model below is the retired one).** A
