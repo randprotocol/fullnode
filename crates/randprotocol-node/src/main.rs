@@ -2490,10 +2490,34 @@ fn opens_storage(cmd: &Cmd) -> bool {
     matches!(cmd, Cmd::Run { .. } | Cmd::Verify { .. } | Cmd::Db { .. } | Cmd::Init { .. } | Cmd::Safety { .. })
 }
 
+/// Colour in the log only for a person at a terminal (issue #143): under systemd stdout is a
+/// pipe to journald, and escapes there break `grep`, log shippers and every parser downstream.
+/// `NO_COLOR` turns it off anywhere (<https://no-color.org>: present and not empty).
+fn log_ansi(is_terminal: bool, no_color: Option<std::ffi::OsString>) -> bool {
+    is_terminal && no_color.is_none_or(|v| v.is_empty())
+}
+
+#[cfg(test)]
+mod log_ansi_tests {
+    use super::log_ansi;
+
+    #[test]
+    fn colour_only_at_a_terminal_and_never_under_no_color() {
+        assert!(log_ansi(true, None), "a terminal with no NO_COLOR gets colour");
+        assert!(!log_ansi(false, None), "a pipe (journald) gets none");
+        assert!(!log_ansi(true, Some("1".into())), "NO_COLOR=1 turns it off at a terminal");
+        assert!(!log_ansi(false, Some("1".into())));
+        assert!(log_ansi(true, Some("".into())), "an empty NO_COLOR is unset (no-color.org)");
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    use std::io::IsTerminal;
+    // `fmt()` writes to stdout, so stdout is the stream whose terminal-ness counts.
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info,libp2p=warn,libp2p_mdns=off".into()))
+        .with_ansi(log_ansi(std::io::stdout().is_terminal(), std::env::var_os("NO_COLOR")))
         .init();
     let cli = Cli::parse();
     let test_profile_allowed = test_fri_profile_allowed(&cli);

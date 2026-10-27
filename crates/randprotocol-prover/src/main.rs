@@ -169,11 +169,20 @@ fn load_key(path: &Path) -> Result<ProverKey> {
     ProverKey::load(path).with_context(|| format!("loading {} (run `rand-prover keygen` first)", path.display()))
 }
 
+/// Colour in the log only for a person at a terminal (issue #143): under systemd or launchd
+/// stderr is a pipe, and escapes there break `grep` and log parsers. `NO_COLOR` turns it off
+/// anywhere (<https://no-color.org>: present and not empty).
+fn log_ansi(is_terminal: bool, no_color: Option<std::ffi::OsString>) -> bool {
+    is_terminal && no_color.is_none_or(|v| v.is_empty())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    use std::io::IsTerminal;
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .with_writer(std::io::stderr)
+        .with_ansi(log_ansi(std::io::stderr().is_terminal(), std::env::var_os("NO_COLOR")))
         .init();
     let cli = Cli::parse();
     let home = expand_home(&cli.home)?;
@@ -321,6 +330,15 @@ async fn shutdown_signal() -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use clap::Parser;
+
+    #[test]
+    fn log_colour_only_at_a_terminal_and_never_under_no_color() {
+        use super::log_ansi;
+        assert!(log_ansi(true, None), "a terminal with no NO_COLOR gets colour");
+        assert!(!log_ansi(false, None), "a pipe (journald) gets none");
+        assert!(!log_ansi(true, Some("1".into())), "NO_COLOR=1 turns it off at a terminal");
+        assert!(log_ansi(true, Some("".into())), "an empty NO_COLOR is unset (no-color.org)");
+    }
 
     #[test]
     fn run_takes_the_fee_flags_both_or_neither() {

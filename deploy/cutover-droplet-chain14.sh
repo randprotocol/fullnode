@@ -115,7 +115,7 @@ $SSH "set -e
   cp -a \$UNIT /root/$SERVICE.service.chain13.bak
   cat > \$UNIT <<UNITEOF
 [Unit]
-Description=RAND full node ($NAME, chain 14)
+Description=RAND full node ($NAME)
 After=network-online.target
 [Service]
 Environment=RUST_LOG=info,libp2p=warn,libp2p_mdns=off
