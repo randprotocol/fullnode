@@ -621,10 +621,18 @@ pub fn startup_check(storage: &Storage, gs: &GenesisState, mode: VerifyMode, exe
                         // from `resume_consensus_from`); the load is handed on, so startup loads
                         // once. A mismatch refuses to start: a pruned node holds no history to
                         // rebuild from, and the walk would only have found the same blob.
-                        let ledger = storage.load_ledger(executor)?;
+                        //
+                        // The comparison is on the ledger as the node will run it — after the
+                        // genesis file's parameters are put back (`reload_ledger_from`): the raw
+                        // load carries none of them, and several are in the state root (staking's
+                        // domains and `admission_by_vote`'s wrapper, the gas section's prices), so
+                        // a raw root never equals the head's on a chain like 21. The setters are
+                        // idempotent, so the reloaded ledger is what is handed on.
+                        let ledger = reload_ledger_from(storage, gs, executor, None)?;
                         snapshot_is_the_head_state(&tip, &ledger).with_context(|| {
                             format!(
-                                "startup checkpoint at height {} (build {}) honoured for the chain, but the ledger snapshot is not the head's state;                                  the walk is not what repairs this",
+                                "startup checkpoint at height {} (build {}) honoured for the chain, but the ledger snapshot is not the head's state; \
+                                 the walk is not what repairs this",
                                 head.height,
                                 &build[..12]
                             )
@@ -5434,6 +5442,39 @@ mod tests {
         assert!(chain[0].contains("startup checkpoint") && chain[0].contains("snapshot"), "{chain:?}");
         assert!(chain.iter().any(|c| c.contains("ledger snapshot") && c.contains("state root")), "{chain:?}");
         assert_eq!(storage.verified_head().unwrap(), Some(row), "the row is not what is wrong; it stays");
+    }
+
+    /// Audit v10, CON-102 regression on chain 21's own genesis (`deploy/genesis-chain21.json`:
+    /// staking with `admission_by_vote`, gas, fees, perps, multisig — genesis parameters that are
+    /// in the state root and that the raw `load_ledger` does not carry): the first start walks
+    /// and writes the checkpoint, the second skips and starts (the snapshot comparison is on the
+    /// reloaded ledger, not the raw load), and a tampered snapshot is still refused.
+    #[test]
+    fn chain_21_restarts_from_its_checkpoint_and_refuses_a_tampered_snapshot() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../deploy/genesis-chain21.json");
+        let file = randprotocol_core::genesis::Genesis::from_json(&std::fs::read_to_string(path).unwrap()).unwrap();
+        let executor = executor_for_profile(&file.fri_profile).unwrap();
+        let gs = file.build(executor.as_ref()).unwrap();
+        assert_eq!(gs.hash().to_hex(), "ca76c2766ed6090ac6ba5dad86b724dd5d2b80c0edfaed287cd8b129e663ca9a");
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
+        storage.init_genesis(&gs).unwrap();
+        assert_ne!(
+            storage.load_ledger(executor.as_ref()).unwrap().state_root(),
+            gs.block.header.state_root,
+            "the raw load is not the head's state on chain 21: what the skip must not compare"
+        );
+        storage.set_checkpoint_build_for_testing(Some(SHA_A));
+        let first = startup_check(&storage, &gs, VerifyMode::Quick, executor.as_ref()).unwrap();
+        assert_eq!(first.verify, StartupVerify::Walked(WalkReason::NoCheckpoint));
+        for restart in 0..2 {
+            let again = startup_check(&storage, &gs, VerifyMode::Quick, executor.as_ref()).unwrap();
+            assert_eq!(again.verify, StartupVerify::Skipped { height: 0 }, "restart {restart} starts from the checkpoint");
+            assert_eq!(again.stored.as_ref().unwrap().state_root(), gs.block.header.state_root);
+        }
+        storage.plant_nullifier_for_testing(&[0xdead_beef; 8]).unwrap();
+        let e = startup_check(&storage, &gs, VerifyMode::Quick, executor.as_ref()).err().expect("a tampered snapshot is refused");
+        assert!(e.chain().any(|c| c.to_string().contains("ledger snapshot")), "{e:#}");
     }
 
     #[test]
