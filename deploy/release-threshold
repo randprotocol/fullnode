@@ -1,0 +1,5 @@
+# How many DISTINCT keys listed in deploy/release-signers must have signed a release's SHA256SUMS
+# (deploy/lib/verify-release.sh; PROC-5). One number. Raise it to 2 only after a second release
+# key is listed in deploy/release-signers - a threshold above the number of listed keys refuses
+# every release. The owner's steps are in docs/deploy.md, "Release trust: a threshold of keys".
+1

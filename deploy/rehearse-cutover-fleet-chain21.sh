@@ -74,7 +74,7 @@ for g in "$G21" "$G21B"; do
     || { echo "rehearse: the dry-run cut failed: $(tail -2 "$T/dry.log")" >&2; exit 1; }
 done
 python3 -c 'import json,sys; g=json.load(open(sys.argv[1])); g.pop("hc_auth_multisig"); json.dump(g, open(sys.argv[2],"w"), indent=1)' "$G21" "$G21X"
-cp deploy/lib/cut-policy.sh deploy/lib/verify-release.sh "$T/repo/deploy/lib/"
+cp deploy/lib/cut-policy.sh deploy/lib/verify-release.sh deploy/lib/fleet-env.sh "$T/repo/deploy/lib/"
 cp deploy/cut-record.template "$T/repo/deploy/"
 # ── the throwaway release key, and the signed SHA256SUMS of each fake release ─────────────────
 ssh-keygen -q -t ed25519 -N '' -C rehearsal -f "$T/key/rel" >/dev/null

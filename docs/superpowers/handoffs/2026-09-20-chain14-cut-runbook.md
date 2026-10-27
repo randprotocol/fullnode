@@ -64,7 +64,7 @@ a fleet that disagrees about "now" by more than 15 s never reaches quorum.
 
 ```bash
 # from a clean checkout of the merged main at $SHA
-deploy/rebuild-vps.sh 188.166.235.187
+deploy/rebuild-vps.sh 203.0.113.33
 ```
 
 `rebuild-vps.sh` writes `.git-rev`, rsyncs the tree (`--exclude .git`, `--delete`) and passes
@@ -153,26 +153,26 @@ cut() { BOOTSTRAPS="$2" PIN=$SHA KEYDIR=$KEYDIR \
         deploy/cutover-droplet-chain14.sh "$1" "$3" "$G8" "$GEN"; }
 
 # 5a. the bootstraps
-cut 164.90.239.200  "$NODE_D $NODE_E" c          # fra1
-cut 165.245.173.74  "$NODE_C $NODE_E" d          # ric1
+cut 203.0.113.23  "$NODE_D $NODE_E" c          # fra1
+cut 203.0.113.25  "$NODE_C $NODE_E" d          # ric1
 
 # 5b. the rest, ONE AT A TIME, each waited to rand_getHealth = ok by the script itself
 BOOT="$NODE_C $NODE_D"
-cut 159.89.185.254  "$BOOT" f                    # nyc3
-cut 139.59.160.76   "$BOOT" lon1
-cut 24.144.89.22    "$BOOT" sfo3
-cut 146.190.243.29  "$BOOT" tor1
-cut 167.71.235.108  "$BOOT" blr1
-cut 170.64.226.65   "$BOOT" syd1
-cut 165.245.142.90  "$BOOT" atl1
-cut 146.190.233.230 "$BOOT" ams3
-cut 192.81.214.91   "$BOOT" nyc1
-cut 107.170.49.234  "$BOOT" nyc2
-cut 143.110.135.126 "$BOOT" sfo2
-cut 201.79.35.212   "$BOOT" mkc1
-cut 168.144.61.10   "$BOOT" mem1
-cut 168.144.102.43  "$BOOT" b                    # sgp1, node B's droplet
-cut 188.166.235.187 "$BOOT" e                    # sgp1, LAST of the droplets: it serves the explorer
+cut 203.0.113.21  "$BOOT" f                    # nyc3
+cut 203.0.113.14   "$BOOT" lon1
+cut 203.0.113.10    "$BOOT" sfo3
+cut 203.0.113.18  "$BOOT" tor1
+cut 203.0.113.27  "$BOOT" blr1
+cut 203.0.113.32   "$BOOT" syd1
+cut 203.0.113.24  "$BOOT" atl1
+cut 203.0.113.17 "$BOOT" ams3
+cut 203.0.113.34   "$BOOT" nyc1
+cut 203.0.113.12  "$BOOT" nyc2
+cut 203.0.113.16 "$BOOT" sfo2
+cut 203.0.113.37   "$BOOT" mkc1
+cut 203.0.113.30   "$BOOT" mem1
+cut 203.0.113.31  "$BOOT" b                    # sgp1, node B's droplet
+cut 203.0.113.33 "$BOOT" e                    # sgp1, LAST of the droplets: it serves the explorer
 
 # 5c. node A, the laptop, last of all
 ```
@@ -201,7 +201,7 @@ The explorer must be redeployed with the chain-14 fleet, not after it:
 
 ```bash
 cd ../randscan && git checkout feat/rpl-tokens
-deploy/push-to-vps.sh 188.166.235.187 <domain>
+deploy/push-to-vps.sh 203.0.113.33 <domain>
 ```
 
 `feat/rpl-tokens` is not optional. **Every `u64` amount this node's RPC serves is now a decimal
@@ -290,9 +290,9 @@ to be re-checked if the fleet has changed:
 | the eighteen validator names and their order | `deploy/gen-chain14-keys.sh` `NAMES`, `deploy/cut-chain14-genesis.sh` `NAMES` — genesis order is `--validator` order |
 | name → IP, all seventeen droplets | `deploy/nodes.env` (read by `gen-chain14-keys.sh` to rebuild the env file), and step 5's `cut` calls above |
 | C and D are the bootstraps | `deploy/run-a.sh`, `run-b.sh`, every droplet's unit, step 5a |
-| E is the build host and the explorer host | `deploy/rebuild-vps.sh`, `cutover-droplet.sh`/`cutover-droplet-chain14.sh`'s `BUILD_HOST` default `188.166.235.187`, randscan's `push-to-vps.sh` |
+| E is the build host and the explorer host | `deploy/rebuild-vps.sh`, `cutover-droplet.sh`/`cutover-droplet-chain14.sh`'s `BUILD_HOST` default `203.0.113.33`, randscan's `push-to-vps.sh` |
 | the twelve regional droplets in batches of four, then F, C, D, E | `deploy/cutover-fleet.sh` — **written for chain ≤ 13 and not usable for this cut**: it calls `cutover-droplet.sh` with `<old-prefix> <new-prefix>` and no node name or bootstrap list. Step 5's explicit loop replaces it. |
-| node B is the sgp1 droplet `168.144.102.43`, not the MacBook Air | `deploy/README.md`, `nodes.env`'s `NODE_B` comment — `cutover-fleet.sh` never knew about it |
+| node B is the sgp1 droplet `203.0.113.31`, not the MacBook Air | `deploy/README.md`, `nodes.env`'s `NODE_B` comment — `cutover-fleet.sh` never knew about it |
 | `--rpc 127.0.0.1:8545`, `--listen /ip4/0.0.0.0/tcp/30303`, `--no-mdns`, service `rand-node` | `deploy/vps-setup.sh`'s unit template, reproduced by `cutover-droplet-chain14.sh` |
 | the key path on a droplet | chains ≤ 13: `/root/fullnode/deploy/node-<name>.key.json`. Chain 14: `/root/keys/node-<name>.key.json` (`REMOTE_KEYDIR`) |
 | `/root/.update-pin` is what node B's auto-updater follows | `deploy/README.md` |

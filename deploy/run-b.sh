@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+. "$(dirname "$0")/lib/fleet-env.sh"; refuse_placeholder_script "$0"
 # Run validator B (behind NAT). Bootstraps to the public DigitalOcean nodes C and D; LAN peers are found via mDNS.
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -14,5 +15,5 @@ DATA=data-b-8123ccac   # keyed on the genesis hash so a regenerated genesis gets
 [ -d $DATA/db ] || $BIN init --datadir $DATA --genesis deploy/genesis-chain13.json
 exec $BIN run --datadir $DATA --key deploy/node-b.key.json --validator \
     --listen /ip4/0.0.0.0/tcp/30303 --rpc 127.0.0.1:8545 \
-    --bootstrap /ip4/164.90.239.200/tcp/30303/p2p/12D3KooWSsBY2RbzwoFtRTJjVDghUqJ1zTwM5dMNra5JyVjpHxDK \
-    --bootstrap /ip4/165.245.173.74/tcp/30303/p2p/12D3KooWCWS38w4DwVt4vnfBnK7i4VFz3BrMziQpfoczSD7bdFg1
+    --bootstrap /ip4/203.0.113.23/tcp/30303/p2p/12D3KooWSsBY2RbzwoFtRTJjVDghUqJ1zTwM5dMNra5JyVjpHxDK \
+    --bootstrap /ip4/203.0.113.25/tcp/30303/p2p/12D3KooWCWS38w4DwVt4vnfBnK7i4VFz3BrMziQpfoczSD7bdFg1

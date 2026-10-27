@@ -32,6 +32,10 @@ else
 fi
 chmod 600 "$KEYFILE"
 /usr/local/bin/rand-node address --key "$KEYFILE"
+# PUBLIC_RPC=1 (VK-2): also open the node's own public listener on loopback, 127.0.0.1:8546 - a
+# fixed method set with no viewing-key methods, rand_mint or rand_getPeers, for the reverse proxy
+# or tunnel in front of a public RPC host. `--rpc` (8545) stays the operator's.
+PUBLIC_RPC_ARGS=""; if [ "${PUBLIC_RPC:-0}" = 1 ]; then PUBLIC_RPC_ARGS="--public-rpc 127.0.0.1:8546"; fi
 BOOT_ARGS=""; for b in $BOOTSTRAPS; do BOOT_ARGS="$BOOT_ARGS --bootstrap $b"; done
 # Retire the pre-rename service if this box ran one (shrugg-node, the name before RAND). This runs
 # before the rand-node unit is written: the rename once turned this line into `rand-node` itself,
@@ -43,7 +47,7 @@ Description=RAND full node ($NODE)
 After=network-online.target
 [Service]
 Environment=RUST_LOG=info,libp2p=warn,libp2p_mdns=off
-ExecStart=/usr/local/bin/rand-node run --datadir $DATA --key $KEYFILE $VALIDATOR_FLAG --listen /ip4/0.0.0.0/tcp/30303 --rpc 127.0.0.1:8545 --no-mdns $BOOT_ARGS
+ExecStart=/usr/local/bin/rand-node run --datadir $DATA --key $KEYFILE $VALIDATOR_FLAG --listen /ip4/0.0.0.0/tcp/30303 --rpc 127.0.0.1:8545 $PUBLIC_RPC_ARGS --no-mdns $BOOT_ARGS
 Restart=always
 RestartSec=3
 [Install]

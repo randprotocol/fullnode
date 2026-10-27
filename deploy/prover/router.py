@@ -31,8 +31,10 @@ Python 3 standard library only. Configuration, all environment:
 
   PROVER_BACKENDS   the shared-key backends behind `/`, comma-separated base URLs
   PROVER_MEMBERS    the members behind `/m/<name>`, comma-separated name=url
-  SUBMIT_BURST      submits one address may make at once (default 6)
-  SUBMIT_PER_MIN    and their refill per minute (default 3)
+  SUBMIT_BURST      submits one address may make at once (default 2)
+  SUBMIT_PER_MIN    and their refill per minute (default 1)
+                    (sized for a two-member pool, VK-10: two members prove ~1.2 jobs a minute,
+                    so one address at 1 a minute cannot hold the pool; raise both with the pool)
   ROUTER_LISTEN     ip:port to listen on (default 127.0.0.1:8650)
 
 The client address is nginx's X-Real-IP (the router listens on loopback only).
@@ -79,6 +81,8 @@ class SubmitMeter:
     addresses the stalest half is dropped, which can only ever be generous."""
 
     MAX_CLIENTS = 100_000
+    DEFAULT_BURST = 2
+    DEFAULT_PER_MIN = 1.0
 
     def __init__(self, burst, per_min):
         self.burst = float(burst)
@@ -400,7 +404,7 @@ def main():
     pool = Pool(urls)
     pool.poll_once()
     threading.Thread(target=pool.poll_forever, daemon=True).start()
-    meter = SubmitMeter(int(os.environ.get("SUBMIT_BURST", "6")), float(os.environ.get("SUBMIT_PER_MIN", "3")))
+    meter = SubmitMeter(int(os.environ.get("SUBMIT_BURST", SubmitMeter.DEFAULT_BURST)), float(os.environ.get("SUBMIT_PER_MIN", SubmitMeter.DEFAULT_PER_MIN)))
     server = ThreadingHTTPServer((host, int(port)), make_handler(pool, members, meter))
     server.daemon_threads = True
     print(f"routing {len(urls)} shared-key prover(s) and {len(members)} member(s) on {host}:{port}", file=sys.stderr, flush=True)

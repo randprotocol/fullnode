@@ -1263,7 +1263,7 @@ Under the observer sentence at line 19 add:
   fi
 ```
 
-(inside the existing `$SSH "set -e … "` string, so the escaping matches its neighbours). `deploy/run-a.sh:16`: append `${PRUNE_ARGS:-}` to the `exec` line. `deploy/nodes.env`: `ARCHIVE=/ip4/168.144.46.203/tcp/30303/p2p/12D3KooWS5usdMPvsbaWSaT2xtKndHvDYurwmueoNvaRRarb2wRf   # obs1, keeps every block`.
+(inside the existing `$SSH "set -e … "` string, so the escaping matches its neighbours). `deploy/run-a.sh:16`: append `${PRUNE_ARGS:-}` to the `exec` line. `deploy/nodes.env`: `ARCHIVE=/ip4/203.0.113.29/tcp/30303/p2p/12D3KooWS5usdMPvsbaWSaT2xtKndHvDYurwmueoNvaRRarb2wRf   # obs1, keeps every block`.
 
 - [ ] **Step 3: Changelog, version, memory**
 
@@ -1290,6 +1290,6 @@ Follows the spec's §7 and the release rule in `docs/deploy.md`.
 1. Merge `feat/history-pruning` to `main` after review; CI green; `cargo test --workspace --release` on the release machine; tag `v0.5.7`.
 2. Archive first: on the randbridge-web droplet, create and attach a 500 GB volume in sgp1, `systemctl stop rand-node`, move `/root/data-obs1-1cff3b7d` onto the volume, symlink or edit the unit's `--datadir`, start, confirm `rand_status.prune_floor == 0` and the head follows the fleet.
 3. Wait for the chain to commit again.
-4. Build on E (`deploy/rebuild-vps.sh 188.166.235.187` from the tagged commit). Then, one droplet at a time, `PRUNE_ARGS="--prune-history 24h" deploy/update-droplet.sh <ip>`; wait for `rand_status.height` to reach the head and one more block before the next.
+4. Build on E (`deploy/rebuild-vps.sh 203.0.113.33` from the tagged commit). Then, one droplet at a time, `PRUNE_ARGS="--prune-history 24h" deploy/update-droplet.sh <ip>`; wait for `rand_status.height` to reach the head and one more block before the next.
 5. Node A: `BINDIR=bin-<tag> PRUNE_ARGS="--prune-history 24h"` in `run-a.sh`'s environment, then `launchctl kill TERM gui/$(id -u)/org.randprotocol.node-a`.
 6. Verify: every validator's `prune_floor` about a day behind the head within an hour, `du -ch db/*.sst` under 15 GB after compaction and flat, obs1 answering `rand_getBlockByHeight(1000)` while a validator answers `-32010`, a fresh observer synced from obs1 reaching the head.

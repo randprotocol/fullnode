@@ -12,9 +12,11 @@
 # "the highest height across the fleet did not change since the previous pass".
 set -uo pipefail
 cd "$(dirname "$0")/.."
+. "$(dirname "$0")/lib/fleet-env.sh"
+require_fleet_env
 STATE=${FLEET_WATCH_STATE:-$HOME/.rand-fleet-watch}
 mkdir -p "$STATE"
-IPS=$(grep -oE '/ip4/[0-9.]+' deploy/nodes.env | cut -d/ -f3 | sort -u)
+IPS=$(grep -oE '/ip4/[0-9.]+' "$NODES_ENV" | cut -d/ -f3 | sort -u)
 rpc() { curl -s -m 5 -X POST -H content-type:application/json --data "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"$2\",\"params\":[]}" "http://$1:8545"; }
 alerts=()
 rows=()

@@ -197,7 +197,7 @@
 #     aside to re-scan.
 #   - The public RPC (Cloudflare) answers Python's urllib with 403: point CHAIN20_RPC at an SSH
 #     tunnel to obs1's RPC (the archive, `prune_floor` 0), e.g.
-#     `ssh -N -L 8545:127.0.0.1:8545 root@168.144.46.203` → CHAIN20_RPC=http://127.0.0.1:8545.
+#     `ssh -N -L 8545:127.0.0.1:8545 root@203.0.113.29` → CHAIN20_RPC=http://127.0.0.1:8545.
 #     The tunnel died twice in the hour of the chain-18 cut (once silently); this script refuses
 #     to start `snapshot` or `balances` on a dead one — re-open it and re-run.
 #   - Take the snapshot with the SAME EMITTER_* the cut uses (the defaults): custody and sequences

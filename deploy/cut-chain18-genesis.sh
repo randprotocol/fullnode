@@ -23,7 +23,7 @@
 #     wallet that holds RAND on chain 17 to it before the scan.
 #   - The public RPC (Cloudflare) answers Python's urllib with 403: point CHAIN17_RPC at an SSH
 #     tunnel to obs1's RPC (the archive, `prune_floor` 0), e.g.
-#     `ssh -N -L 8545:127.0.0.1:8545 root@168.144.46.203` → CHAIN17_RPC=http://127.0.0.1:8545.
+#     `ssh -N -L 8545:127.0.0.1:8545 root@203.0.113.29` → CHAIN17_RPC=http://127.0.0.1:8545.
 #   - `balances` needs a `rand` that decodes chain 17 — the v0.6.3 build (~/rand-node-a/bin-v063/rand);
 #     the cut itself needs the v0.6.6 (cs8/gas) `rand-node`.
 #   - The endpoint redeploy's new bridge emitters do NOT go into chain 18 (the redeploy waits):

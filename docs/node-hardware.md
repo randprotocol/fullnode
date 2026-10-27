@@ -114,7 +114,7 @@ toolchain, and ports 22 and 30303 open (`docs/deploy.md`).
 On the build host (E), build the pinned commit from your machine:
 
 ```bash
-deploy/rebuild-vps.sh 188.166.235.187      # rsync this checkout, cargo build --release, restart E
+deploy/rebuild-vps.sh 203.0.113.33      # rsync this checkout, cargo build --release, restart E
 ```
 
 On the new droplet, as root, with the binaries copied from E to `/usr/local/bin/` and the repo
@@ -200,9 +200,9 @@ The test-profile row is `/usr/bin/time -l rand call …` on this laptop, 2026-09
 the live chain 13 on 2026-09-19 ([`translators.md`](translators.md) §4.6, §4.6.1, §5.4).
 
 A wallet that cannot hold that peak can hand the bundle proof to a delegated prover it owns
-([`docs/prover.md`](prover.md)). The prover needs the same 5.74 GB per proof it runs at once, plus
+([`docs/prover.md`](prover.md)). The prover needs the same 6.2 GB per proof it runs at once, plus
 1 GiB of headroom: `rand-prover run` (and `rand-node run --prover`) refuses to start unless
-`5.74 GB × --max-parallel + 1 GiB` of memory is available.
+`6.2 GB × --max-parallel + 1 GiB` of memory is available.
 
 ## 4. Aggregator
 
@@ -309,7 +309,7 @@ figures below were measured on the single-core build.
 | tier | cycles (up to) | workload measured | memory measured | time measured | final |
 |---|---:|---|---|---|---|
 | 10 | 1 023 | `fib` (production, constraint set 5) | not recorded | 6.05 s | — |
-| 14 | 16 383 | the bundle (wallet, test profile) | 5.74 GB whole `rand call` | 97.0 s | production: 92.2–96.0 s and 1 418 406–1 420 423-byte proofs (chain 13, laptop); memory of the bundle alone not measured yet |
+| 14 | 16 383 | the bundle (wallet, test profile) | 5.74 GB whole `rand call` (live provers: 6.2 GB per bundle, 2026-10-27) | 97.0 s | production: 92.2–96.0 s and 1 418 406–1 420 423-byte proofs (chain 13, laptop); memory of the bundle alone not measured yet |
 | 16 | 65 535 | ERC-20 `approve`, translated | test profile, DigitalOcean: 21.7 GB. Production, laptop: 22.9 GB peak RSS for the whole `rand call` | test profile: 786.7 s (13.1 min). Production: 388.7 s | production: proved and committed on chain 13, 3 412 405-byte proof |
 | 18 | 262 143 | ERC-20, about 66 k–162 k cycles | OOM-killed on a 48 GB laptop at 24.7 GB. On a 64 GB droplet: above 47 GB at 25 min, still running | killed after 1 016 s on the laptop | translated `transfer`: 85.0 GB, 3 230.5 s (53.8 min), 811 600 B proof. Interpreter `evm.bin`: 85.5 GB, 3 143.3 s (52.4 min), 805 108 B proof. Verify: 101.4 s (droplet), 50.2 s at 3.66 GB RSS (laptop). Measured on m-16vcpu-128gb, 2026-09-19 |
 | 19 (rVM) | — | rVM aggregate, N=1, test profile (constraint set 8) | **94.5 GB peak RSS** (Linux, 503 GB droplet). The "about 30 GB" quoted before was macOS RSS, which excludes compressed pages | 1568.2 s (loaded shared box); 2 034.6 s (droplet, whole test binary) | after the phase-2 row cuts the same proof is tier 18; after the quotient layout it proved at 33.27 GB peak live heap on the 48 GB laptop (§4) |
@@ -324,7 +324,7 @@ recursion machine) has its own tiers, sized in rows (`docs/zkvm-m4-m5-progress.m
 
 | workload | size | status |
 |---|---|---|
-| a tier-14 bundle (any wallet) | any machine with more than 5.74 GB free (test profile) | measured |
+| a tier-14 bundle (any wallet) | any machine with more than 6.2 GB free (test profile) | measured |
 | tier 18 | a 128 GB droplet (size slug `m-16vcpu-128gb`, Memory-Optimized, 16 vCPU). OOM-killed on a 64 GB droplet (`g-16vcpu-64gb`) at 65.1 GB after 32 min | measured: 85.0 GB (translated) / 85.5 GB (interpreted) peak RSS, 3 230.5 s / 3 143.3 s |
 | tier 20 | more than 64 GB. OOM-killed on a 64 GB droplet (`g-16vcpu-64gb`) at 65.1 GB after 10 m 41 s | not yet proven; extrapolated at about 330 GB and about 3.6 h (see §5), more than DigitalOcean's largest memory droplet (m-32vcpu-256gb, 256 GB) |
 | aggregate N=1, production | a 503 GB droplet at constraint set 8 (376.9 GB peak); ≥ 256 GB projected after the phase-2 row cuts (`m-32vcpu-256gb`; ≈ 170–175 GB projected after the quotient layout, so with room) | measured at constraint set 8 (§4); the tier-20 proof not yet run |

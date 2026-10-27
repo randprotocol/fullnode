@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
+. "$(dirname "$0")/lib/fleet-env.sh"; refuse_placeholder_script "$0"
 # Run validator A (the laptop, behind NAT) on chain 14. Bootstraps to the public nodes C and D.
 # Chain 14 runs from NODE_A_HOME (default ~/rand-node-a), not from a checkout: the validator key
 # lives off-repo in ~/.rand-chain14 (audit v3 OPS-1) and the checkout is shared between sessions.
 # The whole fleet runs one build (089bdd6, v0.5.7): a genesis-format change is a fork and a mixed
 # fleet stalls. NEVER run node B here too — B is the sgp1 droplet.
 set -euo pipefail
-# RETIRED 2026-09-27: validator A runs on the droplet rand-node-a (139.59.238.151, NODE_A in
+# RETIRED 2026-09-27: validator A runs on the droplet rand-node-a (203.0.113.15, NODE_A in
 # deploy/nodes.env) with the same key. Starting this laptop copy too would sign every view twice
 # under one key — an equivocation — so it refuses unless the droplet has been stopped first and
 # RAND_NODE_A_ON_LAPTOP=1 says so deliberately.
@@ -20,6 +21,6 @@ DATA=data-a-cc30e085   # keyed on the genesis hash so a regenerated genesis gets
 [ -d $DATA/db ] || $BIN init --datadir $DATA --genesis genesis-chain15.json
 exec $BIN run --datadir $DATA --key "$KEYDIR/node-a.key.json" --validator \
     --listen /ip4/0.0.0.0/tcp/30303 --rpc 127.0.0.1:8545 \
-    --bootstrap /ip4/164.90.239.200/tcp/30303/p2p/12D3KooWEQEbUwZRgqhDPXhW7vNBmcRcnhUDGUADe81VFdv3ALYe \
-    --bootstrap /ip4/165.245.173.74/tcp/30303/p2p/12D3KooWJyc5oDHggAr89e9QrRFBy9Tg8TxXh18yzrb1SM6KKLYw \
+    --bootstrap /ip4/203.0.113.23/tcp/30303/p2p/12D3KooWEQEbUwZRgqhDPXhW7vNBmcRcnhUDGUADe81VFdv3ALYe \
+    --bootstrap /ip4/203.0.113.25/tcp/30303/p2p/12D3KooWJyc5oDHggAr89e9QrRFBy9Tg8TxXh18yzrb1SM6KKLYw \
     ${PRUNE_ARGS:-}

@@ -16,9 +16,11 @@
 set -uo pipefail
 OLD=$1; NEW=$2; GENESIS=$3; BATCH=${4:-4}
 cd "$(dirname "$0")/.."
+. "$(dirname "$0")/lib/fleet-env.sh"
 LOGDIR=${LOGDIR:-/tmp/cutover-$NEW}; mkdir -p "$LOGDIR"
-regional=(139.59.160.76 24.144.89.22 146.190.243.29 167.71.235.108 170.64.226.65 165.245.142.90 146.190.233.230 192.81.214.91 107.170.49.234 143.110.135.126 201.79.35.212 168.144.61.10)
-tail_order=(159.89.185.254 164.90.239.200 165.245.173.74 188.166.235.187)   # F, C, D, E
+require_fleet_env
+regional=($(for n in LON1 SFO3 TOR1 BLR1 SYD1 ATL1 AMS3 NYC1 NYC2 SFO2 MKC1 MEM1; do fleet_ip $n; done))
+tail_order=($(fleet_ip F) $(fleet_ip C) $(fleet_ip D) $(fleet_ip E))   # F, C, D, E
 failed=()
 # SKIP="ip ip": droplets already cut over (a re-run refuses them at the unit edit anyway).
 run_batch() {

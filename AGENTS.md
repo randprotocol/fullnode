@@ -71,7 +71,7 @@ lost quorum frees the slot. `initial_price_micros` is required. Pinned: a no-sec
 state root (identical to base `3119a29a`). Suites: core lib 810, node lib 623 (1 ignored), node bin
 55, rpc_contract 7, genesis_cli 14, client lib 210, clippy clean for the three crates. Recommended values deferred until aggregation is admitted (`docs/deploy.md`).
 
-### rVM phase 5 re-vendored (2026-10-15; branch `feat/rvm-phase5-revendor`, NOT merged)
+### rVM phase 5 re-vendored (2026-10-15; branch `feat/rvm-phase5-revendor`, MERGED to main 2026-10-17 as eda9d3b3)
 
 The branch's circuits pin is **`b3e21d9`** (circuits main, the merge of `spike/rvm-phase5`;
 `CIRCUITS_PIN` in `.github/workflows/ci.yml`, both PROVENANCE.md files; synced with
@@ -480,6 +480,12 @@ repositories (BR-*), the papers (PA-*, DOC-*), and custody (OPS-6, BR-4, BR-7).
 
 ### prover.randprotocol.org — the validators' prover pool (LIVE 2026-10-01 ~05:00 WITA; the `parallel` build)
 
+**Current state (2026-10-22 on): two members, `a` (4SK4-P64N-XWEN-ZSZZ) and `b` (0XZX-NZ1J-SPMB-GWZN),
+each with its own key and URL `/m/a`, `/m/b`; the four earlier members and the shared key
+`RGTF-7HKJ-XZFV-GQ1J` are retired, and `trusted-provers.txt` pins only `a` and `b`.** Everything
+below describes the first (five-host, shared-key) shape and is history; the live runbook is
+`deploy/prover/README.md`. Router default per-address submit limit: see `deploy/prover/README.md` (VK-10).
+
 The user's instruction (2026-09-30, then asleep: "always choose the recommended decision; commit and
 push to origin/main often"): five current validators become delegated provers behind one name like
 `rpc.randprotocol.org`, and every client carries it as a trusted prover. Runbook and live status:
@@ -495,10 +501,10 @@ push to origin/main often"): five current validators become delegated provers be
   (laptop copy `~/rand-prover-trusted/`, mode 0700 — losing it means a new fingerprint in every
   client), so the pool has one link, served too at `/.well-known/rand-prover.json`. Viewing-key jobs
   only, no `own=1`, no fee. Members (since 2026-10-01 06:00 UTC): **rand-node-a, rand-archive-2 and two dedicated c-8 droplets, rand-prover-nyc3 / rand-prover-sfo3** — the three guardian hosts were members for one night and were removed on the user's decision (bridge keys and prover work never on one host; add capacity elsewhere). Originally five, each
-  resized CPU/RAM-only to `c-8` (8 vCPU / 16 GB, disk untouched, ~$168/mo) with
-  `deploy/prover/resize-host.sh` — the hosts this laptop's DigitalOcean token can resize; **the
-  three guardian hosts are a stopgap** (audit-v6 #112 key separation) until three of the original
-  validators, in the other DO team, can be resized instead.
+  resized CPU/RAM-only (disk untouched) with `deploy/prover/resize-host.sh`; **the three guardian
+  hosts are a stopgap** (audit-v6 #112 key separation) until three of the original validators can
+  be resized instead. The fleet layout (which host is where) lives in the operator's private
+  configuration, not here.
 - **Trap — the prover was single-threaded by build, not by nature.** `p3-maybe-rayon` was built
   without its `parallel` feature. Measured on chain 18 with real transfers: v0.6.7's `rand-prover`
   took 236.8 s (c-8, Xeon 8168), 234.4 s (c2-8vcpu), 217.0 s (premium-Intel c-8, Xeon 8358) and
@@ -1448,7 +1454,7 @@ rate-limit bucket. **F's Caddy is `disabled`/dead (never started since boot), F 
 ranges — the access log shows separate clients metered separately (one curl 429'd while another
 client in the same hour was not), none from F. Every note below that says "Caddy on droplet F"
 describes a hop that never carried traffic past 2026-09-20; `deploy/caddy/README.md` has the real
-chain and the operator housekeeping (dead `set_real_ip_from 159.89.185.254` on the main vhost,
+chain and the operator housekeeping (dead `set_real_ip_from 203.0.113.21` on the main vhost,
 `.bak` files loaded from `sites-enabled/`). **Trap:** a committed config file is not a running
 service — check `systemctl is-active` and `ss -ltn` before reasoning from one.
 
@@ -1516,13 +1522,11 @@ for rollback — retire them with `deploy/retire-chain-dirs.sh` once chain 15 ha
   Solana USDT 1, one genesis note to his address. `total_supply == Σ locked == custody` at block 0.
 - Relayer funded by 3 × 100 RAND faucet mints (blocks 32/36/40).
 - **2026-09-27, off the laptop and 26 validators.** Validator A moved to droplet `rand-node-a`
-  (139.59.238.151, sgp1; same key, `--prune-history 24h`); the laptop's launchd job is retired and
+  (203.0.113.15, sgp1; same key, `--prune-history 24h`); the laptop's launchd job is retired and
   `deploy/run-a.sh` refuses to start (two signers on one key = equivocation); the laptop keeps
   only an SSH tunnel on 127.0.0.1:8545 → A's RPC for the bridge daemons still there. New second
-  archive `rand-archive-2` (206.81.29.236, fra1, 250 GiB volume `/mnt/rand_archive_2`, full
-  history). Both droplets and the six guardian hosts live in DigitalOcean team "My Team"
-  (dendi@systematictrading.group); the 17 original validator droplets are in another team whose
-  token is not on this machine. Eight nodes were bonded as new validators (1 000 RAND each,
+  archive `rand-archive-2` (203.0.113.38, full history). Where each host runs is kept in the
+  operator's private configuration. Eight nodes were bonded as new validators (1 000 RAND each,
   registration v2, payout wallets `~/.rand-chain15/payout/`, registrations
   `~/.rand-chain15/registrations/`): obs1, rand-archive-2, and guardian hosts 1–6 (their node key
   `/var/lib/randnode/node.key.json`; `--validator --prune-history 24h` in the `chain15.conf`
@@ -1610,7 +1614,7 @@ batch-syncs (it would sit ~700 blocks behind fetching parents one by one). Stage
 binaries as `/root/rand-node.new` on 17 droplets + obs1; stop all 04:23:27, install, start all
 04:23:40 UTC; node A on `bin-089bdd6` (run-a.sh default). The chain paused at 287 354 and committed
 again ~04:55 (13 back); all 17 at head by 04:58. obs1's data moved during the stop onto the
-DigitalOcean volume `randbridge-archive` (250 GiB, sgp1, mounted `/mnt/archive`, the datadir is a
+an attached archive volume (mounted `/mnt/archive`, the datadir is a
 symlink to it); obs1 went v0.5.1 → v0.5.7 (the at-open QC prune dropped 287 354 certificates in
 6 min, then a full verify of 287 356 blocks, done 05:03). obs1 = the archive, no flag.
 **Pruning switched on after the roll, per node:** `--prune-history 24h` appended to each unit's
@@ -2083,7 +2087,7 @@ evict them).
 - **(Until 2026-09-27; since then the upstream is obs1, the archive, through an SSH tunnel — `deploy/caddy/README.md`.) The sale service's RPC upstream is a Caddy route on E, and it lives in randscan's repo.**
   `SALE_RPC_UPSTREAM = https://randscan.org/rpc` (web droplet `/etc/randprotocol/sale.env`) is a
   route in randscan's `deploy/Caddyfile` (since randscan `412a55d`) that `remote_ip`-allowlists the
-  web droplet `159.65.138.161` to E's `127.0.0.1:8545` and 403s the rest. It was first hand-added
+  web droplet `203.0.113.20` to E's `127.0.0.1:8545` and 403s the rest. It was first hand-added
   on E and wiped hours later by a randscan redeploy (`vps-setup.sh` re-renders
   `/etc/caddy/Caddyfile` from the template) — randprotocol.org's `/account` then showed zUSD as
   "asset #1" ("the node could not name every token") until the route was restored. This is safe for

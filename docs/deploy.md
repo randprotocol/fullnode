@@ -27,7 +27,8 @@ it has been followed are under "Rolling out a new commit"; the rules for the nex
 Since this table was written: **chain 19** (v0.6.7, genesis `a3defc93…228a`, 2026-10-01,
 `deploy/cut-chain19-genesis.sh`) and **chain 20** (v0.6.8, genesis `6210cf07…5135`, live since
 2026-10-01 06:17 UTC, `deploy/cut-chain20-genesis.sh`, `deploy/cut-records/chain20.record`; now on
-v0.7.1) — chain 20 is the chain that runs. **Chain 21** is prepared, not cut:
+v0.7.1), then replaced by **chain 21**, the chain that runs (cut 2026-10-12, v0.8.0, genesis
+`ca76c276…`). The paragraph below is the cut's preparation record:
 `deploy/cut-chain21-genesis.sh` carries chain 20's shape and value plus three new sections —
 `fees` (`burn_base`, `burn_floor`), `perps` (RPL-3: BTC-PERP on zUSD) and `multisig` (the
 foundation treasury, 2 of 3) — and private multisig's `hc_auth_multisig` field with 6 MiB proofs
@@ -67,8 +68,7 @@ the genesis hash from the node or take `--genesis-hash`, so they need it only to
   keeps the ledger and one day of blocks); the rest is deleted every 16 blocks
   (`docs/superpowers/specs/2026-09-24-history-pruning-design.md`).
   Two nodes keep everything — the archives, `ARCHIVE` in `deploy/nodes.env` (obs1 on
-  randbridge-web, data dir on a volume) and, since 2026-09-27, `ARCHIVE2` (rand-archive-2, fra1,
-  a 250 GiB volume) — and a node that falls more than a day behind must sync from one of them. **Mainnet units never pass the flag.** A pruned node that fails its startup check does
+  randbridge-web, data dir on a volume) and, since 2026-09-27, `ARCHIVE2` (rand-archive-2) — and a node that falls more than a day behind must sync from one of them. **Mainnet units never pass the flag.** A pruned node that fails its startup check does
   not repair itself: re-sync it from the archive. **Rollback:** a pruned data directory opened by
   a build ≤ v0.5.6 with the default `--verify-chain quick` replays from genesis, finds block 1
   missing and truncates the whole ledger to genesis; run an older build on a pruned data
@@ -436,13 +436,40 @@ What a release is from the next tag on, and who is trusted for what:
    `deploy/roll-all.sh` take `RELEASE_SUMS` and `RELEASE_SIG`, verify first, and read the expected
    sha256s from the signed file. Without them they print that the install is unsigned and refuse,
    unless `ALLOW_UNSIGNED=1` says so on purpose. `SELFTEST=1 bash deploy/lib/verify-release.sh`
-   runs the cases on a throwaway key (13 checks).
+   runs the cases on throwaway keys (20 checks).
 
    ```bash
-   gh release download <tag> -R randprotocol/fullnode -D rel     # rand-node, rand, rand-prover, SHA256SUMS, SHA256SUMS.sig
+   gh release download <tag> -R randprotocol/fullnode -D rel     # rand-node, rand, rand-prover, SHA256SUMS, SHA256SUMS.sig (and SHA256SUMS.sig2 ... when the threshold is above 1)
    RELEASE_SUMS=rel/SHA256SUMS RELEASE_SIG=rel/SHA256SUMS.sig \
      deploy/roll-all.sh rel/rand-node rel/rand "$(awk '$2=="rand-node"{print $1}' rel/SHA256SUMS)" "$(awk '$2=="rand"{print $1}' rel/SHA256SUMS)"
    ```
+
+### Release trust: a threshold of keys (PROC-5)
+
+One signing key is one point of failure. The verifier takes a **threshold**: at least *T* DISTINCT
+keys from `deploy/release-signers` must have signed the release's `SHA256SUMS`, where *T* is the
+number in `deploy/release-threshold` (committed: **1**, because one key is listed; the environment
+may raise it with `RELEASE_THRESHOLD`, never lower it). The signatures are `SHA256SUMS.sig` plus
+`SHA256SUMS.sig2` … `.sig9`, whichever exist; the roll scripts still take only the `.sig` path
+and find its siblings. An unlisted, tampered or duplicate signature counts for nothing, one key
+signing twice counts once, and a *T* above the number of listed keys refuses every release.
+
+`deploy/sign-release.sh SHA256SUMS [key …]` signs with every key it is given (or `$RELEASE_KEYS`,
+or the private keys in `~/.rand-release/`) and then runs the same check. To go to 2-of-N:
+
+1. **Owner:** a second holder generates their own key on their own machine, off any build host,
+   preferably hardware-backed: `ssh-keygen -t ed25519-sk -f ~/.rand-release/release_sk` (or
+   `-t ed25519` with a passphrase). Only the `.pub` leaves that machine.
+2. **Owner:** add it as one more line of `deploy/release-signers`
+   (`<who> namespaces="rand-release" <type> <base64>`), reviewed like any change there.
+3. Each holder signs the same `SHA256SUMS` on their own machine
+   (`ssh-keygen -Y sign -n rand-release -f <key> SHA256SUMS`); upload the first as
+   `SHA256SUMS.sig` and the other as `SHA256SUMS.sig2`
+   (`gh release upload <tag> SHA256SUMS.sig SHA256SUMS.sig2 -R randprotocol/fullnode`).
+4. Only then set `deploy/release-threshold` to `2` (a reviewed change), and check that
+   `SELFTEST=1 bash deploy/lib/verify-release.sh` and a dry `verify_release_sums` on the last
+   release's files behave. Do this before the next release, not during a roll.
+
 
 **What is not in place yet (2026-09-30), stated so nobody reads the above as done:**
 

@@ -58,6 +58,10 @@ struct Cli {
     /// Prove on the CPU even when a GPU is visible to a build that has the CUDA backend.
     #[arg(long, global = true)]
     cpu: bool,
+    /// Prove on this machine even when it reports less free memory than one proof peaks at
+    /// (`rand-prover run` has the same flag). Without it the proof is refused before any work.
+    #[arg(long, global = true, env = "RAND_SKIP_MEMORY_CHECK")]
+    skip_memory_check: bool,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -1604,6 +1608,7 @@ fn backend_for(cuda: bool, cpu: bool) -> Result<Backend> {
 fn proving_for(prover: bool, cuda: bool, cpu: bool, key: &Path, max_prover_fee: &str) -> Result<Proving> {
     let cap = parse_amount(max_prover_fee).map_err(|e| anyhow!("--max-prover-fee {max_prover_fee}: {e}"))?;
     if !prover {
+        randprotocol_client::memory::check_local(randprotocol_client::memory::Proof::Bundle)?;
         return Ok(Proving::local(backend_for(cuda, cpu)?));
     }
     if cuda {
@@ -2049,6 +2054,7 @@ async fn perp(
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    randprotocol_client::memory::set_skip(cli.skip_memory_check);
     // The thread pool a local proof runs on, sized before anything proves (`--threads`, else
     // `RAYON_NUM_THREADS`, else every core — a wallet proves one bundle with a person waiting).
     {
@@ -2106,6 +2112,7 @@ async fn main() -> Result<()> {
                         let len = members.len();
                         members.rotate_left(nanos % len);
                         let mut chosen = None;
+                        let mut outcomes = Vec::new();
                         for m in members {
                             let p = PairedProver::from_link(&m.link, Some(format!("RandProtocol prover {}", m.name)));
                             match RemoteProver::new(p).info().await {
@@ -2113,11 +2120,17 @@ async fn main() -> Result<()> {
                                     chosen = Some(m);
                                     break;
                                 }
-                                Ok(_) => eprintln!("RandProtocol prover {} is busy; trying the next", m.name),
-                                Err(e) => eprintln!("RandProtocol prover {} did not answer ({e:#}); trying the next", m.name),
+                                Ok(_) => {
+                                    outcomes.push(prover::MemberOutcome::Busy);
+                                    eprintln!("RandProtocol prover {} is busy; trying the next", m.name)
+                                }
+                                Err(e) => {
+                                    outcomes.push(prover::classify_info_error(&e));
+                                    eprintln!("RandProtocol prover {} did not answer ({e:#}); trying the next", m.name)
+                                }
                             }
                         }
-                        let m = chosen.ok_or_else(|| anyhow!("every RandProtocol prover is busy or unreachable; try again in a minute, or pair your own"))?;
+                        let m = chosen.ok_or_else(|| anyhow!("{}", prover::trusted_pool_failure(&outcomes)))?;
                         let label = format!("RandProtocol prover {}", m.name);
                         (m.link, name.or(Some(label)))
                     }
@@ -2715,6 +2728,8 @@ async fn main() -> Result<()> {
             }
             let chain_id = rpc.chain_id().await?;
             let profile = profile_of(&rpc).await?;
+            // The invoke proof is always made here, `--prover` or not, so the memory gate runs either way.
+            randprotocol_client::memory::check_local(randprotocol_client::memory::Proof::AlwaysLocal)?;
             let proving = if cli.prover { proving_for(true, false, false, &cli.key, &cli.max_prover_fee)? } else { Proving::local(Backend::Cpu) };
             // The dry run over the REAL context words — the guest branches on them — with eight
             // zero words standing in for the binding, which the guest never reads.
@@ -2830,6 +2845,7 @@ async fn main() -> Result<()> {
             }
             let chain_id = rpc.chain_id().await?;
             let profile = profile_of(&rpc).await?;
+            randprotocol_client::memory::check_local(randprotocol_client::memory::Proof::AlwaysLocal)?;
             let backend = backend_for(cuda, cli.cpu)?;
             // The call proof is always made here, on `--cuda`'s backend; `--prover` moves only the
             // paying bundle.

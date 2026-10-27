@@ -3,7 +3,7 @@
 #
 #   deploy/update-droplet.sh <ip> [build-host]
 #
-# - the binaries come from BUILD_HOST (default: node E, 188.166.235.187), relayed through a
+# - the binaries come from BUILD_HOST (default: node E, 203.0.113.33), relayed through a
 #   scratch directory on this machine with the sha256 checked at every hop (deploy/lib/
 #   relay-binaries.sh) — no agent is forwarded to any droplet (ops review OPS-3: `ssh -A` handed
 #   the laptop's agent to every droplet it touched); build there first with
@@ -22,7 +22,10 @@
 # Run one droplet at a time and let it rejoin (16 peers, height moving) before the next, so the
 # validator quorum is never short by more than one node.
 set -euo pipefail
-IP=$1; BUILD_HOST=${2:-188.166.235.187}
+. "$(dirname "$0")/lib/fleet-env.sh"
+IP=$1; BUILD_HOST=${2:-$(fleet_ip E)}
+refuse_placeholder BUILD_HOST "$BUILD_HOST"
+[ -n "$BUILD_HOST" ] || { echo "BUILD_HOST is empty (give it, or set NODES_ENV to the fleet list)" >&2; exit 1; }
 SERVICE=${SERVICE:-rand-node}
 BIN_NODE=${BIN_NODE:-rand-node}
 BIN_WALLET=${BIN_WALLET:-rand}

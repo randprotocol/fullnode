@@ -26,7 +26,7 @@ MEMBER=${MEMBER:?MEMBER: the member name, 1-16 of a-z0-9, used in its URL /m/<ME
 [[ "$MEMBER" =~ ^[a-z0-9]{1,16}$ ]] || { echo "MEMBER must be 1-16 of a-z0-9" >&2; exit 1; }
 # A release whose SHA256SUMS carries the release key's SHA256SUMS.sig. Never v0.6.7-prover.1 or .2:
 # they can deadlock (AGENTS.md, the prover pool entry).
-TAG=${TAG:-v0.6.9}
+TAG=${TAG:-v0.8.0}   # the current fleet release; bump with each release the fleet moves to
 TUNNEL_PUBKEY=${TUNNEL_PUBKEY:?TUNNEL_PUBKEY: the web droplet\'s tunnel public key file}
 PUBLIC_DIR=${PUBLIC_DIR:-$HOME/rand-prover-trusted/public}
 POOL_URL=${POOL_URL:-https://prover.randprotocol.org}
@@ -40,18 +40,24 @@ done
 
 # --- the signed release, verified here before anything reaches the host ------------------------
 REL=$(mktemp -d); trap 'rm -rf "$REL"' EXIT
-gh release download "$TAG" -R randprotocol/fullnode -D "$REL" -p SHA256SUMS -p SHA256SUMS.sig -p rand-prover
+gh release download "$TAG" -R randprotocol/fullnode -D "$REL" -p SHA256SUMS -p 'SHA256SUMS.sig*' -p rand-prover
 bash -c 'source "$1/../lib/verify-release.sh" && verify_release_sums "$2/SHA256SUMS" "$2/SHA256SUMS.sig" && verify_binary "$2/rand-prover" "$2/SHA256SUMS"' _ "$HERE" "$REL"
 WANT_SHA=$(bash -c 'source "$1/../lib/verify-release.sh" && release_sha "$2/SHA256SUMS" rand-prover' _ "$HERE" "$REL")
 
 # --- the host can hold a proof beside whatever else it runs ------------------------------------
+# The unit's ceiling follows its slot count: ~7 GB per parallel slot (one bundle proof peaks at 6.2 GB,
+# `PROVER_PEAK_BYTES`) + 1 GB for the process, listener and queue: 8G for one slot, 15G for two.
+# MAX_PARALLEL (default 1) fills the unit's --max-parallel too, so the two cannot disagree.
+MAX_PARALLEL=${MAX_PARALLEL:-1}
+[[ "$MAX_PARALLEL" =~ ^[1-9][0-9]*$ ]] || { echo "MAX_PARALLEL must be a positive integer" >&2; exit 1; }
+MEMORY_MAX="$((7 * MAX_PARALLEL + 1))G"
+NEED_MB=$((6200 * MAX_PARALLEL + 1100))   # rand-prover run refuses to start below this (memory.rs)
 read -r CPUS AVAIL_MB < <("${SSH[@]}" 'echo "$(nproc) $(free -m | awk "/Mem:/{print \$7}")"')
-if [ "$AVAIL_MB" -lt 7000 ] || [ "$CPUS" -lt 2 ]; then
-    echo "$TARGET: $CPUS cpu(s), $AVAIL_MB MB available — a prover needs ~7 GB available and a second core. Resize the host first." >&2
+if [ "$AVAIL_MB" -lt "$NEED_MB" ] || [ "$CPUS" -lt 2 ]; then
+    echo "$TARGET: $CPUS cpu(s), $AVAIL_MB MB available — a prover needs ~$((NEED_MB / 1000)).$(((NEED_MB % 1000) / 100)) GB available (6.2 GB per slot + 1 GiB, as rand-prover run requires) and a second core. Resize the host first." >&2
     exit 1
 fi
 THREADS=$((CPUS - 1)); [ "$THREADS" -le 8 ] || THREADS=8   # rand-prover's own default (docs/node-hardware.md §6)
-MEMORY_MAX=8G
 echo "$TARGET ($MEMBER): $CPUS cpus, $AVAIL_MB MB available; $TAG rand-prover ${WANT_SHA:0:16}… (signature verified)"
 
 "${SCP[@]}" "$REL/rand-prover" "$TARGET:/tmp/rand-prover.new"
@@ -71,7 +77,7 @@ case "$LINK" in randprover:*) ;; *) echo "$TARGET: no pairing link came back" >&
 mkdir -p "$PUBLIC_DIR/members"
 printf '%s\n' "$LINK" > "$PUBLIC_DIR/members/$MEMBER.link"
 
-sed -e "s/@THREADS@/$THREADS/g" -e "s/@MEMORY_MAX@/$MEMORY_MAX/g" -e "s|@HOME@|$HOME_DIR|g" -e "s/@PORT@/$PORT/g" "$HERE/rand-prover.service" \
+sed -e "s/@THREADS@/$THREADS/g" -e "s/@MEMORY_MAX@/$MEMORY_MAX/g" -e "s/@MAX_PARALLEL@/$MAX_PARALLEL/g" -e "s|@HOME@|$HOME_DIR|g" -e "s/@PORT@/$PORT/g" "$HERE/rand-prover.service" \
     | "${SSH[@]}" 'cat > /etc/systemd/system/rand-prover-member.service'
 "${SCP[@]}" "$HERE/prover-watchdog.service" "$HERE/prover-watchdog.timer" "$TARGET:/etc/systemd/system/"
 "${SCP[@]}" "$HERE/prover-watchdog.sh" "$TARGET:/usr/local/bin/prover-watchdog.sh"

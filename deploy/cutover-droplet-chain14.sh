@@ -34,7 +34,10 @@ cd "$(dirname "$0")/.."
 . deploy/lib/key-guard.sh
 . deploy/lib/relay-binaries.sh
 
-IP=$1; NAME=$2; NEW=$3; GENESIS=$4; BUILD_HOST=${5:-188.166.235.187}
+. "$(dirname "$0")/lib/fleet-env.sh"
+IP=$1; NAME=$2; NEW=$3; GENESIS=$4; BUILD_HOST=${5:-$(fleet_ip E)}
+refuse_placeholder BUILD_HOST "$BUILD_HOST"
+[ -n "$BUILD_HOST" ] || { echo "BUILD_HOST is empty (give it, or set NODES_ENV to the fleet list)" >&2; exit 1; }
 SERVICE=${SERVICE:-rand-node}
 BIN_NODE=${BIN_NODE:-rand-node}
 BIN_WALLET=${BIN_WALLET:-rand}

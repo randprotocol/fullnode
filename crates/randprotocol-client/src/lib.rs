@@ -24,6 +24,7 @@ use std::time::{Duration, Instant};
 pub mod contacts;
 pub mod governance;
 pub mod memo_display;
+pub mod memory;
 /// Private multisig phase 4: the policy file, proposals, signing, witness assembly and proving —
 /// the parts that need a node, a file or a prover. The pure signer checks are
 /// [`multisig_private`].

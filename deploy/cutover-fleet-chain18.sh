@@ -67,6 +67,8 @@
 # deploy/retire-chain-dirs.sh once chain 18 has run a day.
 set -euo pipefail
 cd "$(dirname "$0")/.."
+. "$(dirname "$0")/lib/fleet-env.sh"
+require_fleet_env
 
 PHASE=${1:?stage|stop|push|switch|start|wait|status}
 TAG=${TAG:-v0.6.6}
@@ -77,8 +79,8 @@ GUARDIAN_HOSTS=${GUARDIAN_HOSTS:-$HOME/.rand-bridge/mainnet-set1/hosts.txt}
 MARKER_GLOB=/tmp/chain18-switched-
 OPTS="-o StrictHostKeyChecking=accept-new -o ConnectTimeout=20 -o BatchMode=yes"
 GOPTS="-i $HOME/.ssh/rand_guardian_ed25519 -o IdentitiesOnly=yes -o UserKnownHostsFile=$HOME/.ssh/rand_guardian_known_hosts -o StrictHostKeyChecking=yes -o ConnectTimeout=20 -o BatchMode=yes"
-BOOTS="164.90.239.200 165.245.173.74"          # C, D — started first, as in every cut
-IPS=$(echo $(grep -oE '/ip4/[0-9.]+' deploy/nodes.env | cut -d/ -f3 | sort -u))   # 20: A–F, 12 regional, obs1, archive-2
+BOOTS=${BOOTS:-$(fleet_ip C) $(fleet_ip D)}          # C, D — started first, as in every cut
+IPS=$(echo $(grep -oE '/ip4/[0-9.]+' "$NODES_ENV" | cut -d/ -f3 | sort -u))   # 20: A–F, 12 regional, obs1, archive-2
 [ "$(echo $IPS | wc -w)" -eq 20 ] || { echo "deploy/nodes.env names $(echo $IPS | wc -w) hosts, expected 20" >&2; exit 1; }
 [ -f "$GUARDIAN_HOSTS" ] || { echo "missing $GUARDIAN_HOSTS" >&2; exit 1; }
 GUARDS=$(echo $(awk '$1 ~ /^[1-6]$/ {print $2}' "$GUARDIAN_HOSTS"))
@@ -124,7 +126,7 @@ stage)
 stop)
   clear_markers
   echo "== stop all 26 $(date -u +%T)"
-  H0=$(rpc 164.90.239.200 rand_status | grep -oE '"height":[0-9]+' | head -1 | cut -d: -f2 || true)
+  H0=$(rpc ${BOOTS%% *} rand_status | grep -oE '"height":[0-9]+' | head -1 | cut -d: -f2 || true)
   echo "   chain 17 head at C: ${H0:-?}"
   each 'systemctl stop rand-node; echo "$(hostname) $(systemctl is-active rand-node || true)"' || true
   echo "STOPPED $(date -u +%T) — cut the genesis now (deploy/cut-chain18-genesis.sh), then push (run it alone, check \$?)"
@@ -222,7 +224,7 @@ wait)
       s=$(rpc "$ip" rand_getHealth | grep -oE '"status":"[a-z_]+"' | cut -d'"' -f4)
       [ "$g" = "$NEW" ] && [ "$s" = ok ] && ok=$((ok+1))
     done
-    H=$(rpc 164.90.239.200 rand_status | grep -oE '"height":[0-9]+' | head -1 | cut -d: -f2)
+    H=$(rpc ${BOOTS%% *} rand_status | grep -oE '"height":[0-9]+' | head -1 | cut -d: -f2)
     echo "  $(date -u +%T) $ok/26 on chain 18 and healthy; C height ${H:-?}"
     if [ "$ok" = 26 ] && [ -n "$H" ] && [ "$H" -gt 2 ]; then echo "=== $(date -u +%T) CUTOVER DONE: all 26 on $NEW, committing at $H"; exit 0; fi
   done

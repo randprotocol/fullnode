@@ -320,6 +320,14 @@ class MemberRouteTest(unittest.TestCase):
             _, r = self.call("/m/a", "prover_info", ip="198.51.100.7")
             self.assertIn("result", r)
 
+    def test_the_default_limit_fits_a_two_member_pool(self):
+        # VK-10: burst 2, 1 a minute. Over ten minutes one address gets 2 + 10 = 12 submits at
+        # most, against the pool's ~11.7 jobs in that time; the old 6 + 3/min let 36 through.
+        m = router.SubmitMeter(router.SubmitMeter.DEFAULT_BURST, router.SubmitMeter.DEFAULT_PER_MIN)
+        admitted = sum(1 for t in range(0, 600) if m.allow("x", now=float(t)))
+        self.assertLessEqual(admitted, 12)
+        self.assertGreaterEqual(admitted, 11)
+
     def test_the_meter_refills(self):
         m = router.SubmitMeter(burst=1, per_min=60)
         self.assertTrue(m.allow("x", now=0.0))

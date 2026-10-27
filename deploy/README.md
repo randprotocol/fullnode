@@ -111,24 +111,24 @@ from chain 7's validator order and can only be confirmed on the droplet itself.
 
 | name | where (chain-7 fleet) | validator address | pubkey | payout (`deploy/payout/…`) |
 |---|---|---|---|---|
-| a | laptop, LAN 192.168.100.123 (NAT) | `2nRdFChBXRmKoe2sQE3ZYDzvdg53QmBZJJ9iweY7hk1v` | `15321b04570d7095…` | `rand11qgA3ETvT…uLm4n9` |
-| b | DigitalOcean sgp1 168.144.102.43 (droplet since 2026-09-19; was the MacBook Air, 192.168.100.79 NAT) | `ByDkxsEfDCR5DrmDufKftvcRsgvufypnZ4SgDQzJAQ7Z` | `4d491d8a5540f005…` | `rand188sGyCRpX…hY5T8k` |
-| c | DigitalOcean fra1 164.90.239.200 | `F6rYLexPhyMmwPNqbEmyyp5FiTmtQqDgZyqScUqYY4F6` | `f3557730c8a76b43…` | `rand14wXebNPJc…rxb3sy` |
-| d | DigitalOcean ric1 165.245.173.74 | `5tMgLSzXL8keU1vg2wtGEXRJkmfBK6GzhjNjxrCFgCaj` | `e95ecd68c5621147…` | `rand13SKXv49EH…thJHN4` |
-| e | DigitalOcean sgp1 188.166.235.187 (RandScan explorer) | `CxeG7vJaxUoKBZZe8U8LGXohH2FvcCbE47AufK6Mp2jf` | `9ffac1e8ff6b687d…` | `rand12nJ3vSqUc…E3YbGt` |
-| f | DigitalOcean nyc3 159.89.185.254 | `DcuuZrzDSJedhFnynLFchNfYmW4UKiZT2nEKbcs2ojmJ` | `b277b8eb8863fca2…` | `rand1CE5oAjb8S…VFDQs2` |
-| lon1 | DigitalOcean lon1 139.59.160.76 | `8UcsaXDSSWcC6fT3CWT89fgUvG4ubaYd61FUQHKiUDLv` | `7edc60fc6e6e35f6…` | `rand12kmqp9BMq…2h77jF` |
-| sfo3 | DigitalOcean sfo3 24.144.89.22 | `9rex7stS6d9QxaAh5nghjaUEratKJFUAmLAoxRFmP7LM` | `5394ea2fc122a869…` | `rand1cjU3K9faj…x2sB7S` |
-| tor1 | DigitalOcean tor1 146.190.243.29 | `CRW3fQsuFa7YSdU5ZDrRMxQjJ4ET9kzf6hg1D8CAhoWH` | `71528cc5c8b11715…` | `rand191phQ9Ffb…YCHDJc` |
-| blr1 | DigitalOcean blr1 167.71.235.108 | `ASzbnFwqVnwsrN81iytkuhNbs8f93Q3h4rQjXPDUNMjU` | `ca6b8bdc43f95a4f…` | `rand1aD55SbVMS…HJjUTs` |
-| syd1 | DigitalOcean syd1 170.64.226.65 | `8cHAjP3wgGDv55Ym2qZrYyu2Mvc7b86jsrN6vWcwZoJV` | `574d78491644c873…` | `rand1CdUmb2fXv…v2YX2p` |
-| atl1 | DigitalOcean atl1 165.245.142.90 | `BV2BfMZJo2Lpo3pR7RfAjytnFxmMhzCWxoUHhXhjT2qL` | `c82e55fd7ff180e0…` | `rand13iwyU6yJM…cJcDx3` |
-| ams3 | DigitalOcean ams3 146.190.233.230 | `6orzEKd3Ds3ZFmp21pidbF19kAe6AczzPCtnMVrKRLeA` | `76bcc53c2370404b…` | `rand16ct7YSQsS…DsRzq9` |
-| nyc1 | DigitalOcean nyc1 192.81.214.91 | `F5RVdAe3Wo2AWHsjKZjFKmGcnTHvJrDpdSHL8gnF4wN1` | `59bd8ed1017f2743…` | `rand15eMjSnZxL…GqYsZj` |
-| nyc2 | DigitalOcean nyc2 107.170.49.234 | `9hU2qrPFxbcZjSse6MJnapYRs4RchALWtJH4RRrbwDGo` | `2c111e425d2fa4d3…` | `rand1AY2hQjQ3X…MHYjq9` |
-| sfo2 | DigitalOcean sfo2 143.110.135.126 | `6NGLfkZcTs3i5LTTbqoYKM9aQCs7ZXygHirTg2AtWhsA` | `c18d93c46e9f8cc5…` | `rand18BY14Pv39…EwrVu6` |
-| mkc1 | DigitalOcean mkc1 201.79.35.212 | `8m5BoX2RA4xTVNfDwKMbWQ3JSChrj69hvJzdSEKMsZDM` | `38c1921b1738182a…` | `rand1qtwxvqK9M…7obifJ` |
-| mem1 | DigitalOcean mem1 168.144.61.10 | `6T5WyBUrYN1noLi3tDKC1Uw5Vf3xabExnWCDdik7VTPV` | `ce48ef3e62463c08…` | `rand15ijmGYjDG…N7co5n` |
+| a | laptop, LAN 203.0.113.36 (NAT) | `2nRdFChBXRmKoe2sQE3ZYDzvdg53QmBZJJ9iweY7hk1v` | `15321b04570d7095…` | `rand11qgA3ETvT…uLm4n9` |
+| b | DigitalOcean sgp1 203.0.113.31 (droplet since 2026-09-19; was the MacBook Air, 203.0.113.35 NAT) | `ByDkxsEfDCR5DrmDufKftvcRsgvufypnZ4SgDQzJAQ7Z` | `4d491d8a5540f005…` | `rand188sGyCRpX…hY5T8k` |
+| c | DigitalOcean fra1 203.0.113.23 | `F6rYLexPhyMmwPNqbEmyyp5FiTmtQqDgZyqScUqYY4F6` | `f3557730c8a76b43…` | `rand14wXebNPJc…rxb3sy` |
+| d | DigitalOcean ric1 203.0.113.25 | `5tMgLSzXL8keU1vg2wtGEXRJkmfBK6GzhjNjxrCFgCaj` | `e95ecd68c5621147…` | `rand13SKXv49EH…thJHN4` |
+| e | DigitalOcean sgp1 203.0.113.33 (RandScan explorer) | `CxeG7vJaxUoKBZZe8U8LGXohH2FvcCbE47AufK6Mp2jf` | `9ffac1e8ff6b687d…` | `rand12nJ3vSqUc…E3YbGt` |
+| f | DigitalOcean nyc3 203.0.113.21 | `DcuuZrzDSJedhFnynLFchNfYmW4UKiZT2nEKbcs2ojmJ` | `b277b8eb8863fca2…` | `rand1CE5oAjb8S…VFDQs2` |
+| lon1 | DigitalOcean lon1 203.0.113.14 | `8UcsaXDSSWcC6fT3CWT89fgUvG4ubaYd61FUQHKiUDLv` | `7edc60fc6e6e35f6…` | `rand12kmqp9BMq…2h77jF` |
+| sfo3 | DigitalOcean sfo3 203.0.113.10 | `9rex7stS6d9QxaAh5nghjaUEratKJFUAmLAoxRFmP7LM` | `5394ea2fc122a869…` | `rand1cjU3K9faj…x2sB7S` |
+| tor1 | DigitalOcean tor1 203.0.113.18 | `CRW3fQsuFa7YSdU5ZDrRMxQjJ4ET9kzf6hg1D8CAhoWH` | `71528cc5c8b11715…` | `rand191phQ9Ffb…YCHDJc` |
+| blr1 | DigitalOcean blr1 203.0.113.27 | `ASzbnFwqVnwsrN81iytkuhNbs8f93Q3h4rQjXPDUNMjU` | `ca6b8bdc43f95a4f…` | `rand1aD55SbVMS…HJjUTs` |
+| syd1 | DigitalOcean syd1 203.0.113.32 | `8cHAjP3wgGDv55Ym2qZrYyu2Mvc7b86jsrN6vWcwZoJV` | `574d78491644c873…` | `rand1CdUmb2fXv…v2YX2p` |
+| atl1 | DigitalOcean atl1 203.0.113.24 | `BV2BfMZJo2Lpo3pR7RfAjytnFxmMhzCWxoUHhXhjT2qL` | `c82e55fd7ff180e0…` | `rand13iwyU6yJM…cJcDx3` |
+| ams3 | DigitalOcean ams3 203.0.113.17 | `6orzEKd3Ds3ZFmp21pidbF19kAe6AczzPCtnMVrKRLeA` | `76bcc53c2370404b…` | `rand16ct7YSQsS…DsRzq9` |
+| nyc1 | DigitalOcean nyc1 203.0.113.34 | `F5RVdAe3Wo2AWHsjKZjFKmGcnTHvJrDpdSHL8gnF4wN1` | `59bd8ed1017f2743…` | `rand15eMjSnZxL…GqYsZj` |
+| nyc2 | DigitalOcean nyc2 203.0.113.12 | `9hU2qrPFxbcZjSse6MJnapYRs4RchALWtJH4RRrbwDGo` | `2c111e425d2fa4d3…` | `rand1AY2hQjQ3X…MHYjq9` |
+| sfo2 | DigitalOcean sfo2 203.0.113.16 | `6NGLfkZcTs3i5LTTbqoYKM9aQCs7ZXygHirTg2AtWhsA` | `c18d93c46e9f8cc5…` | `rand18BY14Pv39…EwrVu6` |
+| mkc1 | DigitalOcean mkc1 203.0.113.37 | `8m5BoX2RA4xTVNfDwKMbWQ3JSChrj69hvJzdSEKMsZDM` | `38c1921b1738182a…` | `rand1qtwxvqK9M…7obifJ` |
+| mem1 | DigitalOcean mem1 203.0.113.30 | `6T5WyBUrYN1noLi3tDKC1Uw5Vf3xabExnWCDdik7VTPV` | `ce48ef3e62463c08…` | `rand15ijmGYjDG…N7co5n` |
 
 The rows are in genesis order (which is chain 7's validator order). C, D, E and the rest of the
 droplets have public IPs and act as bootstrap nodes; A and B are behind NAT and dial out
@@ -371,21 +371,21 @@ scratch, `deploy/rebuild-vps.sh <ip>` rebuilds on a new commit and restarts. Ser
 
 ### What the chain-13 rollout actually did (2026-09-19)
 
-1. E was rebuilt at `86af6eb` with `deploy/rebuild-vps.sh 188.166.235.187`.
+1. E was rebuilt at `86af6eb` with `deploy/rebuild-vps.sh 203.0.113.33`.
 2. All 16 droplets were cut over with
 
    ```bash
    deploy/cutover-droplet.sh <ip> 605eb783 8123ccac deploy/genesis-chain13.json
    ```
 
-3. **mkc1 (201.79.35.212) and mem1 (168.144.61.10) had full 29 GB disks.** Their dead chain-11
+3. **mkc1 (203.0.113.37) and mem1 (203.0.113.30) had full 29 GB disks.** Their dead chain-11
    data dirs (`data-*-79123fa7`, 7 GB) were deleted first, leaving 7 GB free. Later on
    2026-09-19 both were resized from `s5-1vcpu-2gb-30gb` to `s5-1vcpu-2gb-80gb` (same CPU and
    memory, an 80 GB disk; `doctl compute droplet-action resize <id> --size s5-1vcpu-2gb-80gb
    --resize-disk`, one at a time, `rand-node` stopped first). Each now has 77 GB with 55 GB free.
 4. Node A was restarted on `bin-86af6eb/` (`deploy/run-a.sh`).
 5. **Node B now runs on a droplet**, not the MacBook Air, which is offline. `sesh-node-b`,
-   sgp1, `s-2vcpu-4gb`, 168.144.102.43 (created 2026-09-19): the same build (`cc20bf84…`), key
+   sgp1, `s-2vcpu-4gb`, 203.0.113.31 (created 2026-09-19): the same build (`cc20bf84…`), key
    `deploy/node-b.key.json` (peer id `12D3KooWDBrMjejqsbYGLgmDAZd2K4N98yz5VKntcgfpCLsCFUJD`,
    unchanged), data dir `/root/data-rand-node-b-8123ccac`, a unit like C's plus E as a
    bootstrap. **Never run node B on the MacBook Air while this droplet runs**: the same validator
@@ -417,7 +417,7 @@ Live results on chain 13 the same day, from the genesis wallet `shielded-1`
 The RPC release (tag `v0.3`: eleven methods, the `receipts` and `transaction` WebSocket topics,
 the `receipts_by_program` column family) went out as a same-chain binary update, no chain cut:
 
-1. `deploy/rebuild-vps.sh 188.166.235.187` from a detached worktree of `4504a03`. The script now
+1. `deploy/rebuild-vps.sh 203.0.113.33` from a detached worktree of `4504a03`. The script now
    writes `.git-rev` and passes `RAND_BUILD_SHA` to the build, so `rand_getVersion` reports
    `4504a03d…` even though E's tree still carries a stale `.git`. E built in 4 min 17 s; its first
    start logged `built the receipts-by-program index from 117 receipts`.
@@ -450,7 +450,7 @@ the `receipts_by_program` column family) went out as a same-chain binary update,
 ### The same-chain re-pin to `c66e6b8` (2026-09-17, later the same day)
 
 Main moved past `17db41d` by a test-only line (`c66e6b8`), and the fleet was re-pinned to it
-without a chain cut: `deploy/rebuild-vps.sh 188.166.235.187` from a detached worktree of
+without a chain cut: `deploy/rebuild-vps.sh 203.0.113.33` from a detached worktree of
 `c66e6b8` (E rebuilt in 4 minutes and restarted — the same sha256 `b7983e56…` as before, because
 the change is inside `#[cfg(test)]`), then `deploy/update-droplet.sh <ip>` over the other
 fifteen droplets. That script compares the droplet's installed `rand-node` with the build host's
@@ -550,7 +550,7 @@ lock, which is why the stop comes first. Nothing else is touched — the receipt
 and a later v0.3 start rebuilds the index from them.
 
 Then re-pin as for any same-chain update: rebuild the old commit on E with
-`deploy/rebuild-vps.sh 188.166.235.187` from a detached worktree of it (E is the build host, so
+`deploy/rebuild-vps.sh 203.0.113.33` from a detached worktree of it (E is the build host, so
 stop E and drop its index before this — the script restarts E on the rebuilt binary), then
 `deploy/update-droplet.sh <ip>` over the other droplets one at a time; it installs the old
 binaries and restarts the stopped service. On A, run `deploy/run-a.sh` with `BINDIR` set to the

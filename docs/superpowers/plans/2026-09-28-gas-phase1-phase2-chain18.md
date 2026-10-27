@@ -22,7 +22,7 @@
 - Phase 2 (`gas.dynamic`) uses the parent block's closing prices to price a block and updates them in `close_block` by `price' = max(min_price, price + price·adjust_bps·(used − target)/(10 000·target))` in u128 floor division; `adjust_bps ∈ 1..=5000`; `target_block_bytes ≤ max_block_bytes`. Prices are ledger state, persisted beside `META_SUPPLY`, replay-audited, and folded into the state root under `rand-state-7` **only when `dynamic` is present**.
 - Amounts on the wire are decimal strings (`gas_price`, `byte_price`, `min_*`); heights and limits are numbers.
 - Never `cargo fmt` either repo. Every fix red-first with the red quoted in the commit. No vendored fullnode file is hand-edited: circuits first, then `deploy/sync-zkvm.sh`. The `circuits` working tree at `/Users/dendisuhubdy/Github/randprotocol/circuits` is another session's: work in a fresh worktree (`git worktree add /private/tmp/circuits-cs8 -b feat/cs8-gas <base>`), and point the fullnode worktree's `../circuits` at it (`/tmp/circuits` symlink) for path deps.
-- Recursion-heavy tests need `RECURSION_FIXTURES` and ≥ 64 GB; measure on the testbox (`206.189.41.202`, chain-16 memory) or a droplet, never assume the laptop.
+- Recursion-heavy tests need `RECURSION_FIXTURES` and ≥ 64 GB; measure on the testbox (`203.0.113.39`, chain-16 memory) or a droplet, never assume the laptop.
 
 ## Review Focus
 

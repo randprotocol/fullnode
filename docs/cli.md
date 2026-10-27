@@ -401,7 +401,7 @@ one the cut announced; a mismatch on one node is almost always an old binary.
 | `--prover <ADDR>` | off | host the delegated prover (`prover_*` JSON-RPC) on this address: a listener of its own, never the RPC — an address equal to `--rpc`, or a wildcard on `--rpc`'s port, is refused. Refuses to start without `<prover-home>/prover.key.json` (made by `rand-prover keygen`); every prover check runs, and the address is bound, before the node key is read or the database opened |
 | `--prover-home <DIR>` | `<datadir>/prover` | the prover's `prover.key.json` and `pairings.json` |
 | `--prover-accept-spend-key` | retired | **refused at startup** (audit v6, VK-4): a prover no longer accepts a spend-key witness from any wallet. `rand-node run` given this flag, with or without `--prover`, exits before the node key is read with `--prover-accept-spend-key was retired in this release … remove the flag` — take it out of the unit file (`docs/prover.md` §2) |
-| `--prover-max-parallel <N>` | `1` | proofs the hosted prover runs at once; the start is refused unless 5.74 GB × N + 1 GiB of memory is available |
+| `--prover-max-parallel <N>` | `1` | proofs the hosted prover runs at once; the start is refused unless 6.2 GB × N + 1 GiB of memory is available |
 | `--prover-max-queue <N>` | `8` | jobs queued beyond those running |
 | `--prover-cuda` | off | prove on the CUDA backend (a build with `--features cuda`); no CPU fallback. Without it or `--prover-cpu`, a CUDA build takes a visible GPU and logs that it did (`docs/node-hardware.md` §6) |
 | `--prover-cpu` | off | prove on the CPU even when a GPU is visible to a CUDA build |
