@@ -3268,7 +3268,7 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
             let id: [u8; 32] = parse_hash(p, 0)?.0;
             let storage = st.storage.clone();
             // One row read (MSA-4), not the register: an account's row by id.
-            let Some(account) = blocking(st, move || Ok(storage.multisig_enabled()?.then(|| storage.multisig_account(&id)).transpose()?)).await? else {
+            let Some(account) = blocking(st, move || storage.multisig_enabled()?.then(|| storage.multisig_account(&id)).transpose()).await? else {
                 return Ok(json!({ "enabled": false }));
             };
             Ok(account.map_or(Value::Null, |a| {

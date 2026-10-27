@@ -5507,7 +5507,7 @@ pub(crate) mod tests {
                 assert_eq!(start % chunk, 0);
                 assert!(start <= from && from < start + chunk);
                 assert_eq!(limit as u64 % chunk, 0, "whole chunks");
-                assert!(limit >= PAGE && limit <= 1000, "{limit} at chunk {chunk}");
+                assert!((PAGE..=1000).contains(&limit), "{limit} at chunk {chunk}");
             }
             // A pass paging from 0 with full pages: each page starts where the last ended, on a boundary.
             let mut from = 0u64;
