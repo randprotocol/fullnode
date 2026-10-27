@@ -30,7 +30,8 @@ drops: <every balance not carried, with amounts; every non-operator balance>
 # The client rebuild checklist, each item with the version or commit that was built against the
 # new chain and checked before the cut: the wallet CLI (`rand`), the clients repository's apps
 # (desktop, web, extension, iOS, Android), randscan, the website's WASM, the bridge relayer's
-# `rand`.
+# `rand`, and the five website chain pins (randscan, randbridge.org, randprotocol.org,
+# zusd.money, the monorepo's site-sync check; deploy/README.md, cut-over item 9).
 clients: <rand CLI …; clients repo …; randscan …; website WASM …; bridge relayer …>
 
 # The second operator: who rebuilt the genesis from the tag on another machine. Not the author,
