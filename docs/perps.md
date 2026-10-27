@@ -362,8 +362,13 @@ the RAND pair; `collateral_held = initial_collateral + collateral_in − collate
 what the genesis `bound_payouts` rule holds a proof to, and `rand_getSupply` serves them as
 `perps_collateral_in`, `perps_collateral_out` and `perps_collateral_held` (token collateral
 included; `rand_getPerps` carries the same four numbers). They move no term of the RAND identity.
-A `META_PERPS` row written before this build (chain 21's) decodes with both at 0
-(`Perps::decode_persisted`): on that chain they count from the roll, and `bound_payouts` is off.
+Without `bound_payouts` they are reporting state, outside consensus equality: a node rolled onto
+this build counts them from the roll (a v0.8.x row decodes with both at 0) and still compares equal
+to a replay from genesis, so the first start's chain walk finds nothing to repair. The
+`META_PERPS` row stays v0.8.x's bincode byte for byte, followed — only when a counter or a later
+genesis field is not its default — by a trailer (`rand-perps-ext-1` ‖ the extension), which
+v0.8.x's reader ignores (`Perps::encode_persisted`/`decode_persisted`). So a node can roll back
+to v0.8.x on the same database.
 
 ## What the guest sees
 

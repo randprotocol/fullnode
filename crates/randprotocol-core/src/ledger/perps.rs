@@ -587,8 +587,11 @@ impl PartialEq for Perps {
             && self.withdrawals == other.withdrawals
             && self.rand_in == other.rand_in
             && self.rand_out == other.rand_out
-            && self.collateral_in == other.collateral_in
-            && self.collateral_out == other.collateral_out
+            // I-2: the PERP-6 counters are consensus only where they bind (`bound_payouts`).
+            // Elsewhere (chain 21) they are reporting state that starts from a node's roll, so
+            // a replay from genesis and a rolled node must still compare equal.
+            && (!self.config.bound_payouts
+                || (self.collateral_in == other.collateral_in && self.collateral_out == other.collateral_out))
     }
 }
 
@@ -607,6 +610,37 @@ struct PerpsV0 {
     withdrawals: BTreeMap<Word8, PendingWithdrawal>,
     rand_in: u64,
     rand_out: u64,
+}
+
+/// [`PerpsV0`] by reference, for [`Perps::encode_persisted`]: the same bincode.
+#[derive(Serialize)]
+struct PerpsV0Ref<'a> {
+    config: PerpsConfigV0<'a>,
+    accounts: &'a BTreeMap<AccountId, PerpAccount>,
+    oracle: &'a BTreeMap<u32, OracleState>,
+    oracle_nonces: &'a BTreeMap<Address, u64>,
+    proved_root: &'a Word8,
+    proved_height: u64,
+    digests: &'a BTreeMap<u64, Word8>,
+    withdrawals: &'a BTreeMap<Word8, PendingWithdrawal>,
+    rand_in: u64,
+    rand_out: u64,
+}
+
+/// The tag in front of a `META_PERPS` row's trailer (I-2, [`Perps::encode_persisted`]).
+pub const PERSISTED_EXT_TAG: &[u8; 16] = b"rand-perps-ext-1";
+
+/// Everything a `META_PERPS` row holds past the v0.8.x shape: the later genesis fields and the
+/// PERP-6 counters. Fixed-width bincode behind [`PERSISTED_EXT_TAG`].
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct PerpsExt {
+    bound_payouts: bool,
+    initial_collateral: u64,
+    sparse_windows: bool,
+    max_window_heights: u64,
+    engine_program_log_height: u8,
+    collateral_in: u64,
+    collateral_out: u64,
 }
 
 /// The owned twin of [`PerpsConfigV0`], for [`PerpsV0`].
@@ -643,54 +677,98 @@ impl Perps {
         }
     }
 
-    /// A persisted `Perps` (bincode, a node's `META_PERPS` row): this build's shape first, then
-    /// the pre-audit-v10 shape ([`PerpsV0`]) with every later field at its default — so a node
-    /// rolled onto this build reads the row it wrote before (chain 21 has one on every host),
-    /// and writes the new shape at its next commit. The collateral counters start at 0 on such a
-    /// row: they count from the roll, as `bound_payouts` is off on that chain.
+    /// A node's `META_PERPS` row (I-2): the pre-audit-v10 bincode of [`PerpsV0`] — byte for byte
+    /// what v0.8.x writes and reads, so a node can roll back onto it with this database — then,
+    /// only when one of the later fields is not its default, a trailer: [`PERSISTED_EXT_TAG`] ‖
+    /// bincode of [`PerpsExt`]. v0.8.x reads the row with `bincode::deserialize`, which ignores
+    /// trailing bytes, so the trailer is invisible to it.
+    pub fn encode_persisted(&self) -> Vec<u8> {
+        let c = &self.config;
+        let v0 = PerpsV0Ref {
+            config: PerpsConfigV0 {
+                collateral_asset: c.collateral_asset,
+                max_tier: c.max_tier,
+                max_window_blocks: c.max_window_blocks,
+                max_block_inputs: c.max_block_inputs,
+                min_deposit: c.min_deposit,
+                engine_hc: &c.engine_hc,
+                genesis_root: &c.genesis_root,
+                markets: &c.markets,
+            },
+            accounts: &self.accounts,
+            oracle: &self.oracle,
+            oracle_nonces: &self.oracle_nonces,
+            proved_root: &self.proved_root,
+            proved_height: self.proved_height,
+            digests: &self.digests,
+            withdrawals: &self.withdrawals,
+            rand_in: self.rand_in,
+            rand_out: self.rand_out,
+        };
+        let mut out = bincode::serialize(&v0).expect("serializes");
+        let ext = PerpsExt {
+            bound_payouts: c.bound_payouts,
+            initial_collateral: c.initial_collateral,
+            sparse_windows: c.sparse_windows,
+            max_window_heights: c.max_window_heights,
+            engine_program_log_height: c.engine_program_log_height,
+            collateral_in: self.collateral_in,
+            collateral_out: self.collateral_out,
+        };
+        if ext != PerpsExt::default() {
+            out.extend_from_slice(PERSISTED_EXT_TAG);
+            out.extend_from_slice(&bincode::serialize(&ext).expect("serializes"));
+        }
+        out
+    }
+
+    /// [`Self::encode_persisted`]'s inverse: the [`PerpsV0`] prefix, then the trailer when there is
+    /// one (every later field at its default when there is none — a row v0.8.x wrote). A trailer
+    /// that is not this build's tag and extension, exactly, is an error.
     pub fn decode_persisted(bytes: &[u8]) -> Result<Perps, bincode::Error> {
         use bincode::Options;
-        // The old shape first, and only when it consumes the row exactly: this build's row is the
-        // old shape plus nine config bytes in the middle and sixteen counter bytes at the end, so
-        // it can never be read as the old one whole, while an old row read as the new shape could
-        // take its account count for the `bound_payouts` byte and go on into garbage.
-        let exact = bincode::DefaultOptions::new().with_fixint_encoding().reject_trailing_bytes();
-        match exact.deserialize::<PerpsV0>(bytes) {
-            Err(_) => bincode::deserialize::<Perps>(bytes),
-            Ok(v0) => {
-                let c = v0.config;
-                Ok(Perps {
-                    config: PerpsConfig {
-                        collateral_asset: c.collateral_asset,
-                        max_tier: c.max_tier,
-                        max_window_blocks: c.max_window_blocks,
-                        max_block_inputs: c.max_block_inputs,
-                        min_deposit: c.min_deposit,
-                        engine_hc: c.engine_hc,
-                        genesis_root: c.genesis_root,
-                        markets: c.markets,
-                        bound_payouts: false,
-                        initial_collateral: 0,
-                        sparse_windows: false,
-                        max_window_heights: 0,
-                        engine_program_log_height: 0,
-                    },
-                    accounts: v0.accounts,
-                    oracle: v0.oracle,
-                    oracle_nonces: v0.oracle_nonces,
-                    proved_root: v0.proved_root,
-                    proved_height: v0.proved_height,
-                    digests: v0.digests,
-                    withdrawals: v0.withdrawals,
-                    rand_in: v0.rand_in,
-                    rand_out: v0.rand_out,
-                    collateral_in: 0,
-                    collateral_out: 0,
-                    block_inputs: Vec::new(),
-                    last_block_words: None,
-                })
-            }
-        }
+        let prefix = bincode::DefaultOptions::new().with_fixint_encoding().allow_trailing_bytes();
+        let mut rest: &[u8] = bytes;
+        let v0: PerpsV0 = prefix.deserialize_from(&mut rest)?;
+        let ext = if rest.is_empty() {
+            PerpsExt::default()
+        } else {
+            let body = rest
+                .strip_prefix(PERSISTED_EXT_TAG.as_slice())
+                .ok_or_else(|| Box::new(bincode::ErrorKind::Custom("perps row: an unknown trailer".into())))?;
+            bincode::DefaultOptions::new().with_fixint_encoding().reject_trailing_bytes().deserialize::<PerpsExt>(body)?
+        };
+        let c = v0.config;
+        Ok(Perps {
+            config: PerpsConfig {
+                collateral_asset: c.collateral_asset,
+                max_tier: c.max_tier,
+                max_window_blocks: c.max_window_blocks,
+                max_block_inputs: c.max_block_inputs,
+                min_deposit: c.min_deposit,
+                engine_hc: c.engine_hc,
+                genesis_root: c.genesis_root,
+                markets: c.markets,
+                bound_payouts: ext.bound_payouts,
+                initial_collateral: ext.initial_collateral,
+                sparse_windows: ext.sparse_windows,
+                max_window_heights: ext.max_window_heights,
+                engine_program_log_height: ext.engine_program_log_height,
+            },
+            accounts: v0.accounts,
+            oracle: v0.oracle,
+            oracle_nonces: v0.oracle_nonces,
+            proved_root: v0.proved_root,
+            proved_height: v0.proved_height,
+            digests: v0.digests,
+            withdrawals: v0.withdrawals,
+            rand_in: v0.rand_in,
+            rand_out: v0.rand_out,
+            collateral_in: ext.collateral_in,
+            collateral_out: ext.collateral_out,
+            block_inputs: Vec::new(),
+            last_block_words: None,
+        })
     }
 
     /// The collateral the exchange holds as the chain counts it (PERP-6): what the genesis
@@ -3487,12 +3565,16 @@ pub(crate) mod tests {
         assert_eq!(c.check(), Ok(()));
     }
 
-    /// PERP-6: a `META_PERPS` row written before audit v10 (bincode of the old shape) decodes,
-    /// its collateral counters at 0; a row of this build's shape round-trips with them.
+    /// I-2: a `META_PERPS` row v0.8.x wrote (bincode of [`PerpsV0`]) decodes with every later
+    /// field at its default; this build's row is that same bincode — v0.8.x reads it with plain
+    /// `bincode::deserialize`, trailer and all — plus a tagged trailer that carries the counters
+    /// and the later fields; and without `bound_payouts` the counters are outside equality, so a
+    /// rolled node (counters from 0) and a replay from genesis compare equal.
     #[test]
-    fn a_pre_v10_persisted_row_decodes_with_zero_collateral_counters() {
+    fn the_persisted_row_stays_readable_by_v080_and_counters_bind_equality_only_under_the_flag() {
         let (l, _) = withdrawn(5);
         let p = l.perps().unwrap();
+        assert_eq!(p.collateral_in, RAND, "the deposit was counted");
         let c = &p.config;
         let legacy = PerpsV0 {
             config: PerpsConfigV0Owned {
@@ -3516,15 +3598,38 @@ pub(crate) mod tests {
             rand_out: p.rand_out,
         };
         let old_row = bincode::serialize(&legacy).unwrap();
-        assert!(bincode::deserialize::<Perps>(&old_row).is_err(), "the new shape alone cannot read it");
-        let decoded = Perps::decode_persisted(&old_row).expect("the fallback reads it");
+        // A v0.8.x row: read, counters 0 — and equal to the replayed state on this chain (no flag).
+        let decoded = Perps::decode_persisted(&old_row).expect("a v0.8.x row");
         assert_eq!((decoded.collateral_in, decoded.collateral_out), (0, 0));
-        assert_eq!((decoded.rand_in, decoded.proved_height, decoded.accounts.len()), (p.rand_in, 0, 1));
-        assert_eq!(decoded.root(), p.root(), "the consensus state is the same");
-        assert_eq!(decoded.digests, p.digests);
-        let new_row = bincode::serialize(p).unwrap();
-        assert_eq!(&Perps::decode_persisted(&new_row).unwrap(), p, "this build's row, counters included");
+        assert_eq!(decoded.root(), p.root());
+        assert!(&decoded == p, "no bound_payouts: the counters are not compared");
+        // This build's row: v0.8.x's bytes first, then the trailer, which v0.8.x skips.
+        let row = p.encode_persisted();
+        assert_eq!(&row[..old_row.len()], &old_row[..], "the prefix is v0.8.x's row byte for byte");
+        assert_eq!(&row[old_row.len()..old_row.len() + 16], PERSISTED_EXT_TAG);
+        let as_v080: PerpsV0 = bincode::deserialize(&row).expect("v0.8.x reads this build's row");
+        assert_eq!(bincode::serialize(&as_v080).unwrap(), old_row);
+        let back = Perps::decode_persisted(&row).unwrap();
+        assert_eq!((back.collateral_in, back.collateral_out), (p.collateral_in, p.collateral_out), "counters kept");
+        assert_eq!(back.config, p.config);
+        // A default extension writes no trailer at all.
+        let mut plain = p.clone();
+        plain.collateral_in = 0;
+        assert_eq!(plain.encode_persisted(), old_row);
+        // Later genesis fields ride the trailer too.
+        let mut gated = p.clone();
+        gated.config.sparse_windows = true;
+        gated.config.max_window_heights = 16;
+        gated.config.bound_payouts = true;
+        gated.config.engine_program_log_height = 14;
+        assert_eq!(Perps::decode_persisted(&gated.encode_persisted()).unwrap().config, gated.config);
+        // Under the flag the counters are consensus state: compared.
+        let mut moved = gated.clone();
+        moved.collateral_in += 1;
+        assert!(moved != gated);
+        // Junk, and a trailer that is not this build's, are errors.
         assert!(Perps::decode_persisted(b"junk").is_err());
+        assert!(Perps::decode_persisted(&[old_row.clone(), b"other".to_vec()].concat()).is_err());
     }
 
     /// PERP-101: [`ledger_with`]'s ledger with `sparse_windows` on, a 16-height reach.

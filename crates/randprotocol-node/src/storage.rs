@@ -1797,7 +1797,8 @@ impl Storage {
     /// deleted otherwise (`put_program_state`'s rule).
     fn put_perps(&self, batch: &mut WriteBatch, p: Option<&randprotocol_core::ledger::perps::Perps>) -> Result<()> {
         match p {
-            Some(p) => batch.put_cf(self.cf(CF_META), META_PERPS, bincode::serialize(p)?),
+            // I-2: v0.8.x's bincode, plus a trailer it ignores (`Perps::encode_persisted`).
+            Some(p) => batch.put_cf(self.cf(CF_META), META_PERPS, p.encode_persisted()),
             None => batch.delete_cf(self.cf(CF_META), META_PERPS),
         }
         Ok(())
@@ -9270,6 +9271,31 @@ mod tests {
     /// state proof prunes every row at or under its height; `truncate_to` drops the rows above
     /// its height; and the repair puts back what the replay can re-derive — the words of every
     /// height no proof covers — so a truncation below a proof leaves no prover without its input.
+    /// I-2: the perps row a v0.8.x node wrote (no trailer: the counters at 0) reads back equal to
+    /// the replayed state on a chain without `bound_payouts` — the comparison the first start on
+    /// a new build makes (`verify_chain`) — and this build's row keeps the counters.
+    #[test]
+    fn a_v080_perps_row_compares_equal_to_the_replay_after_a_roll() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Storage::open(dir.path()).unwrap();
+        let gs = perps_genesis(7);
+        s.init_genesis(&gs).unwrap();
+        let mut ledger = gs.ledger.clone();
+        let deposit = perp_deposit_tx(&ledger, &key(50), 300, 5_000_000);
+        let b1 = make_perps_block(&gs.block, &mut ledger, vec![deposit], &key(1));
+        s.commit(std::slice::from_ref(&b1), &ledger, &[], &StubExecutor).unwrap();
+        let replayed = ledger.perps().unwrap();
+        assert_eq!(replayed.collateral_in, 5_000_000);
+        assert_eq!(s.perps().unwrap().unwrap().collateral_in, 5_000_000, "this build's row keeps them");
+        let mut as_v080 = replayed.clone();
+        as_v080.collateral_in = 0;
+        as_v080.collateral_out = 0;
+        s.db.put_cf(s.cf(CF_META), META_PERPS, as_v080.encode_persisted()).unwrap();
+        let stored = s.perps().unwrap().unwrap();
+        assert_eq!(stored.collateral_in, 0);
+        assert!(&stored == replayed, "no CORRUPT CHAIN: the counters are not consensus here");
+    }
+
     /// PERP-101: on a `sparse_windows` chain a block without perp inputs records no digest and
     /// carries no words, and storage commits it without a row; a block that did record one must
     /// still carry its words. The ledger reloads as stored.
@@ -9384,7 +9410,7 @@ mod tests {
         assert_eq!(s.perp_inputs(4).unwrap().as_ref(), Some(&w4));
 
         // A stale blob (the genesis one) is named, and repaired from replay.
-        let put = |p: &perps::Perps| s.db.put_cf(s.cf(CF_META), META_PERPS, bincode::serialize(p).unwrap()).unwrap();
+        let put = |p: &perps::Perps| s.db.put_cf(s.cf(CF_META), META_PERPS, p.encode_persisted()).unwrap();
         put(gs.ledger.perps().unwrap());
         let check = s.verify_chain(&gs, VerifyMode::Quick, &StubExecutor).unwrap();
         assert!(check.problem.as_deref().unwrap().contains("perps"), "{:?}", check.problem);
