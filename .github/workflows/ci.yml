@@ -115,6 +115,11 @@ jobs:
         # then this step skipped them, and for a while its comment claimed the nightly covered
         # them; it did not, as no job had the fixtures.
         run: cargo test --workspace --lib --bins --release -- $(scripts/ci-fixture-skips.sh)
+      # CLI-303: the CLI's pinned prover pool is the live pool (names, fingerprints, URLs). Also in
+      # the library suites above; named here so a wrong pin fails by name.
+      - name: The pinned prover pool is the live pool
+        working-directory: fullnode
+        run: cargo test -p randprotocol-client --release --lib prover::tests::the_trusted_provers
       - name: Integration suites that do not prove
         working-directory: fullnode
         # Named one by one rather than filtered by a `--skip` pattern: the cluster suite's proving

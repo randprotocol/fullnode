@@ -704,6 +704,16 @@ mod tests {
             assert!(keys.insert(m.fingerprint.clone()), "{}: two members share a key", m.name);
         }
         assert!(!TRUSTED_PROVERS.contains("RGTF-7HKJ-XZFV-GQ1J"), "the retired shared key is still pinned");
+        // The live pool (CLI-303): these are the fingerprints and URLs the wallets pin too
+        // (clients' `trusted-prover-pool.json`); a change to either is a pool change and edits this line.
+        let live: Vec<(&str, &str, &str)> = members.iter().map(|m| (m.name.as_str(), m.fingerprint.as_str(), m.link.url.as_str())).collect();
+        assert_eq!(
+            live,
+            [
+                ("a", "4SK4-P64N-XWEN-ZSZZ", "https://prover.randprotocol.org/m/a"),
+                ("b", "0XZX-NZ1J-SPMB-GWZN", "https://prover.randprotocol.org/m/b"),
+            ]
+        );
     }
 
     const EXPECTED: Word8 = [7; 8];

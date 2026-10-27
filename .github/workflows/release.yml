@@ -166,6 +166,10 @@ jobs:
           channel=$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)
           rustup toolchain install "$channel" --profile minimal
           echo "rustc=$(rustc --version)" >> "$GITHUB_OUTPUT"
+      # CLI-303: a release does not ship a `rand` whose pinned prover pool is not the live pool.
+      - name: The pinned prover pool is the live pool
+        working-directory: fullnode
+        run: cargo test -p randprotocol-client --release --locked --lib prover::tests::the_trusted_provers
       # RAND_BUILD_SHA is what `rand_getVersion` reports (crates/randprotocol-node/build.rs): the
       # COMMIT, not the tag object.
       - name: Build, locked
