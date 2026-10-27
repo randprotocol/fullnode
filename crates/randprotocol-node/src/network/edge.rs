@@ -999,7 +999,7 @@ mod tests {
         let mut id = 0usize;
         'fill: for host in 0..255u32 {
             for _ in 0..MAX_PENDING_INCOMING_PER_ADDR {
-                match pending(&mut g, id, &format!("/ip4/203.0.{}.{}/tcp/40001", host / 250, host % 250 + 1)) {
+                match pending(&mut g, id, &format!("/ip4/10.0.{}.{}/tcp/40001", host / 250, host % 250 + 1)) {
                     Ok(()) => id += 1,
                     Err(e) => {
                         let d = e.downcast::<Denied>().unwrap();
@@ -1021,7 +1021,7 @@ mod tests {
         assert_eq!(denied(pending(&mut g, 60_100, "/ip4/198.51.100.20/tcp/50001")).kind, Kind::PendingIncomingUnreserved, "still bounded");
         pending(&mut g, 61_000, "/ip4/198.51.100.21/tcp/50000").expect("the bootstrap's host too");
         // One stranger's handshake ends: its slot is a stranger's again, not a reserved one.
-        listen_failure(&mut g, 0, "/ip4/203.0.0.1/tcp/40001");
+        listen_failure(&mut g, 0, "/ip4/10.0.0.1/tcp/40001");
         pending(&mut g, 70_000, "/ip4/192.0.2.99/tcp/1").expect("a freed stranger slot");
         assert_eq!(denied(pending(&mut g, 70_001, "/ip4/192.0.2.98/tcp/1")).kind, Kind::PendingIncomingUnreserved);
 
