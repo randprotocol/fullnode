@@ -103,8 +103,9 @@ pub const MAX_SOURCES_PER_RESERVED_PEER: usize = 4;
 pub const MAX_RESERVED_PENDING_PER_PEER: u32 = 4;
 
 /// How long an advertised or observed reserved source stays trusted without being seen again
-/// (audit v10, NET-1 review): each connection the peer holds from it refreshes it. A configured
-/// (bootstrap) source does not expire.
+/// (audit v10, NET-1 review): a source with a connection open never expires, and the clock runs
+/// from when its last connection closed (re-review N1). A configured (bootstrap) source does not
+/// expire.
 pub const RESERVED_SOURCE_TTL: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
 
 /// How a reserved peer's source was learned, weakest first.
@@ -124,6 +125,9 @@ struct Known {
     source: Source,
     kind: SourceKind,
     seen: std::time::Instant,
+    /// Connections the peer holds from this source right now: a source in use never expires,
+    /// and its `seen` is refreshed again when the last one closes (NET-1 re-review, N1).
+    open: u32,
 }
 
 /// The source addresses reserved peers are known at (audit v10, NET-1): what lets a handshake
@@ -157,7 +161,7 @@ impl ReservedSources {
             let victim = list
                 .iter()
                 .enumerate()
-                .filter(|(_, k)| k.kind != SourceKind::Configured && k.kind <= kind)
+                .filter(|(_, k)| k.kind != SourceKind::Configured && k.open == 0 && k.kind <= kind)
                 .min_by_key(|(_, k)| (k.kind, k.seen))
                 .map(|(i, _)| i);
             match victim {
@@ -167,7 +171,30 @@ impl ReservedSources {
                 None => return,
             }
         }
-        list.push(Known { source, kind, seen: now });
+        list.push(Known { source, kind, seen: now, open: 0 });
+    }
+
+    /// `peer` holds a connection from `source` (seen, so [`SourceKind::Observed`] at least): the
+    /// source is remembered, refreshed, and does not expire while the connection lives.
+    pub fn connected(&mut self, peer: PeerId, source: Source, now: std::time::Instant) {
+        self.add(peer, source, SourceKind::Observed, now);
+        if let Some(k) = self.by_peer.get_mut(&peer).and_then(|l| l.iter_mut().find(|k| k.source == source)) {
+            k.open += 1;
+        }
+    }
+
+    /// A connection [`ReservedSources::connected`] counted closed: the source was seen until now,
+    /// so its expiry runs from here, not from when the connection opened.
+    pub fn disconnected(&mut self, peer: &PeerId, source: Source, now: std::time::Instant) {
+        if let Some(k) = self.by_peer.get_mut(peer).and_then(|l| l.iter_mut().find(|k| k.source == source)) {
+            k.open = k.open.saturating_sub(1);
+            k.seen = now;
+        }
+    }
+
+    /// Whether `k` is still trusted at `now`: configured, in use, or seen within the TTL.
+    fn live(k: &Known, now: std::time::Instant) -> bool {
+        k.kind == SourceKind::Configured || k.open > 0 || now.saturating_duration_since(k.seen) < RESERVED_SOURCE_TTL
     }
 
     /// Forget every source of `peer` (it stopped being reserved).
@@ -178,7 +205,7 @@ impl ReservedSources {
     /// Drop the advertised and observed sources not seen within [`RESERVED_SOURCE_TTL`] of `now`.
     pub fn expire(&mut self, now: std::time::Instant) {
         for list in self.by_peer.values_mut() {
-            list.retain(|k| k.kind == SourceKind::Configured || now.saturating_duration_since(k.seen) < RESERVED_SOURCE_TTL);
+            list.retain(|k| Self::live(k, now));
         }
         self.by_peer.retain(|_, l| !l.is_empty());
     }
@@ -188,7 +215,7 @@ impl ReservedSources {
         self.by_peer
             .iter()
             .filter(|(_, l)| {
-                l.iter().any(|k| &k.source == source && (k.kind == SourceKind::Configured || now.saturating_duration_since(k.seen) < RESERVED_SOURCE_TTL))
+                l.iter().any(|k| &k.source == source && Self::live(k, now))
             })
             .map(|(p, _)| *p)
             .collect()
@@ -413,24 +440,49 @@ pub struct Guard {
     pending: PendingBySource,
     established: EstablishedByPeer,
     sources: ReservedSources,
+    /// Added to the clock (tests only move it): what the source expiry reads.
+    skew: std::time::Duration,
+    /// Every established connection's peer and remote source, so a peer reserved while
+    /// connected has its live sources counted as in use (N1).
+    conn_sources: HashMap<ConnectionId, (PeerId, Source)>,
 }
 
 impl Guard {
     pub fn new(limits: GuardLimits) -> Guard {
-        Guard { limits, pending: PendingBySource::default(), established: EstablishedByPeer::default(), sources: ReservedSources::default() }
+        Guard {
+            limits,
+            pending: PendingBySource::default(),
+            established: EstablishedByPeer::default(),
+            sources: ReservedSources::default(),
+            skew: std::time::Duration::ZERO,
+            conn_sources: HashMap::new(),
+        }
     }
 
-    /// Reserve `peer` (its sources are learned from its connections).
+    fn now(&self) -> std::time::Instant {
+        std::time::Instant::now() + self.skew
+    }
+
+    /// Reserve `peer` (its sources are learned from its connections). A peer reserved while
+    /// connected has the sources of its live connections remembered, in use, at once.
     pub fn reserve(&mut self, peer: PeerId) {
+        if self.established.is_reserved(&peer) {
+            return;
+        }
         self.established.reserve(peer);
+        let now = self.now();
+        let live: Vec<Source> = self.conn_sources.values().filter(|(p, _)| *p == peer).map(|(_, s)| *s).collect();
+        for s in live {
+            self.sources.connected(peer, s, now);
+        }
     }
 
     /// [`Guard::reserve`] plus the sources of `addrs`, learned as `kind` (a bootstrap address is
     /// [`SourceKind::Configured`], an address the peer advertised [`SourceKind::Advertised`] — of
     /// which only the first is kept).
     pub fn reserve_at<'a>(&mut self, peer: PeerId, addrs: impl IntoIterator<Item = &'a Multiaddr>, kind: SourceKind) {
-        self.established.reserve(peer);
-        let now = std::time::Instant::now();
+        self.reserve(peer);
+        let now = self.now();
         for a in addrs {
             self.sources.add(peer, source_of(a), kind, now);
         }
@@ -440,7 +492,7 @@ impl Guard {
     /// there whose handshakes, over all its sources, hold fewer than
     /// [`MAX_RESERVED_PENDING_PER_PEER`] reserved slots.
     fn reserved_for(&mut self, source: &Source) -> bool {
-        let now = std::time::Instant::now();
+        let now = self.now();
         self.sources.expire(now);
         self.sources.peers_at(source, now).iter().any(|p| {
             self.sources.sources_of(p).iter().map(|s| self.pending.reserved_from(s)).sum::<u32>() < MAX_RESERVED_PENDING_PER_PEER
@@ -513,12 +565,21 @@ impl NetworkBehaviour for Guard {
                 self.established.opened(peer_id, connection_id);
                 // A reserved peer seen at an address: its source takes reserved pending slots
                 // from now on (its next reconnect after a restart, say).
+                let source = source_of(endpoint.get_remote_address());
+                self.conn_sources.insert(connection_id, (peer_id, source));
                 if self.established.is_reserved(&peer_id) {
-                    self.sources.add(peer_id, source_of(endpoint.get_remote_address()), SourceKind::Observed, std::time::Instant::now());
+                    let now = self.now();
+                    self.sources.connected(peer_id, source, now);
                 }
             }
-            FromSwarm::ConnectionClosed(ConnectionClosed { peer_id, connection_id, .. }) => {
+            FromSwarm::ConnectionClosed(ConnectionClosed { peer_id, connection_id, endpoint, .. }) => {
                 self.established.closed(&peer_id, connection_id);
+                // N1: the source was in use until now; its expiry starts here.
+                let source = self.conn_sources.remove(&connection_id).map_or_else(|| source_of(endpoint.get_remote_address()), |(_, s)| s);
+                if self.established.is_reserved(&peer_id) {
+                    let now = self.now();
+                    self.sources.disconnected(&peer_id, source, now);
+                }
             }
             FromSwarm::ListenFailure(ListenFailure { connection_id, .. }) => {
                 self.pending.release(connection_id);
@@ -1033,6 +1094,42 @@ mod tests {
         assert_eq!(r.sources_of(&peer), vec![host(1), host(8)]);
         assert!(r.peers_at(&host(1), later + RESERVED_SOURCE_TTL * 10).contains(&peer), "configured never expires");
         assert!(r.peers_at(&host(8), later + RESERVED_SOURCE_TTL).is_empty(), "expired at lookup too");
+    }
+
+    /// NET-1 re-review, N1: a validator's observed source does not lapse while its connection is
+    /// held — a link kept past the TTL, then dropped, leaves the source trusted for another TTL
+    /// from the drop, so the reconnect takes a reserved slot — and lapses a TTL after the drop.
+    /// A peer reserved while already connected has that connection's source in use at once.
+    #[test]
+    fn a_held_connection_keeps_its_source_and_the_ttl_runs_from_the_drop() {
+        use super::super::{MAX_PENDING_INCOMING, RESERVED_PENDING_INCOMING};
+        let mut g = guard();
+        let validator = PeerId::random();
+        g.reserve(validator);
+        let host = "/ip4/198.51.100.60/tcp/30303";
+        let point = listener_point(host);
+        connection_established(&mut g, 1, validator, &point, 0);
+        // Strangers take their whole share, so only a reserved slot admits anyone.
+        for i in 0..(MAX_PENDING_INCOMING - RESERVED_PENDING_INCOMING) as usize {
+            pending(&mut g, 100 + i, &format!("/ip4/203.0.{}.{}/tcp/1", i / 4 / 200, (i / 4) % 200 + 1)).unwrap();
+        }
+        g.skew = RESERVED_SOURCE_TTL * 3; // held for three days
+        pending(&mut g, 10, "/ip4/198.51.100.60/tcp/1").expect("in use: still reserved while connected");
+        listen_failure(&mut g, 10, "/ip4/198.51.100.60/tcp/1");
+        connection_closed(&mut g, 1, validator, &point, 0);
+        g.skew = RESERVED_SOURCE_TTL * 3 + std::time::Duration::from_secs(3600);
+        pending(&mut g, 11, "/ip4/198.51.100.60/tcp/2").expect("an hour after the drop: the reconnect is reserved");
+        listen_failure(&mut g, 11, "/ip4/198.51.100.60/tcp/2");
+        g.skew = RESERVED_SOURCE_TTL * 4 + std::time::Duration::from_secs(1);
+        assert_eq!(denied(pending(&mut g, 12, "/ip4/198.51.100.60/tcp/3")).kind, Kind::PendingIncomingUnreserved, "a TTL after the drop it lapses");
+
+        // Reserved while already connected: the live connection's source is in use.
+        let late = PeerId::random();
+        let late_point = listener_point("/ip4/198.51.100.61/tcp/30303");
+        connection_established(&mut g, 2, late, &late_point, 0);
+        g.reserve(late);
+        g.skew += RESERVED_SOURCE_TTL * 2;
+        pending(&mut g, 13, "/ip4/198.51.100.61/tcp/1").expect("its live connection keeps the source");
     }
 
     /// The guard's handler is the dummy that does nothing, and it never asks the swarm for

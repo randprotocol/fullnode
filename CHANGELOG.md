@@ -71,7 +71,8 @@ Audit v10 fixes (node and client policies, no chain change unless a genesis fiel
   hosts. The per-address cap (4) still applies to everyone.
   One reserved peer holds at most 4 reserved slots over all its sources; of the addresses it
   advertises only one is trusted; observed sources evict advertised ones; advertised and
-  observed sources expire after 24 h unseen (bootstrap addresses never do). Every validator
+  observed sources expire 24 h after they were last in use — a source with a connection open
+  never expires (bootstrap addresses never do). Every validator
   should be in the fleet's `--bootstrap` lists, since learned sources do not survive a restart.
 
 ## v0.8.0 — 2026-10-12 (chain 21 onward)
