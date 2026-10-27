@@ -17,7 +17,10 @@ WALLETS=${WALLETS:-$HOME/Github/randprotocol/fullnode/wallets}
 RPC=${RPC:-http://127.0.0.1:8545}
 EXPLORER=${EXPLORER:-https://randscan.org/api/v1}
 INTERVAL=${INTERVAL:-600}
-NODES=${NODES:-"c=203.0.113.23 d=203.0.113.25 e=203.0.113.33 f=203.0.113.21 lon1=203.0.113.14 sfo3=203.0.113.10 tor1=203.0.113.18 blr1=203.0.113.27 syd1=203.0.113.32 atl1=203.0.113.24 ams3=203.0.113.17 nyc1=203.0.113.34 nyc2=203.0.113.12 sfo2=203.0.113.16 mkc1=203.0.113.37 mem1=203.0.113.30"}
+. "$(dirname "$0")/lib/fleet-env.sh"
+NODES=${NODES:-"$(for n in C D E F LON1 SFO3 TOR1 BLR1 SYD1 ATL1 AMS3 NYC1 NYC2 SFO2 MKC1 MEM1; do echo -n "$(echo $n | tr A-Z a-z)=$(fleet_ip $n) "; done)"}
+refuse_placeholder NODES "$NODES"
+[ -n "$NODES" ] || { echo "NODES is empty (set NODES, or NODES_ENV to the fleet list)" >&2; exit 1; }
 KEY=${SSH_KEY:-$HOME/.ssh/id_ed25519}
 W1=$WALLETS/shielded-1.key.json
 W2=$WALLETS/shielded-2.key.json

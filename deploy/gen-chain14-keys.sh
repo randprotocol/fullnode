@@ -32,6 +32,8 @@
 # Delete a file deliberately to regenerate it.
 set -euo pipefail
 cd "$(dirname "$0")/.."
+. "$(dirname "$0")/lib/fleet-env.sh"
+require_fleet_env
 . deploy/lib/key-guard.sh
 
 NODE=${NODE:-target/release/rand-node}
@@ -95,7 +97,7 @@ done
 # is the laptop behind NAT and has no dialable multiaddr, exactly as today.
 # awk, not sed: BSD sed does not read `\t` in a pattern as a tab.
 peer_of() { awk -F'\t' -v n="$1" '$1 == n { print $4 }' "$KEYDIR/public/validators.tsv"; }
-ip_of() { sed -n "s#^NODE_$1=/ip4/\([0-9.]*\)/tcp/30303/p2p/.*#\1#p" deploy/nodes.env; }
+ip_of() { sed -n "s#^NODE_$1=/ip4/\([0-9.]*\)/tcp/30303/p2p/.*#\1#p" "$NODES_ENV"; }
 {
   printf '# Chain 14: every peer id changed with the OPS-1 key rotation (a p2p identity is\n'
   printf '# `derive_subkey(b"rand-p2p-identity")` of the validator key). Generated %s by\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"

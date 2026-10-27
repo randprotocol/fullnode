@@ -137,6 +137,8 @@
 # target too).
 set -euo pipefail
 cd "$(dirname "$0")/.."
+. "$(dirname "$0")/lib/fleet-env.sh"
+require_fleet_env
 if [ "${SELFTEST:-}" = 1 ]; then exec bash deploy/rehearse-cutover-fleet-chain21.sh "$@"; fi
 # shellcheck disable=SC1091  # sourced from the repo root (the cd above)
 . deploy/lib/cut-policy.sh
@@ -188,9 +190,9 @@ for v in RELEASE_URL STAGE_URL WANT_VERSION; do
   case "${!v}" in *[\'\;\ \"\`\$\\\|\<\>\(\)\{\}]*) echo "$v contains a quote, ';', a space or a shell metacharacter — refused" >&2; exit 1;; esac
 done
 for f in $NEED_FLAGS; do [[ "$f" =~ ^--[a-z0-9-]+$ ]] || { echo "NEED_FLAGS: '$f' is not a --flag — refused" >&2; exit 1; }; done
-BOOTS=${BOOTS:-203.0.113.23 203.0.113.25}   # C, D — started first, as in every cut
+BOOTS=${BOOTS:-$(fleet_ip C) $(fleet_ip D)}   # C, D — started first, as in every cut
 # shellcheck disable=SC2046,SC2005  # word-split on purpose: one space-separated list
-IPS=$(echo $(grep -oE '/ip4/[0-9.]+' deploy/nodes.env | cut -d/ -f3 | sort -u))   # 20: A–F, 12 regional, obs1, archive-2
+IPS=$(echo $(grep -oE '/ip4/[0-9.]+' "$NODES_ENV" | cut -d/ -f3 | sort -u))   # 20: A–F, 12 regional, obs1, archive-2
 NIPS=$(wc -w <<<"$IPS" | tr -d ' ')
 [ "$NIPS" -eq 20 ] || { echo "deploy/nodes.env names $NIPS hosts, expected 20" >&2; exit 1; }
 [ -f "$GUARDIAN_HOSTS" ] || { echo "missing $GUARDIAN_HOSTS" >&2; exit 1; }

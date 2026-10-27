@@ -22,7 +22,10 @@
 # Run one droplet at a time and let it rejoin (16 peers, height moving) before the next, so the
 # validator quorum is never short by more than one node.
 set -euo pipefail
-IP=$1; BUILD_HOST=${2:-203.0.113.33}
+. "$(dirname "$0")/lib/fleet-env.sh"
+IP=$1; BUILD_HOST=${2:-$(fleet_ip E)}
+refuse_placeholder BUILD_HOST "$BUILD_HOST"
+[ -n "$BUILD_HOST" ] || { echo "BUILD_HOST is empty (give it, or set NODES_ENV to the fleet list)" >&2; exit 1; }
 SERVICE=${SERVICE:-rand-node}
 BIN_NODE=${BIN_NODE:-rand-node}
 BIN_WALLET=${BIN_WALLET:-rand}

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+. "$(dirname "$0")/lib/fleet-env.sh"; refuse_placeholder_script "$0"
 # Run validator A (the laptop, behind NAT) on chain 14. Bootstraps to the public nodes C and D.
 # Chain 14 runs from NODE_A_HOME (default ~/rand-node-a), not from a checkout: the validator key
 # lives off-repo in ~/.rand-chain14 (audit v3 OPS-1) and the checkout is shared between sessions.

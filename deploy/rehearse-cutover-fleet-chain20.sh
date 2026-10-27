@@ -66,7 +66,7 @@ for g in "$G20" "$G20B"; do
   DRY_RUN=1 DRY_RUN_NO_PROBE=1 DRY_OUT=$g NODE=$RN WALLET=$RW deploy/cut-chain20-genesis.sh > "$T/dry.log" 2>&1 \
     || { echo "rehearse: the dry-run cut failed: $(tail -2 "$T/dry.log")" >&2; exit 1; }
 done
-cp deploy/lib/cut-policy.sh deploy/lib/verify-release.sh "$T/repo/deploy/lib/"
+cp deploy/lib/cut-policy.sh deploy/lib/verify-release.sh deploy/lib/fleet-env.sh "$T/repo/deploy/lib/"
 cp deploy/cut-record.template "$T/repo/deploy/" 2>/dev/null || true
 
 # ── the fake ssh / scp (the laptop side) ───────────────────────────────────────────────────────

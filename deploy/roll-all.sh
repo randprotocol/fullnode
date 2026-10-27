@@ -36,6 +36,8 @@
 # deploy/update-droplet.sh.
 set -uo pipefail
 cd "$(dirname "$0")/.."
+. "$(dirname "$0")/lib/fleet-env.sh"
+require_fleet_env
 NODE_BIN=$1; WALLET_BIN=$2; WANT=$3; WANT_WALLET=${4:-${WANT_SHA_WALLET:-}}; MSAUTH_VK=${5:-${MSAUTH_VK:-}}
 [ -n "$WANT_WALLET" ] || { echo "no expected sha256 for $WALLET_BIN (fourth argument or WANT_SHA_WALLET) — the wallet binary is installed as root too"; exit 1; }
 if [ -n "$MSAUTH_VK" ]; then
@@ -63,7 +65,7 @@ else
 fi
 [ "$(shasum -a 256 "$NODE_BIN" | cut -d' ' -f1)" = "$WANT" ] || { echo "local $NODE_BIN does not match $WANT"; exit 1; }
 [ "$(shasum -a 256 "$WALLET_BIN" | cut -d' ' -f1)" = "$WANT_WALLET" ] || { echo "local $WALLET_BIN does not match $WANT_WALLET"; exit 1; }
-IPS=$(grep -oE '/ip4/[0-9.]+' deploy/nodes.env | cut -d/ -f3 | sort -u)
+IPS=$(grep -oE '/ip4/[0-9.]+' "$NODES_ENV" | cut -d/ -f3 | sort -u)
 # NO_MSAUTH_VK=1 says "this chain has no multisig"; a host whose genesis names hc_auth_multisig
 # proves it wrong, and its new node would refuse to start without the blob (plan Task 3). So,
 # before anything is copied, every droplet's genesis is read where the node reads it: the

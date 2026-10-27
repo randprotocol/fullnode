@@ -93,6 +93,8 @@
 # "Rollback").
 set -euo pipefail
 cd "$(dirname "$0")/.."
+. "$(dirname "$0")/lib/fleet-env.sh"
+require_fleet_env
 
 PHASE=${1:?preflight|stop|push|switch|start|wait|status|rollback}
 # The v0.6.7 GitHub release's Linux binaries (tag v0.6.7 = 86941a1; its SHA256SUMS).
@@ -104,8 +106,8 @@ GUARDIAN_HOSTS=${GUARDIAN_HOSTS:-$HOME/.rand-bridge/mainnet-set1/hosts.txt}
 MARKER_GLOB=${MARKER_GLOB:-/tmp/chain19-switched-}
 OPTS="-o StrictHostKeyChecking=accept-new -o ConnectTimeout=20 -o BatchMode=yes"
 GOPTS="-i $HOME/.ssh/rand_guardian_ed25519 -o IdentitiesOnly=yes -o UserKnownHostsFile=$HOME/.ssh/rand_guardian_known_hosts -o StrictHostKeyChecking=yes -o ConnectTimeout=20 -o BatchMode=yes"
-BOOTS=${BOOTS:-203.0.113.23 203.0.113.25}   # C, D — started first, as in every cut
-IPS=$(echo $(grep -oE '/ip4/[0-9.]+' deploy/nodes.env | cut -d/ -f3 | sort -u))   # 20: A–F, 12 regional, obs1, archive-2
+BOOTS=${BOOTS:-$(fleet_ip C) $(fleet_ip D)}   # C, D — started first, as in every cut
+IPS=$(echo $(grep -oE '/ip4/[0-9.]+' "$NODES_ENV" | cut -d/ -f3 | sort -u))   # 20: A–F, 12 regional, obs1, archive-2
 [ "$(echo $IPS | wc -w)" -eq 20 ] || { echo "deploy/nodes.env names $(echo $IPS | wc -w) hosts, expected 20" >&2; exit 1; }
 [ -f "$GUARDIAN_HOSTS" ] || { echo "missing $GUARDIAN_HOSTS" >&2; exit 1; }
 GUARDS=$(echo $(awk '$1 ~ /^[1-6]$/ {print $2}' "$GUARDIAN_HOSTS"))

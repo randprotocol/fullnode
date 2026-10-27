@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+. "$(dirname "$0")/lib/fleet-env.sh"; refuse_placeholder_script "$0"
 # Run validator B (behind NAT). Bootstraps to the public DigitalOcean nodes C and D; LAN peers are found via mDNS.
 set -euo pipefail
 cd "$(dirname "$0")/.."

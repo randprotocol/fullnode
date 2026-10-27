@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+. "$(dirname "$0")/lib/fleet-env.sh"; refuse_placeholder_script "$0"
 # Run validator A from a prebuilt binary directory (no cargo build): run-a-pinned.sh <bindir>
 set -euo pipefail
 cd "$(dirname "$0")/.."
