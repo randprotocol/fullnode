@@ -546,11 +546,13 @@ pub async fn start_with(
     let keypair = identity::Keypair::ed25519_from_bytes(&mut seed)?;
     let local_peer_id = PeerId::from(keypair.public());
 
+    let topics = Topics::new(cfg.chain_id);
+    let status_topic = topics.status.hash();
     let gossipsub_config = gossipsub::ConfigBuilder::default()
         .heartbeat_interval(Duration::from_millis(500))
         .validation_mode(if edge.strict_gossip { ValidationMode::Strict } else { ValidationMode::Permissive })
         .max_transmit_size(cfg.limits.gossip_max_transmit_size)
-        .message_id_fn(|m: &gossipsub::Message| MessageId::from(blake3::hash(&m.data).as_bytes().to_vec()))
+        .message_id_fn(move |m: &gossipsub::Message| message_id(m, &status_topic))
         // Application-level validation: this node forwards a transaction only after it has
         // verified here, off the consensus loop. Local to this node — the wire is unchanged, so it
         // rolls out onto a mixed fleet by ordinary restart. `ValidationMode` is `Permissive`
@@ -637,7 +639,6 @@ pub async fn start_with(
         .with_connection_timeout(HANDSHAKE_TIMEOUT)
         .build();
 
-    let topics = Topics::new(cfg.chain_id);
     for t in [&topics.consensus, &topics.tx, &topics.status, &topics.peers] {
         swarm.behaviour_mut().gossipsub.subscribe(t)?;
     }
@@ -649,6 +650,29 @@ pub async fn start_with(
     let (evt_tx, evt_rx) = mpsc::channel(4096);
     tokio::spawn(run(swarm, cfg, pinned, topics, cmd_rx, evt_tx));
     Ok((NetworkHandle { cmd: cmd_tx, local_peer_id }, evt_rx))
+}
+
+/// The gossip message id: blake3 of the bytes, so one transaction or vote forwarded by two peers
+/// is one message — except on the status topic, where the author and the sequence number come
+/// first (issue #144). A `Status` names no author, so two nodes at one head publish identical
+/// bytes, and under a content-only id the second one's status was dropped as a duplicate, as was
+/// every re-publish of an unchanged status (on each `peer connected` and on the 3 s tick):
+/// gossipsub's "Not publishing a message that has already been published" WARN. Every published
+/// status is now its own message. The id is local to each node except in IHAVE/IWANT, where a
+/// pre-#144 peer computes another id for a status, so at worst it pulls a status it already holds
+/// — a few dozen bytes, and only while the fleet is mixed. An unsigned status (no source or
+/// sequence number, which only `Permissive` admits) keeps the content id.
+fn message_id(m: &gossipsub::Message, status_topic: &gossipsub::TopicHash) -> MessageId {
+    let mut h = blake3::Hasher::new();
+    if m.topic == *status_topic {
+        if let (Some(source), Some(seq)) = (m.source, m.sequence_number) {
+            h.update(b"rand-status-id-1");
+            h.update(&source.to_bytes());
+            h.update(&seq.to_be_bytes());
+        }
+    }
+    h.update(&m.data);
+    MessageId::from(h.finalize().as_bytes().to_vec())
 }
 
 /// Hand one verdict to gossipsub. The only place that calls
@@ -763,6 +787,7 @@ async fn run(
                 match cmd {
                     NetworkCommand::Broadcast(msg) => {
                         let topic = topics.for_message(&msg).clone();
+                        let topic_name = topic.to_string();
                         match bincode::serialize(&msg) {
                             Ok(data) => {
                                 if let Err(e) = swarm.behaviour_mut().gossipsub.publish(topic, data) {
@@ -770,7 +795,12 @@ async fn run(
                                         gossipsub::PublishError::NoPeersSubscribedToTopic => {
                                             tracing::debug!("publish: no peers yet")
                                         }
-                                        gossipsub::PublishError::Duplicate => {}
+                                        // gossipsub has already logged its own WARN by now;
+                                        // nothing this node publishes on purpose should get here
+                                        // since #144 (see `message_id`).
+                                        gossipsub::PublishError::Duplicate => {
+                                            tracing::debug!(topic = %topic_name, "publish: already published")
+                                        }
                                         other => tracing::warn!("publish failed: {other}"),
                                     }
                                 }
@@ -1300,6 +1330,61 @@ mod tests {
         assert_ne!(next.message_id, first_id, "a different message is a different id");
         a.report_validation(next, MessageAcceptance::Accept).await;
 
+        a.shutdown().await;
+        b.shutdown().await;
+    }
+
+    /// Issue #144: a `Status` names no author, so under a content-only message id every node at
+    /// one head published the *same* id, the second publisher's status was dropped as a duplicate
+    /// (gossipsub's "Not publishing a message that has already been published" WARN), and so was
+    /// every re-publish of an unchanged status — on each `peer connected` and on the 3 s tick. A
+    /// status's id now also covers its author and sequence number; every other topic keeps the
+    /// content-addressed id, so one transaction forwarded by two peers is still one message.
+    #[test]
+    fn a_status_id_covers_its_author_and_sequence_and_every_other_id_is_the_content() {
+        let topics = Topics::new(7);
+        let data = bincode::serialize(&GossipMessage::Status(Status { height: 9, head_hash: Hash::digest(b"h"), view: 3, floor: 0 })).unwrap();
+        let msg = |topic: &IdentTopic, source: Option<PeerId>, seq: Option<u64>| gossipsub::Message {
+            source,
+            data: data.clone(),
+            sequence_number: seq,
+            topic: topic.hash(),
+        };
+        let (p, q) = (peer_of_seed(1), peer_of_seed(2));
+        let id = |m: &gossipsub::Message| message_id(m, &topics.status.hash());
+        // Status: two authors at one head, and one author publishing twice, are different messages.
+        assert_ne!(id(&msg(&topics.status, Some(p), Some(1))), id(&msg(&topics.status, Some(q), Some(1))));
+        assert_ne!(id(&msg(&topics.status, Some(p), Some(1))), id(&msg(&topics.status, Some(p), Some(2))));
+        assert_eq!(id(&msg(&topics.status, Some(p), Some(1))), id(&msg(&topics.status, Some(p), Some(1))), "a relay of one publish is one message");
+        // An unsigned status (no source or sequence) falls back to the content.
+        assert_eq!(id(&msg(&topics.status, None, None)), MessageId::from(blake3::hash(&data).as_bytes().to_vec()));
+        // Every other topic: the content alone, whoever sent it (and the pinned blake3 form, so a
+        // mixed fleet's IHAVE/IWANT ids agree on them).
+        for t in [&topics.tx, &topics.consensus, &topics.peers] {
+            let content = MessageId::from(blake3::hash(&data).as_bytes().to_vec());
+            assert_eq!(id(&msg(t, Some(p), Some(1))), content, "{t}");
+            assert_eq!(id(&msg(t, Some(q), Some(9))), content, "{t}");
+        }
+    }
+
+    /// Issue #144, end to end: B publishes the same status twice and A receives it twice, under
+    /// two ids. Before, the second publish was gossipsub's duplicate — dropped with a WARN, and
+    /// the new peer a re-announcement on connect was meant for never heard it.
+    #[tokio::test]
+    async fn an_unchanged_status_published_again_is_delivered_again() {
+        let (a, mut a_rx, b, _b_rx) = two_connected_nodes().await;
+        let status = Status { height: 9, head_hash: Hash::digest(b"same"), view: 3, floor: 0 };
+        let (_, first) = gossip_status_to(&b, &mut a_rx, status.clone()).await;
+        a.report_validation(first.clone(), MessageAcceptance::Accept).await;
+        b.broadcast(GossipMessage::Status(status.clone())).await;
+        let again = wait_for(&mut a_rx, Duration::from_secs(10), |e| match e {
+            NetworkEvent::Gossip { msg: GossipMessage::Status(s), id, .. } if s.head_hash == status.head_hash && id.message_id != first.message_id => Some(id),
+            _ => None,
+        })
+        .await
+        .expect("the same status, published again, was not delivered again");
+        assert_eq!(again.propagation_source, b.local_peer_id);
+        a.report_validation(again, MessageAcceptance::Accept).await;
         a.shutdown().await;
         b.shutdown().await;
     }
