@@ -743,8 +743,9 @@ async fn corrupted_rocksdb_is_detected_truncated_and_resynced() {
     let receipt_height = n0.handle.storage.tx_location(&hash).unwrap().unwrap().0;
     wait_height(&[&n0, &n1, &n2], receipt_height + 8, Duration::from_secs(60)).await;
 
-    let head = n2.handle.storage.head().unwrap().height;
-    let dir = stop(n2).await;
+    // `stop_and_head`: the database is reopened below, so wait until the stopped node has let
+    // go of it (every handle dropped), and take the head it left on disk.
+    let (dir, head) = stop_and_head(n2).await;
     // Damage the middle of n2's chain on disk, after the mint block.
     let bad_height = receipt_height + 3;
     {

@@ -2771,11 +2771,14 @@ pub async fn start_with(cfg: NodeConfig, rpc_options: RpcOptions, net_options: N
         // built and pinned, so a proof of them never waits on a key build or on the pool's cold
         // budget, even right after a roll.
         let perps_chain = hs.committed_ledger().perps().is_some();
-        let perp_store = storage.clone();
+        // A store handle only on a perps chain, dropped right after the shape scan: the warm
+        // that follows can take minutes, and a handle held through it keeps the database open
+        // after the node has stopped (re-review).
+        let perp_store = perps_chain.then(|| storage.clone());
         let ex = executor.clone();
         tokio::task::spawn_blocking(move || {
             // Read here, off the startup path: the scan walks up to PERP_WARM_SCAN_BLOCKS blocks.
-            let perp_shapes: Vec<randprotocol_core::confidential::ProofShape> = if perps_chain {
+            let perp_shapes: Vec<randprotocol_core::confidential::ProofShape> = if let Some(perp_store) = perp_store {
                 // Newest first: the recorded shapes (stored oldest first), then the recent
                 // blocks', at most `PERP_WARM_SHAPES` — each build at tier 18 is minutes and GBs.
                 let mut v = perp_store.perp_proof_shapes().unwrap_or_default();
@@ -2793,6 +2796,7 @@ pub async fn start_with(cfg: NodeConfig, rpc_options: RpcOptions, net_options: N
                     }
                 }
                 v.truncate(PERP_WARM_SHAPES);
+                drop(perp_store);
                 v
             } else {
                 Vec::new()
