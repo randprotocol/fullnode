@@ -774,28 +774,29 @@ fn core_profile(fri_profile: &str) -> randprotocol_core::types::FriProfile {
     }
 }
 
-/// The worker's validation of one transaction. An aggregate's covered bundles live in storage,
-/// not the ledger, so its admission pre-flights the byte checks (spec §4 step 1), assembles the
-/// covered records (§3.2's coverability), and takes the covered-carrying path; every other
-/// transaction is the ledger's own `validate`.
-/// CON-60 (review): run `verify`, a pool verification of `tx`, without ever waiting at the
-/// state-proof key-build gate ([`randprotocol_zkvm::executor::PERP_KEY_BUILD_GATE`]). A state
-/// proof whose shape has no key built would build one inside `verify`; it runs only with the gate
-/// taken for the whole verification, and `None` (the caller's `StateProofBusy`) is the answer
-/// while another build holds it. Every other transaction, and a state proof whose key is built,
-/// runs as before. Node policy: a block's application still waits at the gate.
+/// CON-60 (re-review): run `verify`, a pool verification of `tx`, unless it is a state proof
+/// whose shape has no key built while a state-proof key build is running
+/// ([`randprotocol_zkvm::executor::PerpKeyBuildGate::is_busy`]): then `None`, the caller's
+/// `StateProofBusy`, so verify slots do not queue behind a build. The check is advisory — the
+/// gate is never held here — so `verify` takes the key slot and then the gate, as every build
+/// does; a build that starts after the check can still make one verification wait. Every other
+/// transaction, and a state proof whose key is built, runs as before. A block's application is
+/// not this path and waits at the gate.
 pub(crate) fn pool_verify_without_waiting<T>(tx: &Transaction, executor: &dyn ConfidentialExecutor, verify: impl FnOnce() -> T) -> Option<T> {
     let cold = match &tx.action {
         randprotocol_core::types::Action::PerpStateProof { proof, .. } => executor.perp_proof_shape(proof).is_some_and(|s| !executor.perp_key_ready(&s)),
         _ => false,
     };
-    if !cold {
-        return Some(verify());
+    if cold && randprotocol_zkvm::executor::PERP_KEY_BUILD_GATE.is_busy() {
+        return None;
     }
-    let _hold = randprotocol_zkvm::executor::PERP_KEY_BUILD_GATE.try_hold()?;
     Some(verify())
 }
 
+/// The worker's validation of one transaction. An aggregate's covered bundles live in storage,
+/// not the ledger, so its admission pre-flights the byte checks (spec §4 step 1), assembles the
+/// covered records (§3.2's coverability), and takes the covered-carrying path; every other
+/// transaction is the ledger's own `validate`.
 pub(crate) fn validate_for_pool(
     tx: &Transaction,
     ledger: &Ledger,
@@ -7656,8 +7657,84 @@ mod tests {
         assert!(node.cached_proof_refusal(&junk).is_none(), "cleared when the root changed");
     }
 
+    /// CON-60 (re-review), on the real zkVM executor: a pool verification of a cold state-proof
+    /// shape S that races a build of S — the block-application verify of the same proof, or the
+    /// startup warm of S — never deadlocks. The pool's check holds no lock, so the pool verify
+    /// takes S's key slot first and the gate inside it, as the other side does. The race is set
+    /// up the way a held gate would wedge it: the pool path decides first, then the other side
+    /// enters S's build, then the pool verify reaches S. Both finish within the timeout, the key
+    /// is built once, and both verdicts are the honest proof's.
+    #[test]
+    fn a_pool_verify_racing_a_build_of_the_same_shape_never_deadlocks() {
+        use crate::storage::fixtures::{key, make_perps_block, perp_state_proof_tx, perps_genesis};
+        use randprotocol_zkvm::executor::{prove_call_hardened, ZkExecutor};
+        use randprotocol_zkvm::machine::FriProfile as ZkProfile;
+        let program = randprotocol_zkvm::guests::fib(10);
+        let binding = [9u32; randprotocol_core::types::TX_BINDING_WORDS];
+        let (bytes, _, _) = prove_call_hardened(ZkProfile::Test, &program, &[], &[], &binding, [0; 4], None, None).unwrap();
+        let hc = program.digest();
+        let gs = perps_genesis(7);
+        let mut ledger = gs.ledger.clone();
+        make_perps_block(&gs.block, &mut ledger, vec![], &key(1));
+        let mut tx = perp_state_proof_tx(&ledger, 1, [7; 8], vec![], 0);
+        let randprotocol_core::Action::PerpStateProof { proof, .. } = &mut tx.action else { unreachable!() };
+        *proof = bytes.clone();
+        for other_side in ["block application", "startup warm"] {
+            let zk = Arc::new(ZkExecutor::new(ZkProfile::Test));
+            let shape = zk.perp_proof_shape(&bytes).expect("a real proof's shape");
+            assert!(!zk.perp_key_ready(&shape), "S is cold");
+            let (done_tx, done_rx) = std::sync::mpsc::channel::<(&str, bool)>();
+            let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+            let pool = {
+                let (zk, tx, bytes, done) = (zk.clone(), tx.clone(), bytes.clone(), done_tx.clone());
+                std::thread::spawn(move || {
+                    // Other tests in this process may hold the gate: a busy answer is retried.
+                    let verdict = loop {
+                        let mut go = Some(&go_tx);
+                        let v = pool_verify_without_waiting(&tx, zk.as_ref(), || {
+                            // Decided: now let the other side enter S's build, and reach S after it.
+                            if let Some(g) = go.take() {
+                                g.send(()).unwrap();
+                            }
+                            std::thread::sleep(Duration::from_millis(300));
+                            zk.verify_perp(&hc, 20, &binding, &bytes).is_ok()
+                        });
+                        if let Some(v) = v {
+                            break v;
+                        }
+                        std::thread::sleep(Duration::from_millis(20));
+                    };
+                    done.send(("pool", verdict)).unwrap();
+                })
+            };
+            let other = {
+                let (zk, bytes, done) = (zk.clone(), bytes.clone(), done_tx.clone());
+                std::thread::spawn(move || {
+                    go_rx.recv().unwrap();
+                    let ok = if other_side == "block application" {
+                        zk.verify_perp(&hc, 20, &binding, &bytes).is_ok()
+                    } else {
+                        zk.warm_perp(&shape);
+                        true
+                    };
+                    done.send(("other", ok)).unwrap();
+                })
+            };
+            for _ in 0..2 {
+                let (who, ok) = done_rx
+                    .recv_timeout(Duration::from_secs(300))
+                    .unwrap_or_else(|_| panic!("{other_side}: a pool verify and a build of the same shape deadlocked"));
+                assert!(ok, "{other_side}: {who} verified the honest proof");
+            }
+            pool.join().unwrap();
+            other.join().unwrap();
+            assert_eq!(zk.perp_key_builds(), 1, "{other_side}: S's key is built once");
+            assert!(zk.perp_key_ready(&shape));
+        }
+    }
+
     /// CON-60 (review): a pool verification of a state proof whose key is not built never waits
-    /// at the key-build gate. While another thread holds it the verification does not run and the
+    /// at the key-build gate. While a build holds it the verification does not run and the
     /// verdict is `StateProofBusy` (retryable, nothing cached, nothing pooled); a warm-shaped
     /// proof and any other transaction verify as before; with the gate free the cold proof runs.
     #[tokio::test]
@@ -7686,12 +7763,7 @@ mod tests {
         let (taken_tx, taken_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
         let holder = std::thread::spawn(move || {
-            let hold = loop {
-                if let Some(h) = PERP_KEY_BUILD_GATE.try_hold() {
-                    break h;
-                }
-                std::thread::yield_now();
-            };
+            let hold = PERP_KEY_BUILD_GATE.hold_for_test();
             taken_tx.send(()).unwrap();
             release_rx.recv().unwrap();
             drop(hold);

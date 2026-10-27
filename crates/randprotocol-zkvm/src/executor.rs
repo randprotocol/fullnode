@@ -2101,51 +2101,29 @@ impl PerpKeyBuildGate {
     }
 }
 
-std::thread_local! {
-    /// Whether this thread holds [`PERP_KEY_BUILD_GATE`] through a [`PerpBuildHold`], so a build
-    /// it runs meanwhile does not take the lock again.
-    static PERP_BUILD_HELD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
-/// CON-60: [`PERP_KEY_BUILD_GATE`] held by one thread for as long as this lives
-/// ([`PerpKeyBuildGate::try_hold`]); a state-proof key build that thread runs meanwhile goes
-/// through without waiting.
-pub struct PerpBuildHold {
-    _guard: std::sync::MutexGuard<'static, ()>,
-}
-
-impl Drop for PerpBuildHold {
-    fn drop(&mut self) {
-        PERP_BUILD_HELD.with(|h| h.set(false));
-    }
-}
-
 impl PerpKeyBuildGate {
-    /// CON-60, the pool's side of the gate: the gate now, held by this thread, or `None` when
-    /// another build has it. A node's pool verification of a state proof whose key is not built
-    /// takes this before it verifies and answers `StateProofBusy` on `None`, so a verify slot
-    /// never waits behind a build; a block's application keeps waiting at the gate.
-    pub fn try_hold(&'static self) -> Option<PerpBuildHold> {
-        if PERP_BUILD_HELD.with(|h| h.get()) {
-            return None;
-        }
-        let guard = match self.lock.try_lock() {
-            Ok(g) => g,
-            Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
-            Err(std::sync::TryLockError::WouldBlock) => return None,
-        };
-        PERP_BUILD_HELD.with(|h| h.set(true));
-        Some(PerpBuildHold { _guard: guard })
+    /// CON-60, the pool's side of the gate, advisory: whether a state-proof key build is running
+    /// right now. The lock is tried and released at once — never held — so a caller that goes on
+    /// to verify takes the key slot first and the gate inside it, the order every build uses.
+    /// A node's pool answers `StateProofBusy` for a state proof whose key is not built while this
+    /// is `true`, so its verify slots do not queue behind a build; a block's application waits.
+    pub fn is_busy(&self) -> bool {
+        matches!(self.lock.try_lock(), Err(std::sync::TryLockError::WouldBlock))
+    }
+
+    /// A test instrument: hold the gate (a build in flight) until the guard drops.
+    #[doc(hidden)]
+    pub fn hold_for_test(&'static self) -> std::sync::MutexGuard<'static, ()> {
+        self.lock.lock().unwrap_or_else(|e| e.into_inner())
     }
 }
 
 /// The gate's body: one build at a time (a poisoned lock — a build that panicked — still
-/// serialises), counted in [`PerpKeyBuildGate::peak`]. A thread holding the gate through a
-/// [`PerpBuildHold`] builds without taking the lock again.
+/// serialises), counted in [`PerpKeyBuildGate::peak`].
 fn perp_key_build(build: &mut dyn FnMut()) {
     use std::sync::atomic::Ordering::SeqCst;
     let g = &PERP_KEY_BUILD_GATE;
-    let _held = if PERP_BUILD_HELD.with(|h| h.get()) { None } else { Some(g.lock.lock().unwrap_or_else(|e| e.into_inner())) };
+    let _held = g.lock.lock().unwrap_or_else(|e| e.into_inner());
     struct Leave;
     impl Drop for Leave {
         fn drop(&mut self) {
@@ -4135,58 +4113,33 @@ mod tests {
         assert!(zk.perp_pinned.lock().unwrap().reserved.is_empty());
     }
 
-    /// CON-60 (review): the pool's side of the gate. `try_hold` takes the gate or answers `None`
-    /// at once while another thread has it — never waits — and a build the holding thread runs
-    /// meanwhile goes through without taking the lock again (no self-deadlock).
+    /// CON-60 (re-review): the pool's side of the gate is advisory. `is_busy` is `true` while a
+    /// build holds the gate and `false` once it is free, answers at once, and never leaves the
+    /// gate held: a build right after it goes through.
     #[test]
-    fn the_pool_takes_the_build_gate_without_waiting_or_is_told_it_is_busy() {
+    fn the_pools_busy_check_never_holds_the_build_gate() {
         use super::*;
-        use crate::machine::FriProfile;
-        let program = crate::guests::fib(10);
-        let binding = [9u32; TX_BINDING_WORDS];
-        let (bytes, _, _) = prove_call_hardened(FriProfile::Test, &program, &[], &[], &binding, [0; 4], None, None).unwrap();
-        let base = proof_shape(&bytes).unwrap();
         let gate = &PERP_KEY_BUILD_GATE;
-        // Other tests in this process build through the gate too: wait for it to be free.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(600);
-        let hold = loop {
-            if let Some(h) = gate.try_hold() {
-                break h;
-            }
-            assert!(std::time::Instant::now() < deadline, "the gate never came free");
-            std::thread::yield_now();
-        };
-        let elsewhere = std::thread::spawn(|| {
+        let held = gate.hold_for_test();
+        let (busy, took) = std::thread::spawn(|| {
             let t0 = std::time::Instant::now();
-            let got = PERP_KEY_BUILD_GATE.try_hold().is_some();
-            (got, t0.elapsed())
+            (PERP_KEY_BUILD_GATE.is_busy(), t0.elapsed())
         })
         .join()
         .unwrap();
-        assert!(!elsewhere.0, "another thread is told the gate is busy");
-        assert!(elsewhere.1 < std::time::Duration::from_secs(1), "and is told at once");
-        assert!(gate.try_hold().is_none(), "a second hold on the holding thread is refused, not a deadlock");
-        // A build on the holding thread runs through the gate it holds.
-        let zk = ZkExecutor::new(FriProfile::Test);
-        let before = zk.perp_key_builds();
-        zk.perp_machine.verifier_key(Tier(base.tier as usize), base.program_log_height, 9, 0, 0, base.public_log_height);
-        assert_eq!(zk.perp_key_builds(), before + 1);
-        drop(hold);
-        let free = std::thread::spawn(|| {
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(600);
-            loop {
-                if PERP_KEY_BUILD_GATE.try_hold().is_some() {
-                    return true;
-                }
-                if std::time::Instant::now() > deadline {
-                    return false;
-                }
-                std::thread::yield_now();
-            }
+        assert!(busy, "busy while a build holds it");
+        assert!(took < std::time::Duration::from_secs(1), "answered at once");
+        drop(held);
+        // The check itself holds nothing: a build after it (from another thread) runs.
+        let built = std::thread::spawn(|| {
+            let _ = PERP_KEY_BUILD_GATE.is_busy();
+            let mut ran = false;
+            perp_key_build(&mut || ran = true);
+            ran
         })
         .join()
         .unwrap();
-        assert!(free, "released when the hold is dropped");
+        assert!(built);
     }
 
     /// CON-60 round 4: pins are per cache. The general cache takes [`PERP_GENERAL_PINS`] pins and
