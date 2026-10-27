@@ -339,7 +339,10 @@ pub const MAX_CALL_TIER: u8 = 14;
 /// With every pin in place the worst header a call may still declare — tier 14, program and
 /// input tables at 2^16, public at 2^15, both hash tables at their caps — builds in 4.7 s at
 /// 312 MB peak, and eight such keys retained by `Machine`'s cache together peak at 711 MB
-/// (~60 MB retained a key; the same harness, `;`-separated shapes).
+/// (~60 MB a key in process RSS; the same harness, `;`-separated shapes). That is resident
+/// memory the allocator kept from the builds, not the keys: a counting allocator measures a
+/// stored key (`CommonData`: a commitment and per-chip lookup data, nothing trace-sized) at
+/// ~100 KB live heap at every tier (CON-60 round 5, [`PERP_GENERAL_KEYS`]).
 pub const MAX_CALL_KECCAK_LOG_HEIGHT: u8 = 12;
 /// The sha256 table's twin — 2^13 rows, 128 compressions (8 KB hashed). Its preprocessed trace
 /// is ten columns to keccak's 99, so it is the cheaper of the two at equal height (2^16 costs
@@ -2014,22 +2017,28 @@ pub const PERP_CANONICAL_KEYS: usize = 8;
 /// CON-60: the pins of the canonical cache — one per canonical shape. Only canonical shapes
 /// build there, so only they take these.
 pub const PERP_CANONICAL_PINS: usize = 4;
-/// CON-60: the general state-proof key cache (every non-canonical shape). Sized by memory: a
-/// tier-14 key measured ~60 MB retained (`MAX_CALL_KECCAK_LOG_HEIGHT`'s doc comment), and a
-/// key's preprocessed data grows with the tier's row count, so a tier-18 key is estimated at up
-/// to ~16× that, about 1 GB (not measured). A non-canonical honest shape is the prover's
-/// choice, and it pays a rebuild.
+/// CON-60: the general state-proof key cache (every non-canonical shape). A non-canonical honest
+/// shape is the prover's choice, and it pays a rebuild.
+///
+/// Memory, measured with a counting allocator on the perps shape (program height 14, input
+/// `T − 2`, public 7 and 8), Production and Test alike:
+/// - **a stored key keeps ~100 KB of live heap at every tier** (102 KB at tiers 10–16; the
+///   exported blob is 13 677 bytes) — the build's preprocessed traces and Merkle trees are
+///   dropped when it returns, so resident keys cost ~1 MB for all ten;
+/// - **a build is what costs memory**: its heap peaks at 14 MB (tier 10), 53 MB (12), 209 MB
+///   (14), ~0.84 GB (16), growing 4× a tier step, so ~3.3–4 GB at tier 18 (msauth's tier-18
+///   build measured 4.0 GB). Builds therefore run one at a time ([`PERP_KEY_BUILD_GATE`]), and
+///   a validator with under 8 GB should run `max_tier` ≤ 16 (`docs/perps.md`).
 pub const PERP_GENERAL_KEYS: usize = 2;
 /// CON-60: the pins of the general cache. The vendored LRU never evicts a pinned key and grows
 /// past its capacity once only pinned keys remain (it then holds `pins + 1`), so a cache's real
 /// bound is `max(capacity, pins + 1)`. With pins below capacity in both caches that is the
 /// capacity itself: **at most `PERP_GENERAL_KEYS + PERP_CANONICAL_KEYS` = 10 state-proof keys
 /// built and held**, whatever is sent (2 general, and on a chain with the genesis pin at most
-/// the 4 canonical shapes' keys in the canonical cache, so 6 in practice) — at the ~1 GB tier-18
-/// estimate, ≤ 2 GB general beside the canonical set every node needs anyway (4 keys under the
-/// genesis pin, the cache bounding it at 8 on a chain without one).
-/// Beyond that, at most one key per verify worker (4) can be mid-build in a slot the LRU already
-/// dropped. The startup warm builds a shape only while its cache has a pin left.
+/// the 4 canonical shapes' keys in the canonical cache, so 6 in practice) — ~100 KB each, about
+/// 1 MB in all ([`PERP_GENERAL_KEYS`]). The memory that matters is the one build in flight at a
+/// time ([`PERP_KEY_BUILD_GATE`]); the startup warm builds a shape only while its cache has a
+/// pin left, and reserves it first.
 pub const PERP_GENERAL_PINS: usize = 1;
 
 /// CON-60: the state-proof pins, and the pins reserved by a warm or a keep in flight; both count

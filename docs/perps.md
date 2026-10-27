@@ -523,9 +523,8 @@ bridged one.
     own cache of 8 (a chain has at most four canonical shapes); other shapes share a cache of 2.
     Pins are per cache — 4 in the canonical cache, 1 in the general one, each below its cache's
     size — so neither cache ever holds more keys than its size: at most 10 state-proof keys in
-    all, 6 on a chain with the genesis pin (a tier-14 key is ~60 MB retained; a tier-18 key is
-    estimated, not measured, at up to ~1 GB, so ~2 GB for the general cache beside the
-    canonical set every node needs anyway). With its bucket spent a
+    all, 6 on a chain with the genesis pin. A stored key keeps ~100 KB at every tier (its
+    exported blob is 13 677 bytes), so the caches hold about 1 MB. With its bucket spent a
     proof is refused `this node is at its limit of verifier-key builds for new state-proof
     shapes; retry later` (`StateProofBusy`, retryable, never cached, no peer penalised, no
     timing). No refusal moves a bucket. An attacker can force at most one build per canonical
@@ -537,7 +536,12 @@ bridged one.
     builds and pins each whose cache still has a pin (reserving the pin before it builds);
   - **one state-proof key build at a time** per process, across both caches, every verify
     worker and the startup warm: a second cold shape waits for the first build, while proofs of
-    warm shapes keep verifying.
+    warm shapes keep verifying. **The build is the memory cost**: its heap peaks at ~0.84 GB at
+    tier 16 and ~3.3–4 GB at tier 18 (4× a tier step; measured with a counting allocator to tier
+    16, msauth's tier-18 build at 4.0 GB). **A validator with less than 8 GB of memory should run
+    a chain whose perps `max_tier` is at most 16**, or — a follow-up, not built yet — load a
+    precomputed, hash-pinned state-proof key (13.7 KB, as the msauth key is loaded) instead of
+    building it.
 
   **The canonical state-proof shape** (`ledger::perps::canonical_input_log_height`,
   `canonical_witness_words`, `segment_public_log_height`; `rand perp prove` proves at it unless
