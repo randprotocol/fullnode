@@ -370,6 +370,7 @@ pub fn is_permanent(e: &TxError) -> bool {
             | P::PayoutExceedsCollateral { .. } => true,
             P::NonceUsed
             | P::WindowMismatch { .. }
+            | P::WindowTooManyBlocks { .. }
             | P::MissingDigest(_)
             | P::UnknownRequest
             | P::UnknownAccount
@@ -1172,6 +1173,7 @@ pub fn acceptance_for_pool(e: &MempoolError, hash: Hash, refused: &mut RefusedCa
         | MempoolError::PerpAccountFull(_)
         | MempoolError::PerpPoolFull
         | MempoolError::PerpBackpressure { .. }
+        | MempoolError::PerpHeightBackpressure { .. }
         | MempoolError::StateProofBackoff { .. } => Acceptance::Ignore,
     }
 }

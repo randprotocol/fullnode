@@ -6209,6 +6209,8 @@ pub(crate) mod tests {
             genesis_root: [8; 8],
             bound_payouts: false,
             initial_collateral: 0,
+            sparse_windows: false,
+            max_window_heights: 0,
             markets: vec![perps::MarketSpec {
                 id: 0,
                 symbol: "X-PERP".into(),

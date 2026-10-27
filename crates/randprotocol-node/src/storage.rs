@@ -3181,6 +3181,9 @@ impl Storage {
                     }
                 }
                 (None, None) => {}
+                // PERP-101: under `sparse_windows` a block without perp inputs (and no heartbeat
+                // due) records no digest, so it has no words either.
+                (None, Some(p)) if p.config.sparse_windows && p.digest(block.height()).is_none() => {}
                 (words, _) => {
                     return Err(StorageError::Corrupt(format!(
                         "block {} carries perp input words for height {:?} on a chain {} the perps section",
@@ -5219,6 +5222,8 @@ pub(crate) mod fixtures {
             genesis_root: [32; 8],
             bound_payouts: false,
             initial_collateral: 0,
+            sparse_windows: false,
+            max_window_heights: 0,
             markets: vec![randprotocol_core::ledger::perps::MarketSpec {
                 id: 0,
                 symbol: "BTC-PERP".into(),
@@ -9264,6 +9269,39 @@ mod tests {
     /// state proof prunes every row at or under its height; `truncate_to` drops the rows above
     /// its height; and the repair puts back what the replay can re-derive — the words of every
     /// height no proof covers — so a truncation below a proof leaves no prover without its input.
+    /// PERP-101: on a `sparse_windows` chain a block without perp inputs records no digest and
+    /// carries no words, and storage commits it without a row; a block that did record one must
+    /// still carry its words. The ledger reloads as stored.
+    #[test]
+    fn a_sparse_chains_input_less_blocks_store_no_words() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Storage::open(dir.path()).unwrap();
+        let mut file = perps_genesis_file(7);
+        let c = file.perps.as_mut().unwrap();
+        c.sparse_windows = true;
+        c.max_window_heights = 16;
+        let gs = file.build(&StubExecutor).unwrap();
+        s.init_genesis(&gs).unwrap();
+        let mut ledger = gs.ledger.clone();
+        let deposit = perp_deposit_tx(&ledger, &key(50), 300, 5_000_000);
+        let b1 = make_perps_block(&gs.block, &mut ledger, vec![deposit], &key(1));
+        assert!(b1.perp_words.is_some());
+        let b2 = make_perps_block(&b1, &mut ledger, vec![], &key(1));
+        assert_eq!(b2.perp_words, None, "an input-less block leaves no words");
+        s.commit(&[b1.clone(), b2.clone()], &ledger, &[], &StubExecutor).unwrap();
+        assert!(s.perp_inputs(1).unwrap().is_some());
+        assert_eq!(s.perp_inputs(2).unwrap(), None);
+        assert_eq!(s.perps().unwrap().unwrap().pending_heights(), vec![1]);
+        // A recorded block without its words is still torn.
+        let mut probe = ledger.clone();
+        let deposit = perp_deposit_tx(&probe, &key(51), 400, 5_000_000);
+        let mut torn = make_perps_block(&b2, &mut probe, vec![deposit], &key(1));
+        torn.perp_words = None;
+        assert!(s.commit(std::slice::from_ref(&torn), &probe, &[], &StubExecutor).is_err());
+        let reloaded = crate::node::reload_ledger(&s, &gs, &StubExecutor).unwrap();
+        assert_eq!(reloaded.perps(), ledger.perps());
+    }
+
     #[test]
     fn perps_are_persisted_restored_and_truncated() {
         use randprotocol_core::ledger::perps::{self, PerpPayout};

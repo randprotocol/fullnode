@@ -61,8 +61,10 @@ proved root and height, the digests not yet proved, and the withdrawals waiting 
 | `markets` | the `MarketSpec` list below |
 | `bound_payouts` | optional, default `false` (audit v10, PERP-6): a state proof whose payouts total more than the collateral the chain has counted the exchange holding — `initial_collateral + collateral_in − collateral_out` — is refused `PayoutExceedsCollateral`, at validate and at apply. Permanent: an engine that pays what it was never given is an engine fault. Off (chain 21), a payout is bounded by its request alone, and a request only by the note bound 2^63 |
 | `initial_collateral` | optional, default 0: the collateral the genesis engine state already holds (accounts and insurance fund), in collateral units, below 2^63; what the count above starts from |
+| `sparse_windows` | optional, default `false` (PERP-101): blocks without perp inputs record no digest, and a state proof spans up to `max_window_heights` heights over at most `max_window_blocks` recorded blocks ("Sparse windows" below). Off (chain 21), every block records a digest and a window is at most `max_window_blocks` consecutive heights |
+| `max_window_heights` | optional, default 0; required with `sparse_windows`, from `max_window_blocks` to `MAX_WINDOW_HEIGHTS` = 4096, and 0 without it: the most heights one sparse window spans, and the heartbeat interval |
 
-The audit-v10 fields are bound into the genesis hash **only when set** (`PerpsConfig::commit_bytes`:
+The audit-v10 fields (and PERP-101's two) are bound into the genesis hash **only when set** (`PerpsConfig::commit_bytes`:
 the pre-v10 shape's bincode, then each later field tagged by name), so a file that omits them —
 chain 21's — hashes exactly as it did at its cut (`chain_21s_genesis_file_still_hashes_as_cut`).
 
@@ -305,6 +307,44 @@ all:
 The proof is not a bundle's: `proof` is kept inside the transaction's binding, as a call's is, and
 `proof_bytes` is capped by `max_proof_bytes`.
 
+### Sparse windows (PERP-101)
+
+On 1 s blocks one prover cannot keep up with a digest per block (`max_window_blocks` is at most 64
+and a tier-18 proof takes minutes), so withdrawals would wait without bound. Under the genesis flag
+`sparse_windows` the engine is not run over blocks that carry nothing for it:
+
+- **Close.** A block with no perp input records **no digest and no words**, unless
+  `max_window_heights` heights have passed since the last recorded digest (or the proved height,
+  when none waits) — then its `Close` is recorded as a **heartbeat**, so funding, marks and
+  liquidations still run at least every `max_window_heights` heights and every window stays
+  reachable. The oracle median is computed at every close either way (it is ledger state). The
+  engine sees fewer closes: a liquidation or a funding step on a price that moved and moved back
+  between two recorded closes is not run (funding accrues the elapsed time at the next recorded
+  close, capped at one period, as before). That is the trade the flag makes.
+- **Window.** `from_height` equals `proved_height`; `to_height > from_height`;
+  `to_height - from_height <= max_window_heights` (`WindowMismatch`, its `max` that bound);
+  `to_height` is a recorded height (`MissingDigest(to)`); and the span holds at most
+  `max_window_blocks` recorded digests (`WindowTooManyBlocks`). The ledger builds the segment from
+  **every** recorded digest in `from+1 ..= to`, in height order — the segment's shape is unchanged,
+  `n_blocks` is their count — and the engine's block-count output must equal that count. The same
+  engine image proves both kinds of window: it never reads a block's height for order.
+- **Settlement** is unchanged: the proved root and height move to `to`, the covered digests go, and
+  every pending request recorded at or below `to` is settled.
+- **The node.** A block that recorded nothing stores no `perp_inputs` row, and
+  `rand_getPerpInputs` answers `null` for it; `rand_getPerps.pending_heights` lists only the
+  recorded heights. Back-pressure on new orders counts both recorded digests (four
+  `max_window_blocks`) and heights (four `max_window_heights` between the head and the proved
+  height).
+
+**Building a sparse job (a prover).** From `rand_getPerps`: take `pending_heights` greater than
+`proved_height`, ascending, while each is within `max_window_heights` of `proved_height` and at most
+`max_window_blocks` (or the prover's own smaller cap) of them; `to_height` is the last one taken.
+Fetch each one's words with `rand_getPerpInputs [h]` (never the heights between them), replay the
+engine over exactly those blocks in that order, and write the job with `from_height =
+proved_height`, `blocks` = those heights and words. `rand perp prove` checks the job against the
+chain (`check_window`) and refuses one that skips or adds a height before proving. The client
+library's `next_window_heights` is the reference for the selection.
+
 ### The supply audit
 
 A RAND deposit's `burn_r` is inside `burned`; a payout mints a note. The ledger keeps two counters
@@ -486,10 +526,12 @@ not the chain's `proved_root`, which is how the prover learns to roll back.
 - **No withdrawal fee (I2).** The spec's bundled withdrawal is deferred: a request is bundle-less
   and fee-less, bounded by one pending per account and 8 in all at the ledger, and by the pool's
   per-account and pool-wide counts of fee-less perp actions (PERP-1, "The node").
-- **Provers versus 1 s blocks (I7).** `MAX_WINDOW_BLOCKS` is 64, and a tier-16 proof takes 76 to
-  400 s, so on 1 s blocks a single prover falls behind the digests it must cover. A demo chain
-  runs 2 s blocks; back-pressure on inputs while proofs lag, and eliding empty blocks from a
-  window, are follow-ups.
+- **Provers versus 1 s blocks (I7, PERP-101).** `MAX_WINDOW_BLOCKS` is 64, and a tier-16 proof
+  takes 76 to 400 s, so on 1 s blocks a single prover falls behind the digests it must cover on a
+  dense chain (chain 21). Back-pressure holds new orders while proofs lag (PERP-1); genesis
+  `sparse_windows` (from the next cut) elides input-less blocks so a window covers up to
+  `max_window_heights` heights. A busy exchange (inputs in most blocks) still needs proving at the
+  input rate: sparse windows bound the lag by activity, not by block count.
 - **The gate's error (M3).** `PerpError::Disabled` is the section gate's refusal. The five
   bundle-less actions are gated at the action step; a state proof is gated before the size caps
   (so a chain without the section answers `Disabled`, not `ProofTooLarge`).

@@ -123,6 +123,13 @@ pub struct PerpsState {
     pub engine_hc: Word8,
     pub proved_root: Word8,
     pub proved_height: u64,
+    /// PERP-101: blocks without perp inputs are elided from windows (`false` from a node that
+    /// predates the field), and the most heights one window spans then (0 without).
+    pub sparse_windows: bool,
+    pub max_window_heights: u64,
+    /// The recorded heights no state proof has covered, ascending: the blocks the next window
+    /// runs the engine over.
+    pub pending_heights: Vec<u64>,
 }
 
 impl PerpsState {
@@ -139,6 +146,15 @@ impl PerpsState {
             engine_hc: word8_of(&v["engine_hc"], "rand_getPerps.engine_hc")?,
             proved_root: word8_of(&v["proved_root"], "rand_getPerps.proved_root")?,
             proved_height: u64_of(&v["proved_height"], "proved_height")?,
+            sparse_windows: v["sparse_windows"].as_bool().unwrap_or(false),
+            max_window_heights: match &v["max_window_heights"] {
+                Value::Null => 0,
+                h => u64_of(h, "max_window_heights")?,
+            },
+            pending_heights: match v["pending_heights"].as_array() {
+                Some(a) => a.iter().map(|h| u64_of(h, "pending_heights")).collect::<Result<_>>()?,
+                None => Vec::new(),
+            },
         })
     }
 
@@ -464,10 +480,17 @@ impl ProveJob {
             .with_context(|| format!("{} is not a perp prove job", path.display()))
     }
 
-    /// The job's own consistency: a non-empty window of consecutive heights `from + 1 ..= to`,
-    /// at most [`MAX_PERP_PAYOUTS`] payouts, each request at most once, in the engine's order (the
-    /// ledger's rules for a state proof's list: the digest binds the order, nothing sorts it).
+    /// The job's own consistency on a dense chain: [`Self::check_for`] with `sparse` false.
     pub fn check(&self) -> Result<()> {
+        self.check_for(false)
+    }
+
+    /// The job's own consistency: a non-empty window `from + 1 ..= to` — every height of it
+    /// (dense), or strictly ascending heights inside it ending at `to` (`sparse`, PERP-101:
+    /// the chain elides blocks without perp inputs) — at most [`MAX_PERP_PAYOUTS`] payouts, each
+    /// request at most once, in the engine's order (the ledger's rules for a state proof's list:
+    /// the digest binds the order, nothing sorts it).
+    pub fn check_for(&self, sparse: bool) -> Result<()> {
         if self.to_height <= self.from_height || self.blocks.is_empty() {
             bail!(
                 "the job covers no block ({}..={})",
@@ -475,9 +498,23 @@ impl ProveJob {
                 self.to_height
             );
         }
-        let expected = self.from_height.saturating_add(1)..=self.to_height;
-        if self.blocks.len() as u64 != self.to_height - self.from_height
-            || self.blocks.iter().zip(expected).any(|(b, h)| b.height != h)
+        if sparse {
+            let ascending = self.blocks.windows(2).all(|w| w[0].height < w[1].height);
+            let inside = self.blocks.first().is_some_and(|b| b.height > self.from_height);
+            if !ascending || !inside || self.blocks.last().map(|b| b.height) != Some(self.to_height) {
+                bail!(
+                    "the job's blocks are not ascending heights inside {}..={} ending at {}",
+                    self.from_height.saturating_add(1),
+                    self.to_height,
+                    self.to_height
+                );
+            }
+        } else if self.blocks.len() as u64 != self.to_height - self.from_height
+            || self
+                .blocks
+                .iter()
+                .zip(self.from_height.saturating_add(1)..=self.to_height)
+                .any(|(b, h)| b.height != h)
         {
             bail!(
                 "the job's blocks are not the consecutive heights {}..={}",
@@ -564,10 +601,10 @@ pub async fn prove_and_submit_state_proof(
     submit: bool,
     wait: bool,
 ) -> Result<(Hash, u8, usize)> {
-    job.check()?;
+    let state = PerpsState::fetch(rpc).await?;
+    job.check_for(state.sparse_windows)?;
     let executor = ZkExecutor::new(profile);
     let (segment, r_from, r_to) = job_segment(job, &executor);
-    let state = PerpsState::fetch(rpc).await?;
     if job.from_height != state.proved_height {
         bail!(
             "the job starts at height {}; the chain's proved_height is {}",
@@ -582,13 +619,8 @@ pub async fn prove_and_submit_state_proof(
             randprotocol_core::notes::word8_to_hex(&state.proved_root)
         );
     }
-    let span = job.to_height - job.from_height;
-    if span > state.max_window_blocks {
-        bail!(
-            "the job covers {span} blocks; this chain's max_window_blocks is {}",
-            state.max_window_blocks
-        );
-    }
+    let n_blocks = job.blocks.len() as u64;
+    check_window(job, &state)?;
     for (b, block) in job.blocks.iter().enumerate() {
         let served = rpc.get_perp_inputs(block.height).await?.ok_or_else(|| {
             anyhow!(
@@ -628,7 +660,7 @@ pub async fn prove_and_submit_state_proof(
     )
     .map_err(|e| anyhow!("the engine does not run over this window: {e:?}"))?;
     if exec.outputs[0] != randprotocol_core::ledger::perps::PERP_VERSION
-        || u64::from(exec.outputs[1]) != span
+        || u64::from(exec.outputs[1]) != n_blocks
     {
         bail!(
             "the engine refused this window (outputs {:?})",
@@ -685,6 +717,75 @@ pub async fn prove_and_submit_state_proof(
         .hash()
     };
     Ok((hash, proved_tier, proof_bytes))
+}
+
+/// The window rules of the chain for `job`, before anything is proved: on a dense chain at most
+/// `max_window_blocks` heights; under `sparse_windows` (PERP-101) a span of at most
+/// `max_window_heights`, at most `max_window_blocks` blocks, and exactly the chain's recorded
+/// heights inside the span (`rand_getPerps.pending_heights`) — the ledger builds the segment
+/// from every one of them, so a job that skips one would prove a segment the chain never builds.
+pub fn check_window(job: &ProveJob, state: &PerpsState) -> Result<()> {
+    let span = job.to_height - job.from_height;
+    let n_blocks = job.blocks.len() as u64;
+    if !state.sparse_windows {
+        if span > state.max_window_blocks {
+            bail!(
+                "the job covers {span} blocks; this chain's max_window_blocks is {}",
+                state.max_window_blocks
+            );
+        }
+        return Ok(());
+    }
+    if span > state.max_window_heights {
+        bail!(
+            "the job spans {span} heights; this chain's max_window_heights is {}",
+            state.max_window_heights
+        );
+    }
+    if n_blocks > state.max_window_blocks {
+        bail!(
+            "the job runs {n_blocks} blocks; this chain's max_window_blocks is {}",
+            state.max_window_blocks
+        );
+    }
+    let recorded: Vec<u64> = state
+        .pending_heights
+        .iter()
+        .copied()
+        .filter(|h| *h > job.from_height && *h <= job.to_height)
+        .collect();
+    let heights: Vec<u64> = job.blocks.iter().map(|b| b.height).collect();
+    if heights != recorded {
+        bail!(
+            "the job's heights {heights:?} are not the chain's recorded heights {recorded:?} inside {}..={}",
+            job.from_height + 1,
+            job.to_height
+        );
+    }
+    Ok(())
+}
+
+/// The heights the next sparse window runs over (PERP-101), from `rand_getPerps`: the recorded
+/// heights after `proved_height`, ascending, taken while each stays within `max_window_heights`
+/// of `proved_height` and at most `max_window_blocks` (and `cap`, a prover's own limit, when
+/// smaller) of them. The window's `to_height` is the last one. Empty when nothing is recorded
+/// in reach. On a dense chain, the consecutive heights from `proved_height + 1`.
+pub fn next_window_heights(state: &PerpsState, cap: Option<u64>) -> Vec<u64> {
+    let blocks = cap.map_or(state.max_window_blocks, |c| c.min(state.max_window_blocks)).max(1);
+    let reach = if state.sparse_windows { state.max_window_heights } else { blocks };
+    let mut out = Vec::new();
+    let mut want = state.proved_height + 1;
+    for &h in state.pending_heights.iter().filter(|h| **h > state.proved_height) {
+        if h - state.proved_height > reach || out.len() as u64 >= blocks {
+            break;
+        }
+        if !state.sparse_windows && h != want {
+            break;
+        }
+        out.push(h);
+        want = h + 1;
+    }
+    out
 }
 
 /// The tier `rand perp prove` proves at: `--tier` when given, else `needed`, the smallest tier
@@ -829,6 +930,83 @@ mod tests {
         })
         .await;
         (url, sent)
+    }
+
+    fn sparse_state(proved: u64, pending: Vec<u64>) -> PerpsState {
+        PerpsState {
+            collateral_asset: 0,
+            max_tier: 18,
+            max_window_blocks: 2,
+            engine_hc: [9; 8],
+            proved_root: [0; 8],
+            proved_height: proved,
+            sparse_windows: true,
+            max_window_heights: 16,
+            pending_heights: pending,
+        }
+    }
+
+    /// PERP-101: `rand_getPerps`' two new fields and its pending heights decode, and a node that
+    /// predates them reads as a dense chain.
+    #[test]
+    fn perps_state_reads_the_sparse_window_fields() {
+        let mut v = json!({
+            "enabled": true, "collateral_asset": 1, "max_tier": 18, "max_window_blocks": 64,
+            "engine_hc": word8_to_hex(&[9; 8]), "proved_root": word8_to_hex(&[0; 8]),
+            "proved_height": "5", "pending_heights": [6, "9"],
+        });
+        let dense = PerpsState::from_json(&v).unwrap();
+        assert_eq!((dense.sparse_windows, dense.max_window_heights, dense.pending_heights.clone()), (false, 0, vec![6, 9]));
+        v["sparse_windows"] = json!(true);
+        v["max_window_heights"] = json!(4096);
+        let sparse = PerpsState::from_json(&v).unwrap();
+        assert_eq!((sparse.sparse_windows, sparse.max_window_heights), (true, 4096));
+    }
+
+    /// PERP-101: the next sparse window takes the recorded heights after the proved height while
+    /// they stay within `max_window_heights` of it and `max_window_blocks` of them; a dense
+    /// window takes consecutive heights only.
+    #[test]
+    fn the_next_window_follows_the_chains_recorded_heights() {
+        let s = sparse_state(5, vec![6, 9, 21, 40]);
+        assert_eq!(next_window_heights(&s, None), vec![6, 9], "two blocks at most");
+        let mut wide = s.clone();
+        wide.max_window_blocks = 8;
+        assert_eq!(next_window_heights(&wide, None), vec![6, 9, 21], "40 is 35 heights on");
+        assert_eq!(next_window_heights(&wide, Some(1)), vec![6], "a prover's own cap");
+        let mut dense = wide.clone();
+        dense.sparse_windows = false;
+        dense.max_window_heights = 0;
+        dense.pending_heights = vec![6, 7, 8, 10];
+        assert_eq!(next_window_heights(&dense, None), vec![6, 7, 8]);
+        assert!(next_window_heights(&sparse_state(5, vec![]), None).is_empty());
+    }
+
+    /// PERP-101: a sparse job must run exactly the chain's recorded heights inside its span, within
+    /// both bounds; a dense job keeps the consecutive-heights rule.
+    #[test]
+    fn a_sparse_job_must_run_exactly_the_recorded_heights_of_its_span() {
+        let mut j = job();
+        j.blocks[0].height = 6;
+        j.blocks[1].height = 9;
+        j.to_height = 9;
+        assert!(j.check().unwrap_err().to_string().contains("consecutive"), "dense refuses a gap");
+        j.check_for(true).expect("ascending, ending at to");
+        check_window(&j, &sparse_state(5, vec![6, 9, 21])).expect("exactly the recorded heights");
+        let e = check_window(&j, &sparse_state(5, vec![6, 8, 9])).unwrap_err().to_string();
+        assert!(e.contains("recorded heights"), "{e}");
+        let mut far = j.clone();
+        far.to_height = 22;
+        far.blocks[1].height = 22;
+        let e = check_window(&far, &sparse_state(5, vec![6, 22])).unwrap_err().to_string();
+        assert!(e.contains("max_window_heights"), "{e}");
+        let mut many = j.clone();
+        many.blocks.insert(1, JobBlock { height: 7, words: vec![] });
+        let e = check_window(&many, &sparse_state(5, vec![6, 7, 9])).unwrap_err().to_string();
+        assert!(e.contains("max_window_blocks"), "{e}");
+        let mut unordered = j.clone();
+        unordered.blocks.swap(0, 1);
+        assert!(unordered.check_for(true).is_err());
     }
 
     /// M2: the tier is the dry run's unless `--tier` raises it, and a window that needs more than

@@ -3153,6 +3153,10 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
                 "collateral_asset": c.collateral_asset,
                 "max_tier": c.max_tier,
                 "max_window_blocks": c.max_window_blocks,
+                // PERP-101: whether blocks without perp inputs are elided from windows, and the
+                // most heights one window spans then (0 without).
+                "sparse_windows": c.sparse_windows,
+                "max_window_heights": c.max_window_heights,
                 "max_block_inputs": c.max_block_inputs,
                 "min_deposit": c.min_deposit.to_string(),
                 "engine_hc": word8_to_hex(&c.engine_hc),
@@ -8241,6 +8245,8 @@ pub(crate) mod tests {
                 "collateral_asset": 0,
                 "max_tier": 16,
                 "max_window_blocks": 8,
+                "sparse_windows": false,
+                "max_window_heights": 0,
                 "max_block_inputs": 8,
                 "min_deposit": "1000",
                 "engine_hc": word8_to_hex(&cfg.engine_hc),

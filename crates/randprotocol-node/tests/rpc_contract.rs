@@ -1031,6 +1031,8 @@ async fn perps_reads_under_a_perps_section() {
                 genesis_root: [32; 8],
                 bound_payouts: false,
                 initial_collateral: 0,
+                sparse_windows: false,
+                max_window_heights: 0,
                 markets: vec![randprotocol_core::ledger::perps::MarketSpec {
                     id: 0,
                     symbol: "BTC-PERP".into(),

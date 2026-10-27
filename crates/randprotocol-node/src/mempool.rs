@@ -78,6 +78,11 @@ pub enum MempoolError {
     /// prices and state proofs are unaffected. `Full`-class: retryable, never cached.
     #[error("the exchange has {unproved} unproved block digests ({max} is this node's limit for new orders); retry once a state proof lands")]
     PerpBackpressure { unproved: usize, max: usize },
+    /// PERP-101: under `sparse_windows`, the tip is `behind` heights past the proved height —
+    /// [`PERP_BACKPRESSURE_WINDOWS`] × `max_window_heights` or more — so this node admits no new
+    /// order until a prover catches up. The same scope and class as `PerpBackpressure`.
+    #[error("the exchange is {behind} heights past its proved height ({max} is this node's limit for new orders); retry once a state proof lands")]
+    PerpHeightBackpressure { behind: u64, max: u64 },
     /// Audit v10, CON-60 (b): this node refused a state-proof verification a moment ago and
     /// verifies no other state proof for `remaining_ms`. Retryable, never cached, no peer
     /// penalised for a proof the node did not look at.
@@ -117,6 +122,7 @@ impl MempoolError {
                 | MempoolError::PerpAccountFull(_)
                 | MempoolError::PerpPoolFull
                 | MempoolError::PerpBackpressure { .. }
+                | MempoolError::PerpHeightBackpressure { .. }
                 | MempoolError::StateProofBackoff { .. }
         )
     }
@@ -500,6 +506,16 @@ impl Mempool {
             let unproved = p.pending_digests();
             if unproved >= max {
                 return Err(MempoolError::PerpBackpressure { unproved, max });
+            }
+            // PERP-101: under `sparse_windows` a window is bounded by heights too, so the prover
+            // is as far behind when the tip is that many windows' heights past the proved one,
+            // however few digests those heights recorded.
+            if p.config.sparse_windows {
+                let max = p.config.max_window_heights.saturating_mul(PERP_BACKPRESSURE_WINDOWS as u64);
+                let behind = ledger.height().saturating_sub(p.proved_height);
+                if behind >= max {
+                    return Err(MempoolError::PerpHeightBackpressure { behind, max });
+                }
             }
         }
         Ok(())
@@ -4325,6 +4341,43 @@ mod tests {
         after.apply_transactions(std::slice::from_ref(&proof), &key(1).address(), &StubExecutor).unwrap();
         assert_eq!(after.perps().unwrap().pending_digests(), max - 8);
         assert!(m.precheck(&order, &after, &StubExecutor).is_ok(), "orders flow again");
+    }
+
+    /// PERP-101: under `sparse_windows` few digests may wait while many heights do, so a new
+    /// order is also held back once the tip is four windows' heights (`PERP_BACKPRESSURE_WINDOWS`
+    /// × `max_window_heights`, 64 here) past the proved height; a dense chain (chain 21's rule)
+    /// counts digests alone, the same tip included.
+    #[test]
+    fn under_sparse_windows_new_orders_are_held_once_four_windows_of_heights_pass() {
+        use fixtures::{key, make_perps_block, perp_deposit_tx};
+        let a = key(50);
+        let m = Mempool::new(100);
+        let order = perp_order_tx(&a, 1);
+        let run = |sparse: bool| {
+            let mut file = fixtures::perps_genesis_file(7);
+            let c = file.perps.as_mut().unwrap();
+            c.sparse_windows = sparse;
+            c.max_window_heights = if sparse { 16 } else { 0 };
+            let gs = file.build(&StubExecutor).unwrap();
+            let mut l = gs.ledger.clone();
+            let deposit = perp_deposit_tx(&l, &a, 300, 5_000_000);
+            let mut parent = make_perps_block(&gs.block, &mut l, vec![deposit], &key(1));
+            for _ in 2..64 {
+                parent = make_perps_block(&parent, &mut l, vec![], &key(1));
+            }
+            let at_63 = l.clone();
+            make_perps_block(&parent, &mut l, vec![], &key(1));
+            (at_63, l)
+        };
+        let (at_63, at_64) = run(true);
+        assert_eq!(at_64.perps().unwrap().pending_digests(), 4, "1, 17, 33 and 49: far under the digest limit");
+        assert!(m.precheck(&order, &at_63, &StubExecutor).is_ok(), "63 heights behind");
+        let held = MempoolError::PerpHeightBackpressure { behind: 64, max: 64 };
+        assert_eq!(m.precheck(&order, &at_64, &StubExecutor).unwrap_err(), held);
+        assert!(held.is_retryable());
+        // Dense: 64 digests wait, which is the digest limit (32) twice over — that rule, unchanged.
+        let (_, dense) = run(false);
+        assert!(matches!(m.precheck(&order, &dense, &StubExecutor).unwrap_err(), MempoolError::PerpBackpressure { .. }));
     }
 
     /// An invoke's payout notes are leaves like any other: the pool claims them (through

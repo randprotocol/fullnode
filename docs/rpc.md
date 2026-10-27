@@ -419,6 +419,7 @@ without a `perps` section:
 ```json
 { "enabled": true,
   "collateral_asset": 0, "max_tier": 18, "max_window_blocks": 64,
+  "sparse_windows": false, "max_window_heights": 0,
   "max_block_inputs": 8, "min_deposit": "1000000",
   "engine_hc": "<64 hex>", "genesis_root": "<64 hex>",
   "markets": [{ "id": 0, "symbol": "BTC-PERP", "lot": 1000000, "tick": 1000000,
@@ -435,9 +436,16 @@ The last five (audit v10, PERP-6) are the genesis `bound_payouts` gate and `init
 and the ledger's collateral counters in the collateral asset: every deposit, every payout a proof
 listed, and `initial_collateral + in − out`, decimal strings (`docs/perps.md`, "The supply audit").
 
+`sparse_windows` and `max_window_heights` (PERP-101) are the genesis fields of the same names,
+`false` and `0` on a chain without them (chain 21); `max_window_heights` is a JSON number, like
+`max_window_blocks`. A node that predates them omits both: read the absence as `false`/`0`.
+
 The three commitments are 64 lowercase hex characters (a `Word8`, its eight words little-endian).
 `pending_heights` are the closed heights no state proof has covered, ascending: the digests the
-next proof's window is drawn from. A median is a decimal string, `"0"` when the last close had no
+next proof's window is drawn from. On a dense chain (`sparse_windows` false) that is every height
+from `proved_height + 1` to the head. Under `sparse_windows` it is only the **recorded** heights —
+those whose block carried a perp input, and the heartbeat closes — so it has gaps, and the next
+window is built from it as `docs/perps.md` ("Sparse windows") describes. A median is a decimal string, `"0"` when the last close had no
 quorum of fresh oracle stake behind a price (`docs/perps.md`). `max_block_inputs` is the most perp
 inputs one block records and `min_deposit` (a decimal string, `"0"` for no floor) the smallest
 deposit. This is what `perp-prover` and the trading site poll. On the public listener.
@@ -477,7 +485,8 @@ over:
 recomputed over the stored words (`perp_digest`, domain 21); a prover refuses a window whose
 digests do not match its own. `words` are the block's inputs in block order and the closing
 `Close` (`docs/perps.md`, "The word encodings"), each a `u32`. `null` for a height this node holds
-no row for: a state proof has covered it (the row is pruned with the proof), it is above the head,
+no row for: a state proof has covered it (the row is pruned with the proof), the chain runs
+`sparse_windows` and the height recorded no digest (PERP-101: no input and no heartbeat), it is above the head,
 or the chain has no `perps` section. On the public listener.
 
 ### `rand_getMultisig`
@@ -1639,7 +1648,9 @@ withdrawal requests; audit v10, PERP-1) have two caps of their own, 16 per accou
 all, refused `mempool holds 16 fee-less perp actions of account … already` and `mempool full of
 fee-less perp actions (1024)`; and while four `max_window_blocks` of recorded digests wait for a
 state proof a new order is refused `the exchange has N unproved block digests …` (`docs/perps.md`,
-"The node"). All three are `mempool full`'s class: about this node, retryable, never cached.
+"The node"); under genesis `sparse_windows` (PERP-101) also while the head is four
+`max_window_heights` or more past the proved height, refused `the exchange is N heights past its
+proved height …`. All of them are `mempool full`'s class: about this node, retryable, never cached.
 
 ### `rand_getEmission`
 Params: `[]`. Result:

@@ -62,6 +62,9 @@ pub const PERP_FROM: Word8 = [u32::from_le_bytes(*b"rpl3"), u32::from_le_bytes(*
 const _: () = assert!(MAX_PERP_PAYOUTS as u64 <= super::MAX_LEAVES_PER_TX);
 /// The most blocks `max_window_blocks` may set one state proof to cover.
 pub const MAX_WINDOW_BLOCKS: u64 = 64;
+/// The most heights `max_window_heights` may let one sparse-window state proof span (PERP-101),
+/// which is also the longest a sparse chain goes without a recorded `Close`.
+pub const MAX_WINDOW_HEIGHTS: u64 = 4096;
 /// The widest a nonce window reaches below its highest nonce: the 64 bits of `used`.
 const NONCE_WINDOW: u64 = 64;
 /// The most `max_block_inputs` may let one block record: the genesis bound on the perp inputs
@@ -141,6 +144,21 @@ pub struct PerpsConfig {
     /// fresh engine.
     #[serde(default)]
     pub initial_collateral: u64,
+    /// PERP-101 (genesis-gated, default off): sparse windows. A block that records no perp input
+    /// records no digest either — the engine is not run over it — unless `max_window_heights`
+    /// heights have passed since the last recorded digest (or the proved height), when its
+    /// `Close` is recorded as a heartbeat so funding, marks and liquidations still run at least
+    /// that often and every window stays reachable. A state proof then spans at most
+    /// `max_window_heights` heights, ends at a recorded height and runs the engine over every
+    /// digest recorded inside its span — at most `max_window_blocks` of them. Off (chain 21),
+    /// every block records a digest and a window is `max_window_blocks` consecutive heights.
+    #[serde(default)]
+    pub sparse_windows: bool,
+    /// PERP-101: the most heights one state proof may span under `sparse_windows`, and the
+    /// heartbeat interval above; `max_window_blocks..=MAX_WINDOW_HEIGHTS`. 0 (and only 0)
+    /// without `sparse_windows`.
+    #[serde(default)]
+    pub max_window_heights: u64,
 }
 
 /// [`PerpsConfig`] as it was bound into the genesis hash before audit v10 (chains up to 21): the
@@ -183,6 +201,14 @@ impl PerpsConfig {
             out.extend_from_slice(b"initial_collateral");
             out.extend_from_slice(&self.initial_collateral.to_be_bytes());
         }
+        if self.sparse_windows {
+            out.extend_from_slice(b"sparse_windows");
+            out.push(1);
+        }
+        if self.max_window_heights != 0 {
+            out.extend_from_slice(b"max_window_heights");
+            out.extend_from_slice(&self.max_window_heights.to_be_bytes());
+        }
         out
     }
 
@@ -200,6 +226,19 @@ impl PerpsConfig {
             return Err(format!(
                 "perps.max_window_blocks {} is outside 1..={MAX_WINDOW_BLOCKS}",
                 self.max_window_blocks
+            ));
+        }
+        if self.sparse_windows {
+            if !(self.max_window_blocks..=MAX_WINDOW_HEIGHTS).contains(&self.max_window_heights) {
+                return Err(format!(
+                    "perps.max_window_heights {} is outside max_window_blocks..={MAX_WINDOW_HEIGHTS} ({}..={MAX_WINDOW_HEIGHTS})",
+                    self.max_window_heights, self.max_window_blocks
+                ));
+            }
+        } else if self.max_window_heights != 0 {
+            return Err(format!(
+                "perps.max_window_heights {} is set without sparse_windows",
+                self.max_window_heights
             ));
         }
         if !(1..=MAX_BLOCK_INPUTS).contains(&self.max_block_inputs) {
@@ -596,6 +635,8 @@ impl Perps {
                         markets: c.markets,
                         bound_payouts: false,
                         initial_collateral: 0,
+                        sparse_windows: false,
+                        max_window_heights: 0,
                     },
                     accounts: v0.accounts,
                     oracle: v0.oracle,
@@ -719,6 +760,19 @@ impl Perps {
     /// The closed heights no state proof has covered yet, ascending.
     pub fn pending_heights(&self) -> Vec<u64> {
         self.digests.keys().copied().collect()
+    }
+
+    /// The highest height with a recorded digest, or the proved height when none waits: what a
+    /// sparse chain's heartbeat counts from (PERP-101, [`PerpsConfig::sparse_windows`]).
+    pub fn last_recorded_height(&self) -> u64 {
+        self.digests.keys().next_back().copied().unwrap_or(self.proved_height)
+    }
+
+    /// The recorded digests a state proof over `from+1..=to` runs the engine over, in height
+    /// order: every height of the span on a dense chain (where each one is recorded), only the
+    /// recorded ones under `sparse_windows` (PERP-101).
+    pub fn window_heights(&self, from: u64, to: u64) -> impl Iterator<Item = u64> + '_ {
+        self.digests.range(from.saturating_add(1)..=to).map(|(h, _)| *h)
     }
 
     /// How many recorded digests no state proof has covered yet — [`Self::pending_heights`]'s
@@ -1132,12 +1186,29 @@ fn check_state_proof(p: &Perps, from: u64, to: u64, payouts: &[PerpPayout]) -> R
     if payouts.len() > MAX_PERP_PAYOUTS {
         return Err(PerpError::TooManyPayouts(payouts.len()));
     }
-    let max = p.config.max_window_blocks;
-    if from != p.proved_height || to <= from || to - from > max {
-        return Err(PerpError::WindowMismatch { from, to, proved: p.proved_height, max });
-    }
-    if let Some(h) = (from + 1..=to).find(|h| !p.digests.contains_key(h)) {
-        return Err(PerpError::MissingDigest(h));
+    if p.config.sparse_windows {
+        // PERP-101: a span of at most `max_window_heights`, ending at a recorded height, over at
+        // most `max_window_blocks` recorded digests — every one recorded inside it, which the
+        // ledger, not the prover, picks (`state_segment`).
+        let max = p.config.max_window_heights;
+        if from != p.proved_height || to <= from || to - from > max {
+            return Err(PerpError::WindowMismatch { from, to, proved: p.proved_height, max });
+        }
+        if !p.digests.contains_key(&to) {
+            return Err(PerpError::MissingDigest(to));
+        }
+        let blocks = p.window_heights(from, to).count() as u64;
+        if blocks > p.config.max_window_blocks {
+            return Err(PerpError::WindowTooManyBlocks { blocks, max: p.config.max_window_blocks });
+        }
+    } else {
+        let max = p.config.max_window_blocks;
+        if from != p.proved_height || to <= from || to - from > max {
+            return Err(PerpError::WindowMismatch { from, to, proved: p.proved_height, max });
+        }
+        if let Some(h) = (from + 1..=to).find(|h| !p.digests.contains_key(h)) {
+            return Err(PerpError::MissingDigest(h));
+        }
     }
     let mut seen = std::collections::BTreeSet::<&Word8>::new();
     for po in payouts {
@@ -1239,9 +1310,15 @@ fn state_segment(
     fees: u64,
     executor: &dyn ConfidentialExecutor,
 ) -> Result<Vec<u32>, PerpError> {
-    let digests = (from + 1..=to)
-        .map(|h| p.digests.get(&h).copied().ok_or(PerpError::MissingDigest(h)))
-        .collect::<Result<Vec<_>, _>>()?;
+    let digests = if p.config.sparse_windows {
+        // PERP-101: the recorded digests inside the span, in height order; the heights the
+        // ledger elided (no input, no heartbeat) are not run.
+        p.digests.range(from + 1..=to).map(|(_, d)| *d).collect::<Vec<_>>()
+    } else {
+        (from + 1..=to)
+            .map(|h| p.digests.get(&h).copied().ok_or(PerpError::MissingDigest(h)))
+            .collect::<Result<Vec<_>, _>>()?
+    };
     Ok(state_proof_segment(from, to, &p.proved_root, new_root, &payouts_digest(executor, payouts), fees, &digests))
 }
 
@@ -1285,7 +1362,10 @@ pub(super) fn verify_state_proof(
         ConfidentialError::CallTierTooHigh { tier, max } => PerpError::TierTooHigh { tier, max },
         e => PerpError::ProofRefused(e.to_string()),
     })?;
-    if outcome.outputs[0] != PERP_VERSION || u64::from(outcome.outputs[1]) != to_height - from_height {
+    // The block count the engine ran over: the span on a dense chain, the recorded digests
+    // inside it under `sparse_windows` (PERP-101) — the segment's own `n_blocks` either way.
+    let blocks = if c.sparse_windows { p.window_heights(*from_height, *to_height).count() as u64 } else { to_height - from_height };
+    if outcome.outputs[0] != PERP_VERSION || u64::from(outcome.outputs[1]) != blocks {
         return Err(PerpError::ProofRefused("outputs".into()).into());
     }
     Ok(())
@@ -1573,6 +1653,16 @@ pub(super) fn close_block(ledger: &mut Ledger, height: u64, executor: &dyn Confi
             o.median = m.price;
         }
     }
+    // PERP-101, under `sparse_windows`: a block without perp inputs records nothing — unless
+    // `max_window_heights` heights have passed since the last recorded digest (or the proved
+    // height), when its `Close` is recorded as a heartbeat. The median above is kept either way.
+    if p.config.sparse_windows
+        && p.block_inputs.is_empty()
+        && height.saturating_sub(p.last_recorded_height()) < p.config.max_window_heights
+    {
+        p.last_block_words = None;
+        return;
+    }
     let mut words = Vec::new();
     for input in p.block_inputs.drain(..) {
         input.words(&mut words);
@@ -1652,6 +1742,10 @@ pub enum PerpError {
     DepositTooSmall(u64),
     #[error("a payout is the full request or nothing: the request asked for {have}, the payout is {want}")]
     PartialPayout { want: u64, have: u64 },
+    /// PERP-101, under `sparse_windows`: the span holds `blocks` recorded digests, more than
+    /// `max_window_blocks` engine runs.
+    #[error("the window holds {blocks} recorded blocks; a state proof runs at most {max}")]
+    WindowTooManyBlocks { blocks: u64, max: u64 },
     #[error("the request was input at height {height}, outside the proof's window {from}+1..={to}")]
     RequestOutsideWindow { height: u64, from: u64, to: u64 },
     /// Audit v10, PERP-6, under genesis `bound_payouts`: the proof pays `want` collateral units
@@ -1832,6 +1926,8 @@ pub(crate) mod tests {
             genesis_root: [8; 8],
             bound_payouts: false,
             initial_collateral: 0,
+            sparse_windows: false,
+            max_window_heights: 0,
             markets: vec![MarketSpec {
                 id: 0,
                 symbol: "X-PERP".into(),
@@ -3339,6 +3435,153 @@ pub(crate) mod tests {
         let new_row = bincode::serialize(p).unwrap();
         assert_eq!(&Perps::decode_persisted(&new_row).unwrap(), p, "this build's row, counters included");
         assert!(Perps::decode_persisted(b"junk").is_err());
+    }
+
+    /// PERP-101: [`ledger_with`]'s ledger with `sparse_windows` on, a 16-height reach.
+    fn sparse_ledger() -> Ledger {
+        let mut l = ledger_with(true);
+        let c = &mut l.perps_mut().unwrap().config;
+        c.sparse_windows = true;
+        c.max_window_heights = 16;
+        l
+    }
+
+    /// A state proof of `from..=to` the stub accepts on a sparse `l`: the segment over the
+    /// recorded digests inside the span, and the engine reporting that many blocks.
+    fn sparse_state_proof(l: &Ledger, from: u64, to: u64, payouts: Vec<PerpPayout>) -> Transaction {
+        let p = l.perps().unwrap();
+        let digests: Vec<Word8> = p.window_heights(from, to).map(|h| p.digest(h).unwrap()).collect();
+        let seg = state_proof_segment(from, to, &p.proved_root, &[7; 8], &payouts_digest(&StubExecutor, &payouts), 0, &digests);
+        let proof = StubExecutor::make_perp_proof(&ENGINE, 16, outs(digests.len() as u32), &seg);
+        proof_tx(from, to, [7; 8], payouts, 0, proof)
+    }
+
+    /// PERP-101: under `sparse_windows` a block without perp inputs records no digest and leaves
+    /// no words, until `max_window_heights` heights have passed since the last recorded one —
+    /// then its `Close` is recorded as a heartbeat. Without the flag (chain 21's rule) every
+    /// block records one, the same sequence included.
+    #[test]
+    fn sparse_windows_elide_input_less_blocks_until_the_heartbeat() {
+        let run = |mut l: Ledger| {
+            let k = kp(50);
+            dep(&mut l, &k, 10, RAND).unwrap();
+            close(&mut l, 1);
+            assert!(l.take_perp_block_words().is_some(), "an input block leaves its words");
+            for h in 2..=17 {
+                close(&mut l, h);
+                let words = l.take_perp_block_words();
+                if l.perps().unwrap().config.sparse_windows {
+                    assert_eq!(words.is_some(), h == 17, "height {h}: only the heartbeat leaves words");
+                }
+            }
+            l
+        };
+        let dense = run(ledger_with(true));
+        assert_eq!(dense.perps().unwrap().pending_heights(), (1..=17).collect::<Vec<_>>(), "dense: every height");
+        let sparse = run(sparse_ledger());
+        let p = sparse.perps().unwrap();
+        assert_eq!(p.pending_heights(), vec![1, 17], "the input block and the heartbeat 16 heights on");
+        assert_eq!(p.last_recorded_height(), 17);
+        assert_eq!(p.window_heights(0, 17).collect::<Vec<_>>(), vec![1, 17]);
+        assert_ne!(dense.perps().unwrap().root(), p.root(), "the recorded digests differ, so the roots do");
+    }
+
+    /// PERP-101: a sparse window spans at most `max_window_heights`, ends at a recorded height,
+    /// runs every recorded digest inside its span (at most `max_window_blocks`), and the engine
+    /// must report that count, not the span. Settlement drops the covered digests as before.
+    #[test]
+    fn a_sparse_window_runs_the_recorded_blocks_inside_its_span() {
+        let mut l = sparse_ledger();
+        let k = kp(50);
+        dep(&mut l, &k, 10, RAND).unwrap();
+        close(&mut l, 1);
+        for h in 2..=4 {
+            close(&mut l, h);
+        }
+        let w = bare(signed(CHAIN, &k, withdraw(&k, 1, 5, 1)));
+        apply(&mut l, &w).unwrap();
+        close(&mut l, 5);
+        for h in 6..=20 {
+            close(&mut l, h);
+        }
+        assert_eq!(l.perps().unwrap().pending_heights(), vec![1, 5], "the heartbeat is due at 21");
+        let request = word8_from_bytes(w.hash().as_bytes()).unwrap();
+        let payouts = vec![PerpPayout { request, amount: 5 }];
+        // The span's end must be recorded …
+        assert_eq!(refusal(&l, &proof_tx(0, 3, [7; 8], vec![], 0, b"junk".to_vec())), pe(PerpError::MissingDigest(3)));
+        // … and within reach: 16 heights, where a dense window would be 8 (max_window_blocks).
+        assert_eq!(
+            refusal(&l, &proof_tx(0, 17, [7; 8], vec![], 0, b"junk".to_vec())),
+            pe(PerpError::WindowMismatch { from: 0, to: 17, proved: 0, max: 16 })
+        );
+        // The engine's count is the recorded blocks (2), not the span (5).
+        let p = l.perps().unwrap();
+        let digests: Vec<Word8> = p.window_heights(0, 5).map(|h| p.digest(h).unwrap()).collect();
+        assert_eq!(digests.len(), 2);
+        let seg = state_proof_segment(0, 5, &p.proved_root, &[7; 8], &payouts_digest(&StubExecutor, &payouts), 0, &digests);
+        let by_span = proof_tx(0, 5, [7; 8], payouts.clone(), 0, StubExecutor::make_perp_proof(&ENGINE, 16, outs(5), &seg));
+        assert_eq!(refusal(&l, &by_span), pe(PerpError::ProofRefused("outputs".into())), "a span-count engine is refused");
+        let tx = sparse_state_proof(&l, 0, 5, payouts.clone());
+        assert_eq!(l.validate(&tx, &StubExecutor), Ok(()));
+        // A window ending at the first recorded height is fine as well (it pays nothing: the
+        // request is recorded at 5).
+        assert_eq!(l.validate(&sparse_state_proof(&l, 0, 1, vec![]), &StubExecutor), Ok(()));
+        l.set_height(21);
+        apply(&mut l, &tx).unwrap();
+        let p = l.perps().unwrap();
+        assert_eq!((p.proved_height, p.pending_heights()), (5, vec![]));
+        assert!(p.withdrawal(&request).is_none(), "paid");
+        // The heartbeat now counts from the proved height.
+        assert_eq!(p.last_recorded_height(), 5);
+    }
+
+    /// PERP-101: more than `max_window_blocks` recorded digests inside one span is refused by
+    /// name; the shorter window over the first eight passes.
+    #[test]
+    fn a_sparse_window_over_too_many_recorded_blocks_is_refused() {
+        let mut l = sparse_ledger();
+        let k = kp(50);
+        for h in 1..=9u64 {
+            dep(&mut l, &k, 10 * h as u32, RAND).unwrap();
+            close(&mut l, h);
+        }
+        assert_eq!(l.perps().unwrap().pending_heights(), (1..=9).collect::<Vec<_>>());
+        assert_eq!(
+            refusal(&l, &sparse_state_proof(&l, 0, 9, vec![])),
+            pe(PerpError::WindowTooManyBlocks { blocks: 9, max: 8 })
+        );
+        assert_eq!(l.validate(&sparse_state_proof(&l, 0, 8, vec![]), &StubExecutor), Ok(()));
+    }
+
+    /// PERP-101: the genesis rules for the two fields, and their commitment — bound only when
+    /// set, so a file without them (chain 21's) hashes as before.
+    #[test]
+    fn the_sparse_window_fields_are_checked_and_bound_only_when_set() {
+        let c = sample_config();
+        assert_eq!(c.check(), Ok(()));
+        let base = c.commit_bytes();
+        let mut on = c.clone();
+        on.sparse_windows = true;
+        on.max_window_heights = 4096;
+        assert_eq!(on.check(), Ok(()));
+        assert_eq!(
+            on.commit_bytes(),
+            [base.clone(), b"sparse_windows".to_vec(), vec![1], b"max_window_heights".to_vec(), 4096u64.to_be_bytes().to_vec()].concat()
+        );
+        let refused = |f: &dyn Fn(&mut PerpsConfig)| {
+            let mut b = on.clone();
+            f(&mut b);
+            b.check().unwrap_err()
+        };
+        assert!(refused(&|b| b.max_window_heights = MAX_WINDOW_HEIGHTS + 1).contains("max_window_heights"));
+        assert!(refused(&|b| b.max_window_heights = b.max_window_blocks - 1).contains("max_window_heights"), "below one dense window");
+        assert!(refused(&|b| b.max_window_heights = 0).contains("max_window_heights"));
+        assert!(refused(&|b| b.sparse_windows = false).contains("without sparse_windows"));
+        let mut json = serde_json::to_value(&c).unwrap();
+        let o = json.as_object_mut().unwrap();
+        assert!(o.remove("sparse_windows").is_some() && o.remove("max_window_heights").is_some());
+        assert_eq!(serde_json::from_value::<PerpsConfig>(json).unwrap(), c, "absent means off");
+        assert_eq!(serde_json::from_str::<PerpsConfig>(&serde_json::to_string(&on).unwrap()).unwrap(), on);
     }
 
     #[test]
