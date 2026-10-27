@@ -814,8 +814,9 @@ async fn run(
                         let b = swarm.behaviour_mut();
                         b.limits.bypass_peer_id(&id);
                         // Every address it was learned at is its host's source (NET-1).
-                        // At most one of them is kept (an advertised address is the peer's own
-                        // claim); its connections add observed ones.
+                        // At most one of them is kept as advertised (`known` mixes identify claims
+                        // with our own dials); the guard itself carries the sources of the peer's
+                        // live and recently closed connections — dials included — as observed.
                         b.guard.reserve_at(id, known.get(&id).into_iter().flatten(), edge::SourceKind::Advertised);
                     }
                     NetworkCommand::Unreserve(id) => {

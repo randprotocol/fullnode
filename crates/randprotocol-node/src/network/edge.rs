@@ -449,7 +449,15 @@ pub struct Guard {
     /// Every established connection's peer and remote source, so a peer reserved while
     /// connected has its live sources counted as in use (N1).
     conn_sources: HashMap<ConnectionId, (PeerId, Source)>,
+    /// Sources recently seen on a closed connection of any peer (dialed or accepted), so a peer
+    /// reserved later has them as observed — seen, not claimed (re-review N3). At most
+    /// [`MAX_SOURCES_PER_RESERVED_PEER`] per peer and [`MAX_RECENT_PEERS`] peers; entries older
+    /// than [`RESERVED_SOURCE_TTL`] are worthless and are dropped first.
+    recent: HashMap<PeerId, Vec<(Source, std::time::Instant)>>,
 }
+
+/// How many peers [`Guard`] remembers recently seen sources for (N3): a bound, not a topology.
+pub const MAX_RECENT_PEERS: usize = 4096;
 
 impl Guard {
     pub fn new(limits: GuardLimits) -> Guard {
@@ -460,6 +468,7 @@ impl Guard {
             sources: ReservedSources::default(),
             skew: std::time::Duration::ZERO,
             conn_sources: HashMap::new(),
+            recent: HashMap::new(),
         }
     }
 
@@ -475,10 +484,38 @@ impl Guard {
         }
         self.established.reserve(peer);
         let now = self.now();
+        // Sources seen on its earlier, closed connections (a dial included): observed, at the time seen.
+        for (s, seen) in self.recent.remove(&peer).unwrap_or_default() {
+            if now.saturating_duration_since(seen) < RESERVED_SOURCE_TTL {
+                self.sources.add(peer, s, SourceKind::Observed, seen);
+            }
+        }
         let live: Vec<Source> = self.conn_sources.values().filter(|(p, _)| *p == peer).map(|(_, s)| *s).collect();
         for s in live {
             self.sources.connected(peer, s, now);
         }
+    }
+
+    /// Remember that `peer` (not reserved) was seen at `source` (N3).
+    fn remember_recent(&mut self, peer: PeerId, source: Source, now: std::time::Instant) {
+        if source == Source::Unknown {
+            return;
+        }
+        if !self.recent.contains_key(&peer) && self.recent.len() >= MAX_RECENT_PEERS {
+            self.recent.retain(|_, l| l.iter().any(|(_, t)| now.saturating_duration_since(*t) < RESERVED_SOURCE_TTL));
+            if self.recent.len() >= MAX_RECENT_PEERS {
+                let oldest = self.recent.iter().min_by_key(|(_, l)| l.iter().map(|(_, t)| *t).max()).map(|(p, _)| *p);
+                if let Some(p) = oldest {
+                    self.recent.remove(&p);
+                }
+            }
+        }
+        let list = self.recent.entry(peer).or_default();
+        list.retain(|(s, _)| *s != source);
+        if list.len() >= MAX_SOURCES_PER_RESERVED_PEER {
+            list.remove(0);
+        }
+        list.push((source, now));
     }
 
     /// [`Guard::reserve`] plus the sources of `addrs`, learned as `kind` (a bootstrap address is
@@ -504,6 +541,7 @@ impl Guard {
     pub fn unreserve(&mut self, peer: &PeerId) {
         self.established.unreserve(peer);
         self.sources.remove_peer(peer);
+        self.recent.remove(peer);
     }
 
     fn pending_caps(&self) -> PendingCaps {
@@ -578,9 +616,11 @@ impl NetworkBehaviour for Guard {
                 self.established.closed(&peer_id, connection_id);
                 // N1: the source was in use until now; its expiry starts here.
                 let source = self.conn_sources.remove(&connection_id).map_or_else(|| source_of(endpoint.get_remote_address()), |(_, s)| s);
+                let now = self.now();
                 if self.established.is_reserved(&peer_id) {
-                    let now = self.now();
                     self.sources.disconnected(&peer_id, source, now);
+                } else {
+                    self.remember_recent(peer_id, source, now);
                 }
             }
             FromSwarm::ListenFailure(ListenFailure { connection_id, .. }) => {
@@ -1166,6 +1206,36 @@ mod tests {
         assert_eq!(denied(pending(&mut g, 50, "/ip4/198.51.100.71/tcp/9")).kind, Kind::PendingIncomingUnreserved, "the share is still held");
         listen_failure(&mut g, 10, "/ip4/198.51.100.70/tcp/10");
         pending(&mut g, 51, "/ip4/198.51.100.71/tcp/9").expect("one of them finished: one slot back");
+    }
+
+    /// NET-1 re-review, N3: a peer this node dialed (or accepted) before it was reserved has the
+    /// sources of those connections as observed once reserved — they were seen, not claimed — so
+    /// they are not crowded out by its single advertised address; stale ones are not carried.
+    #[test]
+    fn a_peer_reserved_after_a_dial_has_the_dialed_source_as_observed() {
+        let mut g = guard();
+        let v = PeerId::random();
+        let dialed = ConnectedPoint::Dialer { address: addr("/ip4/198.51.100.80/tcp/30303"), role_override: Endpoint::Dialer, port_use: PortUse::Reuse };
+        connection_established(&mut g, 1, v, &dialed, 0);
+        connection_closed(&mut g, 1, v, &dialed, 0);
+        let old = ConnectedPoint::Dialer { address: addr("/ip4/198.51.100.81/tcp/30303"), role_override: Endpoint::Dialer, port_use: PortUse::Reuse };
+        g.skew = std::time::Duration::ZERO;
+        connection_established(&mut g, 2, v, &old, 0);
+        connection_closed(&mut g, 2, v, &old, 0);
+        g.reserve_at(v, [&addr("/ip4/198.51.100.82/tcp/30303"), &addr("/ip4/198.51.100.83/tcp/30303")], SourceKind::Advertised);
+        let s = g.sources.sources_of(&v);
+        assert!(s.contains(&source_of(&addr("/ip4/198.51.100.80/tcp/1"))) && s.contains(&source_of(&addr("/ip4/198.51.100.81/tcp/1"))), "both dialed sources, observed: {s:?}");
+        assert_eq!(s.len(), 3, "and one advertised address: {s:?}");
+        pending(&mut g, 10, "/ip4/198.51.100.80/tcp/5").unwrap();
+        assert_eq!(g.pending.reserved_for(&v), 1, "the dialed host takes a reserved slot");
+        // A peer seen more than a TTL before it was reserved carries nothing.
+        let w = PeerId::random();
+        let p = ConnectedPoint::Dialer { address: addr("/ip4/198.51.100.90/tcp/1"), role_override: Endpoint::Dialer, port_use: PortUse::Reuse };
+        connection_established(&mut g, 3, w, &p, 0);
+        connection_closed(&mut g, 3, w, &p, 0);
+        g.skew += RESERVED_SOURCE_TTL * 2;
+        g.reserve(w);
+        assert!(g.sources.sources_of(&w).is_empty());
     }
 
     /// The guard's handler is the dummy that does nothing, and it never asks the swarm for
