@@ -1033,7 +1033,7 @@ async fn perps_reads_under_a_perps_section() {
                 initial_collateral: 0,
                 sparse_windows: false,
                 max_window_heights: 0,
-                engine_program_log_height: 0,
+                engine_program_log_height: 14,
                 markets: vec![randprotocol_core::ledger::perps::MarketSpec {
                     id: 0,
                     symbol: "BTC-PERP".into(),
@@ -1054,7 +1054,7 @@ async fn perps_reads_under_a_perps_section() {
         // src/rpc.rs `PerpsInfo` / `ChainMarket` / `Median` (each u64 a number or a decimal string).
         row("rand_getPerps", json!([]), "durian.market web/lib/perps/client.ts `parsePerps`, crates/perp-prover/src/rpc.rs `PerpsInfo`", &[
             ("enabled", Bool), ("collateral_asset", Int), ("max_tier", Int), ("max_window_blocks", Int),
-            ("engine_hc", Hex), ("genesis_root", Hex), ("markets", Arr),
+            ("engine_hc", Hex), ("genesis_root", Hex), ("markets", Arr), ("engine_program_log_height", Int),
             ("markets.0.id", Int), ("markets.0.symbol", Str), ("markets.0.lot", Int), ("markets.0.tick", Int),
             ("markets.0.max_leverage", Int), ("markets.0.maintenance_bps", Int), ("markets.0.taker_fee_bps", Int),
             ("markets.0.maker_fee_bps", Int),
@@ -1077,4 +1077,6 @@ async fn perps_reads_under_a_perps_section() {
     let perps = call(addr, "rand_getPerps", json!([])).await;
     assert_eq!(perps["result"]["enabled"], json!(true));
     assert_eq!(perps["result"]["engine_hc"], json!(randprotocol_core::notes::word8_to_hex(&[31; 8])));
+    // CON-60: the genesis pin, under the name durian's perp-prover reads.
+    assert_eq!(perps["result"]["engine_program_log_height"], json!(14));
 }

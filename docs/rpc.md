@@ -419,7 +419,7 @@ without a `perps` section:
 ```json
 { "enabled": true,
   "collateral_asset": 0, "max_tier": 18, "max_window_blocks": 64,
-  "sparse_windows": false, "max_window_heights": 0,
+  "sparse_windows": false, "max_window_heights": 0, "engine_program_log_height": 0,
   "max_block_inputs": 8, "min_deposit": "1000000",
   "engine_hc": "<64 hex>", "genesis_root": "<64 hex>",
   "markets": [{ "id": 0, "symbol": "BTC-PERP", "lot": 1000000, "tick": 1000000,
@@ -439,6 +439,11 @@ listed, and `initial_collateral + in − out`, decimal strings (`docs/perps.md`,
 `sparse_windows` and `max_window_heights` (PERP-101) are the genesis fields of the same names,
 `false` and `0` on a chain without them (chain 21); `max_window_heights` is a JSON number, like
 `max_window_blocks`. A node that predates them omits both: read the absence as `false`/`0`.
+
+`engine_program_log_height` (CON-60) is the genesis pin of the engine's program height, a JSON
+number, `0` on a chain without it (chain 21; chain 22 on sets it). A node that predates the field
+omits it: read absent, `null` or `0` as unpinned. `rand perp prove` proves at the canonical
+state-proof shape by default only on a pinned chain (`docs/perps.md`).
 
 The three commitments are 64 lowercase hex characters (a `Word8`, its eight words little-endian).
 `pending_heights` are the closed heights no state proof has covered, ascending: the digests the

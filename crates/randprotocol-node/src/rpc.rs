@@ -3157,6 +3157,9 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
                 // most heights one window spans then (0 without).
                 "sparse_windows": c.sparse_windows,
                 "max_window_heights": c.max_window_heights,
+                // CON-60: the genesis engine program-height pin, 0 when unset (chain 21); a
+                // prover proves at the canonical shape by default only when it is set.
+                "engine_program_log_height": c.engine_program_log_height,
                 "max_block_inputs": c.max_block_inputs,
                 "min_deposit": c.min_deposit.to_string(),
                 "engine_hc": word8_to_hex(&c.engine_hc),
@@ -8247,6 +8250,7 @@ pub(crate) mod tests {
                 "max_window_blocks": 8,
                 "sparse_windows": false,
                 "max_window_heights": 0,
+                "engine_program_log_height": 0,
                 "max_block_inputs": 8,
                 "min_deposit": "1000",
                 "engine_hc": word8_to_hex(&cfg.engine_hc),
