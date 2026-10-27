@@ -822,6 +822,15 @@ enum PerpCmd {
         /// Return once the node accepts the proof instead of waiting for it to commit.
         #[arg(long)]
         no_wait: bool,
+        /// Prove at the smallest tier the window fits, unpadded — the default on a chain whose
+        /// genesis sets no engine program-height pin (chain 21).
+        #[arg(long, conflicts_with = "canonical")]
+        smallest: bool,
+        /// Prove at the chain's canonical shape (tier max_tier, witness padded; the shape every
+        /// node keeps a key for, CON-60) — the default on a chain whose genesis pins the engine's
+        /// program height (`rand_getPerps.engine_program_log_height`, chain 22 on).
+        #[arg(long)]
+        canonical: bool,
     },
     /// Print the engine state root (hex) of a JSON array of u32 state words.
     GenesisRoot {
@@ -2017,6 +2026,8 @@ async fn perp(
             fri,
             no_submit,
             no_wait,
+            smallest,
+            canonical,
         } => {
             let job = perps::ProveJob::load(&job)?;
             let profile = match fri {
@@ -2025,8 +2036,13 @@ async fn perp(
                 None => profile_of(rpc).await?,
             };
             let chain_id = rpc.chain_id().await?;
-            let (hash, tier, bytes) = perps::prove_and_submit_state_proof(
+            let (hash, tier, bytes) = perps::prove_and_submit_state_proof_shaped(
                 rpc, chain_id, &image, &job, tier, profile, !no_submit, !no_wait,
+                match (canonical, smallest) {
+                    (true, _) => Some(true),
+                    (_, true) => Some(false),
+                    _ => None,
+                },
             )
             .await?;
             println!("tier {tier}\nproof {bytes} bytes");
@@ -2046,6 +2062,9 @@ async fn perp(
             let program = randprotocol_zkvm::codec::program_from_bytes(&bytes)
                 .map_err(|e| anyhow!("{} is not a program image: {e}", image.display()))?;
             println!("{}", word8_to_hex(&perps::image_hc(&program)));
+            // CON-60: the genesis `engine_program_log_height` for this image, on stderr so the
+            // hc stays the only stdout line.
+            eprintln!("engine_program_log_height {}", perps::engine_program_log_height(&program));
         }
         PerpCmd::State => println!("{}", pretty(&rpc.get_perps().await?)),
         PerpCmd::Account {

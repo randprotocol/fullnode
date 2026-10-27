@@ -3157,6 +3157,13 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
                 "collateral_asset": c.collateral_asset,
                 "max_tier": c.max_tier,
                 "max_window_blocks": c.max_window_blocks,
+                // PERP-101: whether blocks without perp inputs are elided from windows, and the
+                // most heights one window spans then (0 without).
+                "sparse_windows": c.sparse_windows,
+                "max_window_heights": c.max_window_heights,
+                // CON-60: the genesis engine program-height pin, 0 when unset (chain 21); a
+                // prover proves at the canonical shape by default only when it is set.
+                "engine_program_log_height": c.engine_program_log_height,
                 "max_block_inputs": c.max_block_inputs,
                 "min_deposit": c.min_deposit.to_string(),
                 "engine_hc": word8_to_hex(&c.engine_hc),
@@ -3173,6 +3180,12 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
                     .collect::<Vec<_>>(),
                 "accounts": p.account_count(),
                 "pending_withdrawals": p.withdrawals().count(),
+                // Audit v10, PERP-6: the gate and the collateral counters it reads.
+                "bound_payouts": c.bound_payouts,
+                "initial_collateral": c.initial_collateral.to_string(),
+                "collateral_in": p.collateral_in.to_string(),
+                "collateral_out": p.collateral_out.to_string(),
+                "collateral_held": p.collateral_held().to_string(),
             }))
         }
         // One trading account by id (`[hex64]`): its key, its nonce window and the withdrawals
@@ -4200,7 +4213,9 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
             // RPL-3: the exchange's RAND is the identity's fifth term (`Ledger::audit`): a RAND
             // deposit's `burn_r` is inside `burned`, and what proofs paid back out is in the pool.
             let audit = match st.storage.perps().map_err(RpcError::internal)? {
-                Some(p) => audit.with_perps(p.rand_in, p.rand_out),
+                Some(p) => audit
+                    .with_perps(p.rand_in, p.rand_out)
+                    .with_perps_collateral(p.config.initial_collateral, p.collateral_in, p.collateral_out),
                 None => audit,
             };
             // Multisig: the register's RAND, chained last as `Ledger::audit` chains it.
@@ -4223,6 +4238,13 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
                 // `burned`). Both "0" without the `perps` section or on a token-collateral one.
                 "perps_rand_out": audit.perps_rand_out.to_string(),
                 "perps_rand_held": audit.perps_rand_held.to_string(),
+                // Audit v10, PERP-6: the exchange's collateral in its own asset — every deposit,
+                // every payout a proof listed, and what it holds (genesis `initial_collateral`
+                // + in − out) — the counters `bound_payouts` holds a proof to. Token collateral
+                // included; all "0" without the section.
+                "perps_collateral_in": audit.perps_collateral_in.to_string(),
+                "perps_collateral_out": audit.perps_collateral_out.to_string(),
+                "perps_collateral_held": audit.perps_collateral_held.to_string(),
                 // Multisig accounts: what genesis seeded the vaults with (issuance), every
                 // `burn_r` a create or deposit put in (already inside `burned`), the RAND payout
                 // notes (inside `pool_value`), the bases pays paid to proposers' `rewards`, and
@@ -8231,6 +8253,9 @@ pub(crate) mod tests {
                 "collateral_asset": 0,
                 "max_tier": 16,
                 "max_window_blocks": 8,
+                "sparse_windows": false,
+                "max_window_heights": 0,
+                "engine_program_log_height": 0,
                 "max_block_inputs": 8,
                 "min_deposit": "1000",
                 "engine_hc": word8_to_hex(&cfg.engine_hc),
@@ -8246,6 +8271,11 @@ pub(crate) mod tests {
                 "medians": [{ "market": 0, "price": "1000000" }],
                 "accounts": 1,
                 "pending_withdrawals": 1,
+                "bound_payouts": false,
+                "initial_collateral": "0",
+                "collateral_in": "5000000",
+                "collateral_out": "0",
+                "collateral_held": "5000000",
             })
         );
         assert_eq!(v["engine_hc"].as_str().unwrap().len(), 64);

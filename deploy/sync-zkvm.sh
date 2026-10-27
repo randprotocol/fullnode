@@ -426,6 +426,83 @@ grep -q 'pub fn verifier_key(&self, tier: Tier, program_log_height: u8, input_lo
   && grep -q 'pub fn log_ext_degrees_pub' "$DST/src/machine.rs" \
   && echo "anchors: verifier_key 6-arg ok; log_ext_degrees_pub ok" \
   || { echo "sync-zkvm.sh: an anchor moved (verifier_key 6-arg or log_ext_degrees_pub)" >&2; exit 1; }
+# CON-60 (fullnode audit): `Machine::check_pre_key`, every refusal `Machine::verify` makes before
+# it builds a verifier key, factored out so the chain executor's `perp_proof_admissible` (a
+# node's pool, deciding whether a state proof would cost a key build) runs exactly verify's
+# prefix and cannot drift from it. `verify` then calls it first. Asserts its anchors and aborts
+# the sync when upstream's `verify` moved.
+python3 - "$DST/src/machine.rs" <<'PY'
+import sys; p=sys.argv[1]; s=open(p).read()
+if "pub fn check_pre_key" in s:
+    sys.exit(0)
+head = "    pub fn verify(&self, hc: &[u32; 8], proof: &Proof) -> Result<(), VerifyError> {\n"
+start = head + "        check_public_values(hc, proof)?;\n"
+end = "        let airs = chips_with_modq(proof.tier, proof.keccak_log_height, proof.sha256_log_height, proof.modq_log_height);\n"
+assert start in s, "machine.rs: Machine::verify's opening no longer matches the check_pre_key anchor"
+a = s.index(start) + len(head)
+b = s.index(end, a)
+prefix = s[a:b]
+assert "verifier_key_with_modq" not in prefix, "check_pre_key prefix would include the key build"
+s = s[:a] + "        self.check_pre_key(hc, proof)?;\n" + s[b:]
+fn = (
+    "    /// Every refusal [`Self::verify`] makes before it builds or looks up a verifier key — the\n"
+    "    /// public values against `hc`, the declared shape, the pc window, the commit PoW witnesses\n"
+    "    /// and the degree bits — in `verify`'s order. `verify` runs exactly this first, so a caller\n"
+    "    /// that must not spend a key build on a proof `verify` would refuse for free (a node's pool,\n"
+    "    /// fullnode CON-60) asks the same function and cannot drift from it.\n"
+    "    pub fn check_pre_key(&self, hc: &[u32; 8], proof: &Proof) -> Result<(), VerifyError> {\n"
+    + prefix +
+    "        Ok(())\n"
+    "    }\n\n"
+)
+i = s.index(head)
+# place the new fn in front of verify's doc comment block: find the start of the doc comment
+j = s.rfind("\n\n", 0, i) + 2
+s = s[:j] + fn + s[j:]
+open(p, "w").write(s)
+PY
+grep -q 'pub fn check_pre_key' "$DST/src/machine.rs" && grep -q 'self.check_pre_key(hc, proof)?;' "$DST/src/machine.rs" \
+  && echo "anchors: check_pre_key ok" \
+  || { echo "sync-zkvm.sh: Machine::verify moved; update the check_pre_key patch" >&2; exit 1; }
+# CON-60 (fullnode audit, round 5): an optional key-build gate. A hook set once on a machine
+# (`Machine::set_key_build_gate`) wraps every verifier-key build — the `get_or_init` closure, and
+# nothing else — so the chain executor can hold all its state-proof machines to one build at a
+# time across every thread (a tier-18 build peaks at ~3.3–4 GB). Unset, nothing changes.
+# Asserts its anchors and aborts the sync when upstream's struct or key build moved.
+python3 - "$DST/src/machine.rs" <<'PY'
+import sys; p=sys.argv[1]; s=open(p).read()
+if "pub fn set_key_build_gate" in s:
+    sys.exit(0)
+def rep(old, new):
+    global s
+    assert s.count(old) == 1, "machine.rs: the key-build gate anchor moved: " + old[:60]
+    s = s.replace(old, new)
+rep("pub struct Machine { pub config: Config, pub profile: FriProfile, keys: Mutex<KeyCache>, key_builds: std::sync::atomic::AtomicUsize }\n",
+    "pub struct Machine { pub config: Config, pub profile: FriProfile, keys: Mutex<KeyCache>, key_builds: std::sync::atomic::AtomicUsize, build_gate: std::sync::OnceLock<KeyBuildGate> }\n\n"
+    "/// A wrapper every verifier-key build of a machine runs inside ([`Machine::set_key_build_gate`]):\n"
+    "/// called with the build, it must run it exactly once (fullnode CON-60 holds it to one build at\n"
+    "/// a time across its state-proof machines).\n"
+    "pub type KeyBuildGate = Arc<dyn Fn(&mut dyn FnMut()) + Send + Sync>;\n")
+rep("            key_builds: std::sync::atomic::AtomicUsize::new(0),\n        }\n    }\n",
+    "            key_builds: std::sync::atomic::AtomicUsize::new(0),\n            build_gate: std::sync::OnceLock::new(),\n        }\n    }\n\n"
+    "    /// Run every later verifier-key build of this machine inside `gate` (set once; a second call\n"
+    "    /// is ignored). Only builds: a cached key is returned without it.\n"
+    "    pub fn set_key_build_gate(&self, gate: KeyBuildGate) { let _ = self.build_gate.set(gate); }\n")
+old = ("            self.key_builds.fetch_add(1, std::sync::atomic::Ordering::SeqCst);\n"
+       "            Arc::new(ProverData::from_airs_and_degrees(&key_config(self.profile), &chips_with_modq(tier, keccak_log_height, sha256_log_height, modq_log_height), &self.log_ext_degrees_with_modq(tier, program_log_height, input_log_height, keccak_log_height, sha256_log_height, modq_log_height, public_log_height, mem_log_height)).common)\n")
+new = ("            let mut built = None;\n"
+       "            let mut build = || {\n"
+       "                self.key_builds.fetch_add(1, std::sync::atomic::Ordering::SeqCst);\n"
+       "                built = Some(Arc::new(ProverData::from_airs_and_degrees(&key_config(self.profile), &chips_with_modq(tier, keccak_log_height, sha256_log_height, modq_log_height), &self.log_ext_degrees_with_modq(tier, program_log_height, input_log_height, keccak_log_height, sha256_log_height, modq_log_height, public_log_height, mem_log_height)).common));\n"
+       "            };\n"
+       "            match self.build_gate.get() { Some(gate) => gate(&mut build), None => build() }\n"
+       "            built.expect(\"a key-build gate runs the build\")\n")
+rep(old, new)
+open(p, "w").write(s)
+PY
+grep -q 'pub fn set_key_build_gate' "$DST/src/machine.rs" && grep -q 'match self.build_gate.get()' "$DST/src/machine.rs" \
+  && echo "anchors: key-build gate ok" \
+  || { echo "sync-zkvm.sh: Machine or its key build moved; update the key-build gate patch" >&2; exit 1; }
 # M3.4/M4.1: `hash.rs`'s program-digest header and `tables/cpu.rs`'s in-circuit copy of the same
 # constant both read `crate::notes::domain::HC` upstream; M4.1 added a second such pair for the
 # input digest, `crate::notes::domain::IN`. Constraint set 6 added a third: `crate::notes::

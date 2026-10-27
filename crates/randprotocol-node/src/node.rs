@@ -162,6 +162,11 @@ pub fn load_genesis(datadir: &std::path::Path) -> Result<(GenesisState, Arc<dyn 
     if gs.ledger.hc_auth_multisig().is_some() {
         executor.enable_auth_multisig();
     }
+    // CON-60: the perps section's `max_tier` and engine pin, so the executor knows the chain's
+    // canonical state-proof shapes before any committed proof shows them.
+    if let Some(c) = gs.ledger.perps().map(|p| &p.config) {
+        executor.set_perp_config(c.max_tier, c.engine_program_log_height);
+    }
     Ok((gs, executor))
 }
 
@@ -1394,6 +1399,11 @@ struct Node {
 /// Incoming proposals applied on blocking workers at once (spec 2026-10-11 off-loop apply §4.1).
 /// One more is delivered on the loop as before, so a burst costs no more than it used to.
 const OFFLOOP_APPLIES: usize = 4;
+/// CON-60 (c): how many committed blocks back the startup warm looks for state proofs whose
+/// shapes it builds and pins (beside the shapes the node recorded).
+pub const PERP_WARM_SCAN_BLOCKS: u64 = 4096;
+/// CON-60 (c): the most state-proof shapes the startup warm builds, newest first.
+pub const PERP_WARM_SHAPES: usize = 8;
 
 /// Proposals held back behind an in-flight parent, over every parent (§4.4). Past it a proposal
 /// is delivered on the loop, where the replica orphans it until its parent lands.
@@ -2737,8 +2747,37 @@ pub async fn start_with(cfg: NodeConfig, rpc_options: RpcOptions, net_options: N
         // Private multisig (genesis `hc_auth_multisig`): its key first, since admission defers
         // every multisig auth proof until it is ready.
         let multisig = hs.committed_ledger().hc_auth_multisig().is_some();
+        // CON-60 (c): on a perps chain, the state-proof shapes this node recorded and those of
+        // the state proofs in its last `PERP_WARM_SCAN_BLOCKS` blocks — the honest prover's — are
+        // built and pinned, so a proof of them never waits on a key build or on the pool's cold
+        // budget, even right after a roll.
+        let perps_chain = hs.committed_ledger().perps().is_some();
+        let perp_store = storage.clone();
         let ex = executor.clone();
         tokio::task::spawn_blocking(move || {
+            // Read here, off the startup path: the scan walks up to PERP_WARM_SCAN_BLOCKS blocks.
+            let perp_shapes: Vec<randprotocol_core::confidential::ProofShape> = if perps_chain {
+                // Newest first: the recorded shapes (stored oldest first), then the recent
+                // blocks', at most `PERP_WARM_SHAPES` — each build at tier 18 is minutes and GBs.
+                let mut v = perp_store.perp_proof_shapes().unwrap_or_default();
+                v.reverse();
+                v.truncate(PERP_WARM_SHAPES);
+                let more = PERP_WARM_SHAPES - v.len();
+                let recent = if more == 0 {
+                    Vec::new()
+                } else {
+                    perp_store.recent_perp_proof_shapes(PERP_WARM_SCAN_BLOCKS, PERP_WARM_SHAPES, ex.as_ref()).unwrap_or_default()
+                };
+                for s in recent {
+                    if !v.contains(&s) {
+                        v.push(s);
+                    }
+                }
+                v.truncate(PERP_WARM_SHAPES);
+                v
+            } else {
+                Vec::new()
+            };
             // `--build-msauth-key` with no key file on a non-validator (development only): the
             // build, first (a validator built it before starting). A loaded key needs nothing
             // here; on the bare executor, since the caching wrapper's default would do nothing.
@@ -2751,6 +2790,13 @@ pub async fn start_with(cfg: NodeConfig, rpc_options: RpcOptions, net_options: N
             }
             ex.warm_bundle();
             tracing::info!("bundle verifier key warmed");
+            // Then the engine's keys (after the bundle's, which every block needs).
+            for shape in &perp_shapes {
+                ex.warm_perp(shape);
+            }
+            if !perp_shapes.is_empty() {
+                tracing::info!("{} state-proof verifier keys warmed", perp_shapes.len());
+            }
             if split_auth {
                 ex.warm_auth();
                 tracing::info!("auth verifier key warmed");
@@ -3124,6 +3170,13 @@ impl Node {
         if let (Some(key), Err(e)) = (v.proof_key, &v.result) {
             self.proof_refused.insert(hash, key, e.clone());
         }
+        // N-1: the verdict is in; a queued order leaves the queue index before it is pooled.
+        self.mempool.verify_done(&v.tx);
+        // CON-60 (b): a verified state proof's shape keeps its key (pinned) and is recorded for
+        // the next start's warm. A refusal changes nothing: it delays no other proof.
+        if v.result.is_ok() {
+            self.keep_state_proof_key(&v.tx);
+        }
         self.note_refusal(hash);
         // A verified transaction is pooled against the *current* tip, not the snapshot it was
         // verified on: `insert_verified` re-runs `precheck` there, so a nullifier spent or an anchor
@@ -3212,6 +3265,8 @@ impl Node {
             self.note_refusal(hash);
             self.report(id, GossipOutcome::Report(a)).await;
         } else {
+            self.mempool.state_proof_queued(&tx, self.hs.tip_ledger(), self.executor.as_ref());
+            self.mempool.verify_queued(&tx);
             self.verify_queue.push_back((tx, VerifySource::Gossip(id)));
             self.pump_verify();
         }
@@ -3256,6 +3311,22 @@ impl Node {
         Ok(())
     }
 
+    /// CON-60 (b): `tx`, a state proof that verified here or committed, keeps its shape's key
+    /// (`ConfidentialExecutor::keep_perp_key` pins it when built; it never builds) and its shape
+    /// is recorded for the startup warm. Nothing for any other transaction.
+    fn keep_state_proof_key(&self, tx: &Transaction) {
+        let randprotocol_core::types::Action::PerpStateProof { proof, .. } = &tx.action else { return };
+        let Some(shape) = self.executor.perp_proof_shape(proof) else { return };
+        self.executor.keep_perp_key(&shape);
+        // The DB read and write off the node loop.
+        let storage = self.storage.clone();
+        tokio::task::spawn_blocking(move || {
+            if let Err(e) = storage.note_perp_proof_shape(shape) {
+                tracing::warn!("recording a state-proof shape: {e}");
+            }
+        });
+    }
+
     /// The `ProofRefused` this node already gave `tx`, a state proof, over the segment the tip
     /// builds for it now (I1); `None` for any other transaction and on a miss. Hashes the
     /// transaction only when it is a state proof the tip would verify.
@@ -3297,6 +3368,8 @@ impl Node {
             let _ = reply.send(Err(e));
             return;
         }
+        self.mempool.state_proof_queued(&tx, self.hs.tip_ledger(), self.executor.as_ref());
+        self.mempool.verify_queued(&tx);
         self.verify_queue.push_back((tx, VerifySource::Rpc(reply)));
         self.pump_verify();
     }
@@ -3465,6 +3538,7 @@ impl Node {
                 if let randprotocol_core::types::Action::Aggregate { covers, .. } = &tx.action {
                     newly_sealed.extend_from_slice(covers);
                 }
+                self.keep_state_proof_key(tx);
             }
             tracing::info!(
                 "committed block {} view {} txs {} hash {:?}",

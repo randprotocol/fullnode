@@ -1724,7 +1724,12 @@ fn common_from_bytes(bytes: &[u8]) -> Result<CommonData<Config>, InstallKeyError
     Ok(CommonData { preprocessed, lookups: wire.lookups })
 }
 
-pub struct Machine { pub config: Config, pub profile: FriProfile, keys: Mutex<KeyCache>, key_builds: std::sync::atomic::AtomicUsize }
+pub struct Machine { pub config: Config, pub profile: FriProfile, keys: Mutex<KeyCache>, key_builds: std::sync::atomic::AtomicUsize, build_gate: std::sync::OnceLock<KeyBuildGate> }
+
+/// A wrapper every verifier-key build of a machine runs inside ([`Machine::set_key_build_gate`]):
+/// called with the build, it must run it exactly once (fullnode CON-60 holds it to one build at
+/// a time across its state-proof machines).
+pub type KeyBuildGate = Arc<dyn Fn(&mut dyn FnMut()) + Send + Sync>;
 
 impl Machine {
     pub fn new(profile: FriProfile) -> Self { Self::with_key_cache_capacity(profile, KEY_CACHE_CAPACITY) }
@@ -1739,8 +1744,13 @@ impl Machine {
             profile,
             keys: Mutex::new(KeyCache { capacity, ..KeyCache::default() }),
             key_builds: std::sync::atomic::AtomicUsize::new(0),
+            build_gate: std::sync::OnceLock::new(),
         }
     }
+
+    /// Run every later verifier-key build of this machine inside `gate` (set once; a second call
+    /// is ignored). Only builds: a cached key is returned without it.
+    pub fn set_key_build_gate(&self, gate: KeyBuildGate) { let _ = self.build_gate.set(gate); }
 
     /// A test instrument: how many verifier keys this machine has built (cache misses that ran
     /// the preprocessing pass), since construction.
@@ -1869,8 +1879,13 @@ impl Machine {
             // floor is the canonical one, and using it makes this function's result independent
             // of which proof happened to miss the cache first.
             let mem_log_height = tier.min_mem_log_height();
-            self.key_builds.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            Arc::new(ProverData::from_airs_and_degrees(&key_config(self.profile), &chips_with_modq(tier, keccak_log_height, sha256_log_height, modq_log_height), &self.log_ext_degrees_with_modq(tier, program_log_height, input_log_height, keccak_log_height, sha256_log_height, modq_log_height, public_log_height, mem_log_height)).common)
+            let mut built = None;
+            let mut build = || {
+                self.key_builds.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                built = Some(Arc::new(ProverData::from_airs_and_degrees(&key_config(self.profile), &chips_with_modq(tier, keccak_log_height, sha256_log_height, modq_log_height), &self.log_ext_degrees_with_modq(tier, program_log_height, input_log_height, keccak_log_height, sha256_log_height, modq_log_height, public_log_height, mem_log_height)).common));
+            };
+            match self.build_gate.get() { Some(gate) => gate(&mut build), None => build() }
+            built.expect("a key-build gate runs the build")
         })
         .clone()
     }
@@ -2175,16 +2190,12 @@ impl Machine {
         Ok((Proof { tier, program_log_height: traces.program_log_height, input_log_height: traces.input_log_height, keccak_log_height: traces.keccak_log_height, sha256_log_height: traces.sha256_log_height, modq_log_height: traces.modq_log_height, public_log_height: traces.public_log_height, mem_log_height: traces.mem_log_height, public_values: traces.public_values.iter().map(|x| x.as_canonical_u64()).collect(), batch }, exec))
     }
 
-    /// M3.4: takes `hc`, not the program — the verifier no longer holds the program at all
-    /// (`docs/03-privacy.md`). `hc` is checked against `pv::HC0..HC7`, the in-circuit program
-    /// digest `tables::cpu`'s digest rows compute and pin; `pc_entry` is no longer
-    /// independently checkable here (the verifier has no `base_pc` from anywhere except the
-    /// proof itself) — it is read out of the proof, still bound in-circuit to the digest
-    /// group's own `PC` (see `tables::cpu`'s `eval`), and indirectly to `hc` too, since
-    /// `Program::digest` absorbs `base_pc`: a mismatched `pc_entry` claim would need a
-    /// matching-but-different program producing the same `hc`, a genuine hash collision, not
-    /// a free forgery.
-    pub fn verify(&self, hc: &[u32; 8], proof: &Proof) -> Result<(), VerifyError> {
+    /// Every refusal [`Self::verify`] makes before it builds or looks up a verifier key — the
+    /// public values against `hc`, the declared shape, the pc window, the commit PoW witnesses
+    /// and the degree bits — in `verify`'s order. `verify` runs exactly this first, so a caller
+    /// that must not spend a key build on a proof `verify` would refuse for free (a node's pool,
+    /// fullnode CON-60) asks the same function and cannot drift from it.
+    pub fn check_pre_key(&self, hc: &[u32; 8], proof: &Proof) -> Result<(), VerifyError> {
         check_public_values(hc, proof)?;
         // M4.2 (Task 5 review): every range check on the proof's declared shape, in one place
         // and before anything is sized from it — `check_declared_heights`' doc comment has the
@@ -2223,6 +2234,20 @@ impl Machine {
         // `keccak_log_height = 0` while carrying nine instances (or vice versa) fails here,
         // before `chips` builds anything.
         if proof.batch.degree_bits != self.log_ext_degrees_with_modq(proof.tier, proof.program_log_height, proof.input_log_height, proof.keccak_log_height, proof.sha256_log_height, proof.modq_log_height, proof.public_log_height, proof.mem_log_height) { return Err(VerifyError::Tier); }
+        Ok(())
+    }
+
+    /// M3.4: takes `hc`, not the program — the verifier no longer holds the program at all
+    /// (`docs/03-privacy.md`). `hc` is checked against `pv::HC0..HC7`, the in-circuit program
+    /// digest `tables::cpu`'s digest rows compute and pin; `pc_entry` is no longer
+    /// independently checkable here (the verifier has no `base_pc` from anywhere except the
+    /// proof itself) — it is read out of the proof, still bound in-circuit to the digest
+    /// group's own `PC` (see `tables::cpu`'s `eval`), and indirectly to `hc` too, since
+    /// `Program::digest` absorbs `base_pc`: a mismatched `pc_entry` claim would need a
+    /// matching-but-different program producing the same `hc`, a genuine hash collision, not
+    /// a free forgery.
+    pub fn verify(&self, hc: &[u32; 8], proof: &Proof) -> Result<(), VerifyError> {
+        self.check_pre_key(hc, proof)?;
         let airs = chips_with_modq(proof.tier, proof.keccak_log_height, proof.sha256_log_height, proof.modq_log_height);
         let pv_vals: Vec<Val> = proof.public_values.iter().map(|x| Val::from_u64(*x)).collect();
         let pvs: Vec<Vec<Val>> = (0..airs.len()).map(|i| if i == 1 { pv_vals.clone() } else { vec![] }).collect();

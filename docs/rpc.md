@@ -439,6 +439,7 @@ without a `perps` section:
 ```json
 { "enabled": true,
   "collateral_asset": 0, "max_tier": 18, "max_window_blocks": 64,
+  "sparse_windows": false, "max_window_heights": 0, "engine_program_log_height": 0,
   "max_block_inputs": 8, "min_deposit": "1000000",
   "engine_hc": "<64 hex>", "genesis_root": "<64 hex>",
   "markets": [{ "id": 0, "symbol": "BTC-PERP", "lot": 1000000, "tick": 1000000,
@@ -446,12 +447,30 @@ without a `perps` section:
   "proved_root": "<64 hex>", "proved_height": 120, "head_height": 131,
   "pending_heights": [121, 122, …, 131],
   "medians": [{ "market": 0, "price": "64250000000" }],
-  "accounts": 3, "pending_withdrawals": 1 }
+  "accounts": 3, "pending_withdrawals": 1,
+  "bound_payouts": false, "initial_collateral": "0",
+  "collateral_in": "150000000000", "collateral_out": "2000000", "collateral_held": "149998000000" }
 ```
+
+The last five (audit v10, PERP-6) are the genesis `bound_payouts` gate and `initial_collateral`,
+and the ledger's collateral counters in the collateral asset: every deposit, every payout a proof
+listed, and `initial_collateral + in − out`, decimal strings (`docs/perps.md`, "The supply audit").
+
+`sparse_windows` and `max_window_heights` (PERP-101) are the genesis fields of the same names,
+`false` and `0` on a chain without them (chain 21); `max_window_heights` is a JSON number, like
+`max_window_blocks`. A node that predates them omits both: read the absence as `false`/`0`.
+
+`engine_program_log_height` (CON-60) is the genesis pin of the engine's program height, a JSON
+number, `0` on a chain without it (chain 21; chain 22 on sets it). A node that predates the field
+omits it: read absent, `null` or `0` as unpinned. `rand perp prove` proves at the canonical
+state-proof shape by default only on a pinned chain (`docs/perps.md`).
 
 The three commitments are 64 lowercase hex characters (a `Word8`, its eight words little-endian).
 `pending_heights` are the closed heights no state proof has covered, ascending: the digests the
-next proof's window is drawn from. A median is a decimal string, `"0"` when the last close had no
+next proof's window is drawn from. On a dense chain (`sparse_windows` false) that is every height
+from `proved_height + 1` to the head. Under `sparse_windows` it is only the **recorded** heights —
+those whose block carried a perp input, and the heartbeat closes — so it has gaps, and the next
+window is built from it as `docs/perps.md` ("Sparse windows") describes. A median is a decimal string, `"0"` when the last close had no
 quorum of fresh oracle stake behind a price (`docs/perps.md`). `max_block_inputs` is the most perp
 inputs one block records and `min_deposit` (a decimal string, `"0"` for no floor) the smallest
 deposit. This is what `perp-prover` and the trading site poll. On the public listener.
@@ -491,7 +510,8 @@ over:
 recomputed over the stored words (`perp_digest`, domain 21); a prover refuses a window whose
 digests do not match its own. `words` are the block's inputs in block order and the closing
 `Close` (`docs/perps.md`, "The word encodings"), each a `u32`. `null` for a height this node holds
-no row for: a state proof has covered it (the row is pruned with the proof), it is above the head,
+no row for: a state proof has covered it (the row is pruned with the proof), the chain runs
+`sparse_windows` and the height recorded no digest (PERP-101: no input and no heartbeat), it is above the head,
 or the chain has no `perps` section. On the public listener.
 
 ### `rand_getMultisig`
@@ -1393,7 +1413,14 @@ chain whose collateral is a token): RAND that state proofs have paid out of the 
 (value entering the pool, inside `pool_value`), and what it still holds, `deposited - paid`. A RAND
 deposit entered through a bundle's `burn_r`, so it is inside `burned` on the pool side, and this is
 its twin, as the program vaults' pair is; `invariant_holds` covers it. A token collateral's supply
-does not move on the way in or out, so nothing is counted for it.
+does not move on the way in or out, so nothing is counted for it there.
+
+`perps_collateral_in`, `perps_collateral_out` and `perps_collateral_held` (audit v10, PERP-6;
+`"0"` without a `perps` section): the exchange's collateral in its own asset, RAND or token —
+every deposit's burn, every payout a state proof listed, and what it holds (the genesis
+`initial_collateral` + in − out). These are the counters the genesis `bound_payouts` rule holds a
+proof to (`docs/perps.md`, "The supply audit"); they move no term of the RAND identity. A node
+rolled onto this build from before it counts from the roll.
 
 `multisig_issued`, `multisig_rand_in`, `multisig_rand_out`, `multisig_base_out` and
 `multisig_rand_held` (multisig accounts, `docs/multisig.md`; `"0"` without a `multisig` section):
@@ -1641,7 +1668,19 @@ Params: `[]`. Result:
 longest-pooled transaction has waited, `null` when the pool is empty. Beside `max_count` the pool
 is capped at eight times the genesis `max_block_bytes` in `bytes` (audit v6, CH-7): past it a
 transaction paying more above its floor per KiB displaces the cheapest, and one paying less is
-refused `mempool full`; governance actions pass both caps.
+refused `mempool full`; governance actions pass both caps. Fee-less perp actions (orders, cancels,
+withdrawal requests; audit v10, PERP-1) have two caps of their own, 16 per account and 1 024 in
+all, refused `mempool holds 16 fee-less perp actions of account … already` and `mempool full of
+fee-less perp actions (1024)`; and, on a chain whose genesis sets `sparse_windows`, while four `max_window_blocks` of recorded digests wait for a
+state proof a new order is refused `the exchange has N unproved block digests …` (`docs/perps.md`,
+"The node"); and there also while the head is four
+`max_window_heights` or more past the proved height, refused `the exchange is N heights past its
+proved height …`. All of them are `mempool full`'s class: about this node, retryable, never cached. A
+On a sparse chain a `PerpCancel` naming no order of its account is refused `the cancel names order
+nonce N, which no order of this account has taken` (I-4), and cancels are held back with orders. `PerpStateProof` whose shape this node holds no verifier key for is refused `this node is at its
+limit of verifier-key builds for new state-proof shapes; retry later` once its cold-build budget
+(2, one more per 30 s) is spent (CON-60, `docs/perps.md`, "The node"); a proof of a shape it has a
+key for always passes. Same class.
 
 ### `rand_getEmission`
 Params: `[]`. Result:

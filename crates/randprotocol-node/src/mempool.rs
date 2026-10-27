@@ -62,16 +62,86 @@ pub enum MempoolError {
     /// never `RefusedCache`d, and no peer is penalised for it.
     #[error("{0}")]
     Warming(&'static str),
+    /// Audit v10, PERP-1 (a): this pool already holds [`MAX_PERP_ACCOUNT_POOLED`] fee-less perp
+    /// actions (orders, cancels, withdrawal requests) of the named account. A `Full`-class
+    /// verdict about this node's pool, never about the transaction: retryable, not cached, no
+    /// peer penalised.
+    #[error("mempool holds {MAX_PERP_ACCOUNT_POOLED} fee-less perp actions of account {0} already; it waits for them to mine")]
+    PerpAccountFull(String),
+    /// Audit v10, PERP-1 (b): this pool holds its cap of fee-less perp actions over every
+    /// account ([`MAX_PERP_POOLED`]), so one more cannot crowd a fee-paying bundle. `Full`-class.
+    #[error("mempool full of fee-less perp actions ({MAX_PERP_POOLED}); it waits for a block or a proof")]
+    PerpPoolFull,
+    /// Audit v10, PERP-1 (e) / PERP-101: the chain has `unproved` recorded block digests no state
+    /// proof has covered — [`PERP_BACKPRESSURE_WINDOWS`] windows' worth or more — so this node
+    /// admits no new order until a prover catches up. Deposits, cancels, withdrawals, oracle
+    /// prices and state proofs are unaffected. `Full`-class: retryable, never cached.
+    #[error("the exchange has {unproved} unproved block digests ({max} is this node's limit for new orders); retry once a state proof lands")]
+    PerpBackpressure { unproved: usize, max: usize },
+    /// PERP-101: under `sparse_windows`, the tip is `behind` heights past the proved height —
+    /// [`PERP_BACKPRESSURE_WINDOWS`] × `max_window_heights` or more — so this node admits no new
+    /// order until a prover catches up. The same scope and class as `PerpBackpressure`.
+    #[error("the exchange is {behind} heights past its proved height ({max} is this node's limit for new orders); retry once a state proof lands")]
+    PerpHeightBackpressure { behind: u64, max: u64 },
+    /// I-4: a `PerpCancel` whose target nonce no order of the account took — neither accepted in
+    /// its nonce window nor pooled here. Retryable (the order may yet arrive), never cached.
+    #[error("the cancel names order nonce {0}, which no order of this account has taken")]
+    PerpCancelUnknownOrder(u64),
+    /// CON-60 (b): a state proof whose shape this node holds no verifier key for, while the
+    /// [`ColdKeyBudget`] is spent. Retryable, never cached, no peer penalised; a proof of a shape
+    /// the node has a key for always passes.
+    #[error("this node is at its limit of verifier-key builds for new state-proof shapes; retry later")]
+    StateProofBusy,
 }
 
 /// The refusal a `Warming` deferral carries, as `rand_sendTransaction` reports it.
 pub const MSAUTH_WARMING: &str = "the multisig auth key is still warming; retry in a minute";
 
+/// Audit v10, PERP-1 (a): the most fee-less perp actions (`PerpOrder`, `PerpCancel`,
+/// `PerpWithdraw`) one account may have pooled at once. An order pays no fee, so without a count
+/// one trading key could fill the pool's 10 000 slots for nothing; a block takes at most
+/// `MAX_ACCOUNT_INPUTS_PER_BLOCK` (8) of an account's inputs, so sixteen is two blocks' worth in
+/// flight — plenty for a market maker, nothing for a flood. Node policy, never a validity rule.
+pub const MAX_PERP_ACCOUNT_POOLED: usize = 16;
+/// Audit v10, PERP-1 (b): the most fee-less perp actions the pool holds over every account, so
+/// they can never crowd out fee-paying bundles whatever the account cap allows. With the ledger's
+/// 15 accounts at 16 each the account cap already binds first (240); this is the backstop for an
+/// engine with more slots.
+pub const MAX_PERP_POOLED: usize = 1024;
+/// Audit v10, PERP-1 (e): with this many `max_window_blocks` of recorded digests unproved, the
+/// prover is too far behind for new orders to settle in reasonable time, and this node admits
+/// none (`MempoolError::PerpBackpressure`) until a state proof lands. Four windows at chain 21's
+/// 64 is 256 digests.
+pub const PERP_BACKPRESSURE_WINDOWS: usize = 4;
+
 impl MempoolError {
     /// Whether the same transaction may succeed if sent again later, unchanged: a deferral
-    /// (`Warming`) or a full pool. Everything else is a verdict on the transaction or its conflicts.
+    /// (`Warming`, `StateProofBusy`) or a full pool (`Full` and the perp caps). Everything
+    /// else is a verdict on the transaction or its conflicts.
     pub fn is_retryable(&self) -> bool {
-        matches!(self, MempoolError::Warming(_) | MempoolError::Full)
+        matches!(
+            self,
+            MempoolError::Warming(_)
+                | MempoolError::Full
+                | MempoolError::PerpAccountFull(_)
+                | MempoolError::PerpPoolFull
+                | MempoolError::PerpBackpressure { .. }
+                | MempoolError::PerpHeightBackpressure { .. }
+                | MempoolError::PerpCancelUnknownOrder(_)
+                | MempoolError::StateProofBusy
+        )
+    }
+}
+
+/// The account a fee-less perp input is from (audit v10, PERP-1): an order's, a cancel's or a
+/// withdrawal request's. `None` for every other action — a `PerpDeposit` rides a fee-paying
+/// bundle and is bounded by it, an oracle and a state proof are no input.
+fn fee_less_perp_account(action: &Action) -> Option<&randprotocol_core::ledger::perps::AccountId> {
+    match action {
+        Action::PerpOrder { account, .. } | Action::PerpCancel { account, .. } | Action::PerpWithdraw { account, .. } => {
+            Some(account)
+        }
+        _ => None,
     }
 }
 
@@ -170,6 +240,12 @@ struct Pooled {
     gas_limit: Option<u64>,
     /// See [`Claims::bridge_rotation`].
     bridge_rotation: Option<u64>,
+    /// This entry's place in the pool's arrival order (audit v10, PERP-1 (c)): the tie-break
+    /// among candidates of equal rank, surplus and fee, ahead of the hash — so grinding a
+    /// transaction's hash buys no place in a block, and the eviction mirror takes the latest
+    /// arrival first. Per pool, never on the wire: two nodes may order a tie differently, which
+    /// only the proposer's choice decides.
+    seq: u64,
 }
 
 /// The register nonce a bundle-less `Unbond` or `Withdraw` claims — and the aggregator
@@ -340,6 +416,88 @@ pub struct Mempool {
     /// RPL-3 (final fix wave, I1): the pooled `PerpStateProof` holding the pool's one reserved
     /// slot ([`Mempool::takes_reserved_slot`]), if any.
     reserved_proof: Option<Hash>,
+    /// Audit v10, PERP-1 (a): how many fee-less perp actions each account has pooled, kept on
+    /// `admit` and `remove_one` like `bytes`; an account leaves the map at zero.
+    perp_accounts: HashMap<randprotocol_core::ledger::perps::AccountId, usize>,
+    /// PERP-1 (b): the sum of `perp_accounts`, against `perp_pool_cap`.
+    perp_pooled: usize,
+    /// [`MAX_PERP_POOLED`], lowered by a test to reach it with the ledger's fifteen accounts.
+    perp_pool_cap: usize,
+    /// PERP-1 (c): the next [`Pooled::seq`].
+    next_seq: u64,
+    /// N-1: pooled `PerpOrder`s by (account, nonce), kept on `admit`/`remove_one`.
+    perp_orders: HashMap<(randprotocol_core::ledger::perps::AccountId, u64), usize>,
+    /// N-1: `PerpOrder`s queued for or in verification on this node ([`Mempool::verify_queued`]).
+    queued_perp_orders: HashMap<(randprotocol_core::ledger::perps::AccountId, u64), usize>,
+    /// CON-60 (b): the bucket over cold state-proof key builds of foreign shapes ([`ColdKeyBudget`]).
+    cold_keys: ColdKeyBudget,
+    /// CON-60 (b): the separate reserve for cold canonical shapes, which no other shape drains.
+    lineage_keys: ColdKeyBudget,
+    /// CON-60: the cost the gate just computed, keyed by transaction hash and the tip's height,
+    /// for the `state_proof_queued` that follows it ([`Mempool::cost_once`]).
+    last_cost: std::sync::Mutex<Option<(Hash, u64, ProofCost)>>,
+}
+
+/// CON-60 (b): the burst of verifier-key builds for state-proof shapes this node has no key for
+/// ("cold" shapes) — and one more every [`COLD_KEY_BUILD_INTERVAL`] after. A tier-18 key build is
+/// over a minute in a debug build and gigabytes, so this bounds what junk proofs of fresh shapes
+/// cost a node: at most `burst + elapsed / interval` builds, whatever is sent.
+pub const COLD_KEY_BUILD_BURST: u32 = 2;
+/// CON-60 (b): the refill interval of [`COLD_KEY_BUILD_BURST`]'s bucket.
+pub const COLD_KEY_BUILD_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// CON-60 (b): what verifying a transaction costs in verifier-key builds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProofCost {
+    /// No build: not a state proof, its key is built, or it is refused before any key.
+    Free,
+    /// A build of this chain's canonical shape (the reserve).
+    Canonical,
+    /// A build of any other shape (the general bucket).
+    Foreign,
+}
+
+/// CON-60 (b), node policy (never a validity rule): a token bucket over the verifier-key builds
+/// state proofs make this node do. A proof whose shape's key is built — the engine's, which the
+/// node pins once a proof of it verifies, warms at startup from its chain's committed proofs, and
+/// keeps when a committed block carries one — never needs a token, so junk of any shape cannot
+/// delay it. A proof of a cold shape takes a token when it is queued; with none left it is
+/// `StateProofBusy` (retryable, never cached, no peer penalised, no timing in the message).
+/// Nothing a refusal does moves the bucket: a junk proof costs one token, its own build.
+#[derive(Debug)]
+pub struct ColdKeyBudget {
+    tokens: f64,
+    at: Option<Instant>,
+}
+
+impl Default for ColdKeyBudget {
+    fn default() -> ColdKeyBudget {
+        ColdKeyBudget { tokens: COLD_KEY_BUILD_BURST as f64, at: None }
+    }
+}
+
+impl ColdKeyBudget {
+    fn level(&self, now: Instant) -> f64 {
+        let gained = self.at.map_or(0.0, |at| now.saturating_duration_since(at).as_secs_f64() / COLD_KEY_BUILD_INTERVAL.as_secs_f64());
+        (self.tokens + gained).min(COLD_KEY_BUILD_BURST as f64)
+    }
+
+    /// Whether a cold build may be queued at `now` (no token taken).
+    pub fn available(&self, now: Instant) -> bool {
+        self.level(now) >= 1.0
+    }
+
+    /// Take a token at `now`; `false` (nothing taken) when there is none.
+    pub fn take(&mut self, now: Instant) -> bool {
+        self.tokens = self.level(now);
+        self.at = Some(now);
+        if self.tokens >= 1.0 {
+            self.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
 }
 
 /// Every commitment `tx` claims: the ones it carries, plus the deposit `ledger` would derive for
@@ -380,6 +538,226 @@ impl Mempool {
             faucet_minters: None,
             gas_policy: None,
             reserved_proof: None,
+            perp_accounts: HashMap::new(),
+            perp_pooled: 0,
+            perp_pool_cap: MAX_PERP_POOLED,
+            next_seq: 0,
+            perp_orders: HashMap::new(),
+            queued_perp_orders: HashMap::new(),
+            cold_keys: ColdKeyBudget::default(),
+            lineage_keys: ColdKeyBudget::default(),
+            last_cost: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// CON-60 (b): what verifying `tx` would cost this node in verifier keys ([`ProofCost`]).
+    /// Cold only when the shape has no key built *and* the proof passes every rule the ledger and
+    /// the executor apply before a key is touched — the ledger's cheap state-proof rules (which
+    /// build the tip's segment), then `perp_proof_admissible` (the executor's header rules and the
+    /// verifier's own pre-key prefix against the genesis `engine_hc`, the segment's public digest,
+    /// the genesis pin) — so a proof refused for free never spends a token. A cold proof of this
+    /// chain's canonical shape is `Canonical`; any other cold proof `Foreign`.
+    fn state_proof_cost(tx: &Transaction, ledger: &Ledger, executor: &dyn ConfidentialExecutor) -> ProofCost {
+        let (Action::PerpStateProof { proof, .. }, Some(p)) = (&tx.action, ledger.perps()) else { return ProofCost::Free };
+        let Some(shape) = executor.perp_proof_shape(proof) else { return ProofCost::Free };
+        if executor.perp_key_ready(&shape) {
+            return ProofCost::Free;
+        }
+        let Ok(segment) = randprotocol_core::ledger::perps::state_proof_segment_on(ledger, tx, executor) else {
+            return ProofCost::Free;
+        };
+        let c = &p.config;
+        if !executor.perp_proof_admissible(proof, &c.engine_hc, c.max_tier, &segment, c.engine_program_log_height) {
+            return ProofCost::Free;
+        }
+        if executor.perp_shape_canonical(&shape) {
+            ProofCost::Canonical
+        } else {
+            ProofCost::Foreign
+        }
+    }
+
+    /// [`Self::state_proof_cost`] once per queued transaction. The gate (`fresh`) always computes
+    /// it and leaves it for the `state_proof_queued` that follows it on the same tip, which reads
+    /// it back only for the same transaction at the same tip height (`fresh` false) and takes it.
+    /// A precheck that fails after the gate drops it ([`Mempool::precheck`]), so a cost is never
+    /// reused across a tip, a change in key readiness or a later resubmission.
+    fn cost_once(&self, tx: &Transaction, ledger: &Ledger, executor: &dyn ConfidentialExecutor, fresh: bool) -> ProofCost {
+        if !matches!(tx.action, Action::PerpStateProof { .. }) {
+            return ProofCost::Free;
+        }
+        let (h, at) = (tx.hash(), ledger.height());
+        let mut last = self.last_cost.lock().unwrap_or_else(|e| e.into_inner());
+        if !fresh {
+            if let Some((lh, lat, c)) = last.take() {
+                if (lh, lat) == (h, at) {
+                    return c;
+                }
+            }
+            return Self::state_proof_cost(tx, ledger, executor);
+        }
+        let c = Self::state_proof_cost(tx, ledger, executor);
+        *last = Some((h, at, c));
+        c
+    }
+
+    fn forget_cost(&self) {
+        *self.last_cost.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    /// CON-60 (b): `Ok` unless `tx` is a state proof that would cost a key build and its bucket
+    /// — the reserve for the chain's canonical shapes, the general one otherwise — is spent.
+    fn state_proof_gate(&self, tx: &Transaction, ledger: &Ledger, executor: &dyn ConfidentialExecutor) -> Result<(), MempoolError> {
+        let now = Instant::now();
+        let ok = match self.cost_once(tx, ledger, executor, true) {
+            ProofCost::Free => true,
+            ProofCost::Canonical => self.lineage_keys.available(now),
+            ProofCost::Foreign => self.cold_keys.available(now),
+        };
+        if ok {
+            Ok(())
+        } else {
+            Err(MempoolError::StateProofBusy)
+        }
+    }
+
+    /// CON-60 (b): `tx` passed [`Mempool::precheck`] and is queued for verification; a state proof
+    /// that will cost a key build takes a token from its bucket.
+    pub fn state_proof_queued(&mut self, tx: &Transaction, ledger: &Ledger, executor: &dyn ConfidentialExecutor) {
+        let now = Instant::now();
+        match self.cost_once(tx, ledger, executor, false) {
+            ProofCost::Free => {}
+            ProofCost::Canonical => {
+                self.lineage_keys.take(now);
+            }
+            ProofCost::Foreign => {
+                self.cold_keys.take(now);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn lineage_keys_mut(&mut self) -> &mut ColdKeyBudget {
+        &mut self.lineage_keys
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cold_keys_mut(&mut self) -> &mut ColdKeyBudget {
+        &mut self.cold_keys
+    }
+
+    /// [`MAX_PERP_POOLED`] lowered, so a test reaches the pool-wide cap before the account cap
+    /// (15 accounts × 16) does.
+    #[cfg(test)]
+    pub(crate) fn with_perp_pool_cap(mut self, cap: usize) -> Mempool {
+        self.perp_pool_cap = cap;
+        self
+    }
+
+    /// How many fee-less perp actions `account` has pooled (audit v10, PERP-1 (a)).
+    pub fn perp_pooled_for(&self, account: &randprotocol_core::ledger::perps::AccountId) -> usize {
+        self.perp_accounts.get(account).copied().unwrap_or(0)
+    }
+
+    /// How many fee-less perp actions the pool holds in all (PERP-1 (b)).
+    pub fn perp_pooled(&self) -> usize {
+        self.perp_pooled
+    }
+
+    /// Audit v10, PERP-1 (a), (b) and (e): the pool's policies over fee-less perp actions, asked
+    /// in [`Mempool::pool_conflicts`] before the general capacity check so the refusal names the
+    /// cap that binds. An order, a cancel or a withdrawal request past the account's
+    /// [`MAX_PERP_ACCOUNT_POOLED`] or the pool's [`MAX_PERP_POOLED`] is `Full`-class; a new order
+    /// while [`PERP_BACKPRESSURE_WINDOWS`] × `max_window_blocks` recorded digests wait for a
+    /// proof is `PerpBackpressure` — orders are what the lagging prover must run the engine over,
+    /// so only they are held back; a deposit, a cancel, a withdrawal, an oracle price or the proof
+    /// itself is never. Every verdict is about this node, none is cached and no peer is penalised.
+    fn perp_policy(&self, tx: &Transaction, ledger: &Ledger) -> Result<(), MempoolError> {
+        let Some(account) = fee_less_perp_account(&tx.action) else { return Ok(()) };
+        if self.perp_pooled_for(account) >= MAX_PERP_ACCOUNT_POOLED {
+            return Err(MempoolError::PerpAccountFull(word8_to_hex(account)));
+        }
+        if self.perp_pooled >= self.perp_pool_cap {
+            return Err(MempoolError::PerpPoolFull);
+        }
+        // PERP-1 (e) / I-3: only on a chain whose genesis sets `sparse_windows` (chain 22 on). A
+        // dense chain records a digest every block, so with proving slower than the block rate
+        // the limit would hold every new order for good; chain 21 keeps accepting them.
+        // I-4: a cancel names an order — one the account's nonce window has accepted (or one
+        // older than the window remembers), or one this pool holds — never a nonce no order took,
+        // so free cancels cannot stand in for inputs. Retryable: the order may still arrive.
+        // N-1: only on a `sparse_windows` chain (chain 22 on); chain 21's cancels are v0.8.0's.
+        // A target the window has not seen is let through when it is above the account's highest
+        // nonce (an order still on its way) or an order this node holds or is verifying — a
+        // gossiped order's cancel can reach precheck while the order waits in the verify queue.
+        if let (Action::PerpCancel { account, nonce, target, .. }, Some(p)) =
+            (&tx.action, ledger.perps().filter(|p| p.config.sparse_windows))
+        {
+            let seen = match p.account(account) {
+                Some(a) => !matches!(a.nonce_seen(*target), Some(false)) || *target > a.nonce_high,
+                None => false,
+            };
+            if target == nonce || !(seen || self.knows_perp_order(account, *target)) {
+                return Err(MempoolError::PerpCancelUnknownOrder(*target));
+            }
+        }
+        // I-4: a cancel is a block input as an order is, so both are held back alike.
+        if let (Action::PerpOrder { .. } | Action::PerpCancel { .. }, Some(p)) =
+            (&tx.action, ledger.perps().filter(|p| p.config.sparse_windows))
+        {
+            let max = (p.config.max_window_blocks as usize).saturating_mul(PERP_BACKPRESSURE_WINDOWS);
+            let unproved = p.pending_digests();
+            if unproved >= max {
+                return Err(MempoolError::PerpBackpressure { unproved, max });
+            }
+            // PERP-101: a sparse window is bounded by heights too, so the prover is as far behind
+            // when the tip is that many windows' heights past the proved one, however few digests
+            // those heights recorded.
+            let max = p.config.max_window_heights.saturating_mul(PERP_BACKPRESSURE_WINDOWS as u64);
+            let behind = ledger.height().saturating_sub(p.proved_height);
+            if behind >= max {
+                return Err(MempoolError::PerpHeightBackpressure { behind, max });
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether this pool holds, or this node is verifying, `account`'s order of nonce `nonce`
+    /// (I-4, N-1): two counted indexes, no scan.
+    fn knows_perp_order(&self, account: &randprotocol_core::ledger::perps::AccountId, nonce: u64) -> bool {
+        self.perp_orders.contains_key(&(*account, nonce)) || self.queued_perp_orders.contains_key(&(*account, nonce))
+    }
+
+    fn order_key(tx: &Transaction) -> Option<(randprotocol_core::ledger::perps::AccountId, u64)> {
+        match &tx.action {
+            Action::PerpOrder { account, body, .. } => Some((*account, body.nonce)),
+            _ => None,
+        }
+    }
+
+    fn bump(map: &mut HashMap<(randprotocol_core::ledger::perps::AccountId, u64), usize>, k: (randprotocol_core::ledger::perps::AccountId, u64), up: bool) {
+        if up {
+            *map.entry(k).or_insert(0) += 1;
+        } else if let Some(n) = map.get_mut(&k) {
+            *n -= 1;
+            if *n == 0 {
+                map.remove(&k);
+            }
+        }
+    }
+
+    /// N-1: `tx` passed precheck and waits for (or is in) verification on this node; its verdict
+    /// comes back through [`Mempool::verify_done`].
+    pub fn verify_queued(&mut self, tx: &Transaction) {
+        if let Some(k) = Self::order_key(tx) {
+            Self::bump(&mut self.queued_perp_orders, k, true);
+        }
+    }
+
+    /// N-1: `tx`'s verification finished (before it is pooled, if it is).
+    pub fn verify_done(&mut self, tx: &Transaction) {
+        if let Some(k) = Self::order_key(tx) {
+            Self::bump(&mut self.queued_perp_orders, k, false);
         }
     }
 
@@ -533,18 +911,20 @@ impl Mempool {
             return Ok(Vec::new());
         }
         let key = (surplus_per_kib(tx.fee(), floor, len), tx.fee());
-        let mut below: Vec<((u128, u64), &Hash, usize)> = self
+        let mut below: Vec<((u128, u64), u64, &Hash, usize)> = self
             .txs
             .iter()
             .filter(|(h, p)| !is_governance(&p.tx.action) && self.reserved_proof != Some(**h))
-            .map(|(h, p)| ((surplus_per_kib(p.tx.fee(), Self::current_floor(p, ledger), p.len), p.tx.fee()), h, p.len))
-            .filter(|(k, _, _)| *k < key)
+            .map(|(h, p)| ((surplus_per_kib(p.tx.fee(), Self::current_floor(p, ledger), p.len), p.tx.fee()), p.seq, h, p.len))
+            .filter(|(k, _, _, _)| *k < key)
             .collect();
-        // Cheapest first; among equals the higher hash goes first, the mirror of the proposer's
-        // lower-hash-first tie break, so every node evicts the same entries.
-        below.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| b.1.cmp(a.1)));
+        // Cheapest first; among equals the latest arrival goes first, then the higher hash — the
+        // mirror of the proposer's earliest-arrival, lower-hash-first tie break
+        // (`candidates_within`; audit v10, PERP-1 (c)), so the entry evicted is the one a block
+        // would have taken last.
+        below.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| b.1.cmp(&a.1)).then_with(|| b.2.cmp(a.2)));
         let (mut freed, mut evict) = (0usize, Vec::new());
-        for (_, h, l) in below {
+        for (_, _, h, l) in below {
             if freed >= over {
                 break;
             }
@@ -613,6 +993,9 @@ impl Mempool {
         // the cap, not an unbounded flood.
         // RPL-3's reserved slot is outside it too (I1, [`Mempool::takes_reserved_slot`]): one
         // state proof, so a pool full of free orders cannot keep out the proof that settles them.
+        // Audit v10, PERP-1: the fee-less perp caps and the order back-pressure first, so a
+        // refusal names the cap that binds.
+        self.perp_policy(tx, ledger)?;
         if !is_governance(&tx.action) && !self.takes_reserved_slot(tx) && self.txs.len() >= self.max_size {
             return Err(MempoolError::Full);
         }
@@ -651,9 +1034,10 @@ impl Mempool {
         let pricing = self.gas_policy_floor(tx, ledger, executor).map_err(MempoolError::Invalid)?;
         (c.floor, c.gas_limit) = (pricing.floor, pricing.gas_limit);
         Self::defer_until_msauth_warm(tx, ledger, executor)?;
+        self.state_proof_gate(tx, ledger, executor).inspect_err(|_| self.forget_cost())?;
         // Before any proof is verified for it: a transaction the byte cap would refuse costs no
         // verification (audit v6, CH-7).
-        c.evict = self.make_room(tx, c.floor, ledger)?;
+        c.evict = self.make_room(tx, c.floor, ledger).inspect_err(|_| self.forget_cost())?;
         Ok(c)
     }
 
@@ -771,11 +1155,21 @@ impl Mempool {
         if self.takes_reserved_slot(&tx) {
             self.reserved_proof = Some(hash);
         }
+        // Audit v10, PERP-1 (a)/(b): the fee-less perp counts, released in `remove_one`.
+        if let Some(account) = fee_less_perp_account(&tx.action) {
+            *self.perp_accounts.entry(*account).or_insert(0) += 1;
+            self.perp_pooled += 1;
+        }
+        if let Some(k) = Self::order_key(&tx) {
+            Self::bump(&mut self.perp_orders, k, true);
+        }
+        let seq = self.next_seq;
+        self.next_seq += 1;
         let len = tx.encoded_len();
         self.bytes += len;
         // `pool_conflicts` refuses a hash already pooled, so nothing is replaced here; if that
         // ever changes, the replaced entry's bytes must leave the total with it.
-        if let Some(old) = self.txs.insert(hash, Pooled { tx, commitments, claim, token, since: Instant::now(), len, floor, gas_limit, bridge_rotation }) {
+        if let Some(old) = self.txs.insert(hash, Pooled { tx, commitments, claim, token, since: Instant::now(), len, floor, gas_limit, bridge_rotation, seq }) {
             self.bytes -= old.len;
         }
         hash
@@ -841,22 +1235,31 @@ impl Mempool {
         let surplus_per_kib = |p: &Pooled, floor: u64| if priced { surplus_per_kib(p.tx.fee(), floor, p.len) } else { 0 };
         // RPL-3 (I1): a state proof ranks after governance and ahead of fee order — fee-less, it
         // would otherwise sort behind every paying transaction and tie with every free order.
+        // Audit v10, PERP-1 (c): a withdrawal request ranks ahead of orders and cancels — it is
+        // the one fee-less input a trader needs to get collateral out, and one account holds at
+        // most one pending — so a flood of free orders cannot keep a withdrawal out of a block.
         let rank = |a: &Action| {
             if is_governance(a) {
-                2u8
+                3u8
             } else if matches!(a, Action::PerpStateProof { .. }) {
+                2
+            } else if matches!(a, Action::PerpWithdraw { .. }) {
                 1
             } else {
                 0
             }
         };
+        // Ties among equal rank, surplus and fee break by arrival (`Pooled::seq`) first and by
+        // hash last (PERP-1 (c)): the hash is the sender's to grind, the arrival order is not.
         ready.sort_by(|a, b| {
             rank(&b.1.tx.action)
                 .cmp(&rank(&a.1.tx.action))
                 .then_with(|| surplus_per_kib(b.1, b.2).cmp(&surplus_per_kib(a.1, a.2)))
                 .then_with(|| b.1.tx.fee().cmp(&a.1.tx.fee()))
+                .then_with(|| a.1.seq.cmp(&b.1.seq))
                 .then_with(|| a.0.cmp(b.0))
         });
+        Self::interleave_perp_accounts(&mut ready);
         // Audit v6, POOL-2 (option 4, node policy — never a validity rule): only a `Call` pays
         // the byte price, and a transfer out-ranks it on surplus per KiB whenever it pays a
         // little over its flat base, so a stream of transfers could fill every block and keep a
@@ -901,6 +1304,43 @@ impl Mempool {
             }
         }
         out
+    }
+
+    /// Audit v10, PERP-1 (d): among the rank-0 fee-less perp inputs — orders and cancels, the
+    /// ones with no fee to rank them — the accounts are interleaved round-robin: the first pooled
+    /// input of each account (accounts in the order of their first entry), then every account's
+    /// second, and so on, each account's own inputs staying in arrival order. The proposer
+    /// trial-applies candidates in this order and a block holds `max_block_inputs`, so the slots
+    /// go to distinct accounts before any account's second input: three accounts flooding a
+    /// 24-input block hold three slots while the others wait, not twenty-four. Only those entries
+    /// move, and only among the positions they held — a fee-paying bundle, a withdrawal, a proof
+    /// or a governance action keeps its place in the fee order.
+    fn interleave_perp_accounts(ready: &mut [(&Hash, &Pooled, u64)]) {
+        let free_input = |a: &Action| matches!(a, Action::PerpOrder { .. } | Action::PerpCancel { .. });
+        let slots: Vec<usize> = ready.iter().enumerate().filter(|(_, (_, p, _))| free_input(&p.tx.action)).map(|(i, _)| i).collect();
+        if slots.len() < 2 {
+            return;
+        }
+        // Each account's queue of positions, accounts in first-seen order.
+        let mut queues: Vec<(randprotocol_core::ledger::perps::AccountId, std::collections::VecDeque<usize>)> = Vec::new();
+        for &i in &slots {
+            let account = *fee_less_perp_account(&ready[i].1.tx.action).expect("an order or a cancel names its account");
+            match queues.iter_mut().find(|(a, _)| *a == account) {
+                Some((_, q)) => q.push_back(i),
+                None => queues.push((account, std::collections::VecDeque::from([i]))),
+            }
+        }
+        let mut order = Vec::with_capacity(slots.len());
+        while order.len() < slots.len() {
+            for (_, q) in queues.iter_mut() {
+                if let Some(i) = q.pop_front() {
+                    order.push(ready[i]);
+                }
+            }
+        }
+        for (slot, entry) in slots.into_iter().zip(order) {
+            ready[slot] = entry;
+        }
     }
 
     /// The cheap half of `Ledger::validate` — everything that can go stale between insertion and
@@ -1219,6 +1659,18 @@ impl Mempool {
         if self.reserved_proof == Some(*hash) {
             self.reserved_proof = None;
         }
+        if let Some(account) = fee_less_perp_account(&p.tx.action) {
+            if let Some(n) = self.perp_accounts.get_mut(account) {
+                *n = n.saturating_sub(1);
+                if *n == 0 {
+                    self.perp_accounts.remove(account);
+                }
+            }
+            self.perp_pooled = self.perp_pooled.saturating_sub(1);
+        }
+        if let Some(k) = Self::order_key(&p.tx) {
+            Self::bump(&mut self.perp_orders, k, false);
+        }
         for nf in p.tx.nullifiers() {
             // Only withdraw the index entries this transaction owns: a conflicting one was never
             // admitted, so an entry pointing elsewhere cannot exist, but checking keeps the two
@@ -1449,16 +1901,19 @@ mod tests {
     }
 
     #[test]
-    fn a_tie_on_fee_is_broken_by_hash_so_every_proposer_agrees() {
+    fn a_tie_on_fee_is_broken_by_arrival_then_hash_so_grinding_buys_nothing() {
+        // Audit v10, PERP-1 (c): equal rank, surplus and fee sort by the pool's arrival order
+        // first — whichever hash is lower — and by hash only between entries that arrived in
+        // the same order, which cannot happen in one pool. Both insertion orders are tried.
         let l = ledger();
-        let mut m = Mempool::new(100);
         let a = fixtures::bundle_tx(&l, [nf(1), nf(2)], [cm(1), cm(2)], fixtures::bundle_fee());
         let b = fixtures::bundle_tx(&l, [nf(3), nf(4)], [cm(3), cm(4)], fixtures::bundle_fee());
-        m.insert(a.clone(), &l, &StubExecutor).unwrap();
-        m.insert(b.clone(), &l, &StubExecutor).unwrap();
-        let mut expected = vec![a, b];
-        expected.sort_by_key(|t| t.hash());
-        assert_eq!(m.candidates(&l, 10), expected);
+        for (first, second) in [(&a, &b), (&b, &a)] {
+            let mut m = Mempool::new(100);
+            m.insert(first.clone(), &l, &StubExecutor).unwrap();
+            m.insert(second.clone(), &l, &StubExecutor).unwrap();
+            assert_eq!(m.candidates(&l, 10), vec![first.clone(), second.clone()], "arrival order, not hash order");
+        }
     }
 
     #[test]
@@ -3942,6 +4397,503 @@ mod tests {
         m.prune(&building);
         assert_eq!(m.len(), 1, "the ninth is not stale");
         assert_eq!(m.block_candidates(&building).len(), 1, "and goes to the next block");
+    }
+
+    /// A trader's signed cancel of `target` at `nonce`, for the PERP-1 pool tests.
+    fn perp_cancel_tx(k: &randprotocol_core::Keypair, nonce: u64, target: u64) -> Transaction {
+        use randprotocol_core::ledger::perps::account_id;
+        fixtures::perp_signed(
+            7,
+            k,
+            Action::PerpCancel { account: account_id(k.public_key()), nonce, target, signature: randprotocol_core::Signature::empty() },
+        )
+    }
+
+    /// The RPL-3 fixture chain with `traders` accounts opened in block 1, at tip 1.
+    fn perps_chain_with(traders: &[&randprotocol_core::Keypair]) -> (randprotocol_core::genesis::GenesisState, Ledger) {
+        use fixtures::{key, make_perps_block, perp_deposit_tx};
+        let gs = fixtures::perps_genesis(7);
+        let mut l = gs.ledger.clone();
+        let deposits = traders.iter().enumerate().map(|(i, k)| perp_deposit_tx(&l, k, 300 + 100 * i as u32, 5_000_000)).collect();
+        make_perps_block(&gs.block, &mut l, deposits, &key(1));
+        (gs, l)
+    }
+
+    /// Audit v10, PERP-1 (a): one account pools at most `MAX_PERP_ACCOUNT_POOLED` fee-less perp
+    /// actions — orders, cancels and withdrawal requests together. The seventeenth is a
+    /// `Full`-class verdict naming the account: retryable, an `Ignore` to gossip, never cached;
+    /// another account is not held to it, a deposit (fee-paying, bundle-carried) is not counted,
+    /// and a slot frees when one of the sixteen leaves.
+    #[test]
+    fn an_account_pools_at_most_sixteen_fee_less_perp_actions() {
+        use crate::admission::{acceptance_for_pool, Acceptance, RefusedCache};
+        use fixtures::{key, perp_deposit_tx, perp_withdraw_tx};
+        use randprotocol_core::ledger::perps::account_id;
+        let (a, b) = (key(50), key(51));
+        let (_gs, l) = perps_chain_with(&[&a, &b]);
+        let mut m = Mempool::new(10_000);
+        for n in 1..MAX_PERP_ACCOUNT_POOLED as u64 {
+            m.insert(perp_order_tx(&a, n), &l, &StubExecutor).unwrap();
+        }
+        m.insert(perp_cancel_tx(&a, 40, 1), &l, &StubExecutor).expect("a cancel is the sixteenth");
+        assert_eq!(m.perp_pooled_for(&account_id(a.public_key())), MAX_PERP_ACCOUNT_POOLED);
+        let full = MempoolError::PerpAccountFull(word8_to_hex(&account_id(a.public_key())));
+        let seventeenth = perp_order_tx(&a, 17);
+        assert_eq!(m.insert(seventeenth.clone(), &l, &StubExecutor), Err(full.clone()));
+        assert_eq!(m.precheck(&seventeenth, &l, &StubExecutor).unwrap_err(), full, "the pre-screen says the same");
+        assert_eq!(m.insert(perp_withdraw_tx(7, &a, 18, 1_000, 1), &l, &StubExecutor), Err(full.clone()), "a request counts too");
+        assert!(full.is_retryable(), "a Full-class verdict");
+        let mut refused = RefusedCache::new(16);
+        assert_eq!(acceptance_for_pool(&full, seventeenth.hash(), &mut refused), Acceptance::Ignore);
+        assert!(refused.is_empty(), "never cached: it is about this pool");
+        // Another account, and the same account's fee-paying deposit, are not held to it.
+        m.insert(perp_order_tx(&b, 1), &l, &StubExecutor).expect("another account");
+        m.insert(perp_deposit_tx(&l, &a, 900, 5_000_000), &l, &StubExecutor).expect("a deposit rides a paying bundle");
+        assert_eq!(m.perp_pooled(), MAX_PERP_ACCOUNT_POOLED + 1, "deposits are not counted");
+        // A slot frees when one of the sixteen leaves.
+        m.remove(&[perp_order_tx(&a, 1).hash()]);
+        m.insert(seventeenth, &l, &StubExecutor).expect("room again");
+        assert_eq!(m.perp_pooled_for(&account_id(a.public_key())), MAX_PERP_ACCOUNT_POOLED);
+    }
+
+    /// Audit v10, PERP-1 (b): the pool-wide cap on fee-less perp actions binds across accounts
+    /// (lowered here, since fifteen accounts at sixteen each never reach 1 024), and a fee-paying
+    /// bundle is admitted past it — the cap is what keeps free orders from crowding bundles out.
+    #[test]
+    fn fee_less_perp_actions_have_a_pool_wide_cap_that_spares_paying_bundles() {
+        use fixtures::key;
+        let (a, b) = (key(50), key(51));
+        let (_gs, l) = perps_chain_with(&[&a, &b]);
+        let mut m = Mempool::new(10_000).with_perp_pool_cap(3);
+        m.insert(perp_order_tx(&a, 1), &l, &StubExecutor).unwrap();
+        m.insert(perp_order_tx(&b, 1), &l, &StubExecutor).unwrap();
+        m.insert(perp_order_tx(&a, 2), &l, &StubExecutor).unwrap();
+        assert_eq!(m.insert(perp_order_tx(&b, 2), &l, &StubExecutor), Err(MempoolError::PerpPoolFull));
+        assert!(MempoolError::PerpPoolFull.is_retryable());
+        let paying = StubExecutor::bound(Transaction::shielded(
+            l.chain_id(),
+            fixtures::v3_bundle(&l, 700, fixtures::RPL2_FEE, (0, 0, 0)),
+            Action::None,
+        ));
+        m.insert(paying, &l, &StubExecutor).expect("a paying bundle is outside the perp cap");
+        assert_eq!(m.len(), 4);
+        m.remove(&[perp_order_tx(&a, 1).hash()]);
+        assert_eq!(m.perp_pooled(), 2);
+        m.insert(perp_order_tx(&b, 2), &l, &StubExecutor).expect("a slot freed");
+    }
+
+    /// Audit v10, PERP-1 (c): among fee-less perp actions a withdrawal request ranks ahead of
+    /// orders and cancels, and ties among orders break by arrival, whichever hash is lower.
+    #[test]
+    fn a_withdrawal_ranks_above_orders_and_order_ties_fall_to_arrival() {
+        use fixtures::{key, perp_withdraw_tx};
+        let (a, b, c) = (key(50), key(51), key(52));
+        let (_gs, l) = perps_chain_with(&[&a, &b, &c]);
+        let (b1, a1) = (perp_order_tx(&b, 1), perp_order_tx(&a, 1));
+        let w = perp_withdraw_tx(7, &c, 1, 1_000, 1);
+        let mut m = Mempool::new(100);
+        m.insert(b1.clone(), &l, &StubExecutor).unwrap();
+        m.insert(a1.clone(), &l, &StubExecutor).unwrap();
+        m.insert(w.clone(), &l, &StubExecutor).unwrap();
+        assert_eq!(m.candidates(&l, 10), vec![w.clone(), b1.clone(), a1.clone()], "the request first, then arrival order");
+        // The other arrival order gives the other tie: the hash decides nothing.
+        let mut m = Mempool::new(100);
+        m.insert(a1.clone(), &l, &StubExecutor).unwrap();
+        m.insert(b1.clone(), &l, &StubExecutor).unwrap();
+        m.insert(w.clone(), &l, &StubExecutor).unwrap();
+        assert_eq!(m.candidates(&l, 10), vec![w, a1, b1]);
+    }
+
+    /// Audit v10, PERP-1 (d): rank-0 perp inputs are offered account by account, round-robin —
+    /// every account's first order, then every second — so the block's `max_block_inputs` (8 on
+    /// the fixture chain) go to distinct accounts before any account's second: A's five, B's
+    /// four and C's three, inserted account by account, mine as 3 / 3 / 2, not 5 / 3 / 0. A
+    /// fee-paying deposit keeps its place ahead of them all.
+    #[test]
+    fn the_proposer_interleaves_perp_accounts_round_robin() {
+        use fixtures::{key, perp_deposit_tx};
+        use randprotocol_core::ledger::perps::account_id;
+        let (a, b, c) = (key(50), key(51), key(52));
+        let (_gs, l) = perps_chain_with(&[&a, &b, &c]);
+        let mut m = Mempool::new(100);
+        let mut orders = Vec::new();
+        for (k, n) in [(&a, 5u64), (&b, 4), (&c, 3)] {
+            for i in 1..=n {
+                let tx = perp_order_tx(k, i);
+                m.insert(tx.clone(), &l, &StubExecutor).unwrap();
+                orders.push(tx);
+            }
+        }
+        let deposit = perp_deposit_tx(&l, &a, 900, 5_000_000);
+        m.insert(deposit.clone(), &l, &StubExecutor).unwrap();
+        let offered = m.block_candidates(&l);
+        assert_eq!(offered.len(), 13);
+        assert_eq!(offered[0], deposit, "the paying bundle is first");
+        let account_of = |tx: &Transaction| match &tx.action {
+            Action::PerpOrder { account, .. } => *account,
+            _ => unreachable!(),
+        };
+        let ids = [account_id(a.public_key()), account_id(b.public_key()), account_id(c.public_key())];
+        let seq: Vec<usize> = offered[1..].iter().map(|tx| ids.iter().position(|id| *id == account_of(tx)).unwrap()).collect();
+        assert_eq!(seq, vec![0, 1, 2, 0, 1, 2, 0, 1, 2, 0, 1, 0], "A B C A B C A B C A B A");
+        let nonce_of = |tx: &Transaction| match &tx.action {
+            Action::PerpOrder { body, .. } => body.nonce,
+            _ => unreachable!(),
+        };
+        assert!(offered[1..].iter().filter(|t| account_of(t) == ids[0]).map(nonce_of).eq(1..=5), "each account's own order is kept");
+        // The proposer's build: the first eight inputs that apply fill the block.
+        let mut building = l.clone();
+        building.set_height(2);
+        let mut mined: Vec<usize> = Vec::new();
+        for tx in &offered {
+            let mut trial = building.clone();
+            if trial.apply_tx(tx, &key(1).address(), &StubExecutor).is_ok() {
+                building = trial;
+                if matches!(tx.action, Action::PerpOrder { .. }) {
+                    mined.push(ids.iter().position(|id| *id == account_of(tx)).unwrap());
+                }
+            }
+        }
+        let count = |i| mined.iter().filter(|&&x| x == i).count();
+        assert_eq!((count(0), count(1), count(2)), (3, 2, 2), "the deposit took one of the eight slots; the rest went round");
+    }
+
+    /// PERP-1 (e), gated on `sparse_windows` (I-3): once four windows of recorded digests wait
+    /// for a proof (`PERP_BACKPRESSURE_WINDOWS` × `max_window_blocks`, 32 on the fixture chain)
+    /// this node admits no new order — a `Full`-class verdict — while a deposit, a withdrawal and
+    /// an oracle price pass; a state proof that covers a window lifts it. A dense chain (chain
+    /// 21's rule) never holds an order back, however many digests wait.
+    #[test]
+    fn new_orders_are_refused_while_four_windows_of_digests_wait_for_a_proof() {
+        use fixtures::{key, make_perps_block, perp_deposit_tx, perp_oracle_tx, perp_state_proof_tx, perp_withdraw_tx};
+        let a = key(50);
+        let chain = |sparse: bool| {
+            let mut file = fixtures::perps_genesis_file(7);
+            let c = file.perps.as_mut().unwrap();
+            c.sparse_windows = sparse;
+            c.max_window_heights = if sparse { 16 } else { 0 };
+            let gs = file.build(&StubExecutor).unwrap();
+            let mut l = gs.ledger.clone();
+            let max = l.perps().unwrap().config.max_window_blocks as usize * PERP_BACKPRESSURE_WINDOWS;
+            // Every block carries an input (a deposit), so every close records a digest on
+            // either kind of chain: `max` wait for a proof.
+            let d = perp_deposit_tx(&l, &a, 300, 5_000_000);
+            let mut parent = make_perps_block(&gs.block, &mut l, vec![d], &key(1));
+            for i in 2..=max {
+                let d = perp_deposit_tx(&l, &a, 300 + 10 * i as u32, 5_000_000);
+                // Block 2 also records the order a cancel below names.
+                let txs = if i == 2 { vec![d, perp_order_tx(&a, 1)] } else { vec![d] };
+                parent = make_perps_block(&parent, &mut l, txs, &key(1));
+            }
+            assert_eq!(l.perps().unwrap().pending_digests(), max);
+            (l, max)
+        };
+        let m = Mempool::new(100);
+        let order = perp_order_tx(&a, 3);
+        let (dense, _) = chain(false);
+        assert!(m.precheck(&order, &dense, &StubExecutor).is_ok(), "chain 21's rule: orders are never held");
+        let (l, max) = chain(true);
+        let held = MempoolError::PerpBackpressure { unproved: max, max };
+        assert_eq!(m.precheck(&order, &l, &StubExecutor).unwrap_err(), held);
+        assert!(held.is_retryable());
+        // I-4: a cancel (of the order block 2 recorded) is an input too, and held alike.
+        assert_eq!(m.precheck(&perp_cancel_tx(&a, 2, 1), &l, &StubExecutor).unwrap_err(), held, "a cancel is held as well");
+        assert!(m.precheck(&perp_cancel_tx(&a, 2, 1), &dense, &StubExecutor).is_ok(), "not on a dense chain");
+        assert!(m.precheck(&perp_withdraw_tx(7, &a, 3, 1_000, l.height() as u32), &l, &StubExecutor).is_ok(), "a request passes");
+        assert!(m.precheck(&perp_deposit_tx(&l, &a, 900, 5_000_000), &l, &StubExecutor).is_ok(), "a deposit passes");
+        assert!(m.precheck(&perp_oracle_tx(7, &key(1), 100, 1), &l, &StubExecutor).is_ok(), "an oracle passes");
+        let proof = perp_state_proof_tx(&l, 8, [7; 8], vec![], 0);
+        assert!(m.precheck(&proof, &l, &StubExecutor).is_ok(), "the proof that lifts it passes");
+        // The proof lands: 24 remain, under the limit.
+        let mut after = l.clone();
+        after.set_height(l.height() + 1);
+        after.apply_transactions(std::slice::from_ref(&proof), &key(1).address(), &StubExecutor).unwrap();
+        assert_eq!(after.perps().unwrap().pending_digests(), max - 8);
+        assert!(m.precheck(&order, &after, &StubExecutor).is_ok(), "orders flow again");
+    }
+
+    /// I-4 / N-1: on a `sparse_windows` chain a cancel must name an order — a nonce the account's
+    /// window accepted (or one older than it remembers), a nonce above its highest (an order on
+    /// its way), an order this pool holds, or one this node is verifying (the gossip race: the
+    /// cancel's precheck runs while its order waits in the verify queue). It is never its own
+    /// target. On a dense chain (chain 21) a cancel is v0.8.0's: no target rule.
+    #[test]
+    fn a_cancel_must_name_an_order_on_a_sparse_chain_and_the_verify_queue_counts() {
+        use fixtures::{key, make_perps_block, perp_deposit_tx};
+        let a = key(50);
+        let chain = |sparse: bool| {
+            let mut file = fixtures::perps_genesis_file(7);
+            let c = file.perps.as_mut().unwrap();
+            c.sparse_windows = sparse;
+            c.max_window_heights = if sparse { 16 } else { 0 };
+            let gs = file.build(&StubExecutor).unwrap();
+            let mut l = gs.ledger.clone();
+            let d = perp_deposit_tx(&l, &a, 300, 5_000_000);
+            let b1 = make_perps_block(&gs.block, &mut l, vec![d], &key(1));
+            // Block 2 records a's orders of nonces 1 and 5: nonce_high 5, nonces 2..=4 unused.
+            make_perps_block(&b1, &mut l, vec![perp_order_tx(&a, 1), perp_order_tx(&a, 5)], &key(1));
+            l
+        };
+        let l = chain(true);
+        let mut m = Mempool::new(100);
+        assert!(m.precheck(&perp_cancel_tx(&a, 6, 1), &l, &StubExecutor).is_ok(), "an accepted order");
+        let unknown = m.precheck(&perp_cancel_tx(&a, 6, 3), &l, &StubExecutor).unwrap_err();
+        assert_eq!(unknown, MempoolError::PerpCancelUnknownOrder(3), "a nonce in the window no order took");
+        assert!(unknown.is_retryable());
+        assert_eq!(m.precheck(&perp_cancel_tx(&a, 6, 6), &l, &StubExecutor).unwrap_err(), MempoolError::PerpCancelUnknownOrder(6), "its own nonce");
+        assert!(m.precheck(&perp_cancel_tx(&a, 6, 9), &l, &StubExecutor).is_ok(), "above the highest: an order on its way");
+        // The gossip race: the order of nonce 3 is queued for verification, its cancel arrives.
+        let order3 = perp_order_tx(&a, 3);
+        m.verify_queued(&order3);
+        assert!(m.precheck(&perp_cancel_tx(&a, 7, 3), &l, &StubExecutor).is_ok(), "an order in the verify queue");
+        // Its verdict comes back and it is pooled: still known, from the pool's index now.
+        m.verify_done(&order3);
+        m.insert(order3.clone(), &l, &StubExecutor).unwrap();
+        assert!(m.precheck(&perp_cancel_tx(&a, 7, 3), &l, &StubExecutor).is_ok(), "a pooled order");
+        m.remove(&[order3.hash()]);
+        assert_eq!(m.precheck(&perp_cancel_tx(&a, 7, 3), &l, &StubExecutor).unwrap_err(), MempoolError::PerpCancelUnknownOrder(3), "gone again");
+        // Chain 21's rule: no target check at all.
+        let dense = chain(false);
+        for target in [3, 6, 9] {
+            assert!(m.precheck(&perp_cancel_tx(&a, 6, target), &dense, &StubExecutor).is_ok(), "dense: target {target}");
+        }
+    }
+
+    /// PERP-101: under `sparse_windows` few digests may wait while many heights do, so a new
+    /// order is also held back once the tip is four windows' heights (`PERP_BACKPRESSURE_WINDOWS`
+    /// × `max_window_heights`, 64 here) past the proved height; a dense chain (chain 21's rule)
+    /// holds none back, the same tip included.
+    #[test]
+    fn under_sparse_windows_new_orders_are_held_once_four_windows_of_heights_pass() {
+        use fixtures::{key, make_perps_block, perp_deposit_tx};
+        let a = key(50);
+        let m = Mempool::new(100);
+        let order = perp_order_tx(&a, 1);
+        let run = |sparse: bool| {
+            let mut file = fixtures::perps_genesis_file(7);
+            let c = file.perps.as_mut().unwrap();
+            c.sparse_windows = sparse;
+            c.max_window_heights = if sparse { 16 } else { 0 };
+            let gs = file.build(&StubExecutor).unwrap();
+            let mut l = gs.ledger.clone();
+            let deposit = perp_deposit_tx(&l, &a, 300, 5_000_000);
+            let mut parent = make_perps_block(&gs.block, &mut l, vec![deposit], &key(1));
+            for _ in 2..64 {
+                parent = make_perps_block(&parent, &mut l, vec![], &key(1));
+            }
+            let at_63 = l.clone();
+            make_perps_block(&parent, &mut l, vec![], &key(1));
+            (at_63, l)
+        };
+        let (at_63, at_64) = run(true);
+        assert_eq!(at_64.perps().unwrap().pending_digests(), 4, "1, 17, 33 and 49: far under the digest limit");
+        assert!(m.precheck(&order, &at_63, &StubExecutor).is_ok(), "63 heights behind");
+        let held = MempoolError::PerpHeightBackpressure { behind: 64, max: 64 };
+        assert_eq!(m.precheck(&order, &at_64, &StubExecutor).unwrap_err(), held);
+        assert!(held.is_retryable());
+        // Dense (chain 21's rule): 64 digests wait and the head is 64 past the proved height, and
+        // the order still passes — back-pressure is a sparse-chain policy (I-3).
+        let (_, dense) = run(false);
+        assert!(m.precheck(&order, &dense, &StubExecutor).is_ok());
+    }
+
+    /// CON-60 (b): junk state proofs — of fresh shapes and of the engine's own — never delay an
+    /// honest proof of the engine's shape (its key is built: the stub's honest shape is warm), and
+    /// a refusal moves nothing. Proofs of cold shapes take a token each from the cold-build bucket;
+    /// with none left they are `StateProofBusy` (retryable, `Ignore` to gossip, no timing in it).
+    #[test]
+    fn junk_state_proofs_never_delay_a_proof_of_a_warm_shape() {
+        use fixtures::{key, make_perps_block, perp_deposit_tx, perp_state_proof_tx};
+        let gs = fixtures::perps_genesis(7);
+        let mut l = gs.ledger.clone();
+        let deposit = perp_deposit_tx(&l, &key(50), 300, 5_000_000);
+        let b1 = make_perps_block(&gs.block, &mut l, vec![deposit], &key(1));
+        make_perps_block(&b1, &mut l, vec![], &key(1));
+        let honest = perp_state_proof_tx(&l, 2, [7; 8], vec![], 0);
+        let shaped = |h: [u8; 4], salt: u8| {
+            let mut tx = honest.clone();
+            let Action::PerpStateProof { proof, .. } = &mut tx.action else { unreachable!() };
+            proof[37..41].copy_from_slice(&h);
+            // A distinct transaction per salt, in an output word (read only after verifying):
+            // every action field is in the segment, which the pre-key rules bind.
+            proof[33] = salt;
+            tx
+        };
+        let mut m = Mempool::new(100);
+        let ex = &StubExecutor;
+        // Spam of fresh shapes: the bucket's burst, then busy.
+        for i in 0..COLD_KEY_BUILD_BURST as u8 {
+            let junk = shaped([15 + i, 0, 0, 0], i);
+            assert!(m.precheck(&junk, &l, ex).is_ok(), "cold #{i} within the burst");
+            m.state_proof_queued(&junk, &l, ex);
+        }
+        let busy = m.precheck(&shaped([40, 0, 0, 0], 9), &l, ex).unwrap_err();
+        assert_eq!(busy, MempoolError::StateProofBusy);
+        assert!(busy.is_retryable());
+        assert!(!busy.to_string().chars().any(|c| c.is_ascii_digit()), "no timing: {busy}");
+        let mut refused = crate::admission::RefusedCache::new(8);
+        assert_eq!(crate::admission::acceptance_for_pool(&busy, honest.hash(), &mut refused), crate::admission::Acceptance::Ignore);
+        // Junk of the engine's own shape costs no token and is not held; nor is the honest proof.
+        for salt in 20..40u8 {
+            let junk = shaped([0; 4], salt);
+            assert!(m.precheck(&junk, &l, ex).is_ok());
+            m.state_proof_queued(&junk, &l, ex);
+        }
+        assert!(m.precheck(&honest, &l, ex).is_ok(), "the honest proof of the warm shape passes, spam or not");
+        assert_eq!(m.precheck(&shaped([41, 0, 0, 0], 10), &l, ex).unwrap_err(), MempoolError::StateProofBusy, "the warm spam took no token");
+        // Bytes that are not a proof's header are the executor's cheap refusal: not held either.
+        let mut junk = honest.clone();
+        let Action::PerpStateProof { proof, .. } = &mut junk.action else { unreachable!() };
+        *proof = b"junk".to_vec();
+        assert!(m.precheck(&junk, &l, ex).is_ok());
+        // The bucket refills one token per interval, and the builds it allows are bounded.
+        let budget = m.cold_keys_mut();
+        let t0 = Instant::now();
+        assert!(!budget.available(t0));
+        assert!(budget.available(t0 + COLD_KEY_BUILD_INTERVAL + std::time::Duration::from_millis(5)));
+        let mut fresh = ColdKeyBudget::default();
+        let ten_minutes = 600u64;
+        let builds = (0..=ten_minutes * 10).filter(|ds| fresh.take(t0 + std::time::Duration::from_millis(ds * 100))).count();
+        let bound = COLD_KEY_BUILD_BURST as u64 + ten_minutes / COLD_KEY_BUILD_INTERVAL.as_secs();
+        assert!(builds as u64 <= bound, "{builds} builds in ten minutes, bound {bound}");
+        assert!(builds as u64 >= bound - 1);
+    }
+
+    /// CON-60 (b) fix 1: a proof the ledger or the executor would refuse before touching a key —
+    /// a tier past `max_tier`, a window the ledger refuses — never takes a token, however it is
+    /// re-salted; fix 2: foreign junk with a valid header drains only the general bucket, and an
+    /// honest proof of a cold shape of the engine's lineage still passes on the lineage reserve.
+    #[test]
+    fn junk_refused_for_free_takes_no_token_and_foreign_junk_cannot_drain_the_lineage_reserve() {
+        use fixtures::{key, make_perps_block, perp_deposit_tx, perp_state_proof_tx};
+        let gs = fixtures::perps_genesis(7);
+        let mut l = gs.ledger.clone();
+        let deposit = perp_deposit_tx(&l, &key(50), 300, 5_000_000);
+        let b1 = make_perps_block(&gs.block, &mut l, vec![deposit], &key(1));
+        make_perps_block(&b1, &mut l, vec![], &key(1));
+        let honest = perp_state_proof_tx(&l, 2, [7; 8], vec![], 0);
+        let patched = |tier: u8, h: [u8; 4], salt: u64| {
+            let mut tx = honest.clone();
+            let Action::PerpStateProof { proof, .. } = &mut tx.action else { unreachable!() };
+            proof[4] = tier;
+            proof[37..41].copy_from_slice(&h);
+            proof[29..37].copy_from_slice(&salt.to_le_bytes()); // output words: unread before the STARK
+            tx
+        };
+        let mut m = Mempool::new(100);
+        let ex = &StubExecutor;
+        // Fix 1: 100 re-salted proofs over max_tier (16), each a fresh cold shape: no token.
+        for salt in 0..100u64 {
+            let junk = patched(20, [15 + (salt % 50) as u8, 0, 0, 0], salt);
+            assert!(m.precheck(&junk, &l, ex).is_ok(), "refused later, for free");
+            m.state_proof_queued(&junk, &l, ex);
+        }
+        // … nor does a window the ledger refuses (it ends at a height not closed).
+        let mut far = patched(16, [30, 0, 0, 0], 1);
+        let Action::PerpStateProof { to_height, .. } = &mut far.action else { unreachable!() };
+        *to_height = 50;
+        for _ in 0..10 {
+            m.state_proof_queued(&far, &l, ex);
+        }
+        let t0 = Instant::now();
+        assert!(m.cold_keys_mut().available(t0) && m.lineage_keys_mut().available(t0), "both buckets untouched");
+        // Fix 2: foreign junk with a valid header (tier 16, program height 15) drains the general bucket …
+        for i in 0..COLD_KEY_BUILD_BURST as u64 {
+            let junk = patched(16, [15, i as u8 + 1, 0, 0], 200 + i);
+            m.state_proof_queued(&junk, &l, ex);
+        }
+        assert_eq!(m.precheck(&patched(16, [15, 9, 0, 0], 300), &l, ex).unwrap_err(), MempoolError::StateProofBusy);
+        // … while an honest proof of a cold canonical shape (tier 16, the engine's program
+        // height, the stub's canonical input height 1) passes on the reserve, which only
+        // canonical shapes draw on — a lineage shape at another input height does not.
+        let lineage = patched(16, [0, 1, 0, 0], 400);
+        assert_eq!(m.precheck(&patched(16, [0, 9, 0, 0], 401), &l, ex).unwrap_err(), MempoolError::StateProofBusy, "non-canonical: the general bucket");
+        assert!(m.precheck(&lineage, &l, ex).is_ok(), "the lineage reserve is intact");
+        m.state_proof_queued(&lineage, &l, ex);
+        let later = Instant::now() + COLD_KEY_BUILD_INTERVAL + std::time::Duration::from_millis(50);
+        assert!(m.cold_keys_mut().available(later), "and the general bucket refills on its own");
+    }
+
+    /// CON-60 round 3: a proof with a valid header but a wrong engine binding or public digest —
+    /// what the verifier refuses before its key — takes no token from either bucket, re-salted
+    /// or not.
+    #[test]
+    fn a_proof_the_verifier_refuses_before_its_key_takes_no_token() {
+        use fixtures::{key, make_perps_block, perp_deposit_tx, perp_state_proof_tx};
+        let gs = fixtures::perps_genesis(7);
+        let mut l = gs.ledger.clone();
+        let deposit = perp_deposit_tx(&l, &key(50), 300, 5_000_000);
+        let b1 = make_perps_block(&gs.block, &mut l, vec![deposit], &key(1));
+        make_perps_block(&b1, &mut l, vec![], &key(1));
+        let honest = perp_state_proof_tx(&l, 2, [7; 8], vec![], 0);
+        let forged = |byte: usize, salt: u64| {
+            let mut tx = honest.clone();
+            let Action::PerpStateProof { proof, .. } = &mut tx.action else { unreachable!() };
+            proof[37..41].copy_from_slice(&[0, 1, 0, 0]); // the cold canonical shape
+            proof[byte] ^= 1;
+            proof[29..37].copy_from_slice(&salt.to_le_bytes());
+            tx
+        };
+        let mut m = Mempool::new(100);
+        let ex = &StubExecutor;
+        // 101..109 is the engine binding (the stub's hc), 69..101 the public digest.
+        let builds = randprotocol_core::confidential::stub_perp_key_builds;
+        let before = builds();
+        for salt in 0..50u64 {
+            for byte in [101, 70] {
+                let junk = forged(byte, salt);
+                assert!(m.precheck(&junk, &l, ex).is_ok());
+                m.state_proof_queued(&junk, &l, ex);
+                // Round 4: free here means free to verify — the verifier refuses it before its key
+                // (the zkVM's own order is pinned by its `a_wrong_digest_state_proof_builds_no_key…`).
+                assert!(l.validate(&junk, ex).is_err());
+            }
+        }
+        assert_eq!(builds(), before, "a proof the pool let through without a token built a key");
+        let t0 = Instant::now();
+        assert!(m.lineage_keys_mut().available(t0) && m.cold_keys_mut().available(t0), "no token taken");
+        // The same cold canonical shape unforged passes the pre-key rules: it takes a reserve
+        // token, and its verification is the one key build.
+        let mut cold = honest.clone();
+        let Action::PerpStateProof { proof, .. } = &mut cold.action else { unreachable!() };
+        proof[37..41].copy_from_slice(&[0, 1, 0, 0]);
+        assert!(m.precheck(&cold, &l, ex).is_ok());
+        m.state_proof_queued(&cold, &l, ex);
+        let _ = l.validate(&cold, ex);
+        assert_eq!(builds(), before + 1);
+        assert!(m.cold_keys_mut().available(t0), "the general bucket untouched");
+        m.lineage_keys_mut().take(t0);
+        assert!(!m.lineage_keys_mut().available(t0), "the reserve paid for it");
+    }
+
+    /// CON-60 round 4: the gate's cost is read back only for the same transaction at the same tip.
+    /// A cold canonical proof the gate priced on one tip, queued against a tip that refuses its
+    /// window (so it would be refused for free), takes no token — the stale `Canonical` is not
+    /// reused — and a gate that ran without a following queue leaves nothing a later one reads.
+    #[test]
+    fn a_state_proofs_cost_is_never_reused_across_tips() {
+        use fixtures::{key, make_perps_block, perp_deposit_tx, perp_state_proof_tx};
+        let gs = fixtures::perps_genesis(7);
+        let mut l = gs.ledger.clone();
+        let deposit = perp_deposit_tx(&l, &key(50), 300, 5_000_000);
+        let b1 = make_perps_block(&gs.block, &mut l, vec![deposit], &key(1));
+        let before = l.clone();
+        make_perps_block(&b1, &mut l, vec![], &key(1));
+        assert_ne!(before.height(), l.height());
+        let mut cold = perp_state_proof_tx(&l, 2, [7; 8], vec![], 0);
+        let Action::PerpStateProof { proof, .. } = &mut cold.action else { unreachable!() };
+        proof[37..41].copy_from_slice(&[0, 1, 0, 0]); // the cold canonical shape
+        let mut m = Mempool::new(100);
+        let ex = &StubExecutor;
+        let t0 = Instant::now();
+        assert!(m.precheck(&cold, &l, ex).is_ok(), "priced Canonical on the tip that closes its window");
+        m.state_proof_queued(&cold, &before, ex);
+        m.state_proof_queued(&cold, &before, ex);
+        assert!(m.lineage_keys_mut().available(t0) && m.lineage_keys_mut().level(t0) >= 2.0, "no token: the other tip refuses it for free");
+        // On its own tip the same transaction pays its one token.
+        assert!(m.precheck(&cold, &l, ex).is_ok());
+        m.state_proof_queued(&cold, &l, ex);
+        assert!(m.lineage_keys_mut().level(t0) < 2.0);
     }
 
     /// An invoke's payout notes are leaves like any other: the pool claims them (through

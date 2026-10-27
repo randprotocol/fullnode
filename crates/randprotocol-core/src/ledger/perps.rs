@@ -62,6 +62,45 @@ pub const PERP_FROM: Word8 = [u32::from_le_bytes(*b"rpl3"), u32::from_le_bytes(*
 const _: () = assert!(MAX_PERP_PAYOUTS as u64 <= super::MAX_LEAVES_PER_TX);
 /// The most blocks `max_window_blocks` may set one state proof to cover.
 pub const MAX_WINDOW_BLOCKS: u64 = 64;
+/// CON-60: the canonical state-proof shape (pool policy, never a validity rule). The honest
+/// prover pads every proof to it, so a node can warm, reserve and keep exactly these keys: for a
+/// chain whose genesis `max_tier` is `T` and a window of `n` recorded blocks,
+///
+/// - tier `T` (prove at the cap, whatever the window needs);
+/// - input height [`canonical_input_log_height`]`(T) = clamp(T − 2, 7, 16)`, reached by appending
+///   zero words to the guest's witness until it is [`canonical_witness_words`]`(T) =
+///   2^h − 1` words long (the guest reads only the words it counts; the padding is never read).
+///   `T − 2` keeps the input digest's Poseidon2 rows (one per four words, so 2^(T−4)) at half
+///   the tier's 2^(T−3) budget (16 384 of 32 768 rows at `T` = 18); 16 is the input table's height for the most words a proof may carry
+///   (`u16::MAX`). At `T` = 18 that is 65 535 words, past the longest 64-block window at 24
+///   inputs a block (≈ 33 000 words with the state); at `T` = 16, 16 383 words — a prover
+///   shortens a window that does not fit;
+/// - public height [`segment_public_log_height`]`(32 + 8n)` — 7 for 1..=11 blocks, 8 for 12..=27,
+///   9 for 28..=59, 10 for 60..=64: at most four shapes per chain;
+/// - the engine's program height, and no keccak or sha256 table.
+pub fn canonical_input_log_height(max_tier: u8) -> u8 {
+    max_tier.saturating_sub(2).clamp(7, 16)
+}
+
+/// CON-60: the length the honest prover pads its witness to — the longest witness of
+/// [`canonical_input_log_height`]: `2^h − 1` words (the input table holds `n + 1` rows).
+pub fn canonical_witness_words(max_tier: u8) -> usize {
+    (1usize << canonical_input_log_height(max_tier)) - 1
+}
+
+/// The public-table height a segment of `words` words declares — `randprotocol-zkvm`'s
+/// `tables::public::public_log_height` restated (core cannot name the zkvm crate; a test there
+/// pins the two): `log2(next_pow2(max(words + 1, 4)))`, at least 7.
+pub fn segment_public_log_height(words: usize) -> u8 {
+    ((words + 1).max(4).next_power_of_two().trailing_zeros() as u8).max(7)
+}
+
+/// The highest `engine_program_log_height` a genesis may pin (CON-60): a program table of 2^24
+/// rows is far past any image a tier-20 proof can hold.
+pub const MAX_ENGINE_PROGRAM_LOG_HEIGHT: u8 = 24;
+/// The most heights `max_window_heights` may let one sparse-window state proof span (PERP-101),
+/// which is also the longest a sparse chain goes without a recorded `Close`.
+pub const MAX_WINDOW_HEIGHTS: u64 = 4096;
 /// The widest a nonce window reaches below its highest nonce: the 64 bits of `used`.
 const NONCE_WINDOW: u64 = 64;
 /// The most `max_block_inputs` may let one block record: the genesis bound on the perp inputs
@@ -128,10 +167,107 @@ pub struct PerpsConfig {
     #[serde(with = "crate::notes::word8_hex")]
     pub genesis_root: Word8,
     pub markets: Vec<MarketSpec>,
+    /// Audit v10, PERP-6 (genesis-gated, default off): a state proof whose payouts total more
+    /// collateral than the exchange holds — `initial_collateral + collateral_in − collateral_out`
+    /// ([`Perps::collateral_held`]) — is refused `PayoutExceedsCollateral`, at validate and at
+    /// apply. The engine pays only what it holds, so an honest proof never trips it; a proof that
+    /// does is an engine fault, and the chain refuses to mint collateral the exchange was never
+    /// given. Off, the payout is bounded by its request alone (the v0 rule; documented as a hole).
+    #[serde(default)]
+    pub bound_payouts: bool,
+    /// PERP-6: the collateral the engine's genesis state already holds (its accounts and
+    /// insurance fund), in collateral units — what [`Perps::collateral_held`] starts from. 0 for a
+    /// fresh engine.
+    #[serde(default)]
+    pub initial_collateral: u64,
+    /// PERP-101 (genesis-gated, default off): sparse windows. A block that records no perp input
+    /// records no digest either — the engine is not run over it — unless `max_window_heights`
+    /// heights have passed since the last recorded digest (or the proved height), when its
+    /// `Close` is recorded as a heartbeat so funding, marks and liquidations still run at least
+    /// that often and every window stays reachable. A state proof then spans at most
+    /// `max_window_heights` heights, ends at a recorded height and runs the engine over every
+    /// digest recorded inside its span — at most `max_window_blocks` of them. Off (chain 21),
+    /// every block records a digest and a window is `max_window_blocks` consecutive heights.
+    #[serde(default)]
+    pub sparse_windows: bool,
+    /// PERP-101: the most heights one state proof may span under `sparse_windows`, and the
+    /// heartbeat interval above; `max_window_blocks..=MAX_WINDOW_HEIGHTS`. 0 (and only 0)
+    /// without `sparse_windows`.
+    #[serde(default)]
+    pub max_window_heights: u64,
+    /// CON-60 (genesis-gated, default 0 = unpinned): the program-table height of the engine
+    /// image `engine_hc` names (`program::program_log_height` of its word count; `rand perp
+    /// image-hc` prints it). Set, a state proof must declare exactly this height and no keccak
+    /// or sha256 table — the engine calls neither — or it is refused `ProofRefused` from its
+    /// header, before any verifier key is built; what is left free is the tier (at most
+    /// `max_tier`) and the input height, a handful of keys. Unset (chain 21), the header is
+    /// only ranged, as for any call.
+    #[serde(default)]
+    pub engine_program_log_height: u8,
+}
+
+/// [`PerpsConfig`] as it was bound into the genesis hash before audit v10 (chains up to 21): the
+/// shape `PerpsConfig::commit_bytes` serializes first, so a genesis that leaves every later field
+/// at its default hashes byte-for-byte as it did.
+#[derive(Serialize)]
+struct PerpsConfigV0<'a> {
+    collateral_asset: u32,
+    max_tier: u8,
+    max_window_blocks: u64,
+    max_block_inputs: u32,
+    min_deposit: u64,
+    engine_hc: &'a Word8,
+    genesis_root: &'a Word8,
+    markets: &'a [MarketSpec],
 }
 
 impl PerpsConfig {
+    /// What the genesis hash binds for this section: the pre-audit-v10 shape's bincode, then
+    /// each later field tagged by name and only when it is not its default — `b"bound_payouts"`
+    /// ‖ `0x01`, `b"initial_collateral"` ‖ be64 — so chain 21's file (which sets none of them)
+    /// commits to exactly the bytes it did at its cut, and any field set is a different chain.
+    pub fn commit_bytes(&self) -> Vec<u8> {
+        let v0 = PerpsConfigV0 {
+            collateral_asset: self.collateral_asset,
+            max_tier: self.max_tier,
+            max_window_blocks: self.max_window_blocks,
+            max_block_inputs: self.max_block_inputs,
+            min_deposit: self.min_deposit,
+            engine_hc: &self.engine_hc,
+            genesis_root: &self.genesis_root,
+            markets: &self.markets,
+        };
+        let mut out = bincode::serialize(&v0).expect("serializes");
+        if self.bound_payouts {
+            out.extend_from_slice(b"bound_payouts");
+            out.push(1);
+        }
+        if self.initial_collateral != 0 {
+            out.extend_from_slice(b"initial_collateral");
+            out.extend_from_slice(&self.initial_collateral.to_be_bytes());
+        }
+        if self.sparse_windows {
+            out.extend_from_slice(b"sparse_windows");
+            out.push(1);
+        }
+        if self.max_window_heights != 0 {
+            out.extend_from_slice(b"max_window_heights");
+            out.extend_from_slice(&self.max_window_heights.to_be_bytes());
+        }
+        if self.engine_program_log_height != 0 {
+            out.extend_from_slice(b"engine_program_log_height");
+            out.push(self.engine_program_log_height);
+        }
+        out
+    }
+
     pub fn check(&self) -> Result<(), String> {
+        if self.initial_collateral >= MAX_NOTE_VALUE {
+            return Err(format!(
+                "perps.initial_collateral {} is not below the note bound 2^63",
+                self.initial_collateral
+            ));
+        }
         if !TIERS.contains(&self.max_tier) {
             return Err(format!("perps.max_tier {} is not a proof tier ({TIERS:?})", self.max_tier));
         }
@@ -139,6 +275,25 @@ impl PerpsConfig {
             return Err(format!(
                 "perps.max_window_blocks {} is outside 1..={MAX_WINDOW_BLOCKS}",
                 self.max_window_blocks
+            ));
+        }
+        if self.sparse_windows {
+            if !(self.max_window_blocks..=MAX_WINDOW_HEIGHTS).contains(&self.max_window_heights) {
+                return Err(format!(
+                    "perps.max_window_heights {} is outside max_window_blocks..={MAX_WINDOW_HEIGHTS} ({}..={MAX_WINDOW_HEIGHTS})",
+                    self.max_window_heights, self.max_window_blocks
+                ));
+            }
+        } else if self.max_window_heights != 0 {
+            return Err(format!(
+                "perps.max_window_heights {} is set without sparse_windows",
+                self.max_window_heights
+            ));
+        }
+        if self.engine_program_log_height > MAX_ENGINE_PROGRAM_LOG_HEIGHT {
+            return Err(format!(
+                "perps.engine_program_log_height {} is above {MAX_ENGINE_PROGRAM_LOG_HEIGHT}",
+                self.engine_program_log_height
             ));
         }
         if !(1..=MAX_BLOCK_INPUTS).contains(&self.max_block_inputs) {
@@ -353,6 +508,20 @@ pub struct PerpAccount {
 }
 
 impl PerpAccount {
+    /// Whether nonce `n` has been accepted, as far as the window remembers: `Some(false)` above
+    /// the highest or unused inside the window, `Some(true)` used, `None` more than 63 below the
+    /// highest (the window has forgotten). For a node's pool (I-4: a cancel must name an order).
+    pub fn nonce_seen(&self, n: u64) -> Option<bool> {
+        if n > self.nonce_high {
+            return Some(false);
+        }
+        let back = self.nonce_high - n;
+        if back >= NONCE_WINDOW {
+            return None;
+        }
+        Some(self.used & (1 << back) != 0)
+    }
+
     /// Accept nonce `n` once. Nonces need not arrive in order — a trader may have several orders
     /// in flight — but each is good once, and one more than 63 below the highest is refused,
     /// since the window no longer remembers whether it was used.
@@ -417,6 +586,16 @@ pub struct Perps {
     /// chain, outside the root. Both 0 on a chain whose collateral is a token.
     pub rand_in: u64,
     pub rand_out: u64,
+    /// Audit v10, PERP-6: Σ collateral ever deposited (every `PerpDeposit`'s burn, RAND or the
+    /// collateral token) and Σ collateral ever paid out by state proofs — the same two counters
+    /// for *any* collateral asset, where `rand_in`/`rand_out` count RAND alone. Derived from the
+    /// chain, outside the root, like the RAND pair; what the `bound_payouts` rule and the supply
+    /// audit's `perps_collateral_*` read. 0 on a row persisted before this field existed
+    /// ([`Perps::decode_persisted`]).
+    #[serde(default)]
+    pub collateral_in: u64,
+    #[serde(default)]
+    pub collateral_out: u64,
     /// The current block's inputs so far. Transient: emptied at every block close.
     #[serde(skip)]
     block_inputs: Vec<PerpInput>,
@@ -426,7 +605,7 @@ pub struct Perps {
     last_block_words: Option<(u64, Vec<u32>)>,
 }
 
-/// Consensus fields only — exactly what the root commits, plus the genesis section and the two
+/// Consensus fields only — exactly what the root commits, plus the genesis section and the four
 /// audit counters (derived from the chain, as `ProgramState`'s are): two ledgers that agree on
 /// them are equal whatever their in-flight transient fields hold.
 impl PartialEq for Perps {
@@ -441,7 +620,73 @@ impl PartialEq for Perps {
             && self.withdrawals == other.withdrawals
             && self.rand_in == other.rand_in
             && self.rand_out == other.rand_out
+            // I-2: the PERP-6 counters are consensus only where they bind (`bound_payouts`).
+            // Elsewhere (chain 21) they are reporting state that starts from a node's roll, so
+            // a replay from genesis and a rolled node must still compare equal.
+            && (!self.config.bound_payouts
+                || (self.collateral_in == other.collateral_in && self.collateral_out == other.collateral_out))
     }
+}
+
+/// [`Perps`] as a node persisted it before audit v10 (`META_PERPS`, bincode — which carries no
+/// field names, so `serde(default)` cannot fill a field the row lacks): the shape
+/// [`Perps::decode_persisted`] falls back to. Its config is the pre-v10 one too.
+#[derive(Serialize, Deserialize)]
+struct PerpsV0 {
+    config: PerpsConfigV0Owned,
+    accounts: BTreeMap<AccountId, PerpAccount>,
+    oracle: BTreeMap<u32, OracleState>,
+    oracle_nonces: BTreeMap<Address, u64>,
+    proved_root: Word8,
+    proved_height: u64,
+    digests: BTreeMap<u64, Word8>,
+    withdrawals: BTreeMap<Word8, PendingWithdrawal>,
+    rand_in: u64,
+    rand_out: u64,
+}
+
+/// [`PerpsV0`] by reference, for [`Perps::encode_persisted`]: the same bincode.
+#[derive(Serialize)]
+struct PerpsV0Ref<'a> {
+    config: PerpsConfigV0<'a>,
+    accounts: &'a BTreeMap<AccountId, PerpAccount>,
+    oracle: &'a BTreeMap<u32, OracleState>,
+    oracle_nonces: &'a BTreeMap<Address, u64>,
+    proved_root: &'a Word8,
+    proved_height: u64,
+    digests: &'a BTreeMap<u64, Word8>,
+    withdrawals: &'a BTreeMap<Word8, PendingWithdrawal>,
+    rand_in: u64,
+    rand_out: u64,
+}
+
+/// The tag in front of a `META_PERPS` row's trailer (I-2, [`Perps::encode_persisted`]).
+pub const PERSISTED_EXT_TAG: &[u8; 16] = b"rand-perps-ext-1";
+
+/// Everything a `META_PERPS` row holds past the v0.8.x shape: the later genesis fields and the
+/// PERP-6 counters. Fixed-width bincode behind [`PERSISTED_EXT_TAG`].
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct PerpsExt {
+    bound_payouts: bool,
+    initial_collateral: u64,
+    sparse_windows: bool,
+    max_window_heights: u64,
+    engine_program_log_height: u8,
+    collateral_in: u64,
+    collateral_out: u64,
+}
+
+/// The owned twin of [`PerpsConfigV0`], for [`PerpsV0`].
+#[derive(Serialize, Deserialize)]
+struct PerpsConfigV0Owned {
+    collateral_asset: u32,
+    max_tier: u8,
+    max_window_blocks: u64,
+    max_block_inputs: u32,
+    min_deposit: u64,
+    engine_hc: Word8,
+    genesis_root: Word8,
+    markets: Vec<MarketSpec>,
 }
 
 impl Perps {
@@ -458,9 +703,112 @@ impl Perps {
             withdrawals: BTreeMap::new(),
             rand_in: 0,
             rand_out: 0,
+            collateral_in: 0,
+            collateral_out: 0,
             block_inputs: Vec::new(),
             last_block_words: None,
         }
+    }
+
+    /// A node's `META_PERPS` row (I-2): the pre-audit-v10 bincode of [`PerpsV0`] — byte for byte
+    /// what v0.8.x writes and reads, so a node can roll back onto it with this database — then,
+    /// only when one of the later fields is not its default, a trailer: [`PERSISTED_EXT_TAG`] ‖
+    /// bincode of [`PerpsExt`]. v0.8.x reads the row with `bincode::deserialize`, which ignores
+    /// trailing bytes, so the trailer is invisible to it.
+    pub fn encode_persisted(&self) -> Vec<u8> {
+        let c = &self.config;
+        let v0 = PerpsV0Ref {
+            config: PerpsConfigV0 {
+                collateral_asset: c.collateral_asset,
+                max_tier: c.max_tier,
+                max_window_blocks: c.max_window_blocks,
+                max_block_inputs: c.max_block_inputs,
+                min_deposit: c.min_deposit,
+                engine_hc: &c.engine_hc,
+                genesis_root: &c.genesis_root,
+                markets: &c.markets,
+            },
+            accounts: &self.accounts,
+            oracle: &self.oracle,
+            oracle_nonces: &self.oracle_nonces,
+            proved_root: &self.proved_root,
+            proved_height: self.proved_height,
+            digests: &self.digests,
+            withdrawals: &self.withdrawals,
+            rand_in: self.rand_in,
+            rand_out: self.rand_out,
+        };
+        let mut out = bincode::serialize(&v0).expect("serializes");
+        let ext = PerpsExt {
+            bound_payouts: c.bound_payouts,
+            initial_collateral: c.initial_collateral,
+            sparse_windows: c.sparse_windows,
+            max_window_heights: c.max_window_heights,
+            engine_program_log_height: c.engine_program_log_height,
+            collateral_in: self.collateral_in,
+            collateral_out: self.collateral_out,
+        };
+        if ext != PerpsExt::default() {
+            out.extend_from_slice(PERSISTED_EXT_TAG);
+            out.extend_from_slice(&bincode::serialize(&ext).expect("serializes"));
+        }
+        out
+    }
+
+    /// [`Self::encode_persisted`]'s inverse: the [`PerpsV0`] prefix, then the trailer when there is
+    /// one (every later field at its default when there is none — a row v0.8.x wrote). A trailer
+    /// that is not this build's tag and extension, exactly, is an error.
+    pub fn decode_persisted(bytes: &[u8]) -> Result<Perps, bincode::Error> {
+        use bincode::Options;
+        let prefix = bincode::DefaultOptions::new().with_fixint_encoding().allow_trailing_bytes();
+        let mut rest: &[u8] = bytes;
+        let v0: PerpsV0 = prefix.deserialize_from(&mut rest)?;
+        let ext = if rest.is_empty() {
+            PerpsExt::default()
+        } else {
+            let body = rest
+                .strip_prefix(PERSISTED_EXT_TAG.as_slice())
+                .ok_or_else(|| Box::new(bincode::ErrorKind::Custom("perps row: an unknown trailer".into())))?;
+            bincode::DefaultOptions::new().with_fixint_encoding().reject_trailing_bytes().deserialize::<PerpsExt>(body)?
+        };
+        let c = v0.config;
+        Ok(Perps {
+            config: PerpsConfig {
+                collateral_asset: c.collateral_asset,
+                max_tier: c.max_tier,
+                max_window_blocks: c.max_window_blocks,
+                max_block_inputs: c.max_block_inputs,
+                min_deposit: c.min_deposit,
+                engine_hc: c.engine_hc,
+                genesis_root: c.genesis_root,
+                markets: c.markets,
+                bound_payouts: ext.bound_payouts,
+                initial_collateral: ext.initial_collateral,
+                sparse_windows: ext.sparse_windows,
+                max_window_heights: ext.max_window_heights,
+                engine_program_log_height: ext.engine_program_log_height,
+            },
+            accounts: v0.accounts,
+            oracle: v0.oracle,
+            oracle_nonces: v0.oracle_nonces,
+            proved_root: v0.proved_root,
+            proved_height: v0.proved_height,
+            digests: v0.digests,
+            withdrawals: v0.withdrawals,
+            rand_in: v0.rand_in,
+            rand_out: v0.rand_out,
+            collateral_in: ext.collateral_in,
+            collateral_out: ext.collateral_out,
+            block_inputs: Vec::new(),
+            last_block_words: None,
+        })
+    }
+
+    /// The collateral the exchange holds as the chain counts it (PERP-6): what the genesis
+    /// engine state held, plus every deposit, less every payout. In `u128`, since the three
+    /// terms are each a `u64`.
+    pub fn collateral_held(&self) -> u128 {
+        (self.config.initial_collateral as u128 + self.collateral_in as u128).saturating_sub(self.collateral_out as u128)
     }
 
     /// `blake3("rand-perps-1", proved_root ‖ proved_height ‖ accounts_root ‖ oracle_root ‖
@@ -560,6 +908,25 @@ impl Perps {
     /// The closed heights no state proof has covered yet, ascending.
     pub fn pending_heights(&self) -> Vec<u64> {
         self.digests.keys().copied().collect()
+    }
+
+    /// The highest height with a recorded digest, or the proved height when none waits: what a
+    /// sparse chain's heartbeat counts from (PERP-101, [`PerpsConfig::sparse_windows`]).
+    pub fn last_recorded_height(&self) -> u64 {
+        self.digests.keys().next_back().copied().unwrap_or(self.proved_height)
+    }
+
+    /// The recorded digests a state proof over `from+1..=to` runs the engine over, in height
+    /// order: every height of the span on a dense chain (where each one is recorded), only the
+    /// recorded ones under `sparse_windows` (PERP-101).
+    pub fn window_heights(&self, from: u64, to: u64) -> impl Iterator<Item = u64> + '_ {
+        self.digests.range(from.saturating_add(1)..=to).map(|(h, _)| *h)
+    }
+
+    /// How many recorded digests no state proof has covered yet — [`Self::pending_heights`]'s
+    /// length without the allocation, for a node's back-pressure policy.
+    pub fn pending_digests(&self) -> usize {
+        self.digests.len()
     }
 
     /// The market's median as the last block close computed it; 0 ("no price") before any close
@@ -967,12 +1334,29 @@ fn check_state_proof(p: &Perps, from: u64, to: u64, payouts: &[PerpPayout]) -> R
     if payouts.len() > MAX_PERP_PAYOUTS {
         return Err(PerpError::TooManyPayouts(payouts.len()));
     }
-    let max = p.config.max_window_blocks;
-    if from != p.proved_height || to <= from || to - from > max {
-        return Err(PerpError::WindowMismatch { from, to, proved: p.proved_height, max });
-    }
-    if let Some(h) = (from + 1..=to).find(|h| !p.digests.contains_key(h)) {
-        return Err(PerpError::MissingDigest(h));
+    if p.config.sparse_windows {
+        // PERP-101: a span of at most `max_window_heights`, ending at a recorded height, over at
+        // most `max_window_blocks` recorded digests — every one recorded inside it, which the
+        // ledger, not the prover, picks (`state_segment`).
+        let max = p.config.max_window_heights;
+        if from != p.proved_height || to <= from || to - from > max {
+            return Err(PerpError::WindowMismatch { from, to, proved: p.proved_height, max });
+        }
+        if !p.digests.contains_key(&to) {
+            return Err(PerpError::MissingDigest(to));
+        }
+        let blocks = p.window_heights(from, to).count() as u64;
+        if blocks > p.config.max_window_blocks {
+            return Err(PerpError::WindowTooManyBlocks { blocks, max: p.config.max_window_blocks });
+        }
+    } else {
+        let max = p.config.max_window_blocks;
+        if from != p.proved_height || to <= from || to - from > max {
+            return Err(PerpError::WindowMismatch { from, to, proved: p.proved_height, max });
+        }
+        if let Some(h) = (from + 1..=to).find(|h| !p.digests.contains_key(h)) {
+            return Err(PerpError::MissingDigest(h));
+        }
     }
     let mut seen = std::collections::BTreeSet::<&Word8>::new();
     for po in payouts {
@@ -992,6 +1376,20 @@ fn check_state_proof(p: &Perps, from: u64, to: u64, payouts: &[PerpPayout]) -> R
         }
         if po.amount != 0 && po.amount != w.amount {
             return Err(PerpError::PartialPayout { want: po.amount, have: w.amount });
+        }
+    }
+    // Audit v10, PERP-6 (under `bound_payouts`): the payouts together never exceed the collateral
+    // the chain has seen the exchange take in. A request is bounded only by the note bound, so
+    // without this a faulty engine (or a proof of one) could mint collateral nobody deposited.
+    // Permanent (`admission::is_permanent`): an honest engine pays at most what it held at `to`,
+    // every unit of it deposited at or before `to` and so already counted here; a proof that
+    // exceeds the count paid what the engine never had, whatever is deposited after it — an
+    // engine fault, which no later state excuses.
+    if p.config.bound_payouts {
+        let want: u128 = payouts.iter().map(|po| po.amount as u128).sum();
+        let have = p.collateral_held();
+        if want > have {
+            return Err(PerpError::PayoutExceedsCollateral { want, have });
         }
     }
     Ok(())
@@ -1060,9 +1458,15 @@ fn state_segment(
     fees: u64,
     executor: &dyn ConfidentialExecutor,
 ) -> Result<Vec<u32>, PerpError> {
-    let digests = (from + 1..=to)
-        .map(|h| p.digests.get(&h).copied().ok_or(PerpError::MissingDigest(h)))
-        .collect::<Result<Vec<_>, _>>()?;
+    let digests = if p.config.sparse_windows {
+        // PERP-101: the recorded digests inside the span, in height order; the heights the
+        // ledger elided (no input, no heartbeat) are not run.
+        p.digests.range(from + 1..=to).map(|(_, d)| *d).collect::<Vec<_>>()
+    } else {
+        (from + 1..=to)
+            .map(|h| p.digests.get(&h).copied().ok_or(PerpError::MissingDigest(h)))
+            .collect::<Result<Vec<_>, _>>()?
+    };
     Ok(state_proof_segment(from, to, &p.proved_root, new_root, &payouts_digest(executor, payouts), fees, &digests))
 }
 
@@ -1102,11 +1506,31 @@ pub(super) fn verify_state_proof(
         return Err(NOT_PERP);
     };
     let c = &p.config;
+    // CON-60, under the genesis pin: the declared shape, from the header alone, before the
+    // executor builds a verifier key for it — the engine's program height and no hash table.
+    if c.engine_program_log_height != 0 {
+        let shape = executor
+            .perp_proof_shape(proof)
+            .ok_or_else(|| PerpError::ProofRefused("the proof's header does not decode".into()))?;
+        if shape.program_log_height != c.engine_program_log_height
+            || shape.keccak_log_height != 0
+            || shape.sha256_log_height != 0
+        {
+            return Err(PerpError::ProofRefused(format!(
+                "declared shape: program height {} (the engine's is {}), keccak {}, sha256 {}",
+                shape.program_log_height, c.engine_program_log_height, shape.keccak_log_height, shape.sha256_log_height
+            ))
+            .into());
+        }
+    }
     let outcome = executor.verify_perp(&c.engine_hc, c.max_tier, segment, proof).map_err(|e| match e {
         ConfidentialError::CallTierTooHigh { tier, max } => PerpError::TierTooHigh { tier, max },
         e => PerpError::ProofRefused(e.to_string()),
     })?;
-    if outcome.outputs[0] != PERP_VERSION || u64::from(outcome.outputs[1]) != to_height - from_height {
+    // The block count the engine ran over: the span on a dense chain, the recorded digests
+    // inside it under `sparse_windows` (PERP-101) — the segment's own `n_blocks` either way.
+    let blocks = if c.sparse_windows { p.window_heights(*from_height, *to_height).count() as u64 } else { to_height - from_height };
+    if outcome.outputs[0] != PERP_VERSION || u64::from(outcome.outputs[1]) != blocks {
         return Err(PerpError::ProofRefused("outputs".into()).into());
     }
     Ok(())
@@ -1208,8 +1632,17 @@ pub(super) fn apply(
                 0 => p.rand_in.checked_add(amount).ok_or(PerpError::Overflow)?,
                 _ => p.rand_in,
             };
+            // PERP-6: whatever the asset, the exchange took `amount` of its collateral in.
+            // I-1: checked only where the counters bind (`bound_payouts`); elsewhere (chain 21)
+            // they are reporting only and saturate, so they add no failure path.
+            let collateral_in = if p.config.bound_payouts {
+                p.collateral_in.checked_add(amount).ok_or(PerpError::Overflow)?
+            } else {
+                p.collateral_in.saturating_add(amount)
+            };
             let p = ledger.perps_mut().ok_or(PerpError::Disabled)?;
             p.rand_in = rand_in;
+            p.collateral_in = collateral_in;
             p.accounts.entry(id).or_insert_with(|| PerpAccount {
                 trading_key: trading_key.clone(),
                 nonce_high: 0,
@@ -1275,7 +1708,20 @@ pub(super) fn apply(
                 0 => p.rand_out.checked_add(paid).ok_or(PerpError::Overflow)?,
                 _ => p.rand_out,
             };
+            // PERP-6: every payout the proof lists leaves the exchange, minted or not — the
+            // engine deducted it from the account either way — so the collateral count (what
+            // `bound_payouts` holds the next proof to) is over the listed amounts, where the
+            // RAND audit counter above is over what re-entered the pool.
+            // I-1: checked under `bound_payouts` (where `check_state_proof` has already held the
+            // sum to what was counted in, so it cannot overflow), saturating otherwise.
+            let collateral_out = if p.config.bound_payouts {
+                let listed = payouts.iter().try_fold(0u64, |acc, po| acc.checked_add(po.amount)).ok_or(PerpError::Overflow)?;
+                p.collateral_out.checked_add(listed).ok_or(PerpError::Overflow)?
+            } else {
+                payouts.iter().fold(p.collateral_out, |acc, po| acc.saturating_add(po.amount))
+            };
             let p = ledger.perps_mut().ok_or(PerpError::Disabled)?;
+            p.collateral_out = collateral_out;
             p.proved_root = *new_root;
             p.proved_height = to;
             p.digests.retain(|h, _| *h > to);
@@ -1384,6 +1830,16 @@ pub(super) fn close_block(ledger: &mut Ledger, height: u64, executor: &dyn Confi
             o.median = m.price;
         }
     }
+    // PERP-101, under `sparse_windows`: a block without perp inputs records nothing — unless
+    // `max_window_heights` heights have passed since the last recorded digest (or the proved
+    // height), when its `Close` is recorded as a heartbeat. The median above is kept either way.
+    if p.config.sparse_windows
+        && p.block_inputs.is_empty()
+        && height.saturating_sub(p.last_recorded_height()) < p.config.max_window_heights
+    {
+        p.last_block_words = None;
+        return;
+    }
     let mut words = Vec::new();
     for input in p.block_inputs.drain(..) {
         input.words(&mut words);
@@ -1463,8 +1919,17 @@ pub enum PerpError {
     DepositTooSmall(u64),
     #[error("a payout is the full request or nothing: the request asked for {have}, the payout is {want}")]
     PartialPayout { want: u64, have: u64 },
+    /// PERP-101, under `sparse_windows`: the span holds `blocks` recorded digests, more than
+    /// `max_window_blocks` engine runs.
+    #[error("the window holds {blocks} recorded blocks; a state proof runs at most {max}")]
+    WindowTooManyBlocks { blocks: u64, max: u64 },
     #[error("the request was input at height {height}, outside the proof's window {from}+1..={to}")]
     RequestOutsideWindow { height: u64, from: u64, to: u64 },
+    /// Audit v10, PERP-6, under genesis `bound_payouts`: the proof pays `want` collateral units
+    /// where the chain has counted the exchange holding `have` (the genesis engine state's, plus
+    /// every deposit, less every payout). An engine fault — permanent.
+    #[error("the proof pays {want} collateral units; the exchange holds {have} — an engine that pays more than it was given")]
+    PayoutExceedsCollateral { want: u128, have: u128 },
 }
 
 #[cfg(test)]
@@ -1636,6 +2101,11 @@ pub(crate) mod tests {
             min_deposit: 0,
             engine_hc: [9; 8],
             genesis_root: [8; 8],
+            bound_payouts: false,
+            initial_collateral: 0,
+            sparse_windows: false,
+            max_window_heights: 0,
+            engine_program_log_height: 0,
             markets: vec![MarketSpec {
                 id: 0,
                 symbol: "X-PERP".into(),
@@ -3018,6 +3488,388 @@ pub(crate) mod tests {
         };
         assert_eq!(refusal(&l, &bare(signed(CHAIN, &kp(1), o.clone()))), pe(PerpError::BadSignature));
         assert_eq!(l.validate(&bare(signed_in(&g, CHAIN, &kp(1), o)), &StubExecutor), Ok(()));
+    }
+
+    /// Audit v10, PERP-6: a request is bounded by the note bound alone (2^63), so a 2^62
+    /// withdrawal against a 10^9 deposit is admissible, and a proof paying it is bounded only by
+    /// the request — accepted without the gate (the documented v0 hole). Under `bound_payouts`
+    /// the proof is refused `PayoutExceedsCollateral` at validate and at apply, nothing written;
+    /// a payout of exactly what was deposited passes, and the genesis `initial_collateral`
+    /// counts towards what the exchange holds.
+    #[test]
+    fn a_payout_past_the_counted_collateral_is_refused_under_bound_payouts() {
+        let huge = 1u64 << 62;
+        let (mut l, request) = withdrawn(huge);
+        assert_eq!(l.perps().unwrap().collateral_held(), RAND as u128, "the deposit was counted");
+        let tx = state_proof(&l, 0, 2, [7; 8], vec![PerpPayout { request, amount: huge }], 0);
+        // Without the gate (chain 21's rule): accepted, a 2^62 note minted from a 10^9 deposit.
+        assert_eq!(l.validate(&tx, &StubExecutor), Ok(()), "v0: bounded by the request alone");
+        let mut off = l.clone();
+        off.set_height(3);
+        apply(&mut off, &tx).expect("the documented hole: the payout is the full request");
+        assert_eq!(off.perps().unwrap().collateral_out, huge);
+        // With the gate: refused by name, permanent, before any proof is looked at.
+        l.perps_mut().unwrap().config.bound_payouts = true;
+        let refused = pe(PerpError::PayoutExceedsCollateral { want: huge as u128, have: RAND as u128 });
+        assert_eq!(refusal(&l, &tx), refused);
+        assert_eq!(refusal(&l, &proof_tx(0, 2, [7; 8], vec![PerpPayout { request, amount: huge }], 0, b"junk".to_vec())), refused, "before the STARK");
+        l.set_height(3);
+        let before = l.clone();
+        assert_eq!(l.apply_tx(&tx, &kp(1).address(), &StubExecutor).map(|_| ()), Err(refused));
+        assert!(l == before, "nothing written");
+        // What was deposited can be paid …
+        let (mut l2, request2) = withdrawn(RAND);
+        l2.perps_mut().unwrap().config.bound_payouts = true;
+        let exact = state_proof(&l2, 0, 2, [7; 8], vec![PerpPayout { request: request2, amount: RAND }], 0);
+        l2.set_height(3);
+        apply(&mut l2, &exact).expect("exactly the collateral held");
+        let p = l2.perps().unwrap();
+        assert_eq!((p.collateral_in, p.collateral_out, p.collateral_held()), (RAND, RAND, 0));
+        let a = l2.audit();
+        assert_eq!((a.perps_collateral_in, a.perps_collateral_out, a.perps_collateral_held), (RAND, RAND, 0));
+        assert!(a.invariant_holds(), "{a:?}");
+        // … and the genesis engine state's collateral counts too.
+        let (mut l3, request3) = withdrawn(RAND);
+        {
+            let c = &mut l3.perps_mut().unwrap().config;
+            c.bound_payouts = true;
+            c.initial_collateral = 5;
+        }
+        assert_eq!(l3.perps().unwrap().collateral_held(), RAND as u128 + 5);
+        let over = state_proof(&l3, 0, 2, [7; 8], vec![PerpPayout { request: request3, amount: RAND }], 0);
+        assert_eq!(l3.validate(&over, &StubExecutor), Ok(()));
+    }
+
+    /// I-1: without `bound_payouts` (chain 21) the collateral counters saturate — a deposit or a
+    /// payout that would carry one past `u64::MAX` applies as it did before the counters existed —
+    /// while under the flag the same overflow is refused.
+    #[test]
+    fn the_collateral_counters_saturate_unless_bound_payouts_is_set() {
+        let (l, request) = withdrawn(5);
+        let payouts = vec![PerpPayout { request, amount: 5 }];
+        let tx = state_proof(&l, 0, 2, [7; 8], payouts, 0);
+        let mut off = l.clone();
+        off.perps_mut().unwrap().collateral_out = u64::MAX - 1;
+        off.set_height(3);
+        apply(&mut off, &tx).expect("chain 21: applies, the counter saturates");
+        assert_eq!(off.perps().unwrap().collateral_out, u64::MAX);
+        let mut dep_off = ledger_with(true);
+        dep_off.perps_mut().unwrap().collateral_in = u64::MAX;
+        dep(&mut dep_off, &kp(50), 10, RAND).expect("chain 21: a deposit past the counter applies");
+        assert_eq!(dep_off.perps().unwrap().collateral_in, u64::MAX);
+        let mut dep_on = ledger_with(true);
+        dep_on.perps_mut().unwrap().config.bound_payouts = true;
+        dep_on.perps_mut().unwrap().collateral_in = u64::MAX;
+        assert_eq!(dep(&mut dep_on, &kp(50), 10, RAND), Err(pe(PerpError::Overflow)), "under the flag: refused");
+    }
+
+    /// PERP-6: the genesis commitment of a section that sets none of the audit-v10 fields is the
+    /// pre-v10 bincode, byte for byte; each new field, set, is tagged on after it.
+    #[test]
+    fn the_sections_commit_bytes_are_the_pre_v10_bincode_until_a_new_field_is_set() {
+        let c = sample_config();
+        let v0 = PerpsConfigV0 {
+            collateral_asset: c.collateral_asset,
+            max_tier: c.max_tier,
+            max_window_blocks: c.max_window_blocks,
+            max_block_inputs: c.max_block_inputs,
+            min_deposit: c.min_deposit,
+            engine_hc: &c.engine_hc,
+            genesis_root: &c.genesis_root,
+            markets: &c.markets,
+        };
+        let legacy = bincode::serialize(&v0).unwrap();
+        assert_eq!(c.commit_bytes(), legacy, "defaults add nothing");
+        let mut bound = c.clone();
+        bound.bound_payouts = true;
+        assert_eq!(bound.commit_bytes(), [legacy.clone(), b"bound_payouts".to_vec(), vec![1]].concat());
+        let mut seeded = c.clone();
+        seeded.initial_collateral = 7;
+        assert_eq!(seeded.commit_bytes(), [legacy.clone(), b"initial_collateral".to_vec(), 7u64.to_be_bytes().to_vec()].concat());
+        // JSON: absent means default, round-trips, and the bound is checked.
+        let mut json = serde_json::to_value(&c).unwrap();
+        let o = json.as_object_mut().unwrap();
+        assert!(o.remove("bound_payouts").is_some() && o.remove("initial_collateral").is_some());
+        assert_eq!(serde_json::from_value::<PerpsConfig>(json).unwrap(), c, "a file without the fields reads as the defaults");
+        assert_eq!(serde_json::from_str::<PerpsConfig>(&serde_json::to_string(&seeded).unwrap()).unwrap(), seeded);
+        let mut big = c.clone();
+        big.initial_collateral = MAX_NOTE_VALUE;
+        assert!(big.check().unwrap_err().contains("initial_collateral"));
+        assert_eq!(c.check(), Ok(()));
+    }
+
+    /// I-2: a `META_PERPS` row v0.8.x wrote (bincode of [`PerpsV0`]) decodes with every later
+    /// field at its default; this build's row is that same bincode — v0.8.x reads it with plain
+    /// `bincode::deserialize`, trailer and all — plus a tagged trailer that carries the counters
+    /// and the later fields; and without `bound_payouts` the counters are outside equality, so a
+    /// rolled node (counters from 0) and a replay from genesis compare equal.
+    #[test]
+    fn the_persisted_row_stays_readable_by_v080_and_counters_bind_equality_only_under_the_flag() {
+        let (l, _) = withdrawn(5);
+        let p = l.perps().unwrap();
+        assert_eq!(p.collateral_in, RAND, "the deposit was counted");
+        let c = &p.config;
+        let legacy = PerpsV0 {
+            config: PerpsConfigV0Owned {
+                collateral_asset: c.collateral_asset,
+                max_tier: c.max_tier,
+                max_window_blocks: c.max_window_blocks,
+                max_block_inputs: c.max_block_inputs,
+                min_deposit: c.min_deposit,
+                engine_hc: c.engine_hc,
+                genesis_root: c.genesis_root,
+                markets: c.markets.clone(),
+            },
+            accounts: p.accounts.clone(),
+            oracle: p.oracle.clone(),
+            oracle_nonces: p.oracle_nonces.clone(),
+            proved_root: p.proved_root,
+            proved_height: p.proved_height,
+            digests: p.digests.clone(),
+            withdrawals: p.withdrawals.clone(),
+            rand_in: p.rand_in,
+            rand_out: p.rand_out,
+        };
+        let old_row = bincode::serialize(&legacy).unwrap();
+        // A v0.8.x row: read, counters 0 — and equal to the replayed state on this chain (no flag).
+        let decoded = Perps::decode_persisted(&old_row).expect("a v0.8.x row");
+        assert_eq!((decoded.collateral_in, decoded.collateral_out), (0, 0));
+        assert_eq!(decoded.root(), p.root());
+        assert!(&decoded == p, "no bound_payouts: the counters are not compared");
+        // This build's row: v0.8.x's bytes first, then the trailer, which v0.8.x skips.
+        let row = p.encode_persisted();
+        assert_eq!(&row[..old_row.len()], &old_row[..], "the prefix is v0.8.x's row byte for byte");
+        assert_eq!(&row[old_row.len()..old_row.len() + 16], PERSISTED_EXT_TAG);
+        let as_v080: PerpsV0 = bincode::deserialize(&row).expect("v0.8.x reads this build's row");
+        assert_eq!(bincode::serialize(&as_v080).unwrap(), old_row);
+        let back = Perps::decode_persisted(&row).unwrap();
+        assert_eq!((back.collateral_in, back.collateral_out), (p.collateral_in, p.collateral_out), "counters kept");
+        assert_eq!(back.config, p.config);
+        // A default extension writes no trailer at all.
+        let mut plain = p.clone();
+        plain.collateral_in = 0;
+        assert_eq!(plain.encode_persisted(), old_row);
+        // Later genesis fields ride the trailer too.
+        let mut gated = p.clone();
+        gated.config.sparse_windows = true;
+        gated.config.max_window_heights = 16;
+        gated.config.bound_payouts = true;
+        gated.config.engine_program_log_height = 14;
+        assert_eq!(Perps::decode_persisted(&gated.encode_persisted()).unwrap().config, gated.config);
+        // Under the flag the counters are consensus state: compared.
+        let mut moved = gated.clone();
+        moved.collateral_in += 1;
+        assert!(moved != gated);
+        // Junk, and a trailer that is not this build's, are errors.
+        assert!(Perps::decode_persisted(b"junk").is_err());
+        assert!(Perps::decode_persisted(&[old_row.clone(), b"other".to_vec()].concat()).is_err());
+    }
+
+    /// PERP-101: [`ledger_with`]'s ledger with `sparse_windows` on, a 16-height reach.
+    fn sparse_ledger() -> Ledger {
+        let mut l = ledger_with(true);
+        let c = &mut l.perps_mut().unwrap().config;
+        c.sparse_windows = true;
+        c.max_window_heights = 16;
+        l
+    }
+
+    /// A state proof of `from..=to` the stub accepts on a sparse `l`: the segment over the
+    /// recorded digests inside the span, and the engine reporting that many blocks.
+    fn sparse_state_proof(l: &Ledger, from: u64, to: u64, payouts: Vec<PerpPayout>) -> Transaction {
+        let p = l.perps().unwrap();
+        let digests: Vec<Word8> = p.window_heights(from, to).map(|h| p.digest(h).unwrap()).collect();
+        let seg = state_proof_segment(from, to, &p.proved_root, &[7; 8], &payouts_digest(&StubExecutor, &payouts), 0, &digests);
+        let proof = StubExecutor::make_perp_proof(&ENGINE, 16, outs(digests.len() as u32), &seg);
+        proof_tx(from, to, [7; 8], payouts, 0, proof)
+    }
+
+    /// PERP-101: under `sparse_windows` a block without perp inputs records no digest and leaves
+    /// no words, until `max_window_heights` heights have passed since the last recorded one —
+    /// then its `Close` is recorded as a heartbeat. Without the flag (chain 21's rule) every
+    /// block records one, the same sequence included.
+    #[test]
+    fn sparse_windows_elide_input_less_blocks_until_the_heartbeat() {
+        let run = |mut l: Ledger| {
+            let k = kp(50);
+            dep(&mut l, &k, 10, RAND).unwrap();
+            close(&mut l, 1);
+            assert!(l.take_perp_block_words().is_some(), "an input block leaves its words");
+            for h in 2..=17 {
+                close(&mut l, h);
+                let words = l.take_perp_block_words();
+                if l.perps().unwrap().config.sparse_windows {
+                    assert_eq!(words.is_some(), h == 17, "height {h}: only the heartbeat leaves words");
+                }
+            }
+            l
+        };
+        let dense = run(ledger_with(true));
+        assert_eq!(dense.perps().unwrap().pending_heights(), (1..=17).collect::<Vec<_>>(), "dense: every height");
+        let sparse = run(sparse_ledger());
+        let p = sparse.perps().unwrap();
+        assert_eq!(p.pending_heights(), vec![1, 17], "the input block and the heartbeat 16 heights on");
+        assert_eq!(p.last_recorded_height(), 17);
+        assert_eq!(p.window_heights(0, 17).collect::<Vec<_>>(), vec![1, 17]);
+        assert_ne!(dense.perps().unwrap().root(), p.root(), "the recorded digests differ, so the roots do");
+    }
+
+    /// PERP-101: a sparse window spans at most `max_window_heights`, ends at a recorded height,
+    /// runs every recorded digest inside its span (at most `max_window_blocks`), and the engine
+    /// must report that count, not the span. Settlement drops the covered digests as before.
+    #[test]
+    fn a_sparse_window_runs_the_recorded_blocks_inside_its_span() {
+        let mut l = sparse_ledger();
+        let k = kp(50);
+        dep(&mut l, &k, 10, RAND).unwrap();
+        close(&mut l, 1);
+        for h in 2..=4 {
+            close(&mut l, h);
+        }
+        let w = bare(signed(CHAIN, &k, withdraw(&k, 1, 5, 1)));
+        apply(&mut l, &w).unwrap();
+        close(&mut l, 5);
+        for h in 6..=20 {
+            close(&mut l, h);
+        }
+        assert_eq!(l.perps().unwrap().pending_heights(), vec![1, 5], "the heartbeat is due at 21");
+        let request = word8_from_bytes(w.hash().as_bytes()).unwrap();
+        let payouts = vec![PerpPayout { request, amount: 5 }];
+        // The span's end must be recorded …
+        assert_eq!(refusal(&l, &proof_tx(0, 3, [7; 8], vec![], 0, b"junk".to_vec())), pe(PerpError::MissingDigest(3)));
+        // … and within reach: 16 heights, where a dense window would be 8 (max_window_blocks).
+        assert_eq!(
+            refusal(&l, &proof_tx(0, 17, [7; 8], vec![], 0, b"junk".to_vec())),
+            pe(PerpError::WindowMismatch { from: 0, to: 17, proved: 0, max: 16 })
+        );
+        // The engine's count is the recorded blocks (2), not the span (5).
+        let p = l.perps().unwrap();
+        let digests: Vec<Word8> = p.window_heights(0, 5).map(|h| p.digest(h).unwrap()).collect();
+        assert_eq!(digests.len(), 2);
+        let seg = state_proof_segment(0, 5, &p.proved_root, &[7; 8], &payouts_digest(&StubExecutor, &payouts), 0, &digests);
+        let by_span = proof_tx(0, 5, [7; 8], payouts.clone(), 0, StubExecutor::make_perp_proof(&ENGINE, 16, outs(5), &seg));
+        assert_eq!(refusal(&l, &by_span), pe(PerpError::ProofRefused("outputs".into())), "a span-count engine is refused");
+        let tx = sparse_state_proof(&l, 0, 5, payouts.clone());
+        assert_eq!(l.validate(&tx, &StubExecutor), Ok(()));
+        // A window ending at the first recorded height is fine as well (it pays nothing: the
+        // request is recorded at 5).
+        assert_eq!(l.validate(&sparse_state_proof(&l, 0, 1, vec![]), &StubExecutor), Ok(()));
+        l.set_height(21);
+        apply(&mut l, &tx).unwrap();
+        let p = l.perps().unwrap();
+        assert_eq!((p.proved_height, p.pending_heights()), (5, vec![]));
+        assert!(p.withdrawal(&request).is_none(), "paid");
+        // The heartbeat now counts from the proved height.
+        assert_eq!(p.last_recorded_height(), 5);
+    }
+
+    /// PERP-101: more than `max_window_blocks` recorded digests inside one span is refused by
+    /// name; the shorter window over the first eight passes.
+    #[test]
+    fn a_sparse_window_over_too_many_recorded_blocks_is_refused() {
+        let mut l = sparse_ledger();
+        let k = kp(50);
+        for h in 1..=9u64 {
+            dep(&mut l, &k, 10 * h as u32, RAND).unwrap();
+            close(&mut l, h);
+        }
+        assert_eq!(l.perps().unwrap().pending_heights(), (1..=9).collect::<Vec<_>>());
+        assert_eq!(
+            refusal(&l, &sparse_state_proof(&l, 0, 9, vec![])),
+            pe(PerpError::WindowTooManyBlocks { blocks: 9, max: 8 })
+        );
+        assert_eq!(l.validate(&sparse_state_proof(&l, 0, 8, vec![]), &StubExecutor), Ok(()));
+    }
+
+    /// PERP-101: the genesis rules for the two fields, and their commitment — bound only when
+    /// set, so a file without them (chain 21's) hashes as before.
+    #[test]
+    fn the_sparse_window_fields_are_checked_and_bound_only_when_set() {
+        let c = sample_config();
+        assert_eq!(c.check(), Ok(()));
+        let base = c.commit_bytes();
+        let mut on = c.clone();
+        on.sparse_windows = true;
+        on.max_window_heights = 4096;
+        assert_eq!(on.check(), Ok(()));
+        assert_eq!(
+            on.commit_bytes(),
+            [base.clone(), b"sparse_windows".to_vec(), vec![1], b"max_window_heights".to_vec(), 4096u64.to_be_bytes().to_vec()].concat()
+        );
+        let refused = |f: &dyn Fn(&mut PerpsConfig)| {
+            let mut b = on.clone();
+            f(&mut b);
+            b.check().unwrap_err()
+        };
+        assert!(refused(&|b| b.max_window_heights = MAX_WINDOW_HEIGHTS + 1).contains("max_window_heights"));
+        assert!(refused(&|b| b.max_window_heights = b.max_window_blocks - 1).contains("max_window_heights"), "below one dense window");
+        assert!(refused(&|b| b.max_window_heights = 0).contains("max_window_heights"));
+        assert!(refused(&|b| b.sparse_windows = false).contains("without sparse_windows"));
+        let mut json = serde_json::to_value(&c).unwrap();
+        let o = json.as_object_mut().unwrap();
+        assert!(o.remove("sparse_windows").is_some() && o.remove("max_window_heights").is_some());
+        assert_eq!(serde_json::from_value::<PerpsConfig>(json).unwrap(), c, "absent means off");
+        assert_eq!(serde_json::from_str::<PerpsConfig>(&serde_json::to_string(&on).unwrap()).unwrap(), on);
+    }
+
+    /// CON-60: under the genesis `engine_program_log_height` pin a state proof declaring another
+    /// program height, or a keccak or sha256 table, is refused from its header — the stub would
+    /// verify each of them, so the refusal is the ledger's, before the executor (and its key
+    /// build) is reached; a header that does not decode is refused too. Without the pin (chain
+    /// 21's rule) the same proofs are verified as before.
+    #[test]
+    fn under_the_engine_program_height_pin_another_shape_is_refused_from_its_header() {
+        use crate::confidential::STUB_PERP_PROGRAM_LOG_HEIGHT as PLH;
+        let (mut l, request) = withdrawn(5);
+        let payouts = vec![PerpPayout { request, amount: 5 }];
+        let seg = segment_on(&l, 0, 2, &[7; 8], &payouts, 0);
+        let shaped = |h: [u8; 4]| proof_tx(0, 2, [7; 8], payouts.clone(), 0, StubExecutor::make_perp_proof_shaped(&ENGINE, 16, outs(2), &seg, h));
+        let others = [[PLH + 1, 0, 0, 0], [PLH, 0, 5, 0], [PLH, 0, 0, 5]];
+        for h in others {
+            assert_eq!(l.validate(&shaped(h), &StubExecutor), Ok(()), "unpinned: {h:?} verifies");
+        }
+        assert_eq!(l.validate(&shaped([0; 4]), &StubExecutor), Ok(()));
+        l.perps_mut().unwrap().config.engine_program_log_height = PLH;
+        assert_eq!(l.validate(&shaped([0; 4]), &StubExecutor), Ok(()), "the engine's height passes");
+        assert_eq!(l.validate(&shaped([PLH, 9, 0, 0]), &StubExecutor), Ok(()), "the input height stays free");
+        for h in others {
+            match refusal(&l, &shaped(h)) {
+                TxError::Perps(PerpError::ProofRefused(why)) => assert!(why.starts_with("declared shape"), "{why}"),
+                e => panic!("{h:?}: {e:?}"),
+            }
+        }
+        assert_eq!(
+            refusal(&l, &proof_tx(0, 2, [7; 8], payouts.clone(), 0, b"junk".to_vec())),
+            pe(PerpError::ProofRefused("the proof's header does not decode".into()))
+        );
+        // And at apply: nothing is written.
+        l.set_height(3);
+        let before = l.clone();
+        assert!(apply(&mut l, &shaped(others[0])).is_err());
+        assert!(l == before);
+        // The genesis field: checked, and bound only when set.
+        let c = sample_config();
+        let mut pinned = c.clone();
+        pinned.engine_program_log_height = 14;
+        assert_eq!(pinned.check(), Ok(()));
+        assert_eq!(pinned.commit_bytes(), [c.commit_bytes(), b"engine_program_log_height".to_vec(), vec![14]].concat());
+        pinned.engine_program_log_height = MAX_ENGINE_PROGRAM_LOG_HEIGHT + 1;
+        assert!(pinned.check().unwrap_err().contains("engine_program_log_height"));
+        let mut json = serde_json::to_value(&c).unwrap();
+        assert!(json.as_object_mut().unwrap().remove("engine_program_log_height").is_some());
+        assert_eq!(serde_json::from_value::<PerpsConfig>(json).unwrap(), c, "absent means unpinned");
+    }
+
+    /// CON-60: the canonical shape's formula, and its four public heights over 1..=64 blocks.
+    #[test]
+    fn the_canonical_shape_is_the_documented_formula() {
+        assert_eq!([10, 12, 14, 16, 18, 20].map(canonical_input_log_height), [8, 10, 12, 14, 16, 16]);
+        assert_eq!(canonical_witness_words(18), 65_535);
+        assert_eq!(canonical_witness_words(16), 16_383);
+        let heights: std::collections::BTreeSet<u8> = (1..=64).map(|n| segment_public_log_height(32 + 8 * n)).collect();
+        assert_eq!(heights.into_iter().collect::<Vec<_>>(), vec![7, 8, 9, 10]);
+        assert_eq!((segment_public_log_height(32 + 8 * 11), segment_public_log_height(32 + 8 * 12)), (7, 8));
+        assert_eq!((segment_public_log_height(32 + 8 * 59), segment_public_log_height(32 + 8 * 60)), (9, 10));
     }
 
     #[test]

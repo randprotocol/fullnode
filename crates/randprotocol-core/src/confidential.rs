@@ -69,6 +69,20 @@ pub enum ConfidentialError {
     Disabled,
 }
 
+/// CON-60: the declared shape of a zkVM proof — the header words its verifier key is keyed by
+/// (`ConfidentialExecutor::perp_proof_shape`). Two proofs of one shape verify under one key, so a
+/// node that has built it once verifies the next for milliseconds; a proof of a new shape costs a
+/// key build first (seconds to minutes at the high tiers).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+pub struct ProofShape {
+    pub tier: u8,
+    pub program_log_height: u8,
+    pub input_log_height: u8,
+    pub keccak_log_height: u8,
+    pub sha256_log_height: u8,
+    pub public_log_height: u8,
+}
+
 /// A method added here must also be forwarded in the node's `verify_cache::CachingExecutor`, or
 /// that wrapper inherits the default. The private-multisig methods — `install_msauth_vk`,
 /// `enable_auth_multisig`, `build_msauth_key`, `auth_header`, `warm_auth_multisig` and
@@ -180,6 +194,55 @@ pub trait ConfidentialExecutor: Send + Sync {
     ) -> Result<CallOutcome, ConfidentialError> {
         Err(ConfidentialError::InvalidProof("this executor does not implement the RPL-3 state-proof rules".into()))
     }
+    /// CON-60: the shape a `PerpStateProof`'s proof declares — the header fields its verifier
+    /// key is built for — read from the header alone, without decoding or verifying the rest.
+    /// `None` when the header does not decode, and from an executor without a header to read
+    /// (the default). Used before any key is built: by the ledger under the genesis
+    /// `engine_program_log_height` pin, and by a node's pool to tell a shape it has verified
+    /// before from one that would cost a fresh key.
+    fn perp_proof_shape(&self, _proof: &[u8]) -> Option<ProofShape> {
+        None
+    }
+    /// CON-60: whether a state proof of `shape` would verify under a key already built — so its
+    /// verification costs milliseconds, not a key build. `true` by default (an executor without
+    /// a key cache has nothing to build).
+    fn perp_key_ready(&self, _shape: &ProofShape) -> bool {
+        true
+    }
+    /// CON-60: keep `shape`'s already-built key for good (a proof of it verified, or a committed
+    /// block carried one). Never builds. A no-op by default.
+    fn keep_perp_key(&self, _shape: &ProofShape) {}
+    /// CON-60: build and keep `shape`'s key ahead of any proof of it (a node's startup warm from
+    /// its chain's committed state proofs). A no-op by default.
+    fn warm_perp(&self, _shape: &ProofShape) {}
+    /// CON-60: whether a state proof's bytes pass every rule the executor applies before a
+    /// verifier key is touched — the header rules (canonical body, tier in range and at most
+    /// `max_tier`, the declared caps, the public height of `segment`), then the verifier's own
+    /// pre-key prefix against `engine_hc` (the public values, pc window, PoW witnesses, degree
+    /// bits), then `segment`'s public digest, and the genesis `engine_program_log_height` pin when
+    /// non-zero. A proof that fails is refused without a key build, so a node's pool never spends
+    /// a cold-build token on it. `true` by default.
+    fn perp_proof_admissible(
+        &self,
+        _proof: &[u8],
+        _engine_hc: &Word8,
+        _max_tier: u8,
+        _segment: &[u32],
+        _engine_program_log_height: u8,
+    ) -> bool {
+        true
+    }
+    /// CON-60: whether `shape` is the canonical state-proof shape of this chain
+    /// (`ledger::perps::canonical_input_log_height` and the rest): tier `max_tier`, the canonical
+    /// input height, the engine's program height (the genesis pin, or a verified shape's), no hash
+    /// table. Only these draw on the pool's reserve and live in the reserved key cache. `false`
+    /// by default.
+    fn perp_shape_canonical(&self, _shape: &ProofShape) -> bool {
+        false
+    }
+    /// CON-60: the genesis perps section's `max_tier` and `engine_program_log_height` (0 = none),
+    /// told once at genesis load.
+    fn set_perp_config(&self, _max_tier: u8, _engine_program_log_height: u8) {}
     /// [`Self::decode_invoke`]'s twin for [`Self::verify_perp`]: everything but the STARK
     /// verification, the segment's digest still compared. The ledger never calls this; kept as
     /// `verify_perp`'s header twin (no production caller). Defaults to the full verify.
@@ -408,6 +471,21 @@ pub trait ConfidentialExecutor: Send + Sync {
 pub struct StubExecutor;
 
 pub const STUB_MARKER: &[u8; 4] = b"STUB";
+
+std::thread_local! {
+    static STUB_PERP_KEY_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// CON-60, a test instrument: how many state-proof verifier keys [`StubExecutor::verify_perp`]
+/// would have built on this thread — one per verification of a cold shape (not
+/// `perp_key_ready`) that passed every pre-key rule, where the zkVM builds its key.
+#[doc(hidden)]
+pub fn stub_perp_key_builds() -> usize {
+    STUB_PERP_KEY_BUILDS.with(|n| n.get())
+}
+/// The program height an unshaped stub state proof declares (CON-60): the engine's honest one in
+/// the stub's world, what a test pins `engine_program_log_height` to.
+pub const STUB_PERP_PROGRAM_LOG_HEIGHT: u8 = 14;
 const STUB_LEN: usize = 4 + 1 + 32 + 32 + 32 + 8 + 8;
 /// Where the program binding starts inside a stub call proof (the gas limit follows it).
 const STUB_PROGRAM_BINDING: usize = STUB_LEN - 16;
@@ -513,6 +591,22 @@ impl StubExecutor {
         v.extend_from_slice(&word8_to_bytes(&StubExecutor.public_digest(segment)));
         v.extend_from_slice(&Self::perp_binding(engine_hc));
         v.extend_from_slice(&crate::gas::gas_max(tier, 0, 0).to_le_bytes());
+        v
+    }
+
+    /// [`Self::make_perp_proof`] declaring `program_log_height`, `input_log_height`,
+    /// `keccak_log_height` and `sha256_log_height` ([`StubExecutor`]'s `perp_proof_shape`; 0
+    /// program height reads as [`STUB_PERP_PROGRAM_LOG_HEIGHT`]). The stub verifies it exactly as
+    /// the unshaped proof: the shape is a header the ledger and the pool read, nothing else.
+    pub fn make_perp_proof_shaped(
+        engine_hc: &Word8,
+        tier: u8,
+        outputs: [u32; 8],
+        segment: &[u32],
+        heights: [u8; 4],
+    ) -> Vec<u8> {
+        let mut v = Self::make_perp_proof(engine_hc, tier, outputs, segment);
+        v[37..41].copy_from_slice(&heights);
         v
     }
 
@@ -777,9 +871,74 @@ impl ConfidentialExecutor for StubExecutor {
         if word8_from_bytes(&proof[69..101]).expect("32 bytes") != self.public_digest(segment) {
             return Err(ConfidentialError::InvalidProof("PublicValues".into()));
         }
+        // CON-60: the zkVM builds the key here, after every pre-key rule (the header, the
+        // binding, the segment's digest) — the stub counts it, so a test can hold the pool's
+        // "free" verdict to "verifying it builds nothing" ([`stub_perp_key_builds`]).
+        if let Some(shape) = self.perp_proof_shape(proof) {
+            if !self.perp_key_ready(&shape) {
+                STUB_PERP_KEY_BUILDS.with(|n| n.set(n.get() + 1));
+            }
+        }
         let outputs = std::array::from_fn(|i| u32::from_le_bytes(proof[5 + 4 * i..9 + 4 * i].try_into().unwrap()));
         let gas_limit = u64::from_le_bytes(proof[STUB_LEN - 8..].try_into().expect("8 bytes"));
         Ok(CallOutcome { tier, outputs, h_in: [0; 8], keccak_log_height: 0, sha256_log_height: 0, gas_limit })
+    }
+
+    /// The stub's shape of a [`Self::make_perp_proof`] proof: its tier, and the program, input,
+    /// keccak and sha256 heights from the first four bytes of its (unread) `h_in` field —
+    /// [`STUB_PERP_PROGRAM_LOG_HEIGHT`] for a zero program height, so an unshaped stub proof has
+    /// the engine's honest shape. `None` for anything that is not a stub proof.
+    fn perp_proof_shape(&self, proof: &[u8]) -> Option<ProofShape> {
+        if proof.len() != STUB_LEN || &proof[..4] != STUB_MARKER {
+            return None;
+        }
+        let h = &proof[37..41];
+        Some(ProofShape {
+            tier: proof[4],
+            program_log_height: if h[0] == 0 { STUB_PERP_PROGRAM_LOG_HEIGHT } else { h[0] },
+            input_log_height: h[1],
+            keccak_log_height: h[2],
+            sha256_log_height: h[3],
+            public_log_height: 0,
+        })
+    }
+
+    /// CON-60: the stub's pre-key rules — a stub proof bound to `engine_hc`, its tier in
+    /// `perps::TIERS` and at most `max_tier`, its public digest `segment`'s, and the pin when set.
+    fn perp_proof_admissible(
+        &self,
+        proof: &[u8],
+        engine_hc: &Word8,
+        max_tier: u8,
+        segment: &[u32],
+        engine_program_log_height: u8,
+    ) -> bool {
+        let Some(shape) = self.perp_proof_shape(proof) else { return false };
+        proof[STUB_PROGRAM_BINDING..STUB_LEN - 8] == Self::perp_binding(engine_hc)
+            && word8_from_bytes(&proof[69..101]).is_some_and(|d| d == self.public_digest(segment))
+            && crate::ledger::perps::TIERS.contains(&shape.tier)
+            && shape.tier <= max_tier
+            && (engine_program_log_height == 0
+                || (shape.program_log_height == engine_program_log_height && shape.keccak_log_height == 0 && shape.sha256_log_height == 0))
+    }
+
+    /// CON-60: the stub's canonical shape — tier 16 (the test chains' `max_tier`), the engine's
+    /// program height, input height 1 (a stub proof's `[0, 1, 0, 0]` heights), no hash table.
+    fn perp_shape_canonical(&self, shape: &ProofShape) -> bool {
+        shape.tier == 16
+            && shape.program_log_height == STUB_PERP_PROGRAM_LOG_HEIGHT
+            && shape.input_log_height == 1
+            && shape.keccak_log_height == 0
+            && shape.sha256_log_height == 0
+    }
+
+    /// CON-60: the stub holds a key for the engine's honest shape only — an unshaped
+    /// [`Self::make_perp_proof`] proof's — so a test can tell warm from cold.
+    fn perp_key_ready(&self, shape: &ProofShape) -> bool {
+        shape.program_log_height == STUB_PERP_PROGRAM_LOG_HEIGHT
+            && shape.input_log_height == 0
+            && shape.keccak_log_height == 0
+            && shape.sha256_log_height == 0
     }
 
     /// A blake3 stand-in for `H_PUB`, length-prefixed like the real one's header, so the empty

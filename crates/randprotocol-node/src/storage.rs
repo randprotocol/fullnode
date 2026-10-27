@@ -287,6 +287,12 @@ const META_PROGRAM_STATE: &str = "program_state";
 /// replay-audited, bincode (the transient per-block fields are `#[serde(skip)]`). Absent on
 /// every chain without a `perps` section.
 const META_PERPS: &str = "perps";
+/// CON-60: `bincode(Vec<ProofShape>)`, the state-proof shapes this node has seen verify or
+/// commit, most recent last — what the startup warm builds and pins. A node cache, never
+/// consensus; a build that does not know the key ignores it.
+const META_PERP_SHAPES: &str = "perp-proof-shapes";
+/// CON-60: how many shapes [`META_PERP_SHAPES`] keeps.
+pub const PERP_SHAPES_KEPT: usize = 32;
 /// `bincode(MultisigRegister)`: every multisig account (signers, threshold, nonce, vault) as of
 /// the head, with the genesis `create_fee` and the four RAND audit counters
 /// (`ledger::multisig::MultisigRegister`). Consensus state — hashed into the state root under
@@ -1965,8 +1971,13 @@ impl Storage {
 
     /// The perps state as of the head (RPL-3), `None` on a chain without the section.
     pub fn perps(&self) -> Result<Option<randprotocol_core::ledger::perps::Perps>> {
+        // `decode_persisted` (audit v10, PERP-6): a row this build wrote, or the pre-v10 shape a
+        // chain-21 node wrote before the roll, its collateral counters starting at 0.
         self.get_meta_raw(META_PERPS)?
-            .map(|b| bincode::deserialize(&b).map_err(|e| StorageError::Corrupt(format!("perps state: {e}"))))
+            .map(|b| {
+                randprotocol_core::ledger::perps::Perps::decode_persisted(&b)
+                    .map_err(|e| StorageError::Corrupt(format!("perps state: {e}")))
+            })
             .transpose()
     }
 
@@ -1974,10 +1985,64 @@ impl Storage {
     /// deleted otherwise (`put_program_state`'s rule).
     fn put_perps(&self, batch: &mut WriteBatch, p: Option<&randprotocol_core::ledger::perps::Perps>) -> Result<()> {
         match p {
-            Some(p) => batch.put_cf(self.cf(CF_META), META_PERPS, bincode::serialize(p)?),
+            // I-2: v0.8.x's bincode, plus a trailer it ignores (`Perps::encode_persisted`).
+            Some(p) => batch.put_cf(self.cf(CF_META), META_PERPS, p.encode_persisted()),
             None => batch.delete_cf(self.cf(CF_META), META_PERPS),
         }
         Ok(())
+    }
+
+    /// CON-60: the state-proof shapes this node recorded ([`Self::note_perp_proof_shape`]),
+    /// oldest first; empty when none (or the row does not decode: it is only a cache).
+    pub fn perp_proof_shapes(&self) -> Result<Vec<randprotocol_core::confidential::ProofShape>> {
+        Ok(self.get_meta_raw(META_PERP_SHAPES)?.and_then(|b| bincode::deserialize(&b).ok()).unwrap_or_default())
+    }
+
+    /// CON-60: record `shape` (a state proof of it verified here, or a committed block carried
+    /// one), keeping the last [`PERP_SHAPES_KEPT`]. Written only when it is new.
+    pub fn note_perp_proof_shape(&self, shape: randprotocol_core::confidential::ProofShape) -> Result<()> {
+        // One read-modify-write at a time: verdicts for two new shapes record both.
+        static RECORD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _one = RECORD.lock().unwrap_or_else(|e| e.into_inner());
+        let mut shapes = self.perp_proof_shapes()?;
+        if shapes.contains(&shape) {
+            return Ok(());
+        }
+        shapes.push(shape);
+        if shapes.len() > PERP_SHAPES_KEPT {
+            shapes.drain(..shapes.len() - PERP_SHAPES_KEPT);
+        }
+        self.db.put_cf(self.cf(CF_META), META_PERP_SHAPES, bincode::serialize(&shapes)?)?;
+        Ok(())
+    }
+
+    /// CON-60: the shapes of the state proofs in the last `blocks` committed blocks, newest
+    /// first, deduplicated, at most `limit` (the walk stops there) — the startup warm's second
+    /// source, for a node that predates [`META_PERP_SHAPES`].
+    pub fn recent_perp_proof_shapes(
+        &self,
+        blocks: u64,
+        limit: usize,
+        executor: &dyn randprotocol_core::confidential::ConfidentialExecutor,
+    ) -> Result<Vec<randprotocol_core::confidential::ProofShape>> {
+        let head = self.head()?.height;
+        let mut out = Vec::new();
+        for h in (head.saturating_sub(blocks)..=head).rev() {
+            if out.len() >= limit {
+                break;
+            }
+            let Some(b) = self.block_by_height(h)? else { continue };
+            for tx in &b.transactions {
+                if let Action::PerpStateProof { proof, .. } = &tx.action {
+                    if let Some(shape) = executor.perp_proof_shape(proof) {
+                        if !out.contains(&shape) {
+                            out.push(shape);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(out)
     }
 
     /// The perp input words block `height` closed with (RPL-3), `None` for a height this store
@@ -3432,6 +3497,9 @@ impl Storage {
                     }
                 }
                 (None, None) => {}
+                // PERP-101: under `sparse_windows` a block without perp inputs (and no heartbeat
+                // due) records no digest, so it has no words either.
+                (None, Some(p)) if p.config.sparse_windows && p.digest(block.height()).is_none() => {}
                 (words, _) => {
                     return Err(StorageError::Corrupt(format!(
                         "block {} carries perp input words for height {:?} on a chain {} the perps section",
@@ -5470,6 +5538,11 @@ pub(crate) mod fixtures {
             min_deposit: 1_000,
             engine_hc: PERPS_ENGINE,
             genesis_root: [32; 8],
+            bound_payouts: false,
+            initial_collateral: 0,
+            sparse_windows: false,
+            max_window_heights: 0,
+            engine_program_log_height: 0,
             markets: vec![randprotocol_core::ledger::perps::MarketSpec {
                 id: 0,
                 symbol: "BTC-PERP".into(),
@@ -9516,6 +9589,64 @@ mod tests {
     /// state proof prunes every row at or under its height; `truncate_to` drops the rows above
     /// its height; and the repair puts back what the replay can re-derive — the words of every
     /// height no proof covers — so a truncation below a proof leaves no prover without its input.
+    /// I-2: the perps row a v0.8.x node wrote (no trailer: the counters at 0) reads back equal to
+    /// the replayed state on a chain without `bound_payouts` — the comparison the first start on
+    /// a new build makes (`verify_chain`) — and this build's row keeps the counters.
+    #[test]
+    fn a_v080_perps_row_compares_equal_to_the_replay_after_a_roll() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Storage::open(dir.path()).unwrap();
+        let gs = perps_genesis(7);
+        s.init_genesis(&gs).unwrap();
+        let mut ledger = gs.ledger.clone();
+        let deposit = perp_deposit_tx(&ledger, &key(50), 300, 5_000_000);
+        let b1 = make_perps_block(&gs.block, &mut ledger, vec![deposit], &key(1));
+        s.commit(std::slice::from_ref(&b1), &ledger, &[], &StubExecutor).unwrap();
+        let replayed = ledger.perps().unwrap();
+        assert_eq!(replayed.collateral_in, 5_000_000);
+        assert_eq!(s.perps().unwrap().unwrap().collateral_in, 5_000_000, "this build's row keeps them");
+        let mut as_v080 = replayed.clone();
+        as_v080.collateral_in = 0;
+        as_v080.collateral_out = 0;
+        s.db.put_cf(s.cf(CF_META), META_PERPS, as_v080.encode_persisted()).unwrap();
+        let stored = s.perps().unwrap().unwrap();
+        assert_eq!(stored.collateral_in, 0);
+        assert!(&stored == replayed, "no CORRUPT CHAIN: the counters are not consensus here");
+    }
+
+    /// PERP-101: on a `sparse_windows` chain a block without perp inputs records no digest and
+    /// carries no words, and storage commits it without a row; a block that did record one must
+    /// still carry its words. The ledger reloads as stored.
+    #[test]
+    fn a_sparse_chains_input_less_blocks_store_no_words() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Storage::open(dir.path()).unwrap();
+        let mut file = perps_genesis_file(7);
+        let c = file.perps.as_mut().unwrap();
+        c.sparse_windows = true;
+        c.max_window_heights = 16;
+        let gs = file.build(&StubExecutor).unwrap();
+        s.init_genesis(&gs).unwrap();
+        let mut ledger = gs.ledger.clone();
+        let deposit = perp_deposit_tx(&ledger, &key(50), 300, 5_000_000);
+        let b1 = make_perps_block(&gs.block, &mut ledger, vec![deposit], &key(1));
+        assert!(b1.perp_words.is_some());
+        let b2 = make_perps_block(&b1, &mut ledger, vec![], &key(1));
+        assert_eq!(b2.perp_words, None, "an input-less block leaves no words");
+        s.commit(&[b1.clone(), b2.clone()], &ledger, &[], &StubExecutor).unwrap();
+        assert!(s.perp_inputs(1).unwrap().is_some());
+        assert_eq!(s.perp_inputs(2).unwrap(), None);
+        assert_eq!(s.perps().unwrap().unwrap().pending_heights(), vec![1]);
+        // A recorded block without its words is still torn.
+        let mut probe = ledger.clone();
+        let deposit = perp_deposit_tx(&probe, &key(51), 400, 5_000_000);
+        let mut torn = make_perps_block(&b2, &mut probe, vec![deposit], &key(1));
+        torn.perp_words = None;
+        assert!(s.commit(std::slice::from_ref(&torn), &probe, &[], &StubExecutor).is_err());
+        let reloaded = crate::node::reload_ledger(&s, &gs, &StubExecutor).unwrap();
+        assert_eq!(reloaded.perps(), ledger.perps());
+    }
+
     #[test]
     fn perps_are_persisted_restored_and_truncated() {
         use randprotocol_core::ledger::perps::{self, PerpPayout};
@@ -9597,7 +9728,7 @@ mod tests {
         assert_eq!(s.perp_inputs(4).unwrap().as_ref(), Some(&w4));
 
         // A stale blob (the genesis one) is named, and repaired from replay.
-        let put = |p: &perps::Perps| s.db.put_cf(s.cf(CF_META), META_PERPS, bincode::serialize(p).unwrap()).unwrap();
+        let put = |p: &perps::Perps| s.db.put_cf(s.cf(CF_META), META_PERPS, p.encode_persisted()).unwrap();
         put(gs.ledger.perps().unwrap());
         let check = s.verify_chain(&gs, VerifyMode::Quick, &StubExecutor).unwrap();
         assert!(check.problem.as_deref().unwrap().contains("perps"), "{:?}", check.problem);

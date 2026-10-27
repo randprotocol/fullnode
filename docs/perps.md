@@ -59,6 +59,15 @@ proved root and height, the digests not yet proved, and the withdrawals waiting 
 | `engine_hc` | the engine guest's program commitment; a state proof of any other program is refused. Hex byte order: each u32 word of `hc` as 8 little-endian hex characters (`word8_to_hex`); `rand perp image-hc --image <FILE>` prints an image's hc in that format, and `rand perp prove` refuses an image that does not match before proving |
 | `genesis_root` | the engine's state root at height 0: `perp_digest(PERP_STATE, State::genesis(markets).encode())`. `perp-prover genesis-state` writes the words and `rand perp genesis-root --state` hashes them |
 | `markets` | the `MarketSpec` list below |
+| `bound_payouts` | optional, default `false` (audit v10, PERP-6): a state proof whose payouts total more than the collateral the chain has counted the exchange holding — `initial_collateral + collateral_in − collateral_out` — is refused `PayoutExceedsCollateral`, at validate and at apply. Permanent: an engine that pays what it was never given is an engine fault. Off (chain 21), a payout is bounded by its request alone, and a request only by the note bound 2^63 |
+| `initial_collateral` | optional, default 0: the collateral the genesis engine state already holds (accounts and insurance fund), in collateral units, below 2^63; what the count above starts from |
+| `sparse_windows` | optional, default `false` (PERP-101): blocks without perp inputs record no digest, and a state proof spans up to `max_window_heights` heights over at most `max_window_blocks` recorded blocks ("Sparse windows" below). Off (chain 21), every block records a digest and a window is at most `max_window_blocks` consecutive heights |
+| `engine_program_log_height` | optional, default 0 = unpinned (CON-60): the program-table height of the engine image (`rand perp image-hc` prints it on stderr as `engine_program_log_height N`). Set, a state proof declaring another program height, or any keccak or sha256 table (the engine calls neither), is refused `ProofRefused("declared shape: …")` from its header before any verifier key is built; a header that does not decode is refused the same way. Left free: the tier (at most `max_tier`) and the input height. 1 to 24 |
+| `max_window_heights` | optional, default 0; required with `sparse_windows`, from `max_window_blocks` to `MAX_WINDOW_HEIGHTS` = 4096, and 0 without it: the most heights one sparse window spans, and the heartbeat interval |
+
+The audit-v10 fields (and PERP-101's two) are bound into the genesis hash **only when set** (`PerpsConfig::commit_bytes`:
+the pre-v10 shape's bincode, then each later field tagged by name), so a file that omits them —
+chain 21's — hashes exactly as it did at its cut (`chain_21s_genesis_file_still_hashes_as_cut`).
 
 `MarketSpec`: `id`, `symbol`, `lot` (the size increment in base atomic units), `tick` (the price
 increment, in quote atomic units per `BASE_UNIT` = 10^9 of base), `max_leverage`,
@@ -109,7 +118,9 @@ against the inputs the block has recorded so far; neither is permanent (the next
 A pool does not refuse on them: its ledger is the tip's, whose block inputs every close empties,
 so `still_applies` never reads them and an input a full block left out stays pooled for the next.
 A block carrying more is refused whole; the proposer's trial apply packs exactly the first
-`max_block_inputs` that apply.
+`max_block_inputs` that apply — and the pool offers the fee-less inputs account by account,
+round-robin (audit v10, PERP-1 (d), "The node" below), so those slots go to distinct accounts
+before any account's second input.
 
 With at most 15 accounts, the per-account cap also bounds a block's words whatever
 `max_block_inputs` says: 15 × 8 inputs × 21 words (a withdrawal's, the longest) + one `Close`
@@ -297,6 +308,44 @@ all:
 The proof is not a bundle's: `proof` is kept inside the transaction's binding, as a call's is, and
 `proof_bytes` is capped by `max_proof_bytes`.
 
+### Sparse windows (PERP-101)
+
+On 1 s blocks one prover cannot keep up with a digest per block (`max_window_blocks` is at most 64
+and a tier-18 proof takes minutes), so withdrawals would wait without bound. Under the genesis flag
+`sparse_windows` the engine is not run over blocks that carry nothing for it:
+
+- **Close.** A block with no perp input records **no digest and no words**, unless
+  `max_window_heights` heights have passed since the last recorded digest (or the proved height,
+  when none waits) — then its `Close` is recorded as a **heartbeat**, so funding, marks and
+  liquidations still run at least every `max_window_heights` heights and every window stays
+  reachable. The oracle median is computed at every close either way (it is ledger state). The
+  engine sees fewer closes: a liquidation or a funding step on a price that moved and moved back
+  between two recorded closes is not run (funding accrues the elapsed time at the next recorded
+  close, capped at one period, as before). That is the trade the flag makes.
+- **Window.** `from_height` equals `proved_height`; `to_height > from_height`;
+  `to_height - from_height <= max_window_heights` (`WindowMismatch`, its `max` that bound);
+  `to_height` is a recorded height (`MissingDigest(to)`); and the span holds at most
+  `max_window_blocks` recorded digests (`WindowTooManyBlocks`). The ledger builds the segment from
+  **every** recorded digest in `from+1 ..= to`, in height order — the segment's shape is unchanged,
+  `n_blocks` is their count — and the engine's block-count output must equal that count. The same
+  engine image proves both kinds of window: it never reads a block's height for order.
+- **Settlement** is unchanged: the proved root and height move to `to`, the covered digests go, and
+  every pending request recorded at or below `to` is settled.
+- **The node.** A block that recorded nothing stores no `perp_inputs` row, and
+  `rand_getPerpInputs` answers `null` for it; `rand_getPerps.pending_heights` lists only the
+  recorded heights. Back-pressure on new orders counts both recorded digests (four
+  `max_window_blocks`) and heights (four `max_window_heights` between the head and the proved
+  height).
+
+**Building a sparse job (a prover).** From `rand_getPerps`: take `pending_heights` greater than
+`proved_height`, ascending, while each is within `max_window_heights` of `proved_height` and at most
+`max_window_blocks` (or the prover's own smaller cap) of them; `to_height` is the last one taken.
+Fetch each one's words with `rand_getPerpInputs [h]` (never the heights between them), replay the
+engine over exactly those blocks in that order, and write the job with `from_height =
+proved_height`, `blocks` = those heights and words. `rand perp prove` checks the job against the
+chain (`check_window`) and refuses one that skips or adds a height before proving. The client
+library's `next_window_heights` is the reference for the selection.
+
 ### The supply audit
 
 A RAND deposit's `burn_r` is inside `burned`; a payout mints a note. The ledger keeps two counters
@@ -305,6 +354,21 @@ chain like RPL-2's, and `Ledger::audit` folds them in as the identity's fifth
 term, beside RPL-2's vaults. `rand_getSupply` serves `perps_rand_out` and `perps_rand_held`
 (`rand_in - rand_out`). On a chain whose collateral is a token both are `"0"`: **a token's supply
 is not audited by this term**, because a token's total supply does not move on the way in or out.
+
+**Collateral counters (audit v10, PERP-6).** Beside the RAND pair the ledger keeps `collateral_in`
+(Σ every deposit's burn) and `collateral_out` (Σ every payout a state proof listed, minted or not —
+the engine deducted it either way), in the collateral asset whatever it is, outside the root like
+the RAND pair; `collateral_held = initial_collateral + collateral_in − collateral_out`. They are
+what the genesis `bound_payouts` rule holds a proof to, and `rand_getSupply` serves them as
+`perps_collateral_in`, `perps_collateral_out` and `perps_collateral_held` (token collateral
+included; `rand_getPerps` carries the same four numbers). They move no term of the RAND identity.
+Without `bound_payouts` they are reporting state, outside consensus equality: a node rolled onto
+this build counts them from the roll (a v0.8.x row decodes with both at 0) and still compares equal
+to a replay from genesis, so the first start's chain walk finds nothing to repair. The
+`META_PERPS` row stays v0.8.x's bincode byte for byte, followed — only when a counter or a later
+genesis field is not its default — by a trailer (`rand-perps-ext-1` ‖ the extension), which
+v0.8.x's reader ignores (`Perps::encode_persisted`/`decode_persisted`). So a node can roll back
+to v0.8.x on the same database.
 
 ## What the guest sees
 
@@ -431,6 +495,95 @@ bridged one.
   evicted to make room, and offered to a block after governance and ahead of fee order, so a pool
   full of free orders cannot keep out the proof that settles them. A second proof while the slot
   is held is pooled like anything else.
+- **A cancel names an order (I-4), on a `sparse_windows` chain.** The pool refuses a
+  `PerpCancel` whose `target` is its own nonce, or a nonce inside the account's window that no
+  order took and that is neither pooled here nor waiting in this node's verify queue: `the cancel
+  names order nonce N, which no order of this account has taken` (retryable, never cached). A
+  target above the account's highest nonce (an order still on its way) or older than the window
+  remembers is let through. On a dense chain (chain 21) cancels are admitted as in v0.8.0. Either
+  way cancels share the account's 16 fee-less slots with orders and withdrawals.
+- **State-proof verifier keys (CON-60).** The executor builds the key a proof's header declares
+  before it verifies anything, and a state proof is fee-less, so junk of ever new shapes would
+  each cost a key build (a tier-18 key is over a minute in a debug build). Node policy, on every
+  chain, never a validity rule — chain 21's verdicts are unchanged:
+  - **the canonical shape.** The honest prover proves every window at the chain's canonical
+    shape (below); a node reserves, caches and keeps exactly those keys;
+  - a proof costs a cold-build token only if its shape has no key built **and** it passes every
+    rule applied before a key is touched: the ledger's window and payout rules over the tip, the
+    executor's header rules (canonical body, tier at most `max_tier`, declared caps, the public
+    height of the tip's segment), the verifier's own pre-key prefix (`Machine::check_pre_key`,
+    the function `Machine::verify` runs first: the public values against the genesis
+    `engine_hc`, canonical values, `TIER`, `GAS`, the pc window, the commit PoW witnesses, the
+    degree bits), the segment's public digest, and the genesis pin. The executor's verify path
+    runs the same function (`perp_pre_key`) before it builds a key — the digest included, which
+    `Machine::verify_public` alone would compare only after the key — so a proof refused for
+    free never spends a token and never builds a key;
+  - tokens come from two buckets of 2, each refilled one per 30 s: a **reserve** for the chain's
+    canonical shapes, and a general bucket for every other shape. Canonical keys live in their
+    own cache of 8 (a chain has at most four canonical shapes); other shapes share a cache of 2.
+    Pins are per cache — 4 in the canonical cache, 1 in the general one, each below its cache's
+    size — so neither cache ever holds more keys than its size: at most 10 state-proof keys in
+    all, 6 on a chain with the genesis pin. A stored key keeps ~100 KB at every tier (its
+    exported blob is 13 677 bytes), so the caches hold about 1 MB. With its bucket spent a
+    proof is refused `this node is at its limit of verifier-key builds for new state-proof
+    shapes; retry later` (`StateProofBusy`, retryable, never cached, no peer penalised, no
+    timing). No refusal moves a bucket. An attacker can force at most one build per canonical
+    shape before every honest shape is warm;
+  - a shape whose proof verified here, or that a committed block carried, is pinned in its
+    cache while that cache has a pin left (never evicted; non-canonical proofs can never take a
+    canonical shape's pin) and recorded in the node's database; at startup, off the node loop and
+    after the bundle key, the node walks the 8 newest recorded or recently committed shapes and
+    builds and pins each whose cache still has a pin (reserving the pin before it builds);
+  - **one state-proof key build at a time** per process, across both caches, every verify
+    worker and the startup warm: a second cold shape waits for the first build, while proofs of
+    warm shapes keep verifying. **The build is the memory cost**: its heap peaks at ~0.84 GB at
+    tier 16 and ~3.3–4 GB at tier 18 (4× a tier step; measured with a counting allocator to tier
+    16, msauth's tier-18 build at 4.0 GB). **A validator with less than 8 GB of memory should run
+    a chain whose perps `max_tier` is at most 16**, or — a follow-up, not built yet — load a
+    precomputed, hash-pinned state-proof key (13.7 KB, as the msauth key is loaded) instead of
+    building it.
+
+  **The canonical state-proof shape** (`ledger::perps::canonical_input_log_height`,
+  `canonical_witness_words`, `segment_public_log_height`; `rand perp prove` proves at it by default
+  only on a chain whose genesis sets `engine_program_log_height`, chain 22 on): for genesis `max_tier` = T and a window of n recorded blocks,
+
+  | component | value |
+  |---|---|
+  | tier | T |
+  | input height | h = clamp(T − 2, 7, 16): the witness is padded with zero words to 2^h − 1 words (65 535 at T = 18, 16 383 at T = 16); a longer witness is refused (prove a shorter window) |
+  | public height | log2(next_pow2(max(32 + 8n + 1, 4))), at least 7: 7 for n = 1..=11, 8 for 12..=27, 9 for 28..=59, 10 for 60..=64 |
+  | program height | the engine image's (genesis `engine_program_log_height` when set, else the shape a verified proof showed) |
+  | keccak, sha256 | none |
+
+  T − 2 keeps the input digest (one Poseidon2 row per four words, so 2^(T−4) rows) at half the
+  tier's 2^(T−3) budget (16 384 of 32 768 rows at T = 18); 16 is the input height of the most words a proof may carry. The guest reads only
+  the words its counts name, so the padding changes nothing it computes.
+
+  **Which shape `rand perp prove` proves at.** On a chain whose genesis pins the engine's program
+  height (`engine_program_log_height`, served as `rand_getPerps.engine_program_log_height`;
+  chain 22 on), the canonical shape above by default. On a chain without the pin (chain 21) the
+  smallest shape the window fits, unpadded, as before: chain 21's `max_tier` is 18, so canonical
+  padding would put every proof at tier 18 (unmeasured, and likely past the prover host), and
+  without a pin a node has no lineage for its reserve anyway. `--canonical` and `--smallest`
+  force either; the pool's policy is the same whichever a prover picks.
+- **Fee-less perp actions in the pool (audit v10, PERP-1).** An order, a cancel or a withdrawal
+  request pays no fee, so the pool bounds them by count rather than by price — node policies,
+  never validity rules, each a `mempool full`-class refusal (retryable, never cached, no peer
+  penalised): **16 per account** (`MAX_PERP_ACCOUNT_POOLED`; two blocks' worth of one account's
+  inputs in flight) and **1 024 in all** (`MAX_PERP_POOLED`, the backstop that keeps them off the
+  fee-paying bundles' space; with 15 accounts the account cap binds first). Among candidates the
+  pool ranks governance, then the state proof, then **withdrawal requests**, then everything else
+  by fee; ties break by **arrival order** first and by hash last, so grinding a transaction's hash
+  buys no place. The rank-0 orders and cancels are offered **round-robin by account** — every
+  account's first pooled input, then every second — so a block's `max_block_inputs` go to distinct
+  accounts before any account's second input: three accounts flooding chain 21's 24-input blocks
+  hold three slots while the others wait. And **back-pressure**, only on a chain whose genesis sets `sparse_windows` (chain 22 on; a
+  dense chain records a digest every block, so on chain 21 it would hold every order for good once
+  proving fell behind): while
+  `PERP_BACKPRESSURE_WINDOWS` (4) × `max_window_blocks` recorded digests wait for a proof, the node
+  admits no new order or cancel (deposits, cancels, withdrawals, oracle prices and proofs are unaffected),
+  so a lagging prover is not buried further. None of this returns collateral without a proof: the
+  "no forced exit" limit below stands.
 - **Transport.** `rand_getPerps`, `rand_getPerpAccount`, `rand_getPerpAccounts` and
   `rand_getPerpInputs` are on the public listener; `rand_getLimits` gains `perps`; `rand_getSupply`
   gains `perps_rand_out` and `perps_rand_held` (`docs/rpc.md`). Every perp action renders in
@@ -450,16 +603,22 @@ not the chain's `proved_root`, which is how the prover learns to roll back.
   cache and the reserved pool slot above are the minimum. A prover register with a bond, so junk
   proofs cost their sender, is a follow-up.
 - **No withdrawal fee (I2).** The spec's bundled withdrawal is deferred: a request is bundle-less
-  and fee-less, bounded only by one pending per account and 8 in all.
-- **Provers versus 1 s blocks (I7).** `MAX_WINDOW_BLOCKS` is 64, and a tier-16 proof takes 76 to
-  400 s, so on 1 s blocks a single prover falls behind the digests it must cover. A demo chain
-  runs 2 s blocks; back-pressure on inputs while proofs lag, and eliding empty blocks from a
-  window, are follow-ups.
+  and fee-less, bounded by one pending per account and 8 in all at the ledger, and by the pool's
+  per-account and pool-wide counts of fee-less perp actions (PERP-1, "The node").
+- **Provers versus 1 s blocks (I7, PERP-101).** `MAX_WINDOW_BLOCKS` is 64, and a tier-16 proof
+  takes 76 to 400 s, so on 1 s blocks a single prover falls behind the digests it must cover on a
+  dense chain (chain 21). Under genesis `sparse_windows` back-pressure holds new orders while proofs lag (PERP-1), and
+  `sparse_windows` (from the next cut) elides input-less blocks so a window covers up to
+  `max_window_heights` heights. A busy exchange (inputs in most blocks) still needs proving at the
+  input rate: sparse windows bound the lag by activity, not by block count.
 - **The gate's error (M3).** `PerpError::Disabled` is the section gate's refusal. The five
   bundle-less actions are gated at the action step; a state proof is gated before the size caps
   (so a chain without the section answers `Disabled`, not `ProofTooLarge`).
-- **Token collateral (M6).** A token's supply is not audited by the perps term: the audit cannot
-  detect a token deposit and payout imbalance.
+- **Token collateral (M6).** A token's supply is not audited by the perps term of the RAND
+  identity. Since audit v10 (PERP-6) the collateral counters cover any asset and, under genesis
+  `bound_payouts`, refuse a proof that pays more than was deposited; on a chain without the flag
+  (chain 21) the counters are reported but bind nothing, and a payout is bounded by its request
+  alone.
 - **Engine capacities.** The ledger pins `MAX_MARKETS` = 2, the pinned engine's capacity, and
   nothing else of the engine's: `MAX_ACCOUNTS` (15) and `MAX_PERP_PAYOUTS` (8) are ledger rules
   chosen to fit it, not engine constants read from it.
