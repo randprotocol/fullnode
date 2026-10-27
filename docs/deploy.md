@@ -172,6 +172,38 @@ node**, and the older advice here (a strict/permissive mix drops messages; only 
 all-stop/all-start) does not hold for this fleet. Turn it on everywhere once it has run on a
 canary.
 
+### The anonymous transaction lane (v0.8.3, issue #146)
+
+Before v0.8.3 every transaction rode the signed gossip topic `rand/<chain>/tx`: each message
+carried the publishing node's PeerId, a signature and a sequence number, every relay kept them,
+and so every node learned which peer first published each transaction. v0.8.3 adds a second
+gossipsub behaviour for transactions alone — `MessageAuthenticity::Anonymous` under
+`ValidationMode::Anonymous`, on its own protocol `/rand/<chain>/txsub`, topic `rand/<chain>/tx/2`.
+A message there has no source, sequence number or signature, and one that carries any is refused.
+Consensus, status and peer bindings stay signed. Rate limiting is unchanged: it always keyed on
+the forwarder (`propagation_source`), never the author.
+
+The two lanes cannot share a topic or a protocol, so the roll runs both, then drops the old one:
+
+1. **Roll v0.8.3 everywhere, flag off (the default).** A v0.8.3 node subscribes both topics,
+   publishes each transaction on both, and relays on both: a copy heard on one lane is held for
+   the verdict on the first copy, so the node judges a transaction once and relays it on both
+   lanes. An older node speaks only `/meshsub` and sees exactly what it saw before — the legacy
+   copy is still signed, so `--strict-gossip` on an older node drops nothing (a v0.8.3 node
+   never publishes unsigned on `/meshsub`). Mixed fleets are safe in either direction: an older
+   node's transactions reach v0.8.3 nodes on the legacy topic. During this phase the legacy copy
+   still names the author: **the privacy gain starts at step 2.**
+2. **After every node on the chain runs v0.8.3 or later** — validators, observers, archives, the
+   site and bridge nodes — restart each with `--anonymous-tx-only`, one at a time. It stops
+   publishing on and subscribing to `rand/<chain>/tx`. Order does not matter: a flagged node
+   still hears every transaction on `tx/2` from the others, and a not-yet-flagged node still
+   publishes on both. A node from before v0.8.3 left on the chain would stop hearing the flagged
+   nodes' transactions (it would still get them in blocks).
+3. The next release can make `--anonymous-tx-only` the default and drop the legacy topic.
+
+The lane does not hide timing: the first node to relay a transaction is still the likeliest
+author to a well-connected observer. That is the Dandelion++ issue's to close.
+
 ## Rolling out a new commit
 
 1. `cargo test` locally, commit, push.

@@ -12,7 +12,17 @@ stopped at v0.4 until 2026-09-30, when the entries v0.5 to v0.6.7 were written f
 
 ## Unreleased
 
-Nothing yet.
+- **Transactions gossip anonymously** (issue #146): a second gossipsub behaviour,
+  `MessageAuthenticity::Anonymous` under `ValidationMode::Anonymous`, protocol
+  `/rand/<chain>/txsub`, topic `rand/<chain>/tx/2`; consensus, status and peer bindings stay
+  signed. Rolls node by node with the legacy signed topic still published and relayed;
+  `--anonymous-tx-only` drops it once no older node is left (`docs/deploy.md`).
+- **No duplicate-publish WARN spam** (issue #144): a status's gossip id covers its author and
+  sequence number, so an unchanged status re-announced on a connect or the 3 s tick goes out
+  instead of being dropped as "already published"; `PublishError::Duplicate` is a debug line.
+- **No ANSI colour in journald** (issue #143): `rand-node` and `rand-prover` colour their log
+  only at a terminal and never under `NO_COLOR`; `deploy/update-droplet.sh` drops "chain 14"
+  from an old unit's `Description=`.
 
 ## v0.8.2 — 2026-10-27 (chain 21, node-only; the genesis-gated rules wait for the next cut)
 

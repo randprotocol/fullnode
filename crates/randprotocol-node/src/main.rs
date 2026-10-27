@@ -759,6 +759,12 @@ enum Cmd {
         /// exchange honest gossip both ways.
         #[arg(long)]
         strict_gossip: bool,
+        /// Gossip transactions only on the anonymous lane `rand/{chain}/tx/2` (issue #146): stop
+        /// subscribing to and publishing on the legacy signed topic `rand/{chain}/tx`, whose
+        /// messages name the node that first published them. Only once every node on the chain
+        /// runs v0.8.3 or later: an older node hears transactions on the legacy topic alone.
+        #[arg(long)]
+        anonymous_tx_only: bool,
         #[arg(long, default_value = "127.0.0.1:8545")]
         rpc: SocketAddr,
         /// Take part in consensus with this node's key. A key in no current epoch's validator
@@ -3000,6 +3006,7 @@ async fn main() -> Result<()> {
             bootstrap,
             reserved_peer,
             strict_gossip,
+            anonymous_tx_only,
             rpc,
             validator,
             no_mdns,
@@ -3092,7 +3099,7 @@ async fn main() -> Result<()> {
                 prune_history,
                 gas_policy: randprotocol_core::gas::GasPolicy::from_prices(gas_price, byte_price),
                 msauth: randprotocol_node::msauth_key::MsauthKeyOptions { path: msauth_vk, build: build_msauth_key },
-            }, rpc_options, node::NetOptions { reserved_peers: reserved_peer, strict_gossip })
+            }, rpc_options, node::NetOptions { reserved_peers: reserved_peer, strict_gossip, anonymous_tx_only })
             .await?;
             // The prover is served once the node's RPC is up and stops with the node; a prover
             // that exits stops the node too.
