@@ -307,7 +307,7 @@ pub enum MemberOutcome {
 }
 
 /// The first release whose pinned pool matches the live one (members `a` and `b`).
-pub const POOL_RELEASE: &str = "0.8.1";
+pub const POOL_RELEASE: &str = "0.8.2";
 
 /// What `pair --trusted` says when no member could be paired (CLI-301). If any member was merely
 /// busy, trying again is right. Otherwise nothing pinned in this build answers as pinned, which a
@@ -1233,7 +1233,7 @@ mod pool_failure_tests {
     fn all_unreachable_or_wrong_key_says_update_and_names_the_version() {
         for o in [vec![MemberOutcome::Unreachable; 2], vec![MemberOutcome::WrongKey; 2], vec![MemberOutcome::Unreachable, MemberOutcome::WrongKey]] {
             let m = trusted_pool_failure(&o);
-            assert!(m.contains("Update rand to version 0.8.1 or later"), "{m}");
+            assert!(m.contains("Update rand to version 0.8.2 or later"), "{m}");
             assert!(!m.contains("try again"), "{m}");
         }
     }
