@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Same-chain binary update of one droplet — no genesis change, no unit edit, data dir kept:
+# Same-chain binary update of one droplet — no genesis change, data dir kept, and the unit edited
+# only to append PRUNE_ARGS (when given) and to drop a chain number from its Description (#143):
 #
 #   deploy/update-droplet.sh <ip> [build-host]
 #
@@ -89,6 +90,13 @@ $SSH "set -e
   install -m 755 /root/$BIN_NODE /root/$BIN_WALLET /usr/local/bin/
   if [ -n \"${PRUNE_ARGS:-}\" ] && ! grep -q -- '--prune-history' /etc/systemd/system/$SERVICE.service; then
     sed -i \"s|^ExecStart=\(.*\)\$|ExecStart=\1 ${PRUNE_ARGS}|\" /etc/systemd/system/$SERVICE.service
+    systemctl daemon-reload
+  fi
+  # A unit written by the chain-14 cutover still says \"RAND full node (d, chain 14)\" (#143): later
+  # cutovers only swap the datadir suffix. The Description names the host and no chain, so it never
+  # goes stale again; the chain is in the datadir and in rand_status.
+  if grep -q '^Description=RAND full node (.*, chain [0-9]*)\$' /etc/systemd/system/$SERVICE.service; then
+    sed -i 's/^Description=RAND full node (\(.*\), chain [0-9]*)\$/Description=RAND full node (\1)/' /etc/systemd/system/$SERVICE.service
     systemctl daemon-reload
   fi
   systemctl restart $SERVICE

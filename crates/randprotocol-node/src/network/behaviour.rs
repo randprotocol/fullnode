@@ -16,7 +16,17 @@ pub struct RandBehaviour {
     /// Second, for the same reason: the per-source pending cap and the per-peer cap that holds
     /// reserved peers too (audit v6, NET-1; [`super::edge`]). It emits nothing either.
     pub guard: super::edge::Guard,
+    /// Consensus, status, peer bindings and — while [`super::EdgeConfig::anonymous_tx_only`] is
+    /// off — the legacy transaction topic: `MessageAuthenticity::Signed`, on gossipsub's own
+    /// `/meshsub` protocol.
     pub gossipsub: gossipsub::Behaviour,
+    /// Transactions only (issue #146): `MessageAuthenticity::Anonymous` under
+    /// `ValidationMode::Anonymous`, so a transaction carries no author, signature or sequence
+    /// number, and one that does is refused. `MessageAuthenticity` is per behaviour, hence a
+    /// second one, on a protocol of its own (`/rand/{chain}/txsub`) so the two never compete for
+    /// one stream. Its events arrive as `RandEvent::Gossipsub` like the first's; the topic tells
+    /// them apart, because each behaviour subscribes only its own.
+    pub tx_gossip: gossipsub::Behaviour,
     pub identify: identify::Behaviour,
     pub kademlia: kad::Behaviour<kad::store::MemoryStore>,
     pub mdns: Toggle<mdns::tokio::Behaviour>,

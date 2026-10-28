@@ -392,8 +392,11 @@ chain id, or to run the old-constraint nodes (or the new ones, on old history) w
 
 ## 8. Networking and sync; mempool
 
-libp2p 0.54 over TCP with Noise and Yamux. Behaviours: **gossipsub** (topics
-`rand/<chain-id>/consensus`, `/tx`, `/status`), **Kademlia** (protocol `/rand/<chain-id>/kad/1`)
+libp2p 0.54 over TCP with Noise and Yamux. Behaviours: **gossipsub**, twice — signed
+(`MessageAuthenticity::Signed`, topics `rand/<chain-id>/consensus`, `/status`, `/peers` and the
+legacy `/tx`) and anonymous (`MessageAuthenticity::Anonymous` under `ValidationMode::Anonymous`, on
+its own protocol `/rand/<chain-id>/txsub`, topic `rand/<chain-id>/tx/2`: a transaction names no
+author, issue #146) — **Kademlia** (protocol `/rand/<chain-id>/kad/1`)
 seeded from `--bootstrap`, **identify**, optional **mDNS** for LAN discovery, **request-response**
 (`/rand/sync/1`, CBOR) for block sync, and **ping** every 15 s. A node remembers every address it
 dialled or learnt through identify and redials disconnected known peers every 30 s, in addition to

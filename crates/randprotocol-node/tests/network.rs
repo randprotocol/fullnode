@@ -316,43 +316,64 @@ async fn each_message_rides_its_own_topic_as_the_bincode_of_the_gossip_message()
     a.h.shutdown().await;
 }
 
-/// The id a delivery is reported with is content-addressed: blake3 of the message bytes, which is
-/// why two forwarders of one message produce one id. Checked from outside against the bytes the
-/// publisher put on the wire.
+fn tx(n: u64) -> randprotocol_core::Transaction {
+    // `chain_id` only makes the bytes differ: the network task never judges a transaction.
+    randprotocol_core::Transaction { chain_id: n, bundle: None, action: randprotocol_core::Action::None }
+}
+
+/// Publish `tx` from `from` until `to` delivers it, as [`gossip_until_delivered`] does a status.
+async fn gossip_tx_until_delivered(from: &NetworkHandle, to: &mut Peer, tx: randprotocol_core::Transaction) -> (PeerId, GossipId) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let want = tx.chain_id;
+    while tokio::time::Instant::now() < deadline {
+        from.broadcast(GossipMessage::Transaction(tx.clone())).await;
+        let got = to
+            .wait(Duration::from_millis(400), |e| match e {
+                NetworkEvent::Gossip { from, msg: GossipMessage::Transaction(t), id } if t.chain_id == want => Some((from, id)),
+                _ => None,
+            })
+            .await;
+        if let Some(got) = got {
+            return got;
+        }
+    }
+    panic!("transaction {want} was never delivered");
+}
+
+/// The id a transaction's delivery is reported with is content-addressed: blake3 of the message
+/// bytes, on either transaction lane (issue #146), which is why two forwarders of one transaction
+/// produce one id. Checked from outside against the bytes the publisher put on the wire. A status
+/// is the exception (issue #144): its id also covers its author and sequence number, so it is not
+/// the bytes' hash.
 #[tokio::test]
 async fn a_delivered_messages_id_is_the_blake3_of_its_bytes() {
     let (mut a, b) = pair(21, 22).await;
-    let s = status(9);
-    let bytes = bincode::serialize(&GossipMessage::Status(s.clone())).unwrap();
-    let (from, id) = gossip_until_delivered(&b.h, &mut a, s).await;
-    assert_eq!(from, b.h.local_peer_id);
+    let t = tx(9);
+    let bytes = bincode::serialize(&GossipMessage::Transaction(t.clone())).unwrap();
+    let (from, id) = gossip_tx_until_delivered(&b.h, &mut a, t).await;
+    assert_eq!(from, b.h.local_peer_id, "one hop: the forwarder, which a transaction's `from` is");
     assert_eq!(id.propagation_source, b.h.local_peer_id);
     assert_eq!(id.message_id.0, blake3::hash(&bytes).as_bytes().to_vec());
+    a.h.report_validation(id, MessageAcceptance::Accept).await;
+
+    let s = status(9);
+    let bytes = bincode::serialize(&GossipMessage::Status(s.clone())).unwrap();
+    let (_, id) = gossip_until_delivered(&b.h, &mut a, s).await;
+    assert_ne!(id.message_id.0, blake3::hash(&bytes).as_bytes().to_vec(), "a status's id is its author's too (#144)");
     a.h.report_validation(id, MessageAcceptance::Accept).await;
     a.h.shutdown().await;
     b.h.shutdown().await;
 }
 
-/// The same bytes published three times are delivered once: the content-addressed id makes the
-/// repeats duplicates at the publisher and at the receiver alike.
-#[tokio::test]
-async fn the_same_bytes_published_again_are_delivered_once() {
-    let (mut a, b) = pair(23, 24).await;
-    // Warm the mesh with another message first, so the publishes below all go out.
-    let (_, id) = gossip_until_delivered(&b.h, &mut a, status(1)).await;
-    a.h.report_validation(id, MessageAcceptance::Accept).await;
-
-    let s = status(2);
-    for _ in 0..3 {
-        b.h.broadcast(GossipMessage::Status(s.clone())).await;
-    }
+/// Every delivery of `pred`'s kind within `within`, each reported Accept.
+async fn count_deliveries(a: &mut Peer, within: Duration, pred: impl Fn(&GossipMessage) -> bool) -> usize {
     let mut deliveries = 0;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
-    while tokio::time::Instant::now() < deadline {
+    let deadline = tokio::time::Instant::now() + within;
+    loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         let got = a
             .wait(remaining, |e| match e {
-                NetworkEvent::Gossip { msg: GossipMessage::Status(got), id, .. } if got.height == 2 => Some(id),
+                NetworkEvent::Gossip { msg, id, .. } if pred(&msg) => Some(id),
                 _ => None,
             })
             .await;
@@ -361,10 +382,35 @@ async fn the_same_bytes_published_again_are_delivered_once() {
                 deliveries += 1;
                 a.h.report_validation(id, MessageAcceptance::Accept).await;
             }
-            None => break,
+            None => return deliveries,
         }
     }
-    assert_eq!(deliveries, 1);
+}
+
+/// The same transaction published three times is delivered once — the content-addressed id makes
+/// the repeats duplicates at the publisher and at the receiver alike, and the copy on the second
+/// lane is held for the first's verdict (issue #146). The same *status* published three times is
+/// three statuses (issue #144): each re-announcement reaches its peers.
+#[tokio::test]
+async fn the_same_bytes_published_again_are_delivered_once() {
+    let (mut a, b) = pair(23, 24).await;
+    // Warm both meshes with other messages first, so the publishes below all go out.
+    let (_, id) = gossip_tx_until_delivered(&b.h, &mut a, tx(1)).await;
+    a.h.report_validation(id, MessageAcceptance::Accept).await;
+    let (_, id) = gossip_until_delivered(&b.h, &mut a, status(1)).await;
+    a.h.report_validation(id, MessageAcceptance::Accept).await;
+    // Drain what the warm-up's retries left behind.
+    count_deliveries(&mut a, Duration::from_millis(1500), |_| true).await;
+
+    for _ in 0..3 {
+        b.h.broadcast(GossipMessage::Transaction(tx(2))).await;
+    }
+    assert_eq!(count_deliveries(&mut a, Duration::from_secs(3), |m| matches!(m, GossipMessage::Transaction(t) if t.chain_id == 2)).await, 1);
+
+    for _ in 0..3 {
+        b.h.broadcast(GossipMessage::Status(status(2))).await;
+    }
+    assert_eq!(count_deliveries(&mut a, Duration::from_secs(3), |m| matches!(m, GossipMessage::Status(s) if s.height == 2)).await, 3);
     a.h.shutdown().await;
     b.h.shutdown().await;
 }

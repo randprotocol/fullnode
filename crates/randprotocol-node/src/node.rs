@@ -2508,6 +2508,9 @@ pub struct NetOptions {
     /// gossipsub's strict validation (`--strict-gossip`, audit v6, CH-7): see
     /// [`network::EdgeConfig::strict_gossip`].
     pub strict_gossip: bool,
+    /// Gossip transactions on the anonymous lane only (`--anonymous-tx-only`, issue #146): see
+    /// [`network::EdgeConfig::anonymous_tx_only`].
+    pub anonymous_tx_only: bool,
 }
 
 pub async fn start(cfg: NodeConfig) -> Result<NodeHandle> {
@@ -2641,6 +2644,7 @@ pub async fn start_with(cfg: NodeConfig, rpc_options: RpcOptions, net_options: N
             reserved: net_options.reserved_peers.clone(),
             bound: peer_bindings.bound_peers(),
             strict_gossip: net_options.strict_gossip,
+            anonymous_tx_only: net_options.anonymous_tx_only,
         },
     )
     .await?;
@@ -7928,7 +7932,7 @@ mod tests {
 
     /// A delivery id from a fresh forwarder.
     fn gossip_id() -> GossipId {
-        GossipId { message_id: libp2p::gossipsub::MessageId::new(b"compact"), propagation_source: PeerId::random() }
+        GossipId { message_id: libp2p::gossipsub::MessageId::new(b"compact"), propagation_source: PeerId::random(), lane: Default::default() }
     }
 
     /// A compact proposal naming only transactions in the pool rebuilds and is handled as a

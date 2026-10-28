@@ -368,6 +368,14 @@ pub struct EdgeConfig {
     /// strict node and a permissive one exchange honest messages both ways (pinned by
     /// `a_strict_node_takes_a_permissive_nodes_signed_gossip_and_drops_a_forged_unsigned_one`).
     pub strict_gossip: bool,
+    /// Gossip transactions on the anonymous lane only (issue #146, `--anonymous-tx-only`): no
+    /// subscription to the legacy signed topic `rand/{chain}/tx`, and nothing published there. Off
+    /// by default for the rolling upgrade: a node then publishes each transaction on both lanes —
+    /// the anonymous `rand/{chain}/tx/2` and, for nodes that predate it, the signed legacy topic,
+    /// which still names this node as the author — and relays on both. Turn it on once no node
+    /// that predates the anonymous lane is left; until then a transaction published only
+    /// anonymously never reaches them by gossip.
+    pub anonymous_tx_only: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -390,6 +398,18 @@ pub struct PeerInfo {
 pub struct GossipId {
     pub message_id: MessageId,
     pub propagation_source: PeerId,
+    /// The gossipsub behaviour that delivered it, which is the one its verdict goes back to.
+    pub lane: GossipLane,
+}
+
+/// Which gossipsub behaviour carried a message (issue #146).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum GossipLane {
+    /// `MessageAuthenticity::Signed`: consensus, status, peer bindings, legacy transactions.
+    #[default]
+    Signed,
+    /// The anonymous transaction lane, `rand/{chain}/tx/2`.
+    AnonymousTx,
 }
 
 #[allow(clippy::large_enum_variant)] // moved once, never stored in bulk: boxing buys nothing
@@ -499,6 +519,9 @@ struct Topics {
     /// predates it is not subscribed, so it never receives a `GossipMessage` variant it cannot
     /// decode — a mixed fleet sees no change on the three topics it shares.
     peers: IdentTopic,
+    /// Transactions on the anonymous lane (issue #146), the only topic `tx_gossip` subscribes.
+    /// `tx` above is the legacy signed topic, kept through the rolling upgrade.
+    tx_anon: IdentTopic,
 }
 
 impl Topics {
@@ -508,7 +531,23 @@ impl Topics {
             tx: IdentTopic::new(format!("rand/{chain_id}/tx")),
             status: IdentTopic::new(format!("rand/{chain_id}/status")),
             peers: IdentTopic::new(format!("rand/{chain_id}/peers")),
+            tx_anon: IdentTopic::new(format!("rand/{chain_id}/tx/2")),
         }
+    }
+
+    /// The lane a delivery came in on: its topic's. Each behaviour subscribes only its own topics
+    /// and gossipsub delivers nothing on a topic its behaviour has not subscribed.
+    fn lane_of(&self, topic: &gossipsub::TopicHash) -> GossipLane {
+        if *topic == self.tx_anon.hash() {
+            GossipLane::AnonymousTx
+        } else {
+            GossipLane::Signed
+        }
+    }
+
+    /// Either transaction topic.
+    fn is_tx(&self, topic: &gossipsub::TopicHash) -> bool {
+        *topic == self.tx.hash() || *topic == self.tx_anon.hash()
     }
 
     fn for_message(&self, msg: &GossipMessage) -> &IdentTopic {
@@ -546,24 +585,17 @@ pub async fn start_with(
     let keypair = identity::Keypair::ed25519_from_bytes(&mut seed)?;
     let local_peer_id = PeerId::from(keypair.public());
 
-    let gossipsub_config = gossipsub::ConfigBuilder::default()
-        .heartbeat_interval(Duration::from_millis(500))
-        .validation_mode(if edge.strict_gossip { ValidationMode::Strict } else { ValidationMode::Permissive })
-        .max_transmit_size(cfg.limits.gossip_max_transmit_size)
-        .message_id_fn(|m: &gossipsub::Message| MessageId::from(blake3::hash(&m.data).as_bytes().to_vec()))
-        // Application-level validation: this node forwards a transaction only after it has
-        // verified here, off the consensus loop. Local to this node — the wire is unchanged, so it
-        // rolls out onto a mixed fleet by ordinary restart. `ValidationMode` is `Permissive`
-        // unless `--strict-gossip` ([`EdgeConfig::strict_gossip`]): it too governs only what this
-        // node accepts, and since every node signs what it publishes, a strict node drops nothing
-        // an honest permissive one sends (tested, audit v6 CH-7). The cost of the switch is that
-        // every delivered message must be reported exactly once (see [`GossipId`]) or this node
-        // stops forwarding it.
-        .validate_messages()
-        .build()
-        .map_err(|e| anyhow::anyhow!("gossipsub config: {e}"))?;
+    let topics = Topics::new(cfg.chain_id);
+    let signed_mode = if edge.strict_gossip { ValidationMode::Strict } else { ValidationMode::Permissive };
+    let gossipsub_config = gossip_config(&cfg.limits, signed_mode, None, topics.status.hash())?;
     let gossipsub = gossipsub::Behaviour::new(MessageAuthenticity::Signed(keypair.clone()), gossipsub_config)
         .map_err(|e| anyhow::anyhow!("gossipsub: {e}"))?;
+    // The anonymous transaction lane (issue #146). `ValidationMode::Anonymous` refuses a message
+    // that carries a source, sequence number or signature, so no relay on this lane can attach
+    // an author either. `--strict-gossip` does not apply: there is no author to check.
+    let tx_config = gossip_config(&cfg.limits, ValidationMode::Anonymous, Some(tx_protocol_prefix(cfg.chain_id)), topics.status.hash())?;
+    let tx_gossip = gossipsub::Behaviour::new(MessageAuthenticity::Anonymous, tx_config)
+        .map_err(|e| anyhow::anyhow!("tx gossipsub: {e}"))?;
 
     let identify = identify::Behaviour::new(identify::Config::new(
         format!("rand/{}/1", cfg.chain_id),
@@ -625,7 +657,7 @@ pub async fn start_with(
             guard.reserve_at(id, [a], edge::SourceKind::Configured);
         }
     }
-    let behaviour = RandBehaviour { limits, guard, gossipsub, identify, kademlia, mdns: Toggle::from(mdns), sync, ping };
+    let behaviour = RandBehaviour { limits, guard, gossipsub, tx_gossip, identify, kademlia, mdns: Toggle::from(mdns), sync, ping };
 
     let mut swarm = libp2p::SwarmBuilder::with_existing_identity(keypair)
         .with_tokio()
@@ -637,18 +669,80 @@ pub async fn start_with(
         .with_connection_timeout(HANDSHAKE_TIMEOUT)
         .build();
 
-    let topics = Topics::new(cfg.chain_id);
-    for t in [&topics.consensus, &topics.tx, &topics.status, &topics.peers] {
+    for t in [&topics.consensus, &topics.status, &topics.peers] {
         swarm.behaviour_mut().gossipsub.subscribe(t)?;
     }
+    if !edge.anonymous_tx_only {
+        swarm.behaviour_mut().gossipsub.subscribe(&topics.tx)?;
+    }
+    swarm.behaviour_mut().tx_gossip.subscribe(&topics.tx_anon)?;
     for addr in &cfg.listen {
         swarm.listen_on(addr.clone())?;
     }
 
     let (cmd_tx, cmd_rx) = mpsc::channel(4096);
     let (evt_tx, evt_rx) = mpsc::channel(4096);
-    tokio::spawn(run(swarm, cfg, pinned, topics, cmd_rx, evt_tx));
+    tokio::spawn(run(swarm, cfg, pinned, topics, !edge.anonymous_tx_only, cmd_rx, evt_tx));
     Ok((NetworkHandle { cmd: cmd_tx, local_peer_id }, evt_rx))
+}
+
+/// One gossipsub behaviour's configuration. Both lanes share everything but the validation mode
+/// and, for the transaction lane, the protocol (`protocol_prefix`, see [`tx_protocol_prefix`]).
+fn gossip_config(
+    limits: &WireLimits,
+    mode: ValidationMode,
+    protocol_prefix: Option<String>,
+    status_topic: gossipsub::TopicHash,
+) -> anyhow::Result<gossipsub::Config> {
+    let mut b = gossipsub::ConfigBuilder::default();
+    b.heartbeat_interval(Duration::from_millis(500))
+        .validation_mode(mode)
+        .max_transmit_size(limits.gossip_max_transmit_size)
+        .message_id_fn(move |m: &gossipsub::Message| message_id(m, &status_topic))
+        // Application-level validation: this node forwards a transaction only after it has
+        // verified here, off the consensus loop. Local to this node — the wire is unchanged, so it
+        // rolls out onto a mixed fleet by ordinary restart. The signed lane's `ValidationMode` is
+        // `Permissive` unless `--strict-gossip` ([`EdgeConfig::strict_gossip`]): it too governs
+        // only what this node accepts, and since every node signs what it publishes there, a
+        // strict node drops nothing an honest permissive one sends (tested, audit v6 CH-7). The
+        // cost of the switch is that every delivered message must be reported exactly once (see
+        // [`GossipId`]) or this node stops forwarding it.
+        .validate_messages();
+    if let Some(prefix) = protocol_prefix {
+        b.protocol_id_prefix(prefix);
+    }
+    b.build().map_err(|e| anyhow::anyhow!("gossipsub config: {e}"))
+}
+
+/// The anonymous transaction lane's gossipsub protocol (issue #146): its own, so its streams never
+/// meet the signed behaviour's `/meshsub`. A node that predates the lane does not speak it; its
+/// connections carry the signed lane only, and gossipsub marks the peer as not supporting this
+/// one — nothing is closed.
+fn tx_protocol_prefix(chain_id: u64) -> String {
+    format!("/rand/{chain_id}/txsub")
+}
+
+/// The gossip message id: blake3 of the bytes, so one transaction or vote forwarded by two peers
+/// is one message — except on the status topic, where the author and the sequence number come
+/// first (issue #144). A `Status` names no author, so two nodes at one head publish identical
+/// bytes, and under a content-only id the second one's status was dropped as a duplicate, as was
+/// every re-publish of an unchanged status (on each `peer connected` and on the 3 s tick):
+/// gossipsub's "Not publishing a message that has already been published" WARN. Every published
+/// status is now its own message. The id is local to each node except in IHAVE/IWANT, where a
+/// pre-#144 peer computes another id for a status, so at worst it pulls a status it already holds
+/// — a few dozen bytes, and only while the fleet is mixed. An unsigned status (no source or
+/// sequence number, which only `Permissive` admits) keeps the content id.
+fn message_id(m: &gossipsub::Message, status_topic: &gossipsub::TopicHash) -> MessageId {
+    let mut h = blake3::Hasher::new();
+    if m.topic == *status_topic {
+        if let (Some(source), Some(seq)) = (m.source, m.sequence_number) {
+            h.update(b"rand-status-id-1");
+            h.update(&source.to_bytes());
+            h.update(&seq.to_be_bytes());
+        }
+    }
+    h.update(&m.data);
+    MessageId::from(h.finalize().as_bytes().to_vec())
 }
 
 /// Hand one verdict to gossipsub. The only place that calls
@@ -663,9 +757,110 @@ pub async fn start_with(
 /// shedding gossip while it catches up would otherwise fill the log with warnings about working
 /// normally.
 fn report_to_gossipsub(swarm: &mut Swarm<RandBehaviour>, id: &GossipId, acceptance: MessageAcceptance) {
-    if !swarm.behaviour_mut().gossipsub.report_message_validation_result(&id.message_id, &id.propagation_source, acceptance)
-    {
+    let b = swarm.behaviour_mut();
+    let lane = match id.lane {
+        GossipLane::Signed => &mut b.gossipsub,
+        GossipLane::AnonymousTx => &mut b.tx_gossip,
+    };
+    if !lane.report_message_validation_result(&id.message_id, &id.propagation_source, acceptance) {
         tracing::debug!(?id, "validation reported for a message no longer in the cache");
+    }
+}
+
+/// [`report_to_gossipsub`], and the same verdict for the other lane's copies of one transaction
+/// that were held for it ([`TxCross`]).
+fn report(swarm: &mut Swarm<RandBehaviour>, cross: &mut TxCross, id: &GossipId, acceptance: MessageAcceptance) {
+    report_to_gossipsub(swarm, id, acceptance);
+    for held in cross.on_verdict(id, acceptance) {
+        report_to_gossipsub(swarm, &held, acceptance);
+    }
+}
+
+/// How long [`TxCross`] remembers a transaction: past gossipsub's own window for a verdict
+/// (`history_length` 5 × the 500 ms heartbeat), after which a report is a no-op anyway.
+const TX_CROSS_TTL: Duration = Duration::from_secs(10);
+/// The most transactions [`TxCross`] tracks at once. Past it a copy is not tracked, and the
+/// other lane's copy reaches the node as an ordinary duplicate.
+const TX_CROSS_MAX: usize = 1 << 16;
+
+/// One transaction heard on both lanes during the rolling upgrade (issue #146). The node judges
+/// one delivery of a transaction and answers any later copy as a duplicate — `Ignore`, not
+/// forwarded — so a transaction first heard anonymously would never be relayed on the legacy
+/// topic, and nodes that predate the anonymous lane would hear it only from a direct neighbour of
+/// its author. So the network task hands the node the first copy only, and reports the verdict
+/// the node gives it for every copy the other lane delivered: a transaction this node accepts is
+/// relayed on both lanes. Both lanes' message ids are the content's (see [`message_id`]), so one
+/// transaction is one id on either. Unused under [`EdgeConfig::anonymous_tx_only`], which has one
+/// lane.
+#[derive(Default)]
+struct TxCross {
+    seen: HashMap<MessageId, CrossEntry>,
+}
+
+struct CrossEntry {
+    first: GossipLane,
+    at: Instant,
+    verdict: Option<MessageAcceptance>,
+    held: Vec<GossipId>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum CrossDelivery {
+    /// Hand it to the node, which reports it.
+    First,
+    /// The other lane's copy was judged: report this.
+    Answer(MessageAcceptance),
+    /// The other lane's copy is still being judged: its verdict is reported for this one too.
+    Held,
+}
+
+impl TxCross {
+    fn on_delivery(&mut self, id: &GossipId, now: Instant) -> CrossDelivery {
+        if let Some(e) = self.seen.get_mut(&id.message_id) {
+            if e.first == id.lane {
+                // Not a second lane: gossipsub delivered one id on one lane twice, which its own
+                // duplicate cache (longer than our TTL) rules out. The node judges it as it would.
+                return CrossDelivery::First;
+            }
+            return match e.verdict {
+                Some(v) => CrossDelivery::Answer(v),
+                None => {
+                    e.held.push(id.clone());
+                    CrossDelivery::Held
+                }
+            };
+        }
+        if self.seen.len() >= TX_CROSS_MAX {
+            return CrossDelivery::First;
+        }
+        self.seen.insert(id.message_id.clone(), CrossEntry { first: id.lane, at: now, verdict: None, held: Vec::new() });
+        CrossDelivery::First
+    }
+
+    /// The verdict on a first copy: every copy held for it, to report the same.
+    fn on_verdict(&mut self, id: &GossipId, acceptance: MessageAcceptance) -> Vec<GossipId> {
+        match self.seen.get_mut(&id.message_id) {
+            Some(e) if e.first == id.lane && e.verdict.is_none() => {
+                e.verdict = Some(acceptance);
+                std::mem::take(&mut e.held)
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// Forget what is older than [`TX_CROSS_TTL`]. Copies still held then (a verdict that never
+    /// came, which every delivery's report-once rule rules out) are returned to be reported
+    /// `Ignore`, so none is left unreported.
+    fn expire(&mut self, now: Instant) -> Vec<GossipId> {
+        let mut orphans = Vec::new();
+        self.seen.retain(|_, e| {
+            let keep = now.duration_since(e.at) < TX_CROSS_TTL;
+            if !keep {
+                orphans.append(&mut e.held);
+            }
+            keep
+        });
+        orphans
     }
 }
 
@@ -726,6 +921,8 @@ async fn run(
     // Reserved for the life of the process: no `Unreserve` removes one (see [`EdgeConfig`]).
     pinned: HashSet<PeerId>,
     topics: Topics,
+    // Publish and relay transactions on the legacy signed topic too ([`EdgeConfig::anonymous_tx_only`] off).
+    legacy_tx: bool,
     mut cmd_rx: mpsc::Receiver<NetworkCommand>,
     evt_tx: mpsc::Sender<NetworkEvent>,
 ) {
@@ -738,6 +935,10 @@ async fn run(
     let mut lan_peers: HashSet<PeerId> = HashSet::new();
     // What each forwarder may deliver before its frames are decoded (GOSSIP-1).
     let mut frames = FrameMeter::new(cfg.limits.gossip_max_transmit_size);
+    // One transaction heard on both lanes (issue #146): only while there are two.
+    let mut cross = TxCross::default();
+    let mut cross_tick = tokio::time::interval(TX_CROSS_TTL / 2);
+    cross_tick.tick().await;
     dial_bootstrap(&mut swarm, &cfg, &peers);
     if !cfg.bootstrap.is_empty() {
         let _ = swarm.behaviour_mut().kademlia.bootstrap();
@@ -753,6 +954,11 @@ async fn run(
                 dial_bootstrap(&mut swarm, &cfg, &peers);
                 redial_known(&mut swarm, &known, &peers);
             }
+            _ = cross_tick.tick() => {
+                for orphan in cross.expire(Instant::now()) {
+                    report_to_gossipsub(&mut swarm, &orphan, MessageAcceptance::Ignore);
+                }
+            }
             _ = kad_bootstrap.tick() => {
                 if let Err(e) = swarm.behaviour_mut().kademlia.bootstrap() {
                     tracing::debug!("kademlia bootstrap: {e}");
@@ -761,23 +967,7 @@ async fn run(
             cmd = cmd_rx.recv() => {
                 let Some(cmd) = cmd else { break };
                 match cmd {
-                    NetworkCommand::Broadcast(msg) => {
-                        let topic = topics.for_message(&msg).clone();
-                        match bincode::serialize(&msg) {
-                            Ok(data) => {
-                                if let Err(e) = swarm.behaviour_mut().gossipsub.publish(topic, data) {
-                                    match e {
-                                        gossipsub::PublishError::NoPeersSubscribedToTopic => {
-                                            tracing::debug!("publish: no peers yet")
-                                        }
-                                        gossipsub::PublishError::Duplicate => {}
-                                        other => tracing::warn!("publish failed: {other}"),
-                                    }
-                                }
-                            }
-                            Err(e) => tracing::error!("encode gossip: {e}"),
-                        }
-                    }
+                    NetworkCommand::Broadcast(msg) => publish(&mut swarm, &topics, legacy_tx, &msg),
                     NetworkCommand::SendSyncRequest { peer, request, reply } => {
                         let id = swarm.behaviour_mut().sync.send_request(&peer, request);
                         let _ = reply.send(id);
@@ -808,7 +998,7 @@ async fn run(
                         let _ = reply.send(list);
                     }
                     NetworkCommand::ReportValidation { id, acceptance } => {
-                        report_to_gossipsub(&mut swarm, &id, acceptance);
+                        report(&mut swarm, &mut cross, &id, acceptance);
                     }
                     NetworkCommand::Reserve(id) => {
                         let b = swarm.behaviour_mut();
@@ -830,11 +1020,51 @@ async fn run(
                 }
             }
             event = swarm.select_next_some() => {
-                handle_swarm_event(event, &mut swarm, &mut peers, &mut known, &mut lan_peers, &mut frames, &evt_tx).await;
+                let mut gossip = GossipState { topics: &topics, frames: &mut frames, cross: &mut cross, legacy_tx };
+                handle_swarm_event(event, &mut swarm, &mut peers, &mut known, &mut lan_peers, &mut gossip, &evt_tx).await;
             }
         }
     }
     tracing::info!("network task stopped");
+}
+
+/// Publish one message: a transaction on the anonymous lane, and on the legacy signed topic too
+/// while `legacy_tx` (issue #146); everything else on the signed lane, on its own topic.
+fn publish(swarm: &mut Swarm<RandBehaviour>, topics: &Topics, legacy_tx: bool, msg: &GossipMessage) {
+    let data = match bincode::serialize(msg) {
+        Ok(data) => data,
+        Err(e) => return tracing::error!("encode gossip: {e}"),
+    };
+    let b = swarm.behaviour_mut();
+    if matches!(msg, GossipMessage::Transaction(_)) {
+        publish_on(&mut b.tx_gossip, &topics.tx_anon, data.clone());
+        if legacy_tx {
+            publish_on(&mut b.gossipsub, &topics.tx, data);
+        }
+    } else {
+        publish_on(&mut b.gossipsub, topics.for_message(msg), data);
+    }
+}
+
+fn publish_on(lane: &mut gossipsub::Behaviour, topic: &IdentTopic, data: Vec<u8>) {
+    if let Err(e) = lane.publish(topic.clone(), data) {
+        match e {
+            gossipsub::PublishError::NoPeersSubscribedToTopic => tracing::debug!(%topic, "publish: no peers yet"),
+            // gossipsub has already logged its own WARN by now; nothing this node publishes on
+            // purpose should get here since #144 (see `message_id`).
+            gossipsub::PublishError::Duplicate => tracing::debug!(%topic, "publish: already published"),
+            other => tracing::warn!(%topic, "publish failed: {other}"),
+        }
+    }
+}
+
+/// What the gossip arm of [`handle_swarm_event`] reads and keeps between events.
+struct GossipState<'a> {
+    topics: &'a Topics,
+    /// What each forwarder may deliver before its frames are decoded (GOSSIP-1).
+    frames: &'a mut FrameMeter,
+    cross: &'a mut TxCross,
+    legacy_tx: bool,
 }
 
 async fn handle_swarm_event(
@@ -843,9 +1073,10 @@ async fn handle_swarm_event(
     peers: &mut HashMap<PeerId, ConnectedPeer>,
     known: &mut HashMap<PeerId, Vec<Multiaddr>>,
     lan_peers: &mut HashSet<PeerId>,
-    frames: &mut FrameMeter,
+    gossip: &mut GossipState<'_>,
     evt_tx: &mpsc::Sender<NetworkEvent>,
 ) {
+    let frames = &mut *gossip.frames;
     match event {
         SwarmEvent::NewListenAddr { address, .. } => {
             tracing::info!(%address, "listening");
@@ -886,24 +1117,47 @@ async fn handle_swarm_event(
             message,
             message_id,
         })) => {
+            let lane = gossip.topics.lane_of(&message.topic);
+            let is_tx = gossip.topics.is_tx(&message.topic);
+            let id = GossipId { message_id, propagation_source, lane };
+            // A transaction's second lane, during the rolling upgrade (issue #146): answered with
+            // the first copy's verdict, never handed to the node a second time.
+            if is_tx && gossip.legacy_tx {
+                match gossip.cross.on_delivery(&id, Instant::now()) {
+                    CrossDelivery::First => {}
+                    CrossDelivery::Answer(a) => return report_to_gossipsub(swarm, &id, a),
+                    CrossDelivery::Held => return,
+                }
+            }
             // Metered by length before anything reads the bytes (audit v6, GOSSIP-1): up to a
             // transmit size's worth of bincode was decoded, and a transaction hashed, before any
             // per-peer meter ran. Over the budget: `Ignore` — not relayed, no one penalised, and
             // reported here because the node loop never sees it.
             if !frames.admit(propagation_source, message.data.len(), Instant::now()) {
                 tracing::debug!(%propagation_source, bytes = message.data.len(), "gossip frame over the forwarder's byte budget; not decoded");
-                report_to_gossipsub(swarm, &GossipId { message_id, propagation_source }, MessageAcceptance::Ignore);
+                report(swarm, gossip.cross, &id, MessageAcceptance::Ignore);
                 return;
             }
             match bincode::deserialize::<GossipMessage>(&message.data) {
+                // The anonymous lane carries transactions and nothing else.
+                Ok(msg) if lane == GossipLane::AnonymousTx && !matches!(msg, GossipMessage::Transaction(_)) => {
+                    tracing::debug!(%propagation_source, "a non-transaction on the anonymous transaction lane");
+                    report(swarm, gossip.cross, &id, MessageAcceptance::Reject);
+                }
                 Ok(msg) => {
-                    // `from` falls back to `propagation_source` for a message that carries no
-                    // source, which is the only case where the two coincide by construction. The
-                    // rate limit still keys on `propagation_source`. Under `Permissive` an unsigned
-                    // message's `source` is only claimed, never proven: the node reads a `Status`
-                    // only when the two agree (SYNC-1, `node::on_status_gossip`).
-                    let from = message.source.unwrap_or(propagation_source);
-                    let id = GossipId { message_id, propagation_source };
+                    // A transaction's author is nobody's business (issue #146): `from` is the
+                    // forwarder, on either lane, and the anonymous lane carries no source at all.
+                    // Otherwise `from` falls back to `propagation_source` for a message that
+                    // carries no source, which is the only case where the two coincide by
+                    // construction. The rate limit keys on `propagation_source` either way. Under
+                    // `Permissive` an unsigned message's `source` is only claimed, never proven:
+                    // the node reads a `Status` only when the two agree (SYNC-1,
+                    // `node::on_status_gossip`).
+                    let from = if matches!(msg, GossipMessage::Transaction(_)) {
+                        propagation_source
+                    } else {
+                        message.source.unwrap_or(propagation_source)
+                    };
                     let _ = evt_tx.send(NetworkEvent::Gossip { from, msg, id }).await;
                 }
                 Err(e) => {
@@ -912,8 +1166,7 @@ async fn handle_swarm_event(
                     // an unreported delivery sits in gossipsub's cache and this node stops
                     // forwarding it for everyone. Reject rather than Ignore — bytes that are not a
                     // `GossipMessage` at all are this peer's fault.
-                    let id = GossipId { message_id, propagation_source };
-                    report_to_gossipsub(swarm, &id, MessageAcceptance::Reject);
+                    report(swarm, gossip.cross, &id, MessageAcceptance::Reject);
                 }
             }
         }
@@ -1302,6 +1555,294 @@ mod tests {
 
         a.shutdown().await;
         b.shutdown().await;
+    }
+
+    /// Issue #144: a `Status` names no author, so under a content-only message id every node at
+    /// one head published the *same* id, the second publisher's status was dropped as a duplicate
+    /// (gossipsub's "Not publishing a message that has already been published" WARN), and so was
+    /// every re-publish of an unchanged status — on each `peer connected` and on the 3 s tick. A
+    /// status's id now also covers its author and sequence number; every other topic keeps the
+    /// content-addressed id, so one transaction forwarded by two peers is still one message.
+    #[test]
+    fn a_status_id_covers_its_author_and_sequence_and_every_other_id_is_the_content() {
+        let topics = Topics::new(7);
+        let data = bincode::serialize(&GossipMessage::Status(Status { height: 9, head_hash: Hash::digest(b"h"), view: 3, floor: 0 })).unwrap();
+        let msg = |topic: &IdentTopic, source: Option<PeerId>, seq: Option<u64>| gossipsub::Message {
+            source,
+            data: data.clone(),
+            sequence_number: seq,
+            topic: topic.hash(),
+        };
+        let (p, q) = (peer_of_seed(1), peer_of_seed(2));
+        let id = |m: &gossipsub::Message| message_id(m, &topics.status.hash());
+        // Status: two authors at one head, and one author publishing twice, are different messages.
+        assert_ne!(id(&msg(&topics.status, Some(p), Some(1))), id(&msg(&topics.status, Some(q), Some(1))));
+        assert_ne!(id(&msg(&topics.status, Some(p), Some(1))), id(&msg(&topics.status, Some(p), Some(2))));
+        assert_eq!(id(&msg(&topics.status, Some(p), Some(1))), id(&msg(&topics.status, Some(p), Some(1))), "a relay of one publish is one message");
+        // An unsigned status (no source or sequence) falls back to the content.
+        assert_eq!(id(&msg(&topics.status, None, None)), MessageId::from(blake3::hash(&data).as_bytes().to_vec()));
+        // Every other topic: the content alone, whoever sent it (and the pinned blake3 form, so a
+        // mixed fleet's IHAVE/IWANT ids agree on them).
+        for t in [&topics.tx, &topics.consensus, &topics.peers] {
+            let content = MessageId::from(blake3::hash(&data).as_bytes().to_vec());
+            assert_eq!(id(&msg(t, Some(p), Some(1))), content, "{t}");
+            assert_eq!(id(&msg(t, Some(q), Some(9))), content, "{t}");
+        }
+    }
+
+    /// Issue #144, end to end: B publishes the same status twice and A receives it twice, under
+    /// two ids. Before, the second publish was gossipsub's duplicate — dropped with a WARN, and
+    /// the new peer a re-announcement on connect was meant for never heard it.
+    #[tokio::test]
+    async fn an_unchanged_status_published_again_is_delivered_again() {
+        let (a, mut a_rx, b, _b_rx) = two_connected_nodes().await;
+        let status = Status { height: 9, head_hash: Hash::digest(b"same"), view: 3, floor: 0 };
+        let (_, first) = gossip_status_to(&b, &mut a_rx, status.clone()).await;
+        a.report_validation(first.clone(), MessageAcceptance::Accept).await;
+        b.broadcast(GossipMessage::Status(status.clone())).await;
+        let again = wait_for(&mut a_rx, Duration::from_secs(10), |e| match e {
+            NetworkEvent::Gossip { msg: GossipMessage::Status(s), id, .. } if s.head_hash == status.head_hash && id.message_id != first.message_id => Some(id),
+            _ => None,
+        })
+        .await
+        .expect("the same status, published again, was not delivered again");
+        assert_eq!(again.propagation_source, b.local_peer_id);
+        a.report_validation(again, MessageAcceptance::Accept).await;
+        a.shutdown().await;
+        b.shutdown().await;
+    }
+
+    // ------------------------------------------- issue #146: the anonymous transaction lane
+
+    fn tx_of(n: u64) -> randprotocol_core::Transaction {
+        // `chain_id` only makes the bytes differ: the network task never judges a transaction.
+        randprotocol_core::Transaction { chain_id: n, bundle: None, action: randprotocol_core::Action::None }
+    }
+
+    /// A bare gossipsub swarm standing in for another node. `tx_lane`: a listener on the
+    /// anonymous lane (its protocol, `rand/7/tx/2`); otherwise a node that predates it (`/meshsub`,
+    /// signed, `rand/7/tx`). `Permissive` either way, so it delivers whatever arrives — a source,
+    /// had the node attached one, included — and content ids, as the node's.
+    fn sniffer(tx_lane: bool) -> (Swarm<gossipsub::Behaviour>, IdentTopic) {
+        let kp = identity::Keypair::generate_ed25519();
+        let mut b = gossipsub::ConfigBuilder::default();
+        b.validation_mode(ValidationMode::Permissive)
+            .heartbeat_interval(Duration::from_millis(200))
+            .max_transmit_size(GOSSIP_MAX_TRANSMIT_SIZE)
+            .message_id_fn(|m: &gossipsub::Message| MessageId::from(blake3::hash(&m.data).as_bytes().to_vec()));
+        if tx_lane {
+            b.protocol_id_prefix(tx_protocol_prefix(7));
+        }
+        let auth = if tx_lane { MessageAuthenticity::Anonymous } else { MessageAuthenticity::Signed(kp.clone()) };
+        let gs = gossipsub::Behaviour::new(auth, b.build().unwrap()).unwrap();
+        let mut sw = libp2p::SwarmBuilder::with_existing_identity(kp)
+            .with_tokio()
+            .with_tcp(tcp::Config::default(), noise::Config::new, yamux::Config::default)
+            .unwrap()
+            .with_behaviour(|_| gs)
+            .unwrap()
+            .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(60)))
+            .build();
+        let topic = IdentTopic::new(if tx_lane { "rand/7/tx/2" } else { "rand/7/tx" });
+        sw.behaviour_mut().subscribe(&topic).unwrap();
+        (sw, topic)
+    }
+
+    /// Drive `sw` for `within`, and return every gossip message it received.
+    async fn sniff(sw: &mut Swarm<gossipsub::Behaviour>, within: Duration) -> Vec<gossipsub::Message> {
+        use libp2p::futures::StreamExt;
+        let until = tokio::time::Instant::now() + within;
+        let mut got = Vec::new();
+        loop {
+            tokio::select! {
+                ev = sw.select_next_some() => {
+                    if let SwarmEvent::Behaviour(gossipsub::Event::Message { message, .. }) = ev {
+                        got.push(message);
+                    }
+                }
+                _ = tokio::time::sleep_until(until) => return got,
+            }
+        }
+    }
+
+    /// Start a node with `edge` and return it with its full address.
+    async fn listening(seed: u8, edge: EdgeConfig) -> (NetworkHandle, mpsc::Receiver<NetworkEvent>, Multiaddr) {
+        let (n, mut rx) = start_with(loopback_cfg(vec![], WireLimits::default()), [seed; 32], edge).await.unwrap();
+        let addr = wait_for(&mut rx, Duration::from_secs(5), |e| match e {
+            NetworkEvent::Listening(a) => Some(a),
+            _ => None,
+        })
+        .await
+        .expect("listening");
+        let full = addr.with(libp2p::multiaddr::Protocol::P2p(n.local_peer_id));
+        (n, rx, full)
+    }
+
+    /// Issue #146: a transaction gossiped on the anonymous lane carries no `source` and no
+    /// sequence number — nothing that names the node that published it. A node that predates the
+    /// lane still gets it, signed, on the legacy topic, unless `--anonymous-tx-only`.
+    #[tokio::test]
+    async fn a_gossiped_transaction_carries_no_author_and_the_legacy_copy_follows_the_flag() {
+        for anonymous_tx_only in [false, true] {
+            let edge = EdgeConfig { anonymous_tx_only, ..EdgeConfig::default() };
+            let (n, _rx, n_addr) = listening(if anonymous_tx_only { 81 } else { 80 }, edge).await;
+            let (mut anon, _) = sniffer(true);
+            let (mut old, _) = sniffer(false);
+            anon.dial(n_addr.clone()).unwrap();
+            old.dial(n_addr).unwrap();
+            // The meshes form over a few heartbeats; a fresh transaction per try, because the
+            // content id makes a second publish of one transaction a duplicate.
+            let (mut on_anon, mut on_old) = (Vec::new(), Vec::new());
+            for k in 0..20u64 {
+                n.broadcast(GossipMessage::Transaction(tx_of(1000 + k))).await;
+                let (a, o) = tokio::join!(sniff(&mut anon, Duration::from_millis(250)), sniff(&mut old, Duration::from_millis(250)));
+                on_anon.extend(a);
+                on_old.extend(o);
+                if !on_anon.is_empty() && (anonymous_tx_only || !on_old.is_empty()) && k >= 4 {
+                    break;
+                }
+            }
+            assert!(!on_anon.is_empty(), "nothing on the anonymous lane (anonymous_tx_only = {anonymous_tx_only})");
+            for m in &on_anon {
+                assert_eq!(m.source, None, "a transaction named its author");
+                assert_eq!(m.sequence_number, None, "a transaction carried a sequence number");
+                assert_eq!(m.topic, IdentTopic::new("rand/7/tx/2").hash());
+                assert!(matches!(bincode::deserialize::<GossipMessage>(&m.data), Ok(GossipMessage::Transaction(_))));
+            }
+            if anonymous_tx_only {
+                assert!(on_old.is_empty(), "--anonymous-tx-only published on the legacy signed topic");
+            } else {
+                assert!(!on_old.is_empty(), "a node that predates the lane got no transaction");
+                assert!(on_old.iter().all(|m| m.source == Some(n.local_peer_id)), "the legacy copy is the signed one");
+            }
+            n.shutdown().await;
+        }
+    }
+
+    /// Issue #146, the rolling upgrade: B publishes on both lanes, A hears each transaction twice
+    /// (once per lane) and its node loop sees it **once**, and when A accepts it, A relays the
+    /// held legacy copy too — so C, a node that predates the lane and is connected to A alone,
+    /// still gets every transaction. Without the hold, the second copy would reach A's node loop,
+    /// be judged a pool duplicate (`Ignore`) and never be relayed on the lane it came in on.
+    #[tokio::test]
+    async fn during_the_roll_a_transaction_is_judged_once_and_relayed_on_both_lanes() {
+        let (a, mut a_rx, a_addr) = listening(82, EdgeConfig::default()).await;
+        let (b, _b_rx) = start(loopback_cfg(vec![a_addr.clone()], WireLimits::default()), [83u8; 32]).await.unwrap();
+        assert!(wait_for(&mut a_rx, Duration::from_secs(10), |e| matches!(e, NetworkEvent::PeerConnected(p) if p == b.local_peer_id).then_some(())).await.is_some());
+        let (mut c, _) = sniffer(false);
+        c.dial(a_addr).unwrap();
+        let c_id = *c.local_peer_id();
+        // C's swarm must be driven for its dial to complete.
+        let (_, c_connected) = tokio::join!(
+            sniff(&mut c, Duration::from_secs(3)),
+            wait_for(&mut a_rx, Duration::from_secs(10), |e| matches!(e, NetworkEvent::PeerConnected(p) if p == c_id).then_some(()))
+        );
+        assert!(c_connected.is_some(), "C never connected to A");
+
+        let mut judged: Vec<GossipId> = Vec::new();
+        let mut at_c = Vec::new();
+        for k in 0..30u64 {
+            b.broadcast(GossipMessage::Transaction(tx_of(2000 + k))).await;
+            // A's node loop: report Accept for every transaction it is handed, as the node does
+            // for one that verifies.
+            let deadline = tokio::time::Instant::now() + Duration::from_millis(400);
+            loop {
+                tokio::select! {
+                    ev = a_rx.recv() => {
+                        if let Some(NetworkEvent::Gossip { from, msg: GossipMessage::Transaction(_), id }) = ev {
+                            assert_eq!(from, id.propagation_source, "a transaction's `from` is its forwarder");
+                            a.report_validation(id.clone(), MessageAcceptance::Accept).await;
+                            judged.push(id);
+                        }
+                    }
+                    got = sniff(&mut c, Duration::from_millis(50)) => at_c.extend(got),
+                    _ = tokio::time::sleep_until(deadline) => break,
+                }
+            }
+            if !at_c.is_empty() && k >= 6 {
+                break;
+            }
+        }
+        // Let the last holds resolve, and drain.
+        let tail = sniff(&mut c, Duration::from_millis(800)).await;
+        at_c.extend(tail);
+        while let Ok(ev) = a_rx.try_recv() {
+            if let NetworkEvent::Gossip { msg: GossipMessage::Transaction(_), id, .. } = ev {
+                judged.push(id);
+            }
+        }
+        assert!(!judged.is_empty(), "A's node loop was never handed a transaction");
+        let ids: HashSet<&MessageId> = judged.iter().map(|id| &id.message_id).collect();
+        assert_eq!(ids.len(), judged.len(), "one transaction reached A's node loop twice");
+        assert!(!at_c.is_empty(), "C, behind A on the legacy topic only, never got a transaction");
+        // C is connected to A alone, so whatever it got, A relayed.
+        for m in &at_c {
+            assert_eq!(m.source, Some(b.local_peer_id), "the legacy copy C got is B's own, relayed");
+        }
+        a.shutdown().await;
+        b.shutdown().await;
+    }
+
+    fn gid(n: u8, lane: GossipLane) -> GossipId {
+        GossipId { message_id: MessageId::from(vec![n]), propagation_source: peer_of_seed(n), lane }
+    }
+
+    /// `TxCross`, the rules: the first copy goes to the node, the other lane's copy waits for its
+    /// verdict or takes it, a verdict releases every held copy once, and an expired entry hands
+    /// back what it still held so it is reported.
+    #[test]
+    fn tx_cross_judges_the_first_copy_and_answers_the_other_lane_with_its_verdict() {
+        use GossipLane::*;
+        let t0 = Instant::now();
+        let mut x = TxCross::default();
+        let first = gid(1, AnonymousTx);
+        assert_eq!(x.on_delivery(&first, t0), CrossDelivery::First);
+        let legacy = GossipId { propagation_source: peer_of_seed(2), lane: Signed, ..first.clone() };
+        assert_eq!(x.on_delivery(&legacy, t0), CrossDelivery::Held);
+        // A verdict reported for the held copy itself releases nothing (it is not the first).
+        assert!(x.on_verdict(&legacy, MessageAcceptance::Reject).is_empty());
+        let released = x.on_verdict(&first, MessageAcceptance::Accept);
+        assert_eq!(released.len(), 1);
+        assert_eq!(released[0].propagation_source, legacy.propagation_source);
+        assert_eq!(released[0].lane, Signed);
+        assert!(x.on_verdict(&first, MessageAcceptance::Accept).is_empty(), "released once");
+        // A later copy on the other lane takes the verdict straight away.
+        let late = GossipId { propagation_source: peer_of_seed(3), lane: Signed, ..first.clone() };
+        assert_eq!(x.on_delivery(&late, t0), CrossDelivery::Answer(MessageAcceptance::Accept));
+        // The first lane again is no second lane: judged as the node would.
+        assert_eq!(x.on_delivery(&first, t0), CrossDelivery::First);
+
+        // Expiry: an entry still holding a copy hands it back to be reported; a fresh one stays.
+        let other = gid(9, Signed);
+        assert_eq!(x.on_delivery(&other, t0), CrossDelivery::First);
+        assert_eq!(x.on_delivery(&GossipId { lane: AnonymousTx, ..other.clone() }, t0), CrossDelivery::Held);
+        assert!(x.expire(t0 + TX_CROSS_TTL / 2).is_empty());
+        let orphans = x.expire(t0 + TX_CROSS_TTL);
+        assert_eq!(orphans.len(), 1);
+        assert_eq!(orphans[0].lane, AnonymousTx);
+        assert!(x.seen.is_empty());
+    }
+
+    /// The anonymous lane's own validation mode refuses a message that names an author, so no
+    /// relay can attach one; and its configuration is accepted by gossipsub at all (Anonymous
+    /// authenticity under Anonymous validation is the only pairing it allows).
+    #[test]
+    fn the_transaction_lane_is_anonymous_by_configuration() {
+        let topics = Topics::new(7);
+        let cfg = gossip_config(&WireLimits::default(), ValidationMode::Anonymous, Some(tx_protocol_prefix(7)), topics.status.hash()).unwrap();
+        assert!(matches!(cfg.validation_mode(), ValidationMode::Anonymous));
+        assert!(gossipsub::Behaviour::<gossipsub::IdentityTransform, gossipsub::AllowAllSubscriptionFilter>::new(MessageAuthenticity::Anonymous, cfg.clone()).is_ok());
+        let kp = identity::Keypair::generate_ed25519();
+        assert!(
+            gossipsub::Behaviour::<gossipsub::IdentityTransform, gossipsub::AllowAllSubscriptionFilter>::new(MessageAuthenticity::Signed(kp), cfg).is_err(),
+            "a signing publisher on the anonymous lane is refused at construction"
+        );
+        assert_eq!(topics.lane_of(&topics.tx_anon.hash()), GossipLane::AnonymousTx);
+        for t in [&topics.tx, &topics.consensus, &topics.status, &topics.peers] {
+            assert_eq!(topics.lane_of(&t.hash()), GossipLane::Signed);
+        }
+        assert!(topics.is_tx(&topics.tx.hash()) && topics.is_tx(&topics.tx_anon.hash()));
+        assert!(!topics.is_tx(&topics.status.hash()));
     }
 
     /// A node with no connection limit accepts every inbound connection, and a fresh libp2p
@@ -1725,13 +2266,17 @@ mod tests {
         assert_eq!(t7.tx.to_string(), "rand/7/tx");
         assert_eq!(t7.status.to_string(), "rand/7/status");
         assert_eq!(t7.peers.to_string(), "rand/7/peers");
-        let names7: HashSet<String> = [&t7.consensus, &t7.tx, &t7.status, &t7.peers].iter().map(|t| t.to_string()).collect();
-        let names8: HashSet<String> = [&t8.consensus, &t8.tx, &t8.status, &t8.peers].iter().map(|t| t.to_string()).collect();
-        assert_eq!(names7.len(), 4, "four distinct topics on one chain");
+        assert_eq!(t7.tx_anon.to_string(), "rand/7/tx/2");
+        let names7: HashSet<String> = [&t7.consensus, &t7.tx, &t7.status, &t7.peers, &t7.tx_anon].iter().map(|t| t.to_string()).collect();
+        let names8: HashSet<String> = [&t8.consensus, &t8.tx, &t8.status, &t8.peers, &t8.tx_anon].iter().map(|t| t.to_string()).collect();
+        assert_eq!(names7.len(), 5, "five distinct topics on one chain");
         assert!(names7.is_disjoint(&names8), "no topic is shared between chains");
         // The hashes gossipsub subscribes by are the names' hashes, so they differ the same way.
-        let hashes: HashSet<_> = [&t7.consensus, &t7.tx, &t7.status, &t7.peers, &t8.consensus, &t8.tx, &t8.status, &t8.peers].iter().map(|t| t.hash()).collect();
-        assert_eq!(hashes.len(), 8);
+        let hashes: HashSet<_> = [&t7.consensus, &t7.tx, &t7.status, &t7.peers, &t7.tx_anon, &t8.consensus, &t8.tx, &t8.status, &t8.peers, &t8.tx_anon]
+            .iter()
+            .map(|t| t.hash())
+            .collect();
+        assert_eq!(hashes.len(), 10);
         // A chain id at the top of the range is spelled in full, not truncated.
         assert_eq!(Topics::new(u64::MAX).tx.to_string(), format!("rand/{}/tx", u64::MAX));
     }
@@ -1880,13 +2425,15 @@ mod tests {
     }
 
     /// `EdgeConfig::default()` is what `start` passes: no reserved or bound peers, permissive
-    /// gossip. The `--strict-gossip` and `--reserved-peer` paths are opt-in.
+    /// gossip, both transaction lanes. The `--strict-gossip`, `--reserved-peer` and
+    /// `--anonymous-tx-only` paths are opt-in.
     #[test]
     fn the_default_edge_config_reserves_nobody_and_is_permissive() {
         let e = EdgeConfig::default();
         assert!(e.reserved.is_empty());
         assert!(e.bound.is_empty());
         assert!(!e.strict_gossip);
+        assert!(!e.anonymous_tx_only, "both transaction lanes by default, for the rolling upgrade (#146)");
     }
 
     /// The handle's commands, each one: every method sends the variant the swarm task matches
@@ -1911,7 +2458,7 @@ mod tests {
         h.unreserve_peer(peer).await;
         assert!(matches!(rx.recv().await, Some(NetworkCommand::Unreserve(p)) if p == peer));
 
-        let id = GossipId { message_id: MessageId::from(vec![1, 2, 3]), propagation_source: peer };
+        let id = GossipId { message_id: MessageId::from(vec![1, 2, 3]), propagation_source: peer, lane: GossipLane::AnonymousTx };
         h.report_validation(id.clone(), MessageAcceptance::Reject).await;
         match rx.recv().await {
             Some(NetworkCommand::ReportValidation { id: got, acceptance: MessageAcceptance::Reject }) => {

@@ -759,6 +759,12 @@ enum Cmd {
         /// exchange honest gossip both ways.
         #[arg(long)]
         strict_gossip: bool,
+        /// Gossip transactions only on the anonymous lane `rand/{chain}/tx/2` (issue #146): stop
+        /// subscribing to and publishing on the legacy signed topic `rand/{chain}/tx`, whose
+        /// messages name the node that first published them. Only once every node on the chain
+        /// runs v0.8.3 or later: an older node hears transactions on the legacy topic alone.
+        #[arg(long)]
+        anonymous_tx_only: bool,
         #[arg(long, default_value = "127.0.0.1:8545")]
         rpc: SocketAddr,
         /// Take part in consensus with this node's key. A key in no current epoch's validator
@@ -2490,10 +2496,34 @@ fn opens_storage(cmd: &Cmd) -> bool {
     matches!(cmd, Cmd::Run { .. } | Cmd::Verify { .. } | Cmd::Db { .. } | Cmd::Init { .. } | Cmd::Safety { .. })
 }
 
+/// Colour in the log only for a person at a terminal (issue #143): under systemd stdout is a
+/// pipe to journald, and escapes there break `grep`, log shippers and every parser downstream.
+/// `NO_COLOR` turns it off anywhere (<https://no-color.org>: present and not empty).
+fn log_ansi(is_terminal: bool, no_color: Option<std::ffi::OsString>) -> bool {
+    is_terminal && no_color.is_none_or(|v| v.is_empty())
+}
+
+#[cfg(test)]
+mod log_ansi_tests {
+    use super::log_ansi;
+
+    #[test]
+    fn colour_only_at_a_terminal_and_never_under_no_color() {
+        assert!(log_ansi(true, None), "a terminal with no NO_COLOR gets colour");
+        assert!(!log_ansi(false, None), "a pipe (journald) gets none");
+        assert!(!log_ansi(true, Some("1".into())), "NO_COLOR=1 turns it off at a terminal");
+        assert!(!log_ansi(false, Some("1".into())));
+        assert!(log_ansi(true, Some("".into())), "an empty NO_COLOR is unset (no-color.org)");
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    use std::io::IsTerminal;
+    // `fmt()` writes to stdout, so stdout is the stream whose terminal-ness counts.
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info,libp2p=warn,libp2p_mdns=off".into()))
+        .with_ansi(log_ansi(std::io::stdout().is_terminal(), std::env::var_os("NO_COLOR")))
         .init();
     let cli = Cli::parse();
     let test_profile_allowed = test_fri_profile_allowed(&cli);
@@ -2976,6 +3006,7 @@ async fn main() -> Result<()> {
             bootstrap,
             reserved_peer,
             strict_gossip,
+            anonymous_tx_only,
             rpc,
             validator,
             no_mdns,
@@ -3068,7 +3099,7 @@ async fn main() -> Result<()> {
                 prune_history,
                 gas_policy: randprotocol_core::gas::GasPolicy::from_prices(gas_price, byte_price),
                 msauth: randprotocol_node::msauth_key::MsauthKeyOptions { path: msauth_vk, build: build_msauth_key },
-            }, rpc_options, node::NetOptions { reserved_peers: reserved_peer, strict_gossip })
+            }, rpc_options, node::NetOptions { reserved_peers: reserved_peer, strict_gossip, anonymous_tx_only })
             .await?;
             // The prover is served once the node's RPC is up and stops with the node; a prover
             // that exits stops the node too.
