@@ -37,6 +37,9 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 bincode = "1.3"
 hex = "0.4"
+# #152: `rand_sendTransaction`'s hex body (2.9 MB of hex a bundle transaction) decoded with a
+# SIMD/table decoder; `hex` took 18 ms of a 92 ms admission. MIT, no dependencies at this feature set.
+faster-hex = { version = "0.10.1", default-features = false }
 # The scan heads `rand_getScanLeaves` serves: 1 208 bytes a leaf as base64 rather than hex, a third
 # less on the wire. Already in the lock through reqwest/hyper; pinned to that version.
 base64 = "=0.22.1"
@@ -97,7 +100,10 @@ opt-level = 2
 # Plonky3 0.7.0 with one fix in two crates (upstream issue Plonky3 #2363, fix PR #2368): HidingFriPcs and
 # MerkleTreeHidingMmcs held a spin lock around their RNG across rayon work, and a
 # worker waiting on a stolen job could steal another `commit` and spin on its own lock for ever
-# (vendor/p3-fri/src/hiding_pcs.rs, "RandProtocol patch"). Everything else is the crates.io source.
+# (vendor/p3-fri/src/hiding_pcs.rs, "RandProtocol patch"). v0.8.3 (#151) adds a second change to the
+# same two crates: their random columns and Merkle salts are counter-mode ChaCha20 streams, one per
+# chunk of rows, filled in parallel (vendor/p3-merkle-tree/src/counter_rng.rs; the proof format and
+# the verifier are unchanged). Everything else is the crates.io source.
 # `vendor/p3-batch-stark` is a third: p3-batch-stark 0.7.0 with a quotient-layout switch
 # (`QuotientLayout`), the circuits fork copied verbatim from circuits 5ff7676; circuits'
 # `vendor/PROVENANCE.md` and `recursion/docs/05-quotient-layout.md` are its record.

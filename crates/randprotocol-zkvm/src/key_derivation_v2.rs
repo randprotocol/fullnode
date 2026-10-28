@@ -52,6 +52,7 @@
 use crate::machine::Val;
 use core::convert::Infallible;
 use p3_field::{PrimeCharacteristicRing, PrimeField64};
+use p3_merkle_tree::CounterModeRng;
 use rand_core::{SeedableRng, TryCryptoRng, TryRng};
 
 /// `true` from constraint set 7 (chain 16): every verifier key is salted from this module's stream.
@@ -75,6 +76,10 @@ pub struct KeyRngV2 {
     /// Squeezed words not yet handed out, consumed from `pos`.
     out: [u32; 4],
     pos: usize,
+    /// Keyed by a secret seed ([`SeedableRng::from_seed`]) rather than a public label: only then
+    /// does it hand out counter-mode keys ([`CounterModeRng`], fullnode #151). A label stream is a
+    /// verifier key's, public and pinned, and keeps its serial output bit for bit.
+    seeded: bool,
 }
 
 /// `[byte length, bytes packed four to a word, little-endian, zero-padded]` — step 1.
@@ -88,7 +93,7 @@ fn push_bytes(words: &mut Vec<u32>, bytes: &[u8]) {
 }
 
 impl KeyRngV2 {
-    fn from_parts(marker: &[u8], bytes: &[u8]) -> Self {
+    fn from_parts(marker: &[u8], bytes: &[u8], seeded: bool) -> Self {
         let mut words = Vec::new();
         push_bytes(&mut words, DOMAIN);
         push_bytes(&mut words, marker);
@@ -102,12 +107,12 @@ impl KeyRngV2 {
             state = crate::hash::permute_state(state);
         }
         // `pos == 4`: the first draw squeezes.
-        Self { state, out: [0; 4], pos: 4 }
+        Self { state, out: [0; 4], pos: 4, seeded }
     }
 
     /// The stream for `label`: a pure function of `DOMAIN`, `label` and the committed Poseidon2
     /// table.
-    pub fn from_label(label: &[u8]) -> Self { Self::from_parts(b"label", label) }
+    pub fn from_label(label: &[u8]) -> Self { Self::from_parts(b"label", label, false) }
 
     fn squeeze(&mut self) {
         self.state = crate::hash::permute_state(self.state);
@@ -154,7 +159,18 @@ impl SeedableRng for KeyRngV2 {
     /// *provided* `seed_from_u64` expands a `u64` through `rand_core`'s own PCG32 — a stream this
     /// module exists to stop depending on — so a consensus-facing caller uses `from_label` (or
     /// `from_seed` with bytes it specifies), never `seed_from_u64`.
-    fn from_seed(seed: [u8; 32]) -> Self { Self::from_parts(b"seed", &seed) }
+    fn from_seed(seed: [u8; 32]) -> Self { Self::from_parts(b"seed", &seed, true) }
+}
+
+/// Fullnode #151 (v0.8.3): a seed-keyed stream (a proving config's clone, keyed by OS entropy)
+/// hands the hiding PCS and MMCS one fresh 256-bit key per call, squeezed from this sponge, and
+/// they expand it in parallel with ChaCha20 (`p3_merkle_tree::counter_rng`). A label stream — a
+/// verifier key's, which is public and pinned by consensus — hands out none and is drawn from
+/// serially exactly as before, so no verifier key moves.
+impl CounterModeRng for KeyRngV2 {
+    fn counter_mode_key(&mut self) -> Option<[u8; 32]> {
+        self.seeded.then(|| p3_merkle_tree::counter_rng::draw_key(self))
+    }
 }
 
 /// The `(mmcs_rng, pcs_rng)` pair behind `machine::key_config`, from [`MMCS_LABEL`] and
@@ -196,6 +212,17 @@ impl TryRng for SaltRng {
 /// Both sources are cryptographic generators: `StdRng` is, and [`KeyRngV2`] keyed by a secret seed
 /// is (its own `TryCryptoRng` note).
 impl TryCryptoRng for SaltRng {}
+
+/// Fullnode #151: OS entropy (`Fresh`) and a seed-keyed sponge hand out counter-mode keys; a
+/// label stream does not ([`KeyRngV2`]'s impl).
+impl CounterModeRng for SaltRng {
+    fn counter_mode_key(&mut self) -> Option<[u8; 32]> {
+        match self {
+            SaltRng::Fresh(r) => r.counter_mode_key(),
+            SaltRng::Key(r) => r.counter_mode_key(),
+        }
+    }
+}
 
 impl SeedableRng for SaltRng {
     type Seed = [u8; 32];

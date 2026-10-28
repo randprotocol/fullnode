@@ -30,8 +30,8 @@ prices block space and proving as two separate goods.
 | block caps | 20 MiB per block, 4 MiB per proof, 2 000 transactions | `docs/node-hardware.md` §0 |
 | **transfers per block** | **7** (20 MiB / 2.85 MB); 3 on the 4 MiB chains | derived |
 | **throughput** | **~6 tx/s** | derived |
-| bundle verify, validator | 838 ms cold, ~16 ms warm; auth proof similar | `docs/node-hardware.md` §2.1 |
-| validator work per block | 14 warm verifications ≈ 0.25 s of one core | derived |
+| transfer verify, validator (bundle + auth proof) | 62 ms warm, 1.56 s cold (v0.8.3; 73 ms / 1.6 s before), M4 Max, n = 38 chain-21 transactions; the earlier 838 ms / 16 ms was a tier-12 research proof | `docs/node-hardware.md` §2.1, fullnode #152 |
+| validator work per block | 7 warm transfer verifications ≈ 0.43 s of one core (≈ 0.51 s before v0.8.3) | derived |
 | validator RAM | ~650 MiB resident | `docs/node-hardware.md` §2.1 |
 | mempool admission | 4 blocking verification workers, queue 64 deep | `docs/architecture.md` §8 |
 | wallet proof, tier 14 | 107.5 s on 1 thread, 13.9 s on 16 (M4 Max); 6.2 GB | `docs/node-hardware.md` §6 |
@@ -43,7 +43,7 @@ prices block space and proving as two separate goods.
 
 ### 1.2 What bounds throughput, in order
 
-1. **Bytes, not compute.** A validator verifies a transaction in 16 ms but stores and gossips
+1. **Bytes, not compute.** A validator verifies a transaction in 62 ms but stores and gossips
    2.85 MB of it. The block cap is what limits the chain to seven transfers, and the cap cannot
    simply rise: at 100 transfers a block every validator would ingest 285 MB every 1.2 s.
 2. **Recursion is not yet buyable.** Aggregation (`docs/aggregation.md`) is the designed remedy:
@@ -71,7 +71,7 @@ guarantees neither lane can starve the other.
                      ──────────────────────                  ──────────────────────────────────
   wallet ──bundle+proofs──▶ any node ──gossip──▶ leader      wallet ──bundle+proofs──▶ aggregator ingress
                                                  │                                        │
-                                                 │           verify each proof (CPU, 16 ms); dedupe
+                                                 │           verify each proof (CPU, 62 ms); dedupe
                                                  │           nullifiers; batch B bundles → leaf proof;
                                                  │           2-to-1 tree → one aggregate (GPU)
                                                  │                                        │
@@ -378,8 +378,8 @@ whole chain is. The root aggregate stays a hash-based STARK.
 
 An aggregator runs the bundle mempool the validators run today, with the same cheap-first
 admission order (`docs/architecture.md` §8), the same nullifier and commitment conflict checks,
-and CPU verification of every inner proof — 16 ms warm, so a 32-core host admits ~2 000 bundles a
-second, more than any one operator will prove. A wallet submits with `rand_sendTransaction` to an
+and CPU verification of every inner proof — 62 ms warm for a transfer's two proofs, so a 32-core
+host admits ~500 transfers a second, more than any one operator will prove. A wallet submits with `rand_sendTransaction` to an
 aggregator's RPC, or to any node, which forwards to the `rand-bundles` gossip topic that
 aggregators subscribe to and validators do not. The wallet learns which lane it is in from
 `rand_getLimits` (§6.2) and the receipt names the covering aggregate.

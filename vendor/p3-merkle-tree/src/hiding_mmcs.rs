@@ -14,6 +14,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use spin::Mutex;
 
+use crate::counter_rng::{CounterModeRng, random_matrix};
 use crate::mmcs::check_widths;
 use crate::pruning::PrunedMerklePaths;
 use crate::{MerkleCap, MerkleTree, MerkleTreeError, MerkleTreeMmcs};
@@ -107,7 +108,7 @@ where
     C: PseudoCompressionFunction<[PW::Value; DIGEST_ELEMS], N>
         + PseudoCompressionFunction<[PW; DIGEST_ELEMS], N>
         + Sync,
-    R: CryptoRng + SeedableRng + Send,
+    R: CryptoRng + SeedableRng + CounterModeRng + Send,
     PW::Value: Eq + Clone,
     [PW::Value; DIGEST_ELEMS]: Serialize + for<'de> Deserialize<'de>,
     StandardUniform: Distribution<P::Value>,
@@ -134,19 +135,36 @@ where
         &self,
         inputs: Vec<M>,
     ) -> (Self::Commitment, Self::ProverData<M>) {
-        // RandProtocol patch (2026-10-01, upstream Plonky3 #2363 / PR #2368): draw every salt under
-        // the lock, then release it before hashing. The tree build is parallel, and a waiting rayon
-        // worker may run a queued commit on this same MMCS, which would spin for ever on a lock its
-        // own thread still holds.
-        let salted_inputs = {
-            let mut rng = self.rng.lock();
-            inputs
+        // RandProtocol patch (2026-10-01, upstream Plonky3 #2363 / PR #2368): the lock is never held
+        // across rayon work. The tree build is parallel, and a waiting rayon worker may run a
+        // queued commit on this same MMCS, which would spin for ever on a lock its own thread
+        // still holds.
+        //
+        // RandProtocol patch (fullnode #151, v0.8.3): the salts are counter-mode streams
+        // (`counter_rng`), generated in parallel outside the lock — the lock is taken only to draw
+        // this commit's 256-bit key. Salt matrix `m` is lane `m`. A generator that hands out no
+        // key (a verifier key's public label stream) keeps the serial draw, bit for bit.
+        let key = self.rng.lock().counter_mode_key();
+        let salted_inputs = match key {
+            Some(key) => inputs
                 .into_iter()
-                .map(|mat| {
-                    let salts = RowMajorMatrix::rand(&mut *rng, mat.height(), SALT_ELEMS);
+                .enumerate()
+                .map(|(m, mat)| {
+                    let lane = u32::try_from(m).expect("fewer than 2^32 matrices in one commit");
+                    let salts = random_matrix(mat.height(), SALT_ELEMS, &key, lane);
                     HorizontalPair::new(mat, salts)
                 })
-                .collect()
+                .collect(),
+            None => {
+                let mut rng = self.rng.lock();
+                inputs
+                    .into_iter()
+                    .map(|mat| {
+                        let salts = RowMajorMatrix::rand(&mut *rng, mat.height(), SALT_ELEMS);
+                        HorizontalPair::new(mat, salts)
+                    })
+                    .collect()
+            }
         };
         self.inner.commit(salted_inputs)
     }

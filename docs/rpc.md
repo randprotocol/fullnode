@@ -177,6 +177,14 @@ the normal mempool, so the mint goes through consensus and every node applies it
 no validator key and answers `faucet mints are signed by validators; ask a validator node`. Poll
 `rand_getTransaction` for the commit.
 
+Only a validator whose key is one of the chain's faucet minters can mint: the genesis
+`staking.faucet_minters` where it lists them, otherwise the genesis validators. Any other validator
+— one bonded after genesis, such as chain 21's guardian hosts — refuses up front with
+`this node's key <address> is not a faucet minter on this chain; the minters are <the list>`
+(v0.8.3, issue #153; before, it built the mint and the pool refused it). `faucet` in `rand_status`
+and `rand_getEmission` is `true` exactly when this node would serve `rand_mint`: the faucet is on,
+the node runs as a validator, and its key is a faucet minter.
+
 On a chain whose genesis sets `staking.faucet_recipients` (chain 15) only the listed wallets can be
 paid: a mint to any other address is refused at admission with `the faucet may not mint to this
 recipient (not in staking.faucet_recipients)` (`docs/staking.md` §2).
@@ -1986,6 +1994,15 @@ the proof's published digest against the one it computed before it submits anyth
 ## Changelog
 
 What changed for clients, in one place. Newest first.
+
+### v0.8.3 — `faucet` means "this node can mint here" (node-only; issue #153)
+
+- `rand_status.faucet` and `rand_getEmission.faucet` are `true` only when the genesis turns the
+  faucet on, the node runs as a validator **and** its key is one of the chain's faucet minters.
+  Before, they echoed the genesis flag, so a validator bonded after genesis advertised a faucet
+  whose every mint failed at admission.
+- `rand_mint` on such a validator refuses before building anything, naming the minter set
+  (`this node's key … is not a faucet minter on this chain; the minters are …`).
 
 ### v0.8.2 — perps fields in `rand_getPerps` and `rand_getSupply` (node-only on chain 21; the rules they report are genesis-gated)
 

@@ -71,6 +71,10 @@ version = "0.7.0"
 [dependencies.p3-matrix]
 version = "0.7.0"
 
+# RandProtocol patch (#151): `p3_merkle_tree::counter_rng`, shared with the hiding MMCS.
+[dependencies.p3-merkle-tree]
+version = "0.7.0"
+
 [dependencies.p3-maybe-rayon]
 version = "0.7.0"
 
@@ -82,7 +86,8 @@ version = "0.7.0"
 
 [dependencies.rand]
 version = "0.10.1"
-features = ["std_rng"]
+# RandProtocol patch (#151): `chacha` for `counter_rng`'s ChaCha20 streams.
+features = ["std_rng", "chacha"]
 default-features = false
 
 [dependencies.serde]

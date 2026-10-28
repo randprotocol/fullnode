@@ -274,6 +274,9 @@ pub struct NodeStatus {
     /// validator that has bonded in but whose epoch has not arrived — or one that has unbonded
     /// below the minimum — is `is_validator` without being `active_validator`.
     pub active_validator: bool,
+    /// #153: this node can serve `rand_mint` — the genesis turns the faucet on, this node runs as a
+    /// validator, and its key is one of the chain's faucet minters (`admission::faucet_refusal`).
+    /// Before v0.8.3 it was the genesis flag alone, `true` on validators whose every mint failed.
     pub faucet: bool,
     pub confidential: bool,
     /// Audit v6, STAKE-2: the genesis says `testnet: true` — the marker that lets a faucet sit
@@ -1598,6 +1601,20 @@ fn parse_shielded(params: &Value, idx: usize) -> Result<ShieldedAddress, RpcErro
     ShieldedAddress::parse(&s).map_err(|e| RpcError::invalid_params(format!("address: {e}")))
 }
 
+/// #152: a hex body, with or without `0x` — `rand_sendTransaction`'s transaction, 5.8 MB of hex for a
+/// bundle transaction — decoded by `faster-hex` (SIMD-checked, table-decoded) instead of `hex`,
+/// which took 18 ms of a 92 ms admission. The same verdicts as `hex::decode`: either case, and
+/// `None` for an odd length or any non-hex character.
+pub fn decode_hex_body(s: &str) -> Option<Vec<u8>> {
+    let src = s.strip_prefix("0x").unwrap_or(s).as_bytes();
+    if !src.len().is_multiple_of(2) {
+        return None;
+    }
+    let mut out = vec![0u8; src.len() / 2];
+    faster_hex::hex_decode(src, &mut out).ok()?;
+    Some(out)
+}
+
 /// A 32-byte value as hex, with or without `0x`: a bridge token address or emitter.
 fn parse_bytes32(params: &Value, idx: usize, name: &str) -> Result<[u8; 32], RpcError> {
     let s: String = param(params, idx, name)?;
@@ -2765,8 +2782,7 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
         }
         "rand_sendTransaction" => {
             let raw: String = param(p, 0, "tx")?;
-            let bytes = hex::decode(raw.strip_prefix("0x").unwrap_or(&raw))
-                .map_err(|_| RpcError::invalid_params("tx must be hex"))?;
+            let bytes = decode_hex_body(&raw).ok_or_else(|| RpcError::invalid_params("tx must be hex"))?;
             let tx = Transaction::decode(&bytes).map_err(|e| RpcError::invalid_params(format!("tx decode: {e}")))?;
             // The body limit admits more than a block can carry — two `max_proof_bytes` proofs
             // are a legal `Call` by the per-part caps and can still be over `max_block_bytes` — so
@@ -5859,6 +5875,40 @@ pub(crate) mod tests {
         // The transport half: a malformed transaction is -32602 before the node is ever asked.
         assert_eq!(call(&st, "rand_sendTransaction", json!(["zz"])).await.unwrap_err().code, -32602);
         assert_eq!(call(&st, "rand_sendTransaction", json!(["00"])).await.unwrap_err().code, -32602);
+    }
+
+    /// #152: `rand_sendTransaction`'s faster-hex decode gives exactly `hex::decode`'s verdicts —
+    /// the same bytes for every valid body (either case, mixed, with or without `0x`), a refusal
+    /// for every odd length and every non-hex character, at every position a SIMD lane boundary
+    /// could hide one in.
+    #[test]
+    fn the_hex_body_decodes_as_hex_does() {
+        use rand::{Rng, SeedableRng};
+        let mut rng = rand::rngs::StdRng::seed_from_u64(152);
+        for len in [0usize, 1, 2, 7, 15, 16, 31, 32, 33, 63, 64, 65, 127, 1000, 4097] {
+            let bytes: Vec<u8> = (0..len).map(|_| rng.gen()).collect();
+            let lower = hex::encode(&bytes);
+            let upper = lower.to_uppercase();
+            let mixed: String = lower.chars().enumerate().map(|(i, c)| if i % 3 == 0 { c.to_ascii_uppercase() } else { c }).collect();
+            for body in [lower.clone(), upper, mixed, format!("0x{lower}")] {
+                assert_eq!(decode_hex_body(&body), Some(bytes.clone()), "{len} bytes");
+                assert_eq!(decode_hex_body(&body).ok_or(()), hex::decode(body.strip_prefix("0x").unwrap_or(&body)).map_err(|_| ()));
+            }
+            if len > 0 {
+                assert_eq!(decode_hex_body(&lower[1..]), None, "odd length");
+                for pos in [0, lower.len() / 2, lower.len() - 1] {
+                    for bad in ['g', 'G', 'x', ' ', '/', ':', '@', '`', '\u{7f}'] {
+                        let mut b = lower.clone().into_bytes();
+                        b[pos] = bad as u8;
+                        let b = String::from_utf8(b).unwrap();
+                        assert_eq!(decode_hex_body(&b), None, "{bad:?} at {pos} of {len} bytes");
+                        assert!(hex::decode(&b).is_err());
+                    }
+                }
+            }
+        }
+        assert_eq!(decode_hex_body("0x"), Some(vec![]));
+        assert_eq!(decode_hex_body("0X00"), None, "only a lowercase 0x prefix, as before");
     }
 
     #[tokio::test]

@@ -1042,6 +1042,33 @@ pub fn faucet_minters(gs: &randprotocol_core::genesis::GenesisState) -> std::col
     }
 }
 
+/// #153: why this node cannot serve `rand_mint`, or `None` when it can — the faucet is on (genesis
+/// `faucet`), this node runs as a validator, and its key is one of the chain's faucet minters
+/// ([`faucet_minters`]: `staking.faucet_minters` where the genesis lists them, else the genesis
+/// validators). What `rand_status` / `rand_getEmission` report as `faucet` (true exactly when this
+/// is `None`), and what `rand_mint` checks before it builds anything — so a validator bonded after
+/// genesis, whose key the pool and the ledger would refuse as a minter, says so up front instead of
+/// advertising a faucet whose every mint fails at admission.
+pub fn faucet_refusal(gs: &randprotocol_core::genesis::GenesisState, is_validator: bool, key: &randprotocol_core::Address) -> Option<String> {
+    if !gs.faucet {
+        return Some("faucet is disabled on this chain".into());
+    }
+    if !is_validator {
+        return Some("faucet mints are signed by validators; ask a validator node".into());
+    }
+    let minters = faucet_minters(gs);
+    if minters.contains(key) {
+        return None;
+    }
+    let source = if gs.staking.as_ref().is_some_and(|s| s.faucet_minters.is_some()) { "staking.faucet_minters" } else { "the genesis validators" };
+    let list: Vec<String> = minters.iter().map(|a| a.to_base58()).collect();
+    Some(format!(
+        "this node's key {key} is not a faucet minter on this chain; the minters are {source} ({}): {}; ask a node run by one of them",
+        list.len(),
+        list.join(", ")
+    ))
+}
+
 /// A faucet `Mint` whose minter has a row in the validator register but is not in `minters`
 /// ([`faucet_minters`]): `TxError::MinterNotAllowed`. `None` for everything else — including a
 /// minter with no row at all, which is the ledger's own `MinterNotValidator`, left to `validate`
@@ -2202,6 +2229,42 @@ mod tests {
         let honest = mint(&operator, 60);
         assert!(pool.precheck(&honest, &l, &StubExecutor).is_ok());
         assert!(pool.insert(honest, &l, &StubExecutor).is_ok());
+    }
+
+    /// #153: `faucet` in `rand_status` means "this node can mint here" — the faucet on, a validator,
+    /// and a key among the chain's faucet minters — and every other case names its reason, the
+    /// non-minter's naming the minter set.
+    #[test]
+    fn the_faucet_is_served_only_by_a_validator_whose_key_is_a_faucet_minter() {
+        use crate::storage::fixtures;
+        use randprotocol_core::genesis::{FaucetMinter, StakingConfig};
+        use randprotocol_core::UNITS_PER_RAND;
+        let (a, b, later) = (fixtures::key(1), fixtures::key(2), fixtures::key(9));
+        let mut g = fixtures::genesis_file_of(1, &[&a, &b], Vec::new(), 10);
+        g.faucet = true;
+        let gs = g.build(&randprotocol_core::confidential::StubExecutor).unwrap();
+        // A genesis validator mints; a key bonded later (the guardian hosts of issue #153) does not.
+        assert_eq!(faucet_refusal(&gs, true, &a.address()), None);
+        let why = faucet_refusal(&gs, true, &later.address()).expect("a post-genesis key is no minter");
+        assert!(why.contains(&later.address().to_base58()) && why.contains("is not a faucet minter"), "{why}");
+        assert!(why.contains("the genesis validators (2)") && why.contains(&a.address().to_base58()) && why.contains(&b.address().to_base58()), "{why}");
+        // Not a validator, or no faucet: those reasons first, as before.
+        assert_eq!(faucet_refusal(&gs, false, &a.address()).as_deref(), Some("faucet mints are signed by validators; ask a validator node"));
+        g.faucet = false;
+        let off = g.build(&randprotocol_core::confidential::StubExecutor).unwrap();
+        assert_eq!(faucet_refusal(&off, true, &a.address()).as_deref(), Some("faucet is disabled on this chain"));
+        // A genesis that lists its minters: the list decides, and the message names it.
+        g.faucet = true;
+        g.staking = Some(StakingConfig {
+            faucet_budget_per_epoch: 100 * UNITS_PER_RAND,
+            bond_activation_epochs: 2,
+            faucet_minters: Some(vec![FaucetMinter(later.address())]),
+            ..Default::default()
+        });
+        let listed = g.build(&randprotocol_core::confidential::StubExecutor).unwrap();
+        assert_eq!(faucet_refusal(&listed, true, &later.address()), None);
+        let why = faucet_refusal(&listed, true, &a.address()).unwrap();
+        assert!(why.contains("staking.faucet_minters (1)") && why.contains(&later.address().to_base58()), "{why}");
     }
 
     /// Where a genesis lists `staking.faucet_minters` the pool's minters are that list, not the

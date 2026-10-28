@@ -257,6 +257,7 @@ rsync -a --delete --exclude executor.rs --exclude shielded.rs --exclude call_env
       --exclude viewing.rs --exclude bundle.rs --exclude hidden_bundle.rs \
       --exclude hidden_cheating.rs --exclude hidden_trace_forgery.rs --exclude guest_provenance.rs --exclude 'auth*.rs' --exclude evm_rt.rs --exclude sbpf_rt.rs \
       --exclude perps_vectors.rs --exclude modq_cheating.rs \
+      --exclude counter_rng.rs --exclude prover_data_cache.rs --exclude decode_memo.rs \
       "$SRC/tests/" "$DST/tests/"
 [ -f "$DST/src/guests.rs" ] || cp "$SRC/src/guests.rs" "$DST/src/guests.rs"
 # M4.1/M4.2: vendor the compiled guest binaries the vendored `tests/e2e.rs` and the local
@@ -536,6 +537,17 @@ PY
 grep -q 'pub fn export_cached_verifier_key_with_modq' "$DST/src/machine.rs" \
   && echo "anchors: export_cached ok" \
   || { echo "sync-zkvm.sh: install_verifier_key moved; update the export_cached patch" >&2; exit 1; }
+# Fullnode #151 (v0.8.3): the prover's random columns and Merkle salts are counter-mode streams
+# (`vendor/p3-merkle-tree/src/counter_rng.rs`), which `key_derivation_v2::{KeyRngV2, SaltRng}` opt
+# into (`impl CounterModeRng`), and `prove_traces` takes its `ProverData` from a process-wide cache
+# (`machine::cached_prover_data`). Both were made on this side first and are not yet in circuits'
+# `research/`; a sync from a circuits commit without them would silently put the serial RNG and
+# the per-proof preprocessed rebuild back (and not compile: `HidingFriPcs` needs `SaltRng:
+# CounterModeRng`). So the sync stops until circuits carries them. `tests/counter_rng.rs` and
+# `tests/prover_data_cache.rs` are this side's and are kept by the rsync above.
+grep -q 'impl CounterModeRng for SaltRng' "$DST/src/key_derivation_v2.rs" && grep -q 'fn cached_prover_data' "$DST/src/machine.rs" \
+  && echo "anchors: #151 counter-mode RNG + ProverData cache ok" \
+  || { echo "sync-zkvm.sh: circuits' research/ lacks fullnode #151 (key_derivation_v2's CounterModeRng impls, machine.rs's cached_prover_data); port them upstream first" >&2; exit 1; }
 # M3.4/M4.1: `hash.rs`'s program-digest header and `tables/cpu.rs`'s in-circuit copy of the same
 # constant both read `crate::notes::domain::HC` upstream; M4.1 added a second such pair for the
 # input digest, `crate::notes::domain::IN`. Constraint set 6 added a third: `crate::notes::
