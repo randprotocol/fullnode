@@ -62,27 +62,23 @@ struct Cli {
     /// (`rand-prover run` has the same flag). Without it the proof is refused before any work.
     #[arg(long, global = true, env = "RAND_SKIP_MEMORY_CHECK")]
     skip_memory_check: bool,
-    /// How many leaves wide each envelope read is when a scan over scan heads fetches the leaves
-    /// this wallet's keys opened: the whole aligned chunk is read, so the node learns which
-    /// chunk held one of this wallet's leaves and not which leaf. `0` reads every envelope (what
-    /// a wallet did before scan heads: the node learns nothing, at full bandwidth). At most 1000,
-    /// the node's page cap; `1` is refused — it would name the leaf. `docs/rpc.md`, scan heads.
-    #[arg(long, global = true, value_name = "N", default_value_t = randprotocol_client::DEFAULT_SCAN_CHUNK, value_parser = scan_chunk_value)]
-    scan_chunk: u64,
+    /// Ignored since v0.8.3 (issue #147): every scan reads every envelope, in fixed pages, so the
+    /// node learns nothing about which leaves are this wallet's. Accepted so old scripts still run.
+    #[arg(long, global = true, value_name = "N", hide = true)]
+    scan_chunk: Option<u64>,
+    /// How long, in seconds, a command waits for its transaction to commit (or for a call's
+    /// receipt) before it gives up — overriding each command's own allowance. A wait that runs
+    /// out after the node accepted the transaction exits 4, "submitted, confirmation unknown".
+    #[arg(long, global = true, env = "RAND_WAIT_TIMEOUT", value_name = "SECS")]
+    wait_timeout: Option<u64>,
+    /// Send every request — to the node and to a paired prover — through this proxy:
+    /// `socks5h://127.0.0.1:9050` for Tor (names resolved at the proxy), `socks5://`, or an
+    /// `http://`/`https://` CONNECT proxy. A proxy that is down fails the command; nothing falls
+    /// back to a direct connection. `docs/cli.md` has a Tor recipe.
+    #[arg(long, global = true, env = "RAND_PROXY", value_name = "URL")]
+    proxy: Option<String>,
     #[command(subcommand)]
     cmd: Cmd,
-}
-
-/// `--scan-chunk`'s range: `0` (every envelope) or 2..=1000 (the node's page cap); `1` would
-/// fetch exactly the wanted leaf, which is what the chunk exists to avoid (audit v10, RPC-201).
-fn scan_chunk_value(s: &str) -> std::result::Result<u64, String> {
-    let n: u64 = s.parse().map_err(|_| format!("`{s}` is not a number of leaves"))?;
-    match n {
-        0 => Ok(0),
-        1 => Err("a chunk of 1 reads exactly the wanted leaf and hides nothing; use 0 to read every envelope, or 2 or more".into()),
-        n if n > randprotocol_client::MAX_SCAN_CHUNK => Err(format!("at most {} leaves, the node's page cap", randprotocol_client::MAX_SCAN_CHUNK)),
-        n => Ok(n),
-    }
 }
 
 #[derive(Subcommand)]
@@ -613,17 +609,26 @@ enum TokenCmd {
         /// The 32-byte salt the asset id is over, hex. Random if not given.
         #[arg(long)]
         salt: Option<String>,
-        /// Fixed supply: mint exactly this many units at registration, forever — `authority` is
-        /// `none`. Needs `--to`; mutually exclusive with `--authority-key-out`.
-        #[arg(long)]
-        fixed_supply: Option<u64>,
+        /// Fixed supply: mint exactly this much at registration, forever — `authority` is
+        /// `none`. In display units at `--decimals` (`--decimals 6 --fixed-supply 1000000` is a
+        /// million tokens), as `token mint --amount` reads them. Needs `--to`; mutually exclusive
+        /// with `--authority-key-out`.
+        #[arg(long, value_name = "AMOUNT", conflicts_with = "fixed_supply_units")]
+        fixed_supply: Option<String>,
+        /// `--fixed-supply` in base units (`--decimals 6 --fixed-supply-units 1000000` is one token).
+        #[arg(long, value_name = "UNITS")]
+        fixed_supply_units: Option<u64>,
         /// A fresh Dilithium2 key file is written here (0600, refusing to overwrite) and becomes
         /// the token's mint authority. Mutually exclusive with `--fixed-supply`.
         #[arg(long)]
         authority_key_out: Option<PathBuf>,
-        /// With `--authority-key-out`: mint this many units at registration too. Needs `--to`.
-        #[arg(long)]
-        initial: Option<u64>,
+        /// With `--authority-key-out`: mint this much at registration too, in display units at
+        /// `--decimals`, as `token mint --amount` reads them. Needs `--to`.
+        #[arg(long, value_name = "AMOUNT", conflicts_with = "initial_units")]
+        initial: Option<String>,
+        /// `--initial` in base units.
+        #[arg(long, value_name = "UNITS")]
+        initial_units: Option<u64>,
         /// The initial mint's recipient. Required with `--fixed-supply` or `--initial`.
         #[arg(long)]
         to: Option<String>,
@@ -1161,6 +1166,18 @@ struct PayoutFile {
 /// The exit code `rand program invoke` leaves on a stale read — distinct, so a calling tool can
 /// re-quote the cells and retry rather than treat it as a hard refusal.
 const STALE_READ_EXIT: i32 = 3;
+
+/// `token create --initial` / `--fixed-supply` (issue #142): the display form at the token's own
+/// `decimals` — what `token mint --amount` reads — or its `-units` twin in base units (clap keeps
+/// the two apart). `None` when neither is given.
+fn token_create_amount(display: Option<&str>, units: Option<u64>, decimals: u8, flag: &str) -> Result<Option<u64>> {
+    match (display, units) {
+        (Some(text), _) => wallet::parse_decimal(text, decimals)
+            .map(Some)
+            .map_err(|e| anyhow!("{flag}: {e} ({flag} is in display units at --decimals {decimals}; {flag}-units takes base units)")),
+        (None, units) => Ok(units),
+    }
+}
 
 /// A decimal amount in units (never RAND's decimals: a payout may be a token's).
 fn parse_units(s: &str, what: &str) -> Result<u64> {
@@ -2089,8 +2106,22 @@ async fn perp(
     Ok(())
 }
 
+/// `rand`'s exit codes: 0 done, 1 failed, 2 a usage error (clap's), [`STALE_READ_EXIT`] (3) a
+/// stale `program invoke`, and [`randprotocol_client::CONFIRMATION_UNKNOWN_EXIT`] (4) a
+/// transaction the node accepted whose commit the wait could not see (issue #141): the hash was
+/// printed (`submitted <kind> <hash>`), and `rand tx <hash>` says what became of it.
 #[tokio::main]
 async fn main() -> Result<()> {
+    match run().await {
+        Err(e) if e.downcast_ref::<randprotocol_client::ConfirmationUnknown>().is_some() => {
+            eprintln!("Error: {e:#}");
+            std::process::exit(randprotocol_client::CONFIRMATION_UNKNOWN_EXIT);
+        }
+        r => r,
+    }
+}
+
+async fn run() -> Result<()> {
     let cli = Cli::parse();
     randprotocol_client::memory::set_skip(cli.skip_memory_check);
     // The thread pool a local proof runs on, sized before anything proves (`--threads`, else
@@ -2103,7 +2134,17 @@ async fn main() -> Result<()> {
             eprintln!("warning: {e}");
         }
     }
-    let rpc = RpcClient::new(cli.rpc.clone()).with_scan_chunk(cli.scan_chunk);
+    // Before any client is built: every `RpcClient` and `RemoteProver` this process makes goes
+    // through it (issue #148).
+    if let Some(proxy) = &cli.proxy {
+        randprotocol_client::set_default_proxy(proxy)?;
+    }
+    if cli.scan_chunk.is_some() {
+        eprintln!("warning: --scan-chunk is ignored since v0.8.3: a scan reads every envelope, in fixed pages, so the node cannot tell which leaves are yours (issue #147)");
+    }
+    let rpc = RpcClient::new(cli.rpc.clone())
+        .with_announce()
+        .with_wait_timeout(cli.wait_timeout.map(Duration::from_secs));
     match cli.cmd {
         Cmd::Keygen => {
             let w = Wallet::generate();
@@ -3408,7 +3449,26 @@ async fn main() -> Result<()> {
             report(&s, "backing listing");
             println!("listed chain {chain} token {} under asset {asset}, at list_nonce {}", hex::encode(token), state.list_nonce);
         }
-        Cmd::Token(TokenCmd::Create { name, symbol, decimals, salt, fixed_supply, authority_key_out, initial, to, program, fee, no_wait, cuda }) => {
+        Cmd::Token(TokenCmd::Create {
+            name,
+            symbol,
+            decimals,
+            salt,
+            fixed_supply,
+            fixed_supply_units,
+            authority_key_out,
+            initial,
+            initial_units,
+            to,
+            program,
+            fee,
+            no_wait,
+            cuda,
+        }) => {
+            // Issue #142: both amounts in display units at the token's own decimals, like every
+            // other token amount; the `-units` flags are the base-unit form.
+            let fixed_supply = token_create_amount(fixed_supply.as_deref(), fixed_supply_units, decimals, "--fixed-supply")?;
+            let initial = token_create_amount(initial.as_deref(), initial_units, decimals, "--initial")?;
             // Every cheap refusal — the flag combination — before any key file, network read or
             // proof.
             let program = program.as_deref().map(|p| Hash::from_hex(p).context("--program: invalid program id")).transpose()?;
@@ -3508,9 +3568,17 @@ async fn main() -> Result<()> {
             };
             report(&result.submission, "token registration");
             println!("index {}, id {} ({})", result.index, result.id.to_hex(), randprotocol_core::token_id::encode(&result.id));
+            if let (Some(units), Some(to)) = (initial_amount, &recipient) {
+                // Both forms, as `token mint` echoes them (issue #142).
+                println!("minted {} to {to}", memo_display::sanitize(&wallet::display_amount(units, decimals, &symbol)));
+            }
             if !no_wait {
-                let committed = rpc.call("rand_getTransaction", serde_json::json!([result.submission.hash.to_hex()])).await?;
-                println!("committed at height {}", committed["height"]);
+                // The wait above saw the commit; a failed read of its height now is not a failure
+                // of the registration (issue #141).
+                match rpc.call("rand_getTransaction", serde_json::json!([result.submission.hash.to_hex()])).await {
+                    Ok(committed) => println!("committed at height {}", committed["height"]),
+                    Err(e) => eprintln!("warning: committed, but reading its height failed ({e:#}); `rand tx {}` shows it", result.submission.hash),
+                }
             }
         }
         Cmd::Token(TokenCmd::Mint { asset, to, amount, authority_key, fee, no_wait, cuda }) => {
@@ -4106,19 +4174,15 @@ mod tests {
         assert!(e.contains("--expect-to rand1nope"), "{e}");
     }
 
-    /// `--scan-chunk` (audit v10, RPC-201) is global, so every command that scans takes it: 0 or
-    /// 2..=1000, 256 by default; 1 and anything past the node's page cap are refused at parse.
+    /// `--scan-chunk` (audit v10, RPC-201) is still a global flag, hidden: accepted and ignored.
     #[test]
-    fn scan_chunk_is_global_and_bounded() {
+    fn scan_chunk_is_still_accepted_and_ignored() {
+        // Issue #147: an old script's `--scan-chunk N` still parses (and is warned about); it no
+        // longer changes what a scan reads.
         let chunk = |args: &[&str]| Cli::try_parse_from([&["rand"], args].concat()).map(|c| c.scan_chunk);
-        assert_eq!(chunk(&["sync"]).unwrap(), randprotocol_client::DEFAULT_SCAN_CHUNK);
-        assert_eq!(chunk(&["sync", "--scan-chunk", "0"]).unwrap(), 0);
-        assert_eq!(chunk(&["--scan-chunk", "64", "balance"]).unwrap(), 64);
-        assert_eq!(chunk(&["sync", "--scan-chunk", "1000"]).unwrap(), 1000);
-        for bad in ["1", "1001", "many"] {
-            let err = chunk(&["sync", "--scan-chunk", bad]).unwrap_err().to_string();
-            assert!(err.contains("scan-chunk"), "{bad}: {err}");
-        }
+        assert_eq!(chunk(&["sync"]).unwrap(), None);
+        assert_eq!(chunk(&["sync", "--scan-chunk", "0"]).unwrap(), Some(0));
+        assert_eq!(chunk(&["--scan-chunk", "64", "balance"]).unwrap(), Some(64));
     }
 
     /// `rand sync` scans from where the store left off; `--rescan` starts the store over first
@@ -4128,6 +4192,20 @@ mod tests {
         let parse = |args: &[&str]| Cli::try_parse_from(std::iter::once("rand").chain(args.iter().copied())).map(|c| c.cmd);
         assert!(matches!(parse(&["sync"]), Ok(Cmd::Sync { rescan: false })));
         assert!(matches!(parse(&["sync", "--rescan"]), Ok(Cmd::Sync { rescan: true })));
+    }
+
+    /// Issue #142: `token create --initial` / `--fixed-supply` read display units at the token's
+    /// own `--decimals`, as `token mint --amount` does; the `-units` twins read base units.
+    #[test]
+    fn token_create_amounts_are_display_units_at_the_tokens_decimals() {
+        assert_eq!(token_create_amount(Some("1000000"), None, 6, "--initial").unwrap(), Some(1_000_000_000_000));
+        assert_eq!(token_create_amount(Some("9.36"), None, 6, "--initial").unwrap(), Some(9_360_000));
+        assert_eq!(token_create_amount(Some("5"), None, 0, "--fixed-supply").unwrap(), Some(5));
+        assert_eq!(token_create_amount(None, Some(1_000_000), 6, "--initial").unwrap(), Some(1_000_000));
+        assert_eq!(token_create_amount(None, None, 6, "--initial").unwrap(), None);
+        let e = token_create_amount(Some("1.5"), None, 0, "--fixed-supply").unwrap_err().to_string();
+        assert!(e.contains("--fixed-supply") && e.contains("at most 0 decimals"), "{e}");
+        assert!(token_create_amount(Some("99999999999"), None, 9, "--initial").is_err(), "past u64 is refused, not wrapped");
     }
 
     /// The five `rand token` commands (T8b): `create` (both authority branches), `mint`,
@@ -4142,7 +4220,7 @@ mod tests {
         else {
             panic!("create --fixed-supply parses")
         };
-        assert_eq!((name.as_str(), symbol.as_str(), decimals, fixed_supply, to_arg.as_deref()), ("Fixed Coin", "FIX", 6, Some(1_000_000), Some(to)));
+        assert_eq!((name.as_str(), symbol.as_str(), decimals, fixed_supply.as_deref(), to_arg.as_deref()), ("Fixed Coin", "FIX", 6, Some("1000000"), Some(to)));
 
         let Ok(Cmd::Token(TokenCmd::Create { authority_key_out, initial, .. })) = parse(&[
             "token", "create", "--name", "Keyed Coin", "--symbol", "KEY", "--decimals", "8",
@@ -4150,7 +4228,26 @@ mod tests {
         ]) else {
             panic!("create --authority-key-out parses")
         };
-        assert_eq!((authority_key_out.as_deref(), initial), (Some(Path::new("authority.key.json")), Some(500)));
+        assert_eq!((authority_key_out.as_deref(), initial.as_deref()), (Some(Path::new("authority.key.json")), Some("500")));
+
+        // Issue #142: the base-unit forms are their own flags, and each excludes its display twin.
+        let Ok(Cmd::Token(TokenCmd::Create { fixed_supply, fixed_supply_units, .. })) =
+            parse(&["token", "create", "--name", "F", "--symbol", "F", "--decimals", "6", "--fixed-supply-units", "1000000", "--to", to])
+        else {
+            panic!("create --fixed-supply-units parses")
+        };
+        assert_eq!((fixed_supply, fixed_supply_units), (None, Some(1_000_000)));
+        let Ok(Cmd::Token(TokenCmd::Create { initial, initial_units, .. })) = parse(&[
+            "token", "create", "--name", "K", "--symbol", "K", "--decimals", "6", "--authority-key-out", "a.json", "--initial-units", "7", "--to", to,
+        ]) else {
+            panic!("create --initial-units parses")
+        };
+        assert_eq!((initial, initial_units), (None, Some(7)));
+        for both in [["--initial", "1", "--initial-units", "1"], ["--fixed-supply", "1", "--fixed-supply-units", "1"]] {
+            let mut args = vec!["token", "create", "--name", "K", "--symbol", "K", "--decimals", "6", "--to", to];
+            args.extend(both);
+            assert!(parse(&args).is_err(), "{both:?} together is refused");
+        }
 
         // Final review B3: `token mint` and `token burn` read AMOUNT in the token's display
         // units, like `send --asset` — one convention across the CLI.

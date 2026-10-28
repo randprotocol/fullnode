@@ -403,7 +403,7 @@ the pool back together.
 | `rand bridge-rotate <ROTATION> --pq <QUORUM>` | submit a guardian-set rotation with the PQ quorum; one RAND fee bundle |
 | `rand bridge-pause --sig <SIG>` / `rand bridge-unpause --pq <QUORUM>` | pause or lift bridge minting; bundle-less, fee-less, no key file |
 | `rand token register-bridged … --pq <QUORUM>` / `rand token list-backing … --pq <QUORUM>` | list a bridged token or a new backing after genesis; one RAND fee bundle |
-| `rand token create --name … --symbol … --decimals … (--fixed-supply <N> --to <ADDR> \| --authority-key-out <FILE> [--initial <N> --to <ADDR>])` | register a token (RPL spec §4) at the next index — fixed supply or `Key`-authorised (a fresh Dilithium2 key file, `rand-node keygen`'s shape); one RAND fee bundle |
+| `rand token create --name … --symbol … --decimals … (--fixed-supply <AMOUNT> --to <ADDR> \| --authority-key-out <FILE> [--initial <AMOUNT> --to <ADDR>])` | register a token (RPL spec §4) at the next index; amounts in display units at `--decimals` (`--fixed-supply-units`/`--initial-units` for base units) — fixed supply or `Key`-authorised (a fresh Dilithium2 key file, `rand-node keygen`'s shape); one RAND fee bundle |
 | `rand token mint --asset <A> --to <ADDR> --amount <N> --authority-key <FILE>` | mint more of a `Key`-authorised token, signed by its authority; one RAND fee bundle |
 | `rand token set-authority --asset <A> --authority-key <FILE> (--new-key <FILE> \| --renounce)` | hand a `Key`-authorised token to another key, or renounce minting for good |
 | `rand token info <A>` / `rand token list` | a token's public row, or every token's, from the whole `rand_getTokens` listing |
@@ -655,9 +655,16 @@ worth naming.
   already reads, and computes every witness itself: a send never calls `rand_getWitness`, and the
   only tree question left is `rand_getAnchor`, which names no leaf (audit v3 PRIV-1). The method
   stays on the node for wallets built before this change.
-- **Scanning.** `rand_getCommitments` hands out everything to everyone, so scanning itself
-  reveals nothing about which leaves are yours — but it does tell the node that *somebody* at
-  your IP is scanning, and how far. Trial decryption is local and, on that path, the node never
+- **Scanning.** `rand` reads the commitment tree in fixed pages of full envelopes
+  (`rand_getCommitments(from, 500)` from its cursor to the tip) and decides which leaves are its
+  own locally, by trial decryption, after the page has arrived. The requests are the same for
+  every wallet scanning the same range, whatever it owns, so the scan reveals nothing about which
+  leaves are yours (v0.8.3, issue #147; from v0.8.0 to v0.8.2 the wallet read full envelopes only
+  around the leaves its keys opened, which told the node which leaves — or which 256-leaf chunks
+  — were its). What the node does learn: that *somebody* at your IP is scanning, when, from which
+  cursor and how far — which bounds when the wallet last synced — and, on a first sync, that it
+  is a fresh store. `--proxy socks5h://127.0.0.1:9050` (Tor; `docs/cli.md`) keeps the IP itself
+  from the node. Trial decryption is local and, on that path, the node never
   sees a viewing key. The exception is the explorer's import below: a node an operator handed a
   viewing key to knows exactly which leaves that key opens — which the key's holder could have
   computed anyway — and the IP of whoever asked it to.

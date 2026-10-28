@@ -21,7 +21,7 @@
 
 use crate::prover::RemoteProver;
 use crate::tree::LocalTree;
-use crate::{AssetRow, ChainLimits, CommitmentRow, RpcClient, ScanLeaf};
+use crate::{AssetRow, ChainLimits, CommitmentRow, RpcClient};
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
@@ -41,7 +41,7 @@ use randprotocol_zkvm::executor::{prove_auth, prove_bundle_for, ZkExecutor};
 use randprotocol_zkvm::hidden::{self, HiddenDigestInput, HiddenDigestInputV3, HiddenOutput, A_SLOTS, SLOTS};
 use randprotocol_zkvm::machine::{Backend, FriProfile};
 use randprotocol_zkvm::notes::{Note, SpendKey, ViewingKey};
-use randprotocol_zkvm::viewing::{EnvelopeHead, ScanKey, TxKey};
+use randprotocol_zkvm::viewing::{ScanKey, TxKey};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -1238,110 +1238,21 @@ enum ScanPass {
     RebuildTree,
 }
 
-/// Whether [`classify`] could find anything in a leaf whose envelope has this head: a head of
-/// exactly [`EnvelopeHead`]'s size that one of `w`'s keys opens, or a head of any other non-zero
-/// length, which is read in full rather than guessed at. An empty head opens for nobody.
-fn may_be_ours(w: &Wallet, leaf: &ScanLeaf) -> bool {
-    if leaf.head.is_empty() {
-        return false;
-    }
-    match EnvelopeHead::from_bytes(&leaf.head) {
-        Some(head) => head.receiver_key(leaf.cm, &w.scan_key).is_some() || head.sender_key(leaf.cm, &w.scan_key).is_some(),
-        None => true,
-    }
-}
-
-/// The `rand_getCommitments` reads — `(from, limit)` — that fetch the envelopes of `wanted`
-/// (sorted leaf indices) at a fetch width of `chunk` leaves (audit v10, RPC-201). Each read is one
-/// aligned chunk, `from` a multiple of `chunk` and `limit` the whole chunk, so the node learns
-/// which chunk held a leaf of the wallet's, not which leaf (a partial tip chunk narrows that; docs/rpc.md): a read is never one wanted leaf
-/// (for a chunk of at least 2), and the leaves between two wanted ones in a chunk ride in the
-/// same read — the gap merging the scan always did, now inside the chunk. A chunk is read once
-/// however many wanted leaves it holds; a read past the tree's end simply comes back short.
-/// `chunk` is at least 1 here: the caller reads the page in full for `0`.
-pub(crate) fn fetch_chunks(wanted: &[u64], chunk: u64) -> Vec<(u64, usize)> {
-    // (Callers page by `heads_page`, so every wanted leaf of one page lies in chunks wholly inside it.)
-    debug_assert!(chunk >= 1, "a zero chunk reads the page in full");
-    let chunk = chunk.max(1);
-    let mut reads: Vec<(u64, usize)> = Vec::new();
-    for &index in wanted {
-        let start = index - index % chunk;
-        if reads.last().is_none_or(|(from, _)| *from != start) {
-            reads.push((start, chunk as usize));
-        }
-    }
-    reads
-}
-
-/// The heads page [`leaf_page`] reads for a cursor at `from` under a scan chunk of `chunk`
-/// (`chunk >= 1`): `(start, limit)`, `start` the chunk boundary at or below `from` and `limit` the
-/// smallest multiple of `chunk` that is at least [`PAGE`] (audit v10, RPC-201 review). Pages then
-/// begin and end on chunk boundaries, so no chunk straddles two pages — a chunk read during a page
-/// says only "a leaf of this chunk", never "of the part of it this page covers" — and each chunk is
-/// read at most once per pass. Within the 1000-row cap for every legal chunk (≤ 1000).
-pub(crate) fn heads_page(from: u64, chunk: u64) -> (u64, usize) {
-    let chunk = chunk.max(1);
-    let start = from - from % chunk;
-    let limit = (PAGE as u64).div_ceil(chunk) * chunk;
-    (start, limit as usize)
-}
-
-/// One page of leaves from `from`, as [`offer_row`] takes them. Against a node that serves scan
-/// heads, the page is read as heads and only the leaves [`may_be_ours`] — and the ones `rebuilt`
-/// does not already account for — are read again in full, by whole aligned chunks of
-/// [`RpcClient::scan_chunk`] leaves ([`fetch_chunks`]; RPC-201), so the node learns at most
-/// which chunk held one of the wallet's leaves; every other row of the page carries an empty
-/// envelope, which [`classify`] skips exactly as it would have skipped the real one. A scan chunk
-/// of `0`, or an older node, reads the page in full.
-async fn leaf_page(rpc: &RpcClient, w: &Wallet, from: u64, rebuilt: &BTreeMap<Word8, Note>) -> Result<Vec<CommitmentRow>> {
-    let chunk = rpc.scan_chunk();
-    if chunk == 0 {
-        return rpc.commitments(from, PAGE).await;
-    }
-    // RPC-201: the heads page starts on the chunk boundary at or below the cursor and spans whole
-    // chunks (`heads_page`); the leaves under the cursor were offered by the pass before and are
-    // dropped here, unread in full.
-    let (start, limit) = heads_page(from, chunk);
-    let Some(mut leaves) = rpc.scan_leaves(start, limit).await? else {
-        return rpc.commitments(from, PAGE).await;
-    };
-    let served = leaves.len();
-    leaves.retain(|l| l.index >= from);
-    // N4: a non-empty page with nothing at or past the cursor may be the tip — or a node (or a
-    // relay with a smaller row cap) that stopped short of the cursor, which must not end the pass
-    // silently. Ask once more from the cursor itself: empty, it is the tip; otherwise those rows
-    // are the page (unaligned, against such a node only).
-    if served > 0 && leaves.is_empty() {
-        let Some(rest) = rpc.scan_leaves(from, limit - (from - start) as usize).await? else {
-            return rpc.commitments(from, PAGE).await;
-        };
-        leaves = rest;
-        leaves.retain(|l| l.index >= from);
-    }
-    let wanted: Vec<u64> = leaves.iter().filter(|l| !rebuilt.contains_key(&l.cm) && may_be_ours(w, l)).map(|l| l.index).collect();
-    let mut full: BTreeMap<u64, CommitmentRow> = BTreeMap::new();
-    for (start, span) in fetch_chunks(&wanted, chunk) {
-        for row in rpc.commitments(start, span).await? {
-            // Rows of the chunk outside this page are dropped: the page before read them, or the
-            // page after will — the chunk is read whole for the node's sake, not the wallet's.
-            full.insert(row.index, row);
-        }
-    }
-    leaves
-        .into_iter()
-        .map(|l| match full.remove(&l.index) {
-            // The node's two answers for one leaf must agree, or its envelope is not this leaf's.
-            Some(row) if row.cm == l.cm && row.height == l.height => Ok(row),
-            Some(_) => Err(anyhow!("getCommitments and getScanLeaves disagree about leaf {}", l.index)),
-            None if wanted.binary_search(&l.index).is_ok() => Err(anyhow!("getCommitments did not serve leaf {}", l.index)),
-            None => Ok(CommitmentRow {
-                index: l.index,
-                cm: l.cm,
-                envelope: Envelope { kem_ct: Vec::new(), to_receiver: Vec::new(), to_sender: Vec::new(), body: Vec::new() },
-                height: l.height,
-            }),
-        })
-        .collect()
+/// One page of leaves from `from`, envelopes and all, as [`offer_row`] takes them: one
+/// `rand_getCommitments(from, PAGE)` read.
+///
+/// Issue #147: the read is the same for every wallet. Which leaves are this wallet's is decided
+/// here, by trial decryption, after the whole page has arrived — never by what is asked for — so
+/// the request sequence a scan makes depends only on the cursor and the tree's size, and a node
+/// (keyed by the caller's IP) learns nothing about which leaves the wallet owns. The scan-heads
+/// path (v0.8.0–v0.8.2) read `rand_getScanLeaves` and then fetched full envelopes only around the
+/// leaves a key opened — even in aligned chunks (audit v10, RPC-201) that told the node which
+/// chunks held the wallet's notes, and a leaf index plus its height names the transaction. Full
+/// pages cost at most ~2.26× the bytes of the heads path, the cost for a wallet whose notes sit in
+/// no chunk, and less the more chunks held one (measured in
+/// `a_scan_reads_the_same_full_pages_for_every_wallet_and_measures_their_cost`).
+async fn leaf_page(rpc: &RpcClient, from: u64) -> Result<Vec<CommitmentRow>> {
+    rpc.commitments(from, PAGE).await
 }
 
 /// One scan pass: page every commitment this wallet has not seen yet, growing the wallet's own
@@ -1358,7 +1269,7 @@ async fn scan_pass(rpc: &RpcClient, w: &Wallet, store: &mut NoteStore) -> Result
     let mut tip: Option<u64> = None;
 
     loop {
-        let rows = leaf_page(rpc, w, store.scanned_index, &rebuilt).await?;
+        let rows = leaf_page(rpc, store.scanned_index).await?;
         if rows.is_empty() {
             break;
         }
@@ -1387,7 +1298,7 @@ async fn scan_pass(rpc: &RpcClient, w: &Wallet, store: &mut NoteStore) -> Result
     // deposit is in the store from then on.
     let mut from = 0;
     while !rebuilt.is_empty() {
-        let rows = leaf_page(rpc, w, from, &rebuilt).await?;
+        let rows = leaf_page(rpc, from).await?;
         if rows.is_empty() {
             // Every leaf there is has been offered and some rebuilt note still has no leaf: the
             // node rendered a public-note transaction whose commitment its own tree does not hold.
@@ -2936,7 +2847,8 @@ async fn settle(
         // notes spendable, where marking them here would strand them until the store is thrown
         // away and rebuilt.
         rpc.wait_for_transaction(hash, COMMIT_TIMEOUT).await?;
-        scan(rpc, w, store).await?;
+        // Committed: a rescan that fails now does not undo it, and says so (issue #141).
+        scan(rpc, w, store).await.with_context(|| format!("{hash} committed, but the rescan after it failed; `rand balance` rescans"))?;
     } else {
         // Nothing will confirm these for the caller, so they are held back rather than declared
         // spent: `pending` keeps them out of coin selection without the one-way write that
@@ -5414,159 +5326,124 @@ pub(crate) mod tests {
         c
     }
 
-    /// The scan-head path (`rand_getScanLeaves`, bodies fetched only for the leaves a key opens)
-    /// ends with exactly the store the full path (`rand_getCommitments` for every leaf) ends with,
-    /// and reads far fewer full envelopes doing it.
+    /// Issue #147: the scan's requests must not depend on which leaves are the wallet's. Two
+    /// wallets — one that owns leaves all over this chain (received, sent, change, a dummy, an odd
+    /// head, public notes) and one that owns none — scanning the same chain from an empty store
+    /// make exactly the same calls with exactly the same parameters, every method included; and the
+    /// leaves are read only as whole fixed pages, never as heads.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_scan_over_heads_finds_exactly_what_a_full_scan_finds() {
+    async fn two_wallets_make_identical_requests_whatever_they_own() {
         let me = Wallet::from_spend_key(SpendKey([13; 8]));
+        let nobody = Wallet::from_spend_key(SpendKey([99; 8]));
         let mut c = every_kind_of_leaf(&me);
         c.headers_carry_public_notes = true;
-        let leaves = c.leaves.len();
+        c.scan_leaves = true;
+        let leaves = c.leaves.len() as u64;
         let chain = Arc::new(Mutex::new(c));
+        let mut logs = Vec::new();
         let mut stores = Vec::new();
-        let mut served = Vec::new();
-        // The full path; heads at the default chunk (wider than this chain: one read of everything);
-        // heads at a 4-leaf chunk; heads with chunk 0 (every envelope, the legacy privacy).
-        for (heads, chunk) in [(false, crate::DEFAULT_SCAN_CHUNK), (true, crate::DEFAULT_SCAN_CHUNK), (true, 4), (true, 0)] {
+        for w in [&me, &nobody] {
+            chain.lock().unwrap().requests.clear();
+            let rpc = serve(&chain).await;
+            let mut store = NoteStore::default();
+            scan(&rpc, w, &mut store).await.unwrap();
+            assert_eq!(store.scanned_index, leaves);
+            logs.push(chain.lock().unwrap().requests.clone());
+            stores.push(store);
+        }
+        assert_eq!(stores[0].notes.len(), 3 + 2 + 1 + 1, "the owner found its notes");
+        assert!(stores[1].notes.is_empty(), "the other found none");
+        assert_eq!(logs[0], logs[1], "the node sees the same request sequence from both wallets");
+        let reads: Vec<&serde_json::Value> = logs[0].iter().filter(|(m, _)| m == "rand_getCommitments").map(|(_, p)| p).collect();
+        assert!(!reads.is_empty());
+        assert!(reads.iter().all(|p| p[1] == serde_json::json!(PAGE)), "fixed-size pages only: {reads:?}");
+        assert_eq!(reads[0][0], serde_json::json!(0), "from the start of the range");
+        assert!(logs[0].iter().all(|(m, _)| m != "rand_getScanLeaves"), "no heads read, even from a node that serves them");
+    }
+
+    /// The same holds over a long range with sparse ownership; and the byte cost of the fix is measured. Chain 21's envelope (`envelope_bytes` 1860,
+    /// the memo format) on 2 000 leaves, the wallet owning six of them in four of the eight 256-leaf chunks:
+    /// the scan now reads every full envelope, which the heads path (v0.8.0–v0.8.2) traded for a
+    /// heads read plus the full rows of each chunk holding one of the wallet's leaves. Both costs
+    /// are counted from this fake's own replies (the JSON bytes of each `result`) and printed (run
+    /// with `--nocapture`). A full row is ~2.26× a head, which is the whole cost for a wallet whose notes
+    /// sit in no chunk; this wallet's old scan already read half the envelopes, so here it is ~1.07×.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_scan_reads_the_same_full_pages_for_every_wallet_and_measures_their_cost() {
+        use randprotocol_core::notes::EnvelopeFormat;
+        let me = Wallet::from_spend_key(SpendKey([21; 8]));
+        let stranger = Wallet::from_spend_key(SpendKey([22; 8]));
+        let nobody = Wallet::from_spend_key(SpendKey([23; 8]));
+        let seal = |from: &Wallet, to: &Wallet, n: &Note| {
+            randprotocol_zkvm::address::seal_note_as(EnvelopeFormat::Memo, &from.vk, &to.address, n, &TxKey::random(), "").unwrap()
+        };
+        let mut c = ChainState::new();
+        let filler = seal(&stranger, &stranger, &Note::new(stranger.vk.pk(), stranger.vk.pk(), 1, 0, 1));
+        assert_eq!(filler.kem_ct.len() + filler.to_receiver.len() + filler.to_sender.len() + filler.body.len(), 1860, "chain 21's envelope");
+        const LEAVES: u64 = 2000;
+        let owned = [10u64, 11, 700, 701, 1500, 1999];
+        let mut block = Vec::new();
+        for i in 0..LEAVES {
+            block.push(if owned.contains(&i) {
+                let n = Note::new(me.vk.pk(), stranger.vk.pk(), 5 + i, 0, 1);
+                (n.commitment(), seal(&stranger, &me, &n))
+            } else {
+                // Strangers' traffic: one envelope, reused under distinct commitments.
+                (Note::new(stranger.vk.pk(), stranger.vk.pk(), i, 0, 1).commitment(), filler.clone())
+            });
+            if block.len() == 100 {
+                c.commit(Vec::new(), std::mem::take(&mut block));
+            }
+        }
+        c.scan_leaves = true;
+        let chain = Arc::new(Mutex::new(c));
+
+        let mut logs = Vec::new();
+        let mut full_bytes = 0;
+        for w in [&me, &nobody] {
             {
                 let mut c = chain.lock().unwrap();
-                (c.scan_leaves, c.full_rows_served, c.scan_leaf_asks) = (heads, 0, 0);
-                c.commitment_reads.clear();
+                c.requests.clear();
+                c.reply_bytes.clear();
             }
-            // A client of its own each time: the fallback is remembered per client.
-            let rpc = serve(&chain).await.with_scan_chunk(chunk);
+            let rpc = serve(&chain).await;
             let mut store = NoteStore::default();
-            scan(&rpc, &me, &mut store).await.unwrap();
-            assert_eq!(store.scanned_index, leaves as u64);
+            scan(&rpc, w, &mut store).await.unwrap();
+            if logs.is_empty() {
+                assert_eq!(store.notes.len(), owned.len());
+            }
             let c = chain.lock().unwrap();
-            served.push((c.full_rows_served, c.scan_leaf_asks, c.commitment_reads.clone()));
-            stores.push(serde_json::to_value(&store).unwrap());
+            logs.push(c.requests.clone());
+            full_bytes = c.reply_bytes.get("rand_getCommitments").copied().unwrap_or(0);
         }
-        assert!(stores.iter().all(|s| *s == stores[0]), "the same notes, sent rows, cursor and tree every way");
-        let notes = stores[1]["notes"].as_array().unwrap();
-        assert_eq!(notes.len(), 3 + 2 + 1 + 1, "three public notes, two fundings, the change, the odd-head note");
-        assert_eq!(stores[1]["sent"].as_array().unwrap().len(), 1);
-        let (legacy_rows, _, _) = &served[0];
-        assert!(*legacy_rows >= leaves, "the full path reads every envelope");
-        // Wanted in full: the two fundings, sent, change, dummy, owned-by-another, the odd head —
-        // never a stranger's leaf, a garbage envelope, nor a public note (found from its
-        // transaction, not its envelope). RPC-201: what is *read* is the aligned chunk around each,
-        // so the node learns the chunk and not the leaf.
-        let (default_rows, default_asks, default_reads) = &served[1];
-        assert!(*default_asks >= 1);
-        assert_eq!(default_reads, &vec![(0, crate::DEFAULT_SCAN_CHUNK)], "a chain shorter than one chunk: one read of chunk 0, whole");
-        assert_eq!(*default_rows, leaves, "which is every leaf there is");
-        let (small_rows, _, small_reads) = &served[2];
-        assert!(small_reads.iter().all(|(from, limit)| from % 4 == 0 && *limit == 4), "every read is one aligned 4-leaf chunk: {small_reads:?}");
-        assert!(small_reads.windows(2).all(|w| w[0].0 < w[1].0), "each chunk read once, in order");
-        assert!(*small_rows < leaves && *small_rows > 7, "fewer than every envelope, more than the wanted leaves alone: {small_rows} of {leaves}");
-        let (zero_rows, zero_asks, zero_reads) = &served[3];
-        assert_eq!(*zero_asks, 0, "chunk 0 asks for no heads");
-        assert!(*zero_rows >= leaves && zero_reads.iter().all(|(_, limit)| *limit == PAGE as u64), "chunk 0 pages every envelope: {zero_reads:?}");
-    }
+        assert_eq!(logs[0], logs[1], "identical request sequences over 2 000 leaves");
 
-    /// Audit v10, RPC-201: the reads a scan over heads makes for its wanted leaves are whole
-    /// aligned chunks — `from` a multiple of the chunk, `limit` the chunk — one per chunk that
-    /// holds a wanted leaf, in order; never a read of exactly one wanted leaf, however the wanted
-    /// leaves fall. The gap merging stays: wanted leaves of one chunk share its read.
-    #[test]
-    fn envelope_reads_are_aligned_chunks_and_never_a_single_wanted_leaf() {
-        assert_eq!(fetch_chunks(&[], 256), vec![]);
-        assert_eq!(fetch_chunks(&[5], 256), vec![(0, 256)]);
-        assert_eq!(fetch_chunks(&[255, 256], 256), vec![(0, 256), (256, 256)]);
-        assert_eq!(fetch_chunks(&[28, 29, 30, 700, 701], 256), vec![(0, 256), (512, 256)], "a chunk is read once for all its wanted leaves");
-        assert_eq!(fetch_chunks(&[3, 4, 9], 4), vec![(0, 4), (4, 4), (8, 4)]);
-        for chunk in [2u64, 3, 4, 8, 256, 1000] {
-            for wanted in [vec![0u64], vec![1], vec![chunk - 1], vec![chunk], vec![2 * chunk + 1], vec![7, 7 + chunk, 7 + 5 * chunk], (0..40).collect()] {
-                let reads = fetch_chunks(&wanted, chunk);
-                for (from, limit) in &reads {
-                    assert_eq!(from % chunk, 0, "aligned: {reads:?} for {wanted:?} at {chunk}");
-                    assert_eq!(*limit as u64, chunk, "whole: {reads:?}");
-                    assert!(!(wanted.contains(from) && *limit == 1), "never one wanted leaf");
-                }
-                assert!(wanted.iter().all(|w| reads.iter().any(|(from, limit)| *from <= *w && *w < from + *limit as u64)), "every wanted leaf is covered");
-                assert!(reads.windows(2).all(|w| w[0].0 < w[1].0), "once per chunk, in order");
-            }
-        }
-    }
-
-    /// RPC-201 review: heads pages start on the chunk boundary at or below the cursor and span
-    /// whole chunks, at least a [`PAGE`] and within the node's 1000-row cap, so a chunk never
-    /// straddles two pages; a pass that pages from 0 visits each chunk in exactly one page.
-    #[test]
-    fn heads_pages_are_aligned_to_the_chunk_and_no_chunk_straddles_two() {
-        assert_eq!(heads_page(0, 256), (0, 512));
-        assert_eq!(heads_page(512, 256), (512, 512));
-        assert_eq!(heads_page(300, 256), (256, 512), "a mid-chunk cursor pages from its chunk's start");
-        assert_eq!(heads_page(7, 1000), (0, 1000));
-        assert_eq!(heads_page(9, 4), (8, 500));
-        for chunk in [2u64, 3, 4, 7, 256, 333, 500, 501, 1000] {
-            for from in [0u64, 1, chunk - 1, chunk, 5 * chunk + 3, 123_457] {
-                let (start, limit) = heads_page(from, chunk);
-                assert_eq!(start % chunk, 0);
-                assert!(start <= from && from < start + chunk);
-                assert_eq!(limit as u64 % chunk, 0, "whole chunks");
-                assert!((PAGE..=1000).contains(&limit), "{limit} at chunk {chunk}");
-            }
-            // A pass paging from 0 with full pages: each page starts where the last ended, on a boundary.
-            let mut from = 0u64;
-            for _ in 0..5 {
-                let (start, limit) = heads_page(from, chunk);
-                assert_eq!(start, from, "every page after the first starts at the previous end");
-                from = start + limit as u64;
-            }
-        }
-    }
-
-    /// RPC-201 re-review, N4: a node (or relay) whose heads page is capped below the distance
-    /// from the chunk boundary to the cursor answers a page that lies wholly under the cursor.
-    /// That is not the tip: the scan must still reach the end, not stop there silently.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_heads_page_wholly_under_the_cursor_does_not_end_the_scan() {
-        let me = Wallet::from_spend_key(SpendKey([15; 8]));
-        let mut c = every_kind_of_leaf(&me);
-        c.headers_carry_public_notes = true;
-        c.scan_leaves = true;
-        c.scan_leaves_cap = Some(2);
-        let leaves = c.leaves.len() as u64;
-        assert!(leaves > 4, "the cursor passes a chunk boundary + 2");
-        let chain = Arc::new(Mutex::new(c));
-        let rpc = serve(&chain).await.with_scan_chunk(4);
-        let mut store = NoteStore::default();
-        scan(&rpc, &me, &mut store).await.unwrap();
-        assert_eq!(store.scanned_index, leaves, "every leaf, though two of the heads pages lay under the cursor");
-    }
-
-    /// Against a node without `rand_getScanLeaves`, the scan falls back to full pages and asks
-    /// for the method once per client, not once per page.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_node_without_scan_heads_is_asked_once_then_paged_in_full() {
-        let me = Wallet::from_spend_key(SpendKey([14; 8]));
-        let mut c = every_kind_of_leaf(&me);
-        c.headers_carry_public_notes = true;
-        let chain = Arc::new(Mutex::new(c));
-        let rpc = serve(&chain).await;
-        let mut store = NoteStore::default();
-        scan(&rpc, &me, &mut store).await.unwrap();
-        chain.lock().unwrap().fund(&me, 2, 0);
-        scan(&rpc, &me, &mut store).await.unwrap();
-        assert_eq!(chain.lock().unwrap().scan_leaf_asks, 1, "one -32601, remembered by the client");
-        assert_eq!(store.notes.len(), 3 + 2 + 1 + 1 + 1);
-    }
-
-    /// A refusal that is not "no such method" is an error of the scan, not a reason to fall back.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_failing_scan_head_page_fails_the_scan() {
-        let me = Wallet::from_spend_key(SpendKey([15; 8]));
-        let mut c = every_kind_of_leaf(&me);
-        c.scan_leaves = true;
-        c.fail = Some("rand_getScanLeaves");
-        let chain = Arc::new(Mutex::new(c));
-        let rpc = serve(&chain).await;
-        let err = scan(&rpc, &me, &mut NoteStore::default()).await.unwrap_err();
-        assert!(err.to_string().contains("injected"), "{err}");
-        assert_eq!(chain.lock().unwrap().full_rows_served, 0, "no silent fallback to full pages");
+        // What the heads path read for the same range: every head, plus each 256-leaf chunk that
+        // held an owned leaf (chunks 0, 2, 5 and 7 here), in full.
+        let mut c = chain.lock().unwrap();
+        let bytes_of = |r: Reply| match r {
+            Reply::Ok(v) => v.to_string().len(),
+            _ => panic!("the fake refused"),
+        };
+        let heads_bytes = bytes_of(c.answer("rand_getScanLeaves", &serde_json::json!([0, LEAVES])));
+        let mut chunks: Vec<u64> = owned.iter().map(|i| i - i % 256).collect();
+        chunks.dedup();
+        let chunk_bytes: usize = chunks.iter().map(|start| bytes_of(c.answer("rand_getCommitments", &serde_json::json!([start, 256])))).sum();
+        let old = heads_bytes + chunk_bytes;
+        let ratio = full_bytes as f64 / old as f64;
+        let per_leaf_full = full_bytes as f64 / LEAVES as f64;
+        let per_leaf_head = heads_bytes as f64 / LEAVES as f64;
+        eprintln!(
+            "issue #147 scan cost over {LEAVES} leaves (envelope 1860 B): full pages {full_bytes} B ({per_leaf_full:.0} B/leaf); \
+             heads path {old} B = heads {heads_bytes} B ({per_leaf_head:.0} B/leaf) + {} owned chunks {chunk_bytes} B; ratio {ratio:.2}x; \
+             full/heads per leaf {:.2}x",
+            chunks.len(),
+            per_leaf_full / per_leaf_head
+        );
+        assert!(full_bytes >= LEAVES as usize * 3720, "every envelope, hex: {full_bytes}");
+        // The worst case is a wallet whose leaves fall in no chunk: it paid for the heads alone.
+        assert!((2.0..2.6).contains(&(per_leaf_full / per_leaf_head)), "full/heads per leaf");
+        assert!(ratio >= 1.0 && ratio < per_leaf_full / per_leaf_head, "{ratio}");
     }
 
     #[test]
@@ -5853,6 +5730,11 @@ pub(crate) mod tests {
         full_rows_served: usize,
         /// Every `rand_getCommitments` read this node was asked for, `(from, limit)`, in order.
         commitment_reads: Vec<(u64, u64)>,
+        /// Every call this node was asked, `(method, params)`, in order (issue #147: what the
+        /// node can see of a scan).
+        requests: Vec<(String, serde_json::Value)>,
+        /// The JSON bytes of every `result` served, by method.
+        reply_bytes: BTreeMap<String, usize>,
         /// `rand_getLimits`' `envelope_bytes` (task 7): `None` — this fake's default — is a chain
         /// that predates the field, same as a genuinely absent one; `Some(MEMO_ENVELOPE_BYTES)`
         /// is the memo format.
@@ -5944,6 +5826,8 @@ pub(crate) mod tests {
                 scan_leaf_asks: 0,
                 full_rows_served: 0,
                 commitment_reads: Vec::new(),
+                requests: Vec::new(),
+                reply_bytes: BTreeMap::new(),
                 hc_bundle: ZkExecutor::hc_bundle(),
                 hc_auth: None,
                 hc_auth_multisig: None,
@@ -6141,7 +6025,18 @@ pub(crate) mod tests {
     /// The chain behind a real socket, and a client for it.
     async fn serve(chain: &Arc<Mutex<ChainState>>) -> RpcClient {
         let c = chain.clone();
-        RpcClient::new(rpc_fn(move |m, p| c.lock().unwrap().answer(m, p)).await)
+        RpcClient::new(
+            rpc_fn(move |m, p| {
+                let mut c = c.lock().unwrap();
+                c.requests.push((m.to_string(), p.clone()));
+                let reply = c.answer(m, p);
+                if let Reply::Ok(v) = &reply {
+                    *c.reply_bytes.entry(m.to_string()).or_default() += v.to_string().len();
+                }
+                reply
+            })
+            .await,
+        )
     }
 
     /// Private multisig (`msig_private`'s tests): a chain whose `rand_status` names bundle guest v3,
@@ -7734,7 +7629,8 @@ pub(crate) mod tests {
             // The send goes through; the wait's very first call does not.
             c.fail = Some("rand_getTransactionStatus");
         }
-        let rpc = serve(&chain).await;
+        // Issue #141: the failing poll is retried until the wait's deadline; a short one here.
+        let rpc = serve(&chain).await.with_wait_timeout(Some(std::time::Duration::from_millis(500)));
         let mut store = NoteStore::default();
         let kp = Keypair::generate();
 
@@ -7757,8 +7653,10 @@ pub(crate) mod tests {
         .await
         .unwrap_err();
 
-        // It is an `RpcError`, exactly as a refusal is — and it is not a `SubmitRefused`.
-        assert!(e.downcast_ref::<crate::RpcError>().is_some(), "{e}");
+        // Issue #141: the failing poll ends the wait as `ConfirmationUnknown` (its `RpcError`
+        // named inside) — and it is not a `SubmitRefused`.
+        assert!(e.downcast_ref::<crate::ConfirmationUnknown>().is_some(), "{e}");
+        assert!(format!("{e:#}").contains("injected failure"), "the poll's failure is named: {e:#}");
         assert!(e.downcast_ref::<crate::SubmitRefused>().is_none(), "a post-send failure is not a refusal: {e}");
         // The registration did reach the node, so the key is kept.
         assert_eq!(chain.lock().unwrap().sent.len(), 1, "the transaction was submitted");

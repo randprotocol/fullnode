@@ -357,6 +357,16 @@ pub struct RemoteProver {
     fee_announced: std::sync::atomic::AtomicBool,
 }
 
+/// The prover link's HTTP client: 10 s to connect, 60 s a request, through `proxy` or the
+/// process's default proxy.
+fn prover_http(proxy: Option<reqwest::Proxy>) -> Result<reqwest::Client> {
+    crate::http_builder(proxy)
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(60))
+        .build()
+        .context("building the prover's http client")
+}
+
 /// Reads the digest a bundle proof of the guest `hc` publishes, at a FRI profile.
 pub(crate) type PublishedDigest = std::sync::Arc<dyn Fn(FriProfile, &Word8, &[u8]) -> Result<Word8> + Send + Sync>;
 
@@ -368,11 +378,7 @@ fn executor_digest(profile: FriProfile, hc: &Word8, proof: &[u8]) -> Result<Word
 
 impl RemoteProver {
     pub fn new(paired: PairedProver) -> RemoteProver {
-        let http = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(60))
-            .build()
-            .expect("an http client");
+        let http = prover_http(None).expect("an http client");
         let no_verify = std::env::var("RAND_PROVER_NO_VERIFY").is_ok_and(|v| v == "1");
         RemoteProver {
             paired,
@@ -386,6 +392,14 @@ impl RemoteProver {
             max_fee: DEFAULT_MAX_PROVER_FEE,
             fee_announced: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// This prover, reached through the proxy at `url` (`--proxy`, issue #148) — or, for `None`,
+    /// the process's default ([`crate::set_default_proxy`]), which [`RemoteProver::new`] already
+    /// uses.
+    pub fn with_proxy(mut self, url: Option<&str>) -> Result<RemoteProver> {
+        self.http = prover_http(url.map(crate::parse_proxy).transpose()?)?;
+        Ok(self)
     }
 
     /// The cap on a quoted fee (`--max-prover-fee`, base units); 0 refuses any fee.
@@ -1042,6 +1056,18 @@ mod tests {
                 assert!(!r.warned_history(), "and no warning about a witness that is never sent");
             }
         }
+    }
+
+    /// Issue #148: with a proxy the wallet reaches its paired prover only through it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_remote_prover_with_a_proxy_is_reached_through_it() {
+        let (paired, state) = fake(Finish::Done { flip: 0, publish_flip: 0, proof_len: 100 }, true, |_| {}).await;
+        let target = paired.url.trim_start_matches("http://").trim_end_matches('/').to_string();
+        let (proxy, seen) = crate::socks_stub::socks5_stub().await;
+        let r = RemoteProver::new(paired).with_proxy(Some(&proxy)).unwrap();
+        r.info().await.unwrap();
+        assert_eq!(state.lock().unwrap().seen, vec!["prover_info".to_string()]);
+        assert!(seen.lock().unwrap().contains(&target), "{:?} via {target}", seen.lock().unwrap());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

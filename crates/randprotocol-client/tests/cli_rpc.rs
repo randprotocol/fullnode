@@ -388,6 +388,37 @@ fn node_reading() -> Fake {
     }))
 }
 
+/// Issue #148: `--proxy` (and `RAND_PROXY`) sends the RPC through a SOCKS5 proxy — the node is
+/// reached only as the proxy's CONNECT target — and a dead proxy fails the command instead of
+/// falling back to a direct connection.
+#[test]
+fn proxy_routes_the_rpc_through_socks5_and_a_dead_proxy_is_never_bypassed() {
+    let node = node_reading();
+    let dir = tempfile::tempdir().unwrap();
+    let key = dir.path().join("none.json");
+    let target = node.url.trim_start_matches("http://").to_string();
+
+    let (proxy, seen) = socks5_stub();
+    let r = rand(&node.url, &key, &["--proxy", &proxy, "head"]);
+    assert!(r.ok, "{}", r.err);
+    assert_eq!(serde_json::from_str::<Value>(&r.out).unwrap()["height"], 7);
+    assert!(seen.lock().unwrap().contains(&target), "{:?}", seen.lock().unwrap());
+
+    let (proxy, seen) = socks5_stub();
+    let r = rand_env(&node.url, &key, &["head"], &[("RAND_PROXY", &proxy)]);
+    assert!(r.ok, "{}", r.err);
+    assert!(seen.lock().unwrap().contains(&target), "RAND_PROXY too: {:?}", seen.lock().unwrap());
+
+    let calls = node.calls.lock().unwrap().len();
+    let dead = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
+    let r = rand(&node.url, &key, &["--proxy", &format!("socks5h://{dead}"), "head"]);
+    assert!(!r.ok, "a dead proxy fails the command");
+    assert_eq!(node.calls.lock().unwrap().len(), calls, "and the node was never reached directly");
+
+    let r = rand(&node.url, &key, &["--proxy", "socks4://127.0.0.1:9050", "head"]);
+    assert!(!r.ok && r.err.contains("--proxy"), "{}", r.err);
+}
+
 #[test]
 fn head_status_peers_validators_print_the_reply_as_pretty_json() {
     let node = node_reading();
@@ -630,6 +661,36 @@ fn faucet_mints_to_the_wallet_address_and_waits_for_the_commit() {
         "{}",
         bad.err
     );
+}
+
+/// Issue #141: the node accepted the mint and every status poll then fails. `rand` must not
+/// exit 1 (a failure the caller would retry): it exits 4, "submitted, confirmation unknown", with
+/// the hash and a `rand tx` hint, after printing the hash before it waited.
+#[test]
+fn a_faucet_mint_whose_status_polls_fail_exits_4_with_the_hash() {
+    let hash = "aa".repeat(32);
+    let node = fake(Box::new(|m, _| match m {
+        "rand_mint" => Ok(json!("aa".repeat(32))),
+        "rand_getTransactionStatus" => Err((-32603, "node loop closed".into())),
+        _ => Err((-32601, "method not found".into())),
+    }));
+    let dir = tempfile::tempdir().unwrap();
+    let key = keygen(&dir);
+    let r = rand(&node.url, &key, &["--wait-timeout", "2", "faucet", "--amount", "1"]);
+    assert_eq!(r.code, Some(4), "stdout {}\nstderr {}", r.out, r.err);
+    assert!(r.out.contains(&format!("submitted mint {hash}")), "{}", r.out);
+    assert!(r.err.contains("confirmation unknown") && r.err.contains(&format!("rand tx {hash}")), "{}", r.err);
+    assert!(r.err.contains("node loop closed"), "the last poll's failure is named: {}", r.err);
+    let polls = node.methods().iter().filter(|m| *m == "rand_getTransactionStatus").count();
+    assert!(polls >= 2, "the failed poll was retried, not fatal: {polls}");
+
+    // A rejection is still exit 1.
+    let rejecting = fake(Box::new(|m, _| match m {
+        "rand_mint" => Ok(json!("aa".repeat(32))),
+        "rand_getTransactionStatus" => Ok(json!([{ "status": "rejected", "reason": "no" }])),
+        _ => Err((-32601, "method not found".into())),
+    }));
+    assert_eq!(rand(&rejecting.url, &key, &["faucet", "--amount", "1"]).code, Some(1));
 }
 
 #[test]

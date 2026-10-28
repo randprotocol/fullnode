@@ -358,6 +358,15 @@ fn token_create_refuses_every_bad_flag_combination_before_the_network() {
             "--program is the token's whole authority",
         ),
         (vec!["--program", "nothex"], "--program: invalid program id"),
+        // Issue #142: display units at `--decimals` (2 here), like `token mint --amount`.
+        (
+            vec!["--authority-key-out", out_s, "--initial", "1.234", "--to", &to],
+            "at most 2 decimals",
+        ),
+        (
+            vec!["--fixed-supply", "1", "--fixed-supply-units", "100", "--to", &to],
+            "cannot be used with",
+        ),
     ];
     for (extra, want) in cases {
         let mut args = vec![

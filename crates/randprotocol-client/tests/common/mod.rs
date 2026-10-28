@@ -91,12 +91,20 @@ impl Fake {
 
 pub struct Run {
     pub ok: bool,
+    /// The exit code (`None` if a signal ended it).
+    pub code: Option<i32>,
     pub out: String,
     pub err: String,
 }
 
 pub fn rand(rpc: &str, key: &std::path::Path, args: &[&str]) -> Run {
+    rand_env(rpc, key, args, &[])
+}
+
+/// [`rand`] with extra environment variables.
+pub fn rand_env(rpc: &str, key: &std::path::Path, args: &[&str], env: &[(&str, &str)]) -> Run {
     let o = Command::new(env!("CARGO_BIN_EXE_rand"))
+        .envs(env.iter().copied())
         .arg("--key")
         .arg(key)
         .args(["--rpc", rpc])
@@ -106,6 +114,7 @@ pub fn rand(rpc: &str, key: &std::path::Path, args: &[&str]) -> Run {
         .expect("run rand");
     Run {
         ok: o.status.success(),
+        code: o.status.code(),
         out: String::from_utf8_lossy(&o.stdout).into(),
         err: String::from_utf8_lossy(&o.stderr).into(),
     }
@@ -122,4 +131,57 @@ pub fn keygen(dir: &tempfile::TempDir) -> std::path::PathBuf {
 
 pub fn address_of(key: &std::path::Path) -> String {
     rand(DEAD, key, &["address"]).out.trim().to_string()
+}
+
+/// A minimal SOCKS5 proxy (no auth, CONNECT only) for the `--proxy` tests (issue #148): returns
+/// its `socks5h://` URL and every `host:port` it was asked to connect to.
+pub fn socks5_stub() -> (String, Arc<Mutex<Vec<String>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("socks5h://{}", listener.local_addr().unwrap());
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let log = seen.clone();
+    std::thread::spawn(move || {
+        for sock in listener.incoming() {
+            let Ok(mut sock) = sock else { return };
+            let log = log.clone();
+            std::thread::spawn(move || -> Option<()> {
+                let mut hello = [0u8; 2];
+                sock.read_exact(&mut hello).ok()?;
+                let mut methods = vec![0u8; hello[1] as usize];
+                sock.read_exact(&mut methods).ok()?;
+                sock.write_all(&[5, 0]).ok()?;
+                let mut req = [0u8; 4];
+                sock.read_exact(&mut req).ok()?;
+                let host = match req[3] {
+                    1 => {
+                        let mut ip = [0u8; 4];
+                        sock.read_exact(&mut ip).ok()?;
+                        std::net::Ipv4Addr::from(ip).to_string()
+                    }
+                    3 => {
+                        let mut len = [0u8; 1];
+                        sock.read_exact(&mut len).ok()?;
+                        let mut name = vec![0u8; len[0] as usize];
+                        sock.read_exact(&mut name).ok()?;
+                        String::from_utf8(name).ok()?
+                    }
+                    _ => return None,
+                };
+                let mut port = [0u8; 2];
+                sock.read_exact(&mut port).ok()?;
+                let target = format!("{host}:{}", u16::from_be_bytes(port));
+                log.lock().unwrap().push(target.clone());
+                let upstream = std::net::TcpStream::connect(&target).ok()?;
+                sock.write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0]).ok()?;
+                let (mut a, mut b) = (sock.try_clone().ok()?, upstream.try_clone().ok()?);
+                let (mut sock, mut upstream) = (sock, upstream);
+                let t = std::thread::spawn(move || std::io::copy(&mut a, &mut b));
+                let _ = std::io::copy(&mut upstream, &mut sock);
+                let _ = sock.shutdown(std::net::Shutdown::Both);
+                let _ = t.join();
+                Some(())
+            });
+        }
+    });
+    (url, seen)
 }

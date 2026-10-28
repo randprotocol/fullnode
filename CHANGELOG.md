@@ -12,6 +12,10 @@ stopped at v0.4 until 2026-09-30, when the entries v0.5 to v0.6.7 were written f
 
 ## Unreleased
 
+v0.8.3 (not yet tagged):
+
+Node:
+
 - **Dandelion++ stem relay for transactions** (issue #145): a transaction submitted over RPC is
   sent to one stem successor over the new request-response protocol `/rand/<chain>/stem/1`, relays
   pass it on and fluff it (publish on gossip) with probability q, and an embargo timer on every
@@ -31,6 +35,29 @@ stopped at v0.4 until 2026-09-30, when the entries v0.5 to v0.6.7 were written f
 - **No ANSI colour in journald** (issue #143): `rand-node` and `rand-prover` colour their log
   only at a terminal and never under `NO_COLOR`; `deploy/update-droplet.sh` drops "chain 14"
   from an old unit's `Description=`.
+
+Wallet (`rand`; client-only, no node or chain change):
+
+- **`rand` no longer exits 1 after a successful submit** (#141): `submitted <kind> <hash>` is
+  printed on stderr as soon as the node accepts a transaction; status polls that time out or are
+  reset are retried with backoff until the wait's deadline; a wait that never sees the commit exits
+  **4** ("submitted, confirmation unknown", with a `rand tx <hash>` hint). Exit 1 is a real
+  failure only. New global `--wait-timeout <SECS>` / `RAND_WAIT_TIMEOUT`. Exit codes in
+  `docs/cli.md`.
+- **Behaviour change: `rand token create --initial` and `--fixed-supply` read display units** at
+  `--decimals` (#142), as `token mint --amount`, `token burn` and `send --asset` always have:
+  `--decimals 6 --initial 1000000` is now a million tokens, not one. The base-unit form is
+  `--initial-units` / `--fixed-supply-units`. Scripts that passed base units must switch to the
+  `-units` flags. `token create` echoes the mint as `minted <display> <SYMBOL> (<N> units)`.
+- **Privacy: the scan no longer reveals which leaves are the wallet's** (#147): `rand` pages
+  `rand_getCommitments` over the whole range in fixed 500-row pages and decides ownership locally,
+  so its requests do not depend on what it owns; it no longer reads `rand_getScanLeaves`. Cost: at
+  most ~2.26× the bytes of the v0.8.0–v0.8.2 heads scan (3 885 vs 1 720 bytes of JSON a leaf on
+  chain 21's envelope). `--scan-chunk` is accepted and ignored, with a warning.
+- **`--proxy <URL>` / `RAND_PROXY`** (#148): every request to the node and to a paired prover goes
+  through a SOCKS5 (`socks5h://` for Tor, `socks5://`) or HTTP(S) CONNECT proxy; a dead proxy fails
+  the command, never a direct connection. reqwest's `socks` feature is enabled in the client (no
+  new crates: reqwest 0.12.28 proxies through hyper-util). Tor recipe in `docs/cli.md`.
 
 ## v0.8.2 — 2026-10-27 (chain 21, node-only; the genesis-gated rules wait for the next cut)
 
