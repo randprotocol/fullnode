@@ -2036,6 +2036,22 @@ What changed for clients, in one place. Newest first.
 - `rand_mint` on such a validator refuses before building anything, naming the minter set
   (`this node's key … is not a faucet minter on this chain; the minters are …`).
 
+### v0.8.3 — stem relay and the admission budget (node-only; issues #145, #157)
+
+- `rand_sendTransaction`: the hash means the transaction verified and was stemmed or broadcast
+  ("What a hash means"). A stemmed transaction reads `unknown` in `rand_getTransactionStatus` and
+  is left out of `rand_getMempoolInfo` on every node until one publishes it.
+- `rand_sendTransaction` (and any POST) past the admission budget: `-32005`, HTTP 503,
+  `Retry-After: 1`, with `wanted` / `available` / `limit` in `data`; nothing was queued, retry.
+- `rand_status`: `admission_bytes`, `admission_budget_bytes`.
+
+### v0.8.3 — the wallet's scan reads every envelope again (client-only; issue #147)
+
+`rand` pages `rand_getCommitments` over the whole scanned range in fixed 500-row pages and no
+longer calls `rand_getScanLeaves`, so its requests are the same whichever leaves it owns.
+`--scan-chunk` is accepted and ignored, with a warning. No RPC method changes; the cost is in the
+scan-heads section above.
+
 ### v0.8.2 — perps fields in `rand_getPerps` and `rand_getSupply` (node-only on chain 21; the rules they report are genesis-gated)
 
 - `rand_getPerps`: `bound_payouts`, `initial_collateral`, `collateral_in`, `collateral_out`,
@@ -2044,13 +2060,6 @@ What changed for clients, in one place. Newest first.
   counters; a node before v0.8.2 omits them (read absence as off).
 - `rand_getSupply`: `perps_collateral_in`, `perps_collateral_out`, `perps_collateral_held`
   (`"0"` without a `perps` section).
-
-### v0.8.3 — the wallet's scan reads every envelope again (client-only; issue #147)
-
-`rand` pages `rand_getCommitments` over the whole scanned range in fixed 500-row pages and no
-longer calls `rand_getScanLeaves`, so its requests are the same whichever leaves it owns.
-`--scan-chunk` is accepted and ignored, with a warning. No RPC method changes; the cost is in the
-scan-heads section above.
 
 ### v0.8.2 — the wallet's scan reads envelopes by aligned chunk (client-only; RPC-201)
 

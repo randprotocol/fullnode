@@ -44,6 +44,18 @@ Node:
   to gossip), now documented; a stemmed transaction is charged on the verify queue like a gossiped
   one and dropped, its peer unpenalised, past the budget. The unit templates set
   `MemoryHigh=85%`; 4 GB is the validator minimum.
+- **Faster proving** (issue #151): the hiding PCS's random columns and the hiding MMCS's Merkle
+  salts are ChaCha20 counter-mode streams filled in parallel (`vendor/p3-merkle-tree`
+  `counter_rng.rs`), sampled exactly as before; verifier-key label streams keep the serial draw,
+  so no verifier key moves and the wire format and verifier are unchanged. `ProverData` is cached
+  per `(profile, tier, table heights)` in a process-wide LRU (4 shapes, tiers ≤ 16). A tier-14
+  bundle proof on an M4 Max: 19.5 s → 11.3 s (10.1 s warm); an auth proof 1.4 s → 0.9 s.
+- **One decode per proof per admission** (issue #152): the canonical decode is memoised on the
+  exact bytes across the header checks and both verifies, and `rand_sendTransaction` decodes its
+  hex body with `faster-hex` (18 ms → 1.2 ms for a bundle); an admission is ~63 ms, was ~90 ms.
+- **`faucet` means this node can mint** (issue #153): `rand_status.faucet` and
+  `rand_getEmission.faucet` are `true` only on a validator whose key is a faucet minter, and
+  `rand_mint` on any other validator refuses up front, naming the minters.
 
 Wallet (`rand`; client-only, no node or chain change):
 
