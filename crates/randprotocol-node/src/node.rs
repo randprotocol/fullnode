@@ -2,7 +2,7 @@
 //! network handle; turns consensus `Action`s into I/O and network events into
 //! consensus input.
 
-use crate::admission::{self, GossipOutcome, Verdict, VerifySource, VerifyLimits};
+use crate::admission::{self, AdmissionBudget, AdmissionCharge, GossipOutcome, Verdict, VerifySource, VerifyLimits};
 use crate::compact;
 use crate::dandelion::{Dandelion, DandelionConfig, DandelionStats, Decision, Edge, FluffReason, LoopAction};
 use crate::mempool::{Mempool, MempoolError};
@@ -1391,11 +1391,14 @@ struct Node {
     /// Verifications on blocking workers right now, capped at `verify_limits.in_flight`.
     verify_in_flight: usize,
     /// Transactions waiting for one of those slots, capped at `verify_limits.queue` by
-    /// [`GossipOutcome::for_transaction`].
-    verify_queue: VecDeque<(Transaction, VerifySource)>,
+    /// [`GossipOutcome::for_transaction`], each with its bytes charged against `admission`.
+    verify_queue: VecDeque<(Transaction, VerifySource, AdmissionCharge)>,
     /// The verification concurrency and queue bounds, sized to the host once at startup
     /// (spec 2026-10-05 §6; `--verify-workers` overrides).
     verify_limits: VerifyLimits,
+    /// Issue #157: the byte budget the verify queue shares with the RPC's request bodies
+    /// (`RpcState::admission`, the same semaphore).
+    admission: AdmissionBudget,
     /// The sender every verification task answers on; its receiver is an arm of the loop's
     /// `select!`.
     verdicts_tx: mpsc::Sender<Verdict>,
@@ -2511,6 +2514,11 @@ pub struct RpcOptions {
     /// A bearer token the viewing-key methods require on the operator's listener
     /// (`--rpc-viewing-token-file`). `None` keeps the loopback rule.
     pub viewing_token: Option<Arc<str>>,
+    /// Issue #157: the admission byte budget in bytes (`--admission-budget-mb`), shared by the
+    /// RPC's request bodies and the verify queue (gossip and RPC); `None` sizes it to the host
+    /// ([`AdmissionBudget::default_for`]). Here rather than in [`NodeConfig`] so the many literal
+    /// `NodeConfig`s stay untouched.
+    pub admission_budget: Option<usize>,
 }
 
 /// What [`start_with`] adds to the network beyond [`NodeConfig`] (audit v6, NET-1): its own
@@ -2725,7 +2733,27 @@ pub async fn start_with(cfg: NodeConfig, rpc_options: RpcOptions, net_options: N
         tracing::warn!("this chain's genesis carries its own gas section; --gas-price/--byte-price are ignored");
     }
     let rpc_limits = rpc::ChainLimits::of(&gs.ledger).with_gas_policy(cfg.gas_policy);
+    // Issue #157: one byte budget over admission memory — the RPC's request bodies and the verify
+    // queue — sized from the host's RAM unless `--admission-budget-mb` says otherwise, and never
+    // under one largest submission.
+    let admission = {
+        let floor = AdmissionBudget::floor_for(rpc_limits.rpc_max_body_bytes(), rpc_limits.max_block_bytes);
+        let bytes = match rpc_options.admission_budget {
+            Some(b) if b < floor => anyhow::bail!(
+                "--admission-budget-mb {} is under one largest transaction on this chain ({} MiB: the {}-byte request-body cap plus the {}-byte block cap)",
+                b >> 20,
+                floor.div_ceil(1 << 20),
+                rpc_limits.rpc_max_body_bytes(),
+                rpc_limits.max_block_bytes
+            ),
+            Some(b) => b,
+            None => AdmissionBudget::default_for(randprotocol_prover::memory::total_bytes(), floor),
+        };
+        AdmissionBudget::new(bytes)
+    };
+    tracing::info!("admission budget: {} MiB (request bodies and the verify queue)", admission.limit() >> 20);
     let rpc_state = RpcState {
+            admission: admission.clone(),
             limiter: Arc::new(crate::rpc::RpcLimiter::default()),
             viewing_open: cfg.viewing_open,
             public: false,
@@ -2957,6 +2985,7 @@ pub async fn start_with(cfg: NodeConfig, rpc_options: RpcOptions, net_options: N
         snapshot: None,
         verify_in_flight: 0,
         verify_limits,
+        admission,
         verify_queue: VecDeque::new(),
         verdicts_tx,
         applied_tx,
@@ -3184,6 +3213,8 @@ impl Node {
         // questions for an operator.
         s.refused_cache = self.refused.len();
         s.verify_queue = self.verify_queue.len();
+        s.admission_bytes = self.admission.in_use();
+        s.admission_budget_bytes = self.admission.limit();
         // Read without touching the registry's lock: this runs on the node loop every pass, and a
         // scan holds its own key's lock for as long as it takes (audit v3, VK-1).
         s.viewing_keys = self.viewing_count.load(std::sync::atomic::Ordering::Relaxed);
@@ -3211,7 +3242,7 @@ impl Node {
     /// goes straight back to the `select!`. The verdict returns on its own arm.
     fn pump_verify(&mut self) {
         while self.verify_in_flight < self.verify_limits.in_flight {
-            let Some((tx, source)) = self.verify_queue.pop_front() else { break };
+            let Some((tx, source, charge)) = self.verify_queue.pop_front() else { break };
             let ledger = self.snapshot();
             let storage = self.storage.clone();
             let profile = core_profile(&self.gs.fri_profile);
@@ -3236,7 +3267,7 @@ impl Node {
                 };
                 // The loop is the only receiver and outlives every task it spawned, so a send
                 // failure means the node is already shutting down.
-                let _ = out.blocking_send(Verdict { tx, result, source, proof_key, busy });
+                let _ = out.blocking_send(Verdict { tx, result, source, proof_key, busy, charge });
             });
         }
     }
@@ -3524,11 +3555,17 @@ impl Node {
             let a = admission::acceptance_for_pool(&e, hash, &mut self.refused);
             self.note_refusal(hash);
             self.report(id, GossipOutcome::Report(a)).await;
-        } else {
+        } else if let Ok(charge) = self.admission.try_charge(admission::charge_of(&tx)) {
             self.mempool.state_proof_queued(&tx, self.hs.tip_ledger(), self.executor.as_ref());
             self.mempool.verify_queued(&tx);
-            self.verify_queue.push_back((tx, VerifySource::Gossip(id)));
+            self.verify_queue.push_back((tx, VerifySource::Gossip(id), charge));
             self.pump_verify();
+        } else {
+            // Issue #157: the admission budget is spent. Shed like a full queue — `Ignore`, so the
+            // forwarder is not penalised and a later copy is judged afresh — rather than queueing
+            // bytes this host may not have. A park waiting for it is still filled below.
+            tracing::debug!(%hash, in_use = self.admission.in_use(), "admission budget full; gossiped transaction shed");
+            self.report(id, GossipOutcome::Report(admission::Acceptance::Ignore)).await;
         }
         match for_park {
             Some(tx) => self.fill_parks(tx).await,
@@ -3634,9 +3671,18 @@ impl Node {
             let _ = reply.send(Err(e));
             return;
         }
+        // Issue #157: the decoded transaction's bytes, beside the request body the RPC already
+        // charged. Refused now (`-32005`, retry) rather than queued past the budget.
+        let charge = match self.admission.try_charge(admission::charge_of(&tx)) {
+            Ok(c) => c,
+            Err(busy) => {
+                let _ = reply.send(Err(MempoolError::AdmissionBusy(busy)));
+                return;
+            }
+        };
         self.mempool.state_proof_queued(&tx, self.hs.tip_ledger(), self.executor.as_ref());
         self.mempool.verify_queued(&tx);
-        self.verify_queue.push_back((tx, VerifySource::Rpc(reply)));
+        self.verify_queue.push_back((tx, VerifySource::Rpc(reply), charge));
         self.pump_verify();
     }
 
@@ -7832,6 +7878,7 @@ mod tests {
             snapshot: None,
             verify_in_flight: 0,
             verify_limits: VerifyLimits::for_cores(1),
+            admission: AdmissionBudget::new(AdmissionBudget::DEFAULT_MAX),
             verify_queue: VecDeque::new(),
             verdicts_tx,
             applied_tx,
@@ -7915,7 +7962,7 @@ mod tests {
         assert!(matches!(refused, randprotocol_core::TxError::Perps(PerpError::ProofRefused(_))), "{refused:?}");
         let key = admission::state_proof_key(&junk, &tip, &StubExecutor).expect("a state proof over a closed window");
         let (first, _) = oneshot::channel();
-        node.on_verdict(Verdict { tx: junk.clone(), result: Err(refused.clone()), source: VerifySource::Rpc(first), proof_key: Some(key), busy: false })
+        node.on_verdict(Verdict { tx: junk.clone(), result: Err(refused.clone()), source: VerifySource::Rpc(first), proof_key: Some(key), busy: false, charge: AdmissionCharge::none() })
             .await
             .unwrap();
 
@@ -8052,7 +8099,7 @@ mod tests {
         // The busy verdict: the RPC caller hears `StateProofBusy`; nothing is cached.
         let (reply, answer) = oneshot::channel();
         node.verify_in_flight = 1;
-        node.on_verdict(Verdict { tx: cold.clone(), result: Ok(()), source: VerifySource::Rpc(reply), proof_key: None, busy: true }).await.unwrap();
+        node.on_verdict(Verdict { tx: cold.clone(), result: Ok(()), source: VerifySource::Rpc(reply), proof_key: None, busy: true, charge: AdmissionCharge::none() }).await.unwrap();
         let busy = answer.await.unwrap().unwrap_err();
         assert_eq!(busy, MempoolError::StateProofBusy);
         assert!(busy.is_retryable());
@@ -9211,6 +9258,48 @@ mod tests {
         node.on_gossiped_tx(junk.clone(), gossip_id()).await.unwrap();
         assert!(node.recent_txs.get(&junk.hash()).is_none(), "bytes already refused are not cached");
         assert_eq!(reports(&drain(&mut seen).await).len(), 1, "the refused one reported now, the queued one on its verdict");
+    }
+
+    /// Issue #157: the verify queue holds a transaction only with its bytes charged against the
+    /// admission budget. Past the budget a gossiped transaction is shed `Ignore` (never `Reject`)
+    /// and an RPC submission is answered `AdmissionBusy` at once; the charge comes back when the
+    /// verdict has been handled, and the next transaction is queued. No worker runs (no verify
+    /// slots), so nothing here depends on timing.
+    #[tokio::test]
+    async fn the_verify_queue_is_bounded_by_the_admission_budget() {
+        let (_d, storage, gs, hs) = replica_past_a_boundary();
+        let (mut node, mut seen) = bare_node(storage, gs, hs);
+        let ledger = node.hs.tip_ledger().clone();
+        let (first, second, third) = (next_tx(&ledger, 1), next_tx(&ledger, 2), next_tx(&ledger, 3));
+        node.admission = AdmissionBudget::new(admission::charge_of(&first));
+        node.verify_limits = VerifyLimits { in_flight: 0, queue: 64 };
+
+        node.on_gossiped_tx(first.clone(), gossip_id()).await.unwrap();
+        assert_eq!(node.verify_queue.len(), 1, "the first fits the budget exactly");
+        assert_eq!(node.admission.in_use(), node.admission.limit());
+
+        node.on_gossiped_tx(second.clone(), gossip_id()).await.unwrap();
+        assert_eq!(node.verify_queue.len(), 1, "the second is not queued");
+        assert_eq!(reports(&drain(&mut seen).await), vec![libp2p::gossipsub::MessageAcceptance::Ignore], "shed, its forwarder not penalised");
+        assert!(node.refused.get(&second.hash()).is_none(), "and nothing cached against it");
+
+        let (reply, rx) = oneshot::channel();
+        node.submit_tx(third.clone(), reply).await;
+        let refused = rx.await.unwrap().unwrap_err();
+        assert!(matches!(refused, MempoolError::AdmissionBusy(_)) && refused.is_retryable(), "{refused}");
+        assert_eq!(node.verify_queue.len(), 1);
+
+        // The first one's verdict: handled, then its charge is back.
+        let (tx, source, charge) = node.verify_queue.pop_front().unwrap();
+        node.on_verdict(Verdict { tx, result: Ok(()), source, proof_key: None, busy: false, charge }).await.unwrap();
+        assert!(node.mempool.contains(&first.hash()), "pooled on its verdict");
+        assert_eq!(node.admission.in_use(), 0, "released once the verdict is handled");
+
+        // The budget has room again: the RPC submission now queues (its size fits the budget).
+        let room = node.admission.limit() >= admission::charge_of(&third);
+        let (reply, _rx) = oneshot::channel();
+        node.submit_tx(third.clone(), reply).await;
+        assert_eq!(node.verify_queue.len(), usize::from(room));
     }
 
     /// A connected forwarder whose transaction allowance is spent, under a limiter that does not

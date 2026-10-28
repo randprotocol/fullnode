@@ -81,7 +81,13 @@ Sources: `deploy/nodes.env`, `deploy/README.md`.
 
 Rules that follow from these numbers:
 
-- **2 GB of RAM runs a validator** on this chain today. The fleet's `s-1vcpu-2gb` droplets do it.
+- **4 GB of RAM is the validator minimum** (issue #157). A 2 GB droplet runs a validator at rest
+  (~1.4 GB resident), but the 2026-10-27 overnight run OOM-killed the 2 GB validators 24 times in
+  8 h, each after a burst of eight ~2.9 MB transactions; the one 4 GB node in a burst survived
+  it. v0.8.3 bounds admission memory (`--admission-budget-mb`, 1/16 of RAM by default, ~117 MiB
+  on a 2 GB host), and the unit templates (`deploy/vps-setup.sh`, `deploy/cutover-droplet-rand.sh`)
+  set `MemoryHigh=85%` so the kernel reclaims and throttles before it kills. A 2 GB host that has
+  to stay on needs both, plus swap (the fleet's have 1 GB).
 - **Disk, not RAM, is the limit.** Keep at least 20 GB free for builds (`docs/block-space.md` §5)
   and delete a retired chain's data dir after a cut-over (`deploy/retire-chain-dirs.sh`). A
   validator runs `--prune-history 24h`; a node refuses to start under 1 GB free and

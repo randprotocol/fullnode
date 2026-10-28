@@ -868,6 +868,13 @@ enum Cmd {
         /// Proof-verification workers (default: the cores minus two, at least four — spec 2026-10-05 §6).
         #[arg(long, value_name = "N")]
         verify_workers: Option<usize>,
+        /// Admission memory budget in MiB (issue #157): one byte budget over RPC request bodies
+        /// and transactions waiting for verification, gossiped or submitted. Past it,
+        /// `rand_sendTransaction` answers -32005 (busy, retry) and gossiped transactions are shed
+        /// unpenalised. Default: 1/16 of the host's RAM within 64–256 MiB, and never under one
+        /// largest transaction (body cap plus block cap); a value under that is refused.
+        #[arg(long, value_name = "MIB", value_parser = clap::value_parser!(u64).range(1..))]
+        admission_budget_mb: Option<u64>,
         /// Apply incoming proposals on the consensus loop, as before v0.8.0, instead of on a
         /// blocking worker (spec 2026-10-11 off-loop apply §4.5): the kill switch. The by-hash
         /// fetch answer binding is a separate fix and stays on.
@@ -3048,6 +3055,7 @@ async fn main() -> Result<()> {
             prover_cpu,
             prover_threads,
             verify_workers,
+            admission_budget_mb,
             apply_proposals_inline,
             prover_skip_memory_check,
             prover_allow_origin,
@@ -3098,7 +3106,10 @@ async fn main() -> Result<()> {
                     Some(std::sync::Arc::<str>::from(token))
                 }
             };
-            let rpc_options = node::RpcOptions { public_addr: public_rpc, viewing_token };
+            let admission_budget = admission_budget_mb
+                .map(|mb| usize::try_from(mb).ok().and_then(|mb| mb.checked_mul(1 << 20)).ok_or_else(|| anyhow::anyhow!("--admission-budget-mb {mb} is too large")))
+                .transpose()?;
+            let rpc_options = node::RpcOptions { public_addr: public_rpc, viewing_token, admission_budget };
             let handle = node::start_with(NodeConfig {
                 viewing_open: rpc_viewing_open,
                 datadir,

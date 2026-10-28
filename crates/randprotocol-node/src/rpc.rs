@@ -262,6 +262,12 @@ pub struct NodeStatus {
     /// Normally 0: a queue that sits near the cap means this node is shedding gossiped
     /// transactions, and it is unrelated to the sync counters above.
     pub verify_queue: usize,
+    /// Issue #157: bytes charged against the admission budget right now — request bodies being
+    /// served plus transactions waiting for or under verification — and the budget itself
+    /// (`--admission-budget-mb`). Near the budget, `rand_sendTransaction` answers `-32005` and
+    /// gossiped transactions are shed with `Ignore`.
+    pub admission_bytes: usize,
+    pub admission_budget_bytes: usize,
     pub mempool_size: usize,
     /// Viewing keys this node holds for node-side scanning (`rand_importViewingKey`), against
     /// `viewing::MAX_VIEWING_KEYS`. In memory only, so it reads zero after every restart. Nonzero
@@ -650,6 +656,9 @@ pub struct RpcState {
     /// with it, being on loopback is no longer enough — any process on the host can be on
     /// loopback — and a caller anywhere that presents it is served.
     pub viewing_token: Option<Arc<str>>,
+    /// Issue #157: the node's admission byte budget, shared by both listeners and the verify
+    /// queue. Every POST body is charged against it before it is read ([`charge_body`]).
+    pub admission: crate::admission::AdmissionBudget,
 }
 
 impl RpcState {
@@ -746,6 +755,10 @@ fn id_member<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Value>, D:
     Value::deserialize(d).map(Some)
 }
 
+/// JSON-RPC `-32005`, "busy, retry" (issue #157): the code the sale proxy already used for "slow
+/// down", which the wallet retries with back-off (`randprotocol_client::is_rate_limited`).
+pub const BUSY_CODE: i64 = -32005;
+
 #[derive(Debug)]
 struct RpcError {
     code: i64,
@@ -770,6 +783,16 @@ impl RpcError {
     }
     fn internal(m: impl std::fmt::Display) -> RpcError {
         RpcError { code: -32603, message: m.to_string(), data: None }
+    }
+    /// Code `-32005`: busy, retry (issue #157) — the admission byte budget cannot take this
+    /// request now. Nothing was queued; the same request may succeed in a moment. `data` carries
+    /// the numbers.
+    fn busy(b: crate::admission::AdmissionBusy) -> RpcError {
+        RpcError {
+            code: BUSY_CODE,
+            message: b.to_string(),
+            data: Some(json!({ "wanted": b.wanted, "available": b.available, "limit": b.limit })),
+        }
     }
     /// Code `-32010`: the height is below this node's retention floor (history pruning spec §4).
     fn pruned(h: u64, floor: u64) -> RpcError {
@@ -1125,6 +1148,8 @@ pub async fn serve(addr: SocketAddr, state: RpcState) -> anyhow::Result<(SocketA
         // upgrade is a GET with no body, so the layer costs it nothing; frames are bounded by
         // `ws::WS_MAX_FRAME_BYTES` instead.
         .layer(axum::extract::DefaultBodyLimit::max(max_body_bytes))
+        // Issue #157: every POST body charged against the admission budget before it is read.
+        .layer(axum::middleware::from_fn_with_state(state.clone(), charge_body))
         .with_state(state);
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let bound = listener.local_addr()?;
@@ -1137,6 +1162,59 @@ pub async fn serve(addr: SocketAddr, state: RpcState) -> anyhow::Result<(SocketA
         }
     });
     Ok((bound, task))
+}
+
+/// Issue #157: charge a POST's body against the admission budget before axum reads it, and hold
+/// the charge until the response is built — for `rand_sendTransaction`, until the verdict, so a
+/// burst of large submissions is bounded while it waits rather than buffered without limit. The
+/// declared `Content-Length` is what is charged (capped at the body limit, which refuses anything
+/// longer); a body without one is charged the whole limit. A charge that does not fit is answered
+/// at once with `-32005` and HTTP 503 + `Retry-After: 1`. A GET (the WebSocket upgrade) has no
+/// body and is not charged.
+async fn charge_body(
+    State(st): State<RpcState>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    if req.method() != axum::http::Method::POST {
+        return next.run(req).await;
+    }
+    let declared = req
+        .headers()
+        .get(axum::http::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<usize>().ok())
+        .map_or(st.max_body_bytes, |n| n.min(st.max_body_bytes));
+    match st.admission.try_charge(declared) {
+        Ok(charge) => {
+            let response = next.run(req).await;
+            drop(charge);
+            response
+        }
+        Err(busy) => {
+            // The body is read and dropped a chunk at a time — never buffered — before the answer
+            // goes out: a server that answers without reading leaves hyper to close the connection
+            // under a client still writing, which then sees a reset instead of this `-32005`. At
+            // most the body limit is drained; past it the connection closes as it would at the
+            // limit anyway.
+            use futures::StreamExt;
+            let mut body = req.into_body().into_data_stream();
+            let mut drained = 0usize;
+            while drained <= st.max_body_bytes {
+                match body.next().await {
+                    Some(Ok(chunk)) => drained += chunk.len(),
+                    _ => break,
+                }
+            }
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                [(axum::http::header::RETRY_AFTER, "1")],
+                Json(error_value(Value::Null, RpcError::busy(busy))),
+            )
+                .into_response()
+        }
+    }
 }
 
 /// One error response object. Built from an `RpcError` so every `-32600` in this file comes from
@@ -2801,8 +2879,11 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
                 .send(NodeCommand::SubmitTx { tx, reply })
                 .await
                 .map_err(|_| RpcError::internal("node loop closed"))?;
+            // Issue #157: the hash comes back only from `Node::on_verdict`, after the transaction
+            // verified, was pooled and was handed to gossip (`docs/rpc.md`, "What a hash means").
             match rx.await.map_err(|_| RpcError::internal("node loop dropped reply"))? {
                 Ok(h) => Ok(json!(h.to_hex())),
+                Err(MempoolError::AdmissionBusy(b)) => Err(RpcError::busy(b)),
                 Err(e) => Err(RpcError::rejected(e.to_string())),
             }
         }
@@ -4503,6 +4584,7 @@ pub(crate) mod tests {
             refusals: tokio::sync::broadcast::channel(HEAD_CHANNEL).0,
             ws_conns: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             viewing: Arc::new(RwLock::new(crate::viewing::Registry::default())),
+            admission: crate::admission::AdmissionBudget::new(crate::admission::AdmissionBudget::DEFAULT_MAX),
         }
     }
 
@@ -8958,6 +9040,86 @@ pub(crate) mod tests {
         let msg = v["error"]["message"].as_str().unwrap_or_default();
         assert!(msg.contains(&RPC_MAX_BODY_BYTES.to_string()), "the message must name the limit: {msg}");
 
+        task.abort();
+    }
+
+    /// Issue #157: eight concurrent ~1.6 MB `rand_sendTransaction`s against a budget of three
+    /// bodies. Exactly three reach the node loop, which holds their replies (as a node does while
+    /// it verifies); the other five are answered `-32005` (HTTP 503, `Retry-After`) at once, the
+    /// budget never over its limit. Released, the three get their hashes and the budget is empty
+    /// again; a retry then goes through. Deterministic: every step waits on a message, none on a
+    /// clock — the held three cannot answer before the test replies, so whatever answers first
+    /// is a refusal.
+    #[tokio::test]
+    async fn concurrent_large_submissions_past_the_admission_budget_are_told_to_retry() {
+        const N: usize = 8;
+        const HELD: usize = 3;
+        let gs = genesis_with(7, vec![alloc_note(20, 1_000)]);
+        let (_dir, st) = state_for(&gs);
+        let tx = |i: u32| Transaction {
+            chain_id: gs.chain_id,
+            bundle: None,
+            action: Action::Deploy { base_pc: i, words: vec![0x13; 200_000], public: vec![] },
+        };
+        let body = |i: u32| serde_json::to_vec(&json!({ "jsonrpc": "2.0", "id": i, "method": "rand_sendTransaction", "params": [hex::encode(tx(i).encode())] })).unwrap();
+        let len = body(0).len();
+        assert!(len > 1_500_000 && (0..N as u32).all(|i| body(i).len() == len), "equal, large bodies: {len} B");
+        let budget = crate::admission::AdmissionBudget::new(HELD * len + len / 2);
+        // A stand-in node loop that answers nothing until the test says so.
+        let (node_tx, mut node_rx) = mpsc::channel(N);
+        let st = RpcState { admission: budget.clone(), node: node_tx, ..st };
+        let (addr, task) = serve("127.0.0.1:0".parse().unwrap(), st).await.unwrap();
+
+        let (done_tx, mut done) = mpsc::unbounded_channel();
+        for i in 0..N as u32 {
+            let (raw, done_tx) = (body(i), done_tx.clone());
+            // Every outcome is sent, a transport error included, so a failure fails the test
+            // rather than leaving it waiting for an answer that never comes.
+            tokio::spawn(async move {
+                let answer = async {
+                    let resp = reqwest::Client::new().post(format!("http://{addr}")).header("content-type", "application/json").body(raw).send().await?;
+                    let status = resp.status();
+                    let retry_after = resp.headers().get("retry-after").and_then(|v| v.to_str().ok()).map(str::to_string);
+                    Ok::<_, reqwest::Error>((status, retry_after, resp.json::<Value>().await?))
+                };
+                let _ = done_tx.send(answer.await.map_err(|e| e.to_string()));
+            });
+        }
+
+        let mut held = Vec::new();
+        for _ in 0..HELD {
+            match node_rx.recv().await.expect("a submission reaches the node") {
+                NodeCommand::SubmitTx { tx, reply } => held.push((tx.hash(), reply)),
+                _ => panic!("only submissions are sent"),
+            }
+        }
+        for _ in 0..N - HELD {
+            let (status, retry_after, v) = done.recv().await.unwrap().expect("the refused request is answered, not reset");
+            assert_eq!(status, reqwest::StatusCode::SERVICE_UNAVAILABLE, "{v}");
+            assert_eq!(retry_after.as_deref(), Some("1"));
+            assert_eq!(v["error"]["code"], json!(BUSY_CODE), "{v}");
+            assert!(v["error"]["message"].as_str().unwrap().starts_with("busy:"), "{v}");
+            assert_eq!(v["error"]["data"]["limit"], json!(budget.limit()));
+        }
+        assert_eq!(budget.in_use(), HELD * len, "three bodies charged, never more than the budget");
+        assert!(node_rx.try_recv().is_err(), "no fourth submission reached the node");
+
+        for (hash, reply) in held.drain(..) {
+            reply.send(Ok(hash)).unwrap();
+        }
+        for _ in 0..HELD {
+            let (status, _, v) = done.recv().await.unwrap().expect("answered");
+            assert_eq!(status, reqwest::StatusCode::OK);
+            assert!(v["result"].as_str().is_some_and(|h| h.len() == 64), "{v}");
+        }
+        assert_eq!(budget.in_use(), 0, "every charge is back once its response is out");
+
+        // With room again, the same request a refused caller retries reaches the node.
+        let raw = body(7);
+        let retry = tokio::spawn(async move { reqwest::Client::new().post(format!("http://{addr}")).header("content-type", "application/json").body(raw).send().await.unwrap().status() });
+        let NodeCommand::SubmitTx { tx: got, reply } = node_rx.recv().await.unwrap() else { panic!("a submission") };
+        reply.send(Ok(got.hash())).unwrap();
+        assert_eq!(retry.await.unwrap(), reqwest::StatusCode::OK);
         task.abort();
     }
 

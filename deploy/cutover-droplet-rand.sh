@@ -55,6 +55,10 @@ After=network-online.target
 [Service]
 Environment=RUST_LOG=info,libp2p=warn,libp2p_mdns=off
 ExecStart=/usr/local/bin/rand-node run --datadir \$DATA --key /root/fullnode/deploy/node-$NAME.key.json --validator --listen /ip4/0.0.0.0/tcp/30303 --rpc 127.0.0.1:8545 --no-mdns$BOOT_ARGS
+# Issue #157: reclaim and throttle above 85% of RAM rather than let the OOM killer take the node
+# mid-burst (it did 24 times in 8 h on the 2 GB validators). No MemoryMax: a cap kills, which is
+# what this avoids. Pair it with swap; 4 GB is the validator minimum (docs/node-hardware.md).
+MemoryHigh=85%
 Restart=always
 RestartSec=3
 [Install]

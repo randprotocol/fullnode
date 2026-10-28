@@ -35,6 +35,13 @@ Node:
 - **No ANSI colour in journald** (issue #143): `rand-node` and `rand-prover` colour their log
   only at a terminal and never under `NO_COLOR`; `deploy/update-droplet.sh` drops "chain 14"
   from an old unit's `Description=`.
+- **Admission memory is bounded** (issue #157): one byte budget (`--admission-budget-mb`; default
+  1/16 of RAM within 64–256 MiB, never under one largest transaction) over RPC request bodies and
+  the verify queue, gossiped and submitted. Past it `rand_sendTransaction` answers `-32005`
+  (HTTP 503, `Retry-After: 1`) without reading the request into memory, and gossip sheds with
+  `Ignore`. `rand_status` gains `admission_bytes` and `admission_budget_bytes`. The hash
+  `rand_sendTransaction` returns still means verified, pooled and handed to gossip, now
+  documented. The unit templates set `MemoryHigh=85%`; 4 GB is the validator minimum.
 
 Wallet (`rand`; client-only, no node or chain change):
 

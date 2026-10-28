@@ -618,6 +618,137 @@ impl VerifyLimits {
     }
 }
 
+/// Issue #157: one byte budget over the memory admission holds before a transaction is pooled.
+///
+/// The 2026-10-27 overnight run OOM-killed 2 GB validators 24 times in 8 h. Each kill followed a
+/// burst of eight ~2.9 MB transactions: the RPC buffered the 5.7 MB hex bodies, and gossip queued
+/// the decoded transactions for verification, 64 deep beside 4 in flight, with nothing counting
+/// bytes. Each of those holders now takes an [`AdmissionCharge`] from this one budget and gives it
+/// back when it is done:
+///
+/// - the RPC: a POST's declared body length (`Content-Length`, else the body cap), held from
+///   before the body is read until the response is built (`rpc::charge_body`). A
+///   `rand_sendTransaction` waits for its verdict inside that window, so its hex body stays
+///   charged throughout;
+/// - the verify queue: [`charge_of`] the decoded transaction, from when it is queued (gossip or
+///   RPC) until its verdict has been handled (`Verdict::charge`).
+///
+/// It is never waited on. A charge that does not fit is refused at once: the RPC answers `-32005`
+/// ("busy, retry"), and gossip reports `Ignore`, so the forwarder is not penalised and an honest
+/// peer's copy reaches this node again later. A byte count, not an RSS measurement: what it bounds
+/// is what bursts of large transactions add on top of a node's resting footprint.
+#[derive(Clone, Debug)]
+pub struct AdmissionBudget {
+    sem: std::sync::Arc<tokio::sync::Semaphore>,
+    limit: usize,
+}
+
+/// Bytes held against an [`AdmissionBudget`]; dropping it gives them back.
+#[derive(Debug)]
+pub struct AdmissionCharge {
+    _permit: tokio::sync::OwnedSemaphorePermit,
+}
+
+impl AdmissionCharge {
+    /// A charge of nothing against a budget of its own, for tests that build a [`Verdict`] by
+    /// hand.
+    #[cfg(test)]
+    pub(crate) fn none() -> AdmissionCharge {
+        AdmissionBudget::new(0).try_charge(0).expect("a zero charge always fits")
+    }
+}
+
+/// A charge the budget could not take now: `wanted` bytes with `available` of `limit` free.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AdmissionBusy {
+    pub wanted: usize,
+    pub available: usize,
+    pub limit: usize,
+}
+
+impl std::fmt::Display for AdmissionBusy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "busy: this node's admission memory is full ({} of {} MiB in use, {} KiB wanted); retry shortly",
+            (self.limit - self.available) >> 20,
+            self.limit >> 20,
+            self.wanted.div_ceil(1024)
+        )
+    }
+}
+
+impl AdmissionBudget {
+    /// The default's ceiling: 256 MiB, on any host with about 4 GB or more.
+    pub const DEFAULT_MAX: usize = 256 << 20;
+    /// The default's floor before [`AdmissionBudget::default_for`] raises it to one largest
+    /// submission.
+    pub const DEFAULT_MIN: usize = 64 << 20;
+    /// The default is this fraction of the host's RAM: 1/16, so ~117 MiB on the fleet's 1 967 MB
+    /// droplets, which sit at ~1.4 GB resident with ~250 MB to spare. Counted bytes are not all of
+    /// the memory they cost (a decoded transaction's allocations, verify scratch), so the budget
+    /// stays well under the headroom.
+    pub const RAM_DIVISOR: u64 = 16;
+
+    pub fn new(limit: usize) -> AdmissionBudget {
+        let limit = limit.min(tokio::sync::Semaphore::MAX_PERMITS);
+        AdmissionBudget { sem: std::sync::Arc::new(tokio::sync::Semaphore::new(limit)), limit }
+    }
+
+    /// The default budget on a host with `total_ram` bytes: `total_ram / 16` within
+    /// [`DEFAULT_MIN`](Self::DEFAULT_MIN)..=[`DEFAULT_MAX`](Self::DEFAULT_MAX), and never below
+    /// `floor` — one largest submission ([`AdmissionBudget::floor_for`]), so the budget can
+    /// always admit the biggest transaction the chain allows once it is otherwise idle. `0`
+    /// (RAM unknown) takes the ceiling.
+    pub fn default_for(total_ram: u64, floor: usize) -> usize {
+        let share = match total_ram {
+            0 => Self::DEFAULT_MAX,
+            n => usize::try_from(n / Self::RAM_DIVISOR).unwrap_or(usize::MAX).clamp(Self::DEFAULT_MIN, Self::DEFAULT_MAX),
+        };
+        share.max(floor)
+    }
+
+    /// One largest `rand_sendTransaction` in flight: its body at the RPC's cap plus the decoded
+    /// transaction at the block cap. A budget under this could refuse a valid transaction for
+    /// ever, so `--admission-budget-mb` below it is refused at startup.
+    pub fn floor_for(max_body_bytes: usize, max_block_bytes: usize) -> usize {
+        max_body_bytes.saturating_add(max_block_bytes)
+    }
+
+    /// Take `bytes` now, or say why not. Never waits. A charge larger than the whole budget is
+    /// always refused (it could never fit).
+    pub fn try_charge(&self, bytes: usize) -> Result<AdmissionCharge, AdmissionBusy> {
+        let busy = || AdmissionBusy { wanted: bytes, available: self.available(), limit: self.limit };
+        let n = u32::try_from(bytes).map_err(|_| busy())?;
+        if bytes > self.limit {
+            return Err(busy());
+        }
+        match self.sem.clone().try_acquire_many_owned(n) {
+            Ok(permit) => Ok(AdmissionCharge { _permit: permit }),
+            Err(_) => Err(busy()),
+        }
+    }
+
+    pub fn limit(&self) -> usize {
+        self.limit
+    }
+
+    pub fn available(&self) -> usize {
+        self.sem.available_permits()
+    }
+
+    /// Bytes charged right now.
+    pub fn in_use(&self) -> usize {
+        self.limit - self.available()
+    }
+}
+
+/// What a decoded transaction is charged while it waits for verification: its bincode length,
+/// computed without encoding it.
+pub fn charge_of(tx: &Transaction) -> usize {
+    bincode::serialized_size(tx).map_or(usize::MAX, |n| usize::try_from(n).unwrap_or(usize::MAX))
+}
+
 /// What this node has decided to tell gossipsub about one delivered message.
 ///
 /// libp2p's own [`MessageAcceptance`] derives `Debug` and nothing else — no `Clone`, no `PartialEq`
@@ -670,6 +801,9 @@ pub struct Verdict {
     /// found the state-proof key-build gate taken ([`crate::node::pool_verify_without_waiting`]).
     /// The answer is `StateProofBusy`, retryable: `result` is unused, nothing is cached.
     pub busy: bool,
+    /// Issue #157: the transaction's bytes against the [`AdmissionBudget`], taken when it was
+    /// queued and given back when this verdict is dropped, at the end of `Node::on_verdict`.
+    pub charge: AdmissionCharge,
 }
 
 /// How many refused state proofs to remember (RPL-3 final fix wave, I1). Only proofs against the
@@ -1229,7 +1363,8 @@ pub fn acceptance_for_pool(e: &MempoolError, hash: Hash, refused: &mut RefusedCa
         | MempoolError::PerpBackpressure { .. }
         | MempoolError::PerpHeightBackpressure { .. }
         | MempoolError::PerpCancelUnknownOrder(_)
-        | MempoolError::StateProofBusy => Acceptance::Ignore,
+        | MempoolError::StateProofBusy
+        | MempoolError::AdmissionBusy(_) => Acceptance::Ignore,
     }
 }
 
@@ -2354,5 +2489,64 @@ mod tests {
             assert!(l.allow(&mut b, t0 + Duration::from_secs(3600)), "refilled {i}");
         }
         assert!(!l.allow(&mut b, t0 + Duration::from_secs(3600)), "the burst is the ceiling");
+    }
+
+    /// Issue #157: the budget takes charges up to its limit and no further, refuses at once
+    /// (never waits), and gets each charge's bytes back when the charge is dropped.
+    #[test]
+    fn the_admission_budget_refuses_past_its_limit_and_releases_on_drop() {
+        let budget = AdmissionBudget::new(10_000);
+        let a = budget.try_charge(6_000).expect("fits");
+        let b = budget.try_charge(4_000).expect("fits exactly");
+        assert_eq!((budget.in_use(), budget.available()), (10_000, 0));
+        let busy = budget.try_charge(1).unwrap_err();
+        assert_eq!(busy, AdmissionBusy { wanted: 1, available: 0, limit: 10_000 });
+        assert!(busy.to_string().starts_with("busy:") && busy.to_string().contains("retry"), "{busy}");
+        drop(a);
+        assert_eq!(budget.in_use(), 4_000, "the first charge's bytes are back");
+        assert!(budget.try_charge(6_001).is_err(), "one byte too many is still refused");
+        let c = budget.try_charge(6_000).expect("fits again");
+        // A clone is the same budget, not a second one.
+        let shared = budget.clone();
+        assert!(shared.try_charge(1).is_err());
+        drop(b);
+        drop(c);
+        assert_eq!((budget.in_use(), shared.in_use()), (0, 0));
+        // Larger than the whole budget: refused even when idle, since it could never fit.
+        assert_eq!(budget.try_charge(10_001).unwrap_err().available, 10_000);
+        assert!(budget.try_charge(usize::MAX).is_err());
+        // A zero charge always fits.
+        let full = budget.try_charge(10_000).unwrap();
+        assert!(budget.try_charge(0).is_ok());
+        drop(full);
+        assert_eq!(budget.in_use(), 0);
+    }
+
+    /// Issue #157: the default is 1/16 of the host's RAM within 64–256 MiB, and never under one
+    /// largest submission.
+    #[test]
+    fn the_default_admission_budget_follows_the_host() {
+        const MIB: usize = 1 << 20;
+        let floor = AdmissionBudget::floor_for(8_867_840, 4 * MIB);
+        assert_eq!(floor, 8_867_840 + 4 * MIB);
+        // The fleet's 2 GB droplets (1 967 MB): ~117 MiB.
+        assert_eq!(AdmissionBudget::default_for(1_967 * 1_000_000, floor), 1_967 * 1_000_000 / 16);
+        assert_eq!(AdmissionBudget::default_for(4 << 30, floor), 256 * MIB, "4 GiB: the ceiling");
+        assert_eq!(AdmissionBudget::default_for(64 << 30, floor), 256 * MIB);
+        assert_eq!(AdmissionBudget::default_for(512 << 20, floor), 64 * MIB, "the floor of the range");
+        assert_eq!(AdmissionBudget::default_for(0, floor), 256 * MIB, "RAM unknown");
+        // A chain whose largest submission is past the share: the submission wins.
+        assert_eq!(AdmissionBudget::default_for(1 << 30, 300 * MIB), 300 * MIB);
+    }
+
+    /// Issue #157: a transaction is charged its bincode length, computed without encoding it.
+    #[test]
+    fn a_transaction_is_charged_its_encoded_length() {
+        let tx = Transaction {
+            chain_id: 7,
+            bundle: None,
+            action: randprotocol_core::Action::Deploy { base_pc: 0, words: vec![0x13; 1_000], public: vec![] },
+        };
+        assert_eq!(charge_of(&tx), tx.encoded_len());
     }
 }
