@@ -166,17 +166,19 @@ On a genesis with `hc_auth_multisig` the first term counts **three** proofs at t
 single-key guest's small fixed shape (`rpc::rpc_max_body_bytes`).
 
 **What a hash means** (issue #157). The hash comes back only after the transaction has passed
-every check above, the proofs included, has been pooled at the current tip, and has been handed
-to this node's gossip for publishing (`Node::on_verdict`). This has been so since admission moved
-off the loop; nothing acknowledges a transaction that is only queued. The hand-off is to the
-node's own network task, so a node killed in the moment after it answers can still lose the
+every check above, the proofs included, and has been stemmed or broadcast (`Node::on_verdict`,
+`Node::route_verified`): either held in this node's stempool under its embargo and handed to its
+Dandelion++ stem successor (issue #145, above), or — the fluff, or no stem-capable peer — pooled at
+the current tip and handed to this node's gossip for publishing. This has been so since admission
+moved off the loop; nothing acknowledges a transaction that is only queued. Either hand-off is to
+the node's own network task, so a node killed in the moment after it answers can still lose the
 transaction before the first peer has it. The OOM kills of 2026-10-27 that lost 18 acknowledged
 transactions were that window; the admission budget below is what closes them. Acceptance is
 still not commitment.
 
 **Busy, retry: `-32005`** (issue #157). Every POST body is charged against the node's admission
 byte budget before it is read, and held until the answer; a transaction is charged again, by its
-decoded size, while it waits for verification. A request the budget cannot take now is answered at
+decoded size, while it waits for verification — a peer's stem (issue #145) included. A request the budget cannot take now is answered at
 once with HTTP 503, `Retry-After: 1` and
 
 ```json
@@ -187,7 +189,8 @@ once with HTTP 503, `Retry-After: 1` and
 
 Nothing was queued: send the same request again in a moment. `rand` does (it backs off on
 `-32005` five times, about 31 s). A gossiped transaction that does not fit is reported `Ignore`, so
-its forwarder is never penalised.
+its forwarder is never penalised; a stemmed one is dropped the same way, and the predecessor's
+embargo fluffs it if no other copy arrives.
 
 ### `rand_mint` (testnet faucet)
 Params: `[address]` or `[address, amount]`, where `address` is a `rand1…` shielded address and

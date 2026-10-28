@@ -3452,9 +3452,21 @@ impl Node {
             self.note_refusal(hash);
             return;
         }
+        // Issue #157 × #145: a stemmed transaction waits on the same verify queue as a gossiped
+        // or submitted one, so it is charged against the same admission budget, and the charge
+        // comes back when its verdict has been handled (`Verdict::charge`). Past the budget it is
+        // dropped as gossip sheds one — nothing cached, the peer not penalised — and the
+        // predecessor's embargo fluffs it if no other copy gets through.
+        let charge = match self.admission.try_charge(admission::charge_of(&tx)) {
+            Ok(c) => c,
+            Err(busy) => {
+                tracing::debug!(%hash, %from, %busy, "admission budget full; stemmed transaction dropped");
+                return;
+            }
+        };
         self.mempool.state_proof_queued(&tx, self.hs.tip_ledger(), self.executor.as_ref());
         self.mempool.verify_queued(&tx);
-        self.verify_queue.push_back((tx, VerifySource::Stem(from)));
+        self.verify_queue.push_back((tx, VerifySource::Stem(from), charge));
         self.pump_verify();
     }
 
@@ -8298,7 +8310,7 @@ mod tests {
         let tx = next_tx(node.hs.tip_ledger(), 1);
         let h = tx.hash();
         let pred = PeerId::random();
-        node.on_verdict(Verdict { tx: tx.clone(), result: Ok(()), source: VerifySource::Stem(pred), proof_key: None, busy: false })
+        node.on_verdict(Verdict { tx: tx.clone(), result: Ok(()), source: VerifySource::Stem(pred), proof_key: None, busy: false, charge: AdmissionCharge::none() })
             .await
             .unwrap();
         let out = drain(&mut seen).await;
@@ -8330,7 +8342,7 @@ mod tests {
         let tx = next_tx(node.hs.tip_ledger(), 2);
         let h = tx.hash();
         let (reply, answer) = oneshot::channel();
-        node.on_verdict(Verdict { tx: tx.clone(), result: Ok(()), source: VerifySource::Rpc(reply), proof_key: None, busy: false })
+        node.on_verdict(Verdict { tx: tx.clone(), result: Ok(()), source: VerifySource::Rpc(reply), proof_key: None, busy: false, charge: AdmissionCharge::none() })
             .await
             .unwrap();
         assert_eq!(answer.await.unwrap(), Ok(h));
@@ -8362,7 +8374,7 @@ mod tests {
             let tx = next_tx(node.hs.tip_ledger(), 3);
             let h = tx.hash();
             let (reply, answer) = oneshot::channel();
-            node.on_verdict(Verdict { tx, result: Ok(()), source: VerifySource::Rpc(reply), proof_key: None, busy: false }).await.unwrap();
+            node.on_verdict(Verdict { tx, result: Ok(()), source: VerifySource::Rpc(reply), proof_key: None, busy: false, charge: AdmissionCharge::none() }).await.unwrap();
             assert_eq!(answer.await.unwrap(), Ok(h));
             let out = drain(&mut seen).await;
             assert_eq!(broadcast_txs(&out), vec![h], "enabled = {}", cfg.enabled);
@@ -8379,7 +8391,7 @@ mod tests {
         let (_d, mut node, mut seen, _succ) = stem_node(1.0, Duration::from_secs(60));
         let tx = next_tx(node.hs.tip_ledger(), 4);
         let h = tx.hash();
-        node.on_verdict(Verdict { tx, result: Ok(()), source: VerifySource::Stem(PeerId::random()), proof_key: None, busy: false })
+        node.on_verdict(Verdict { tx, result: Ok(()), source: VerifySource::Stem(PeerId::random()), proof_key: None, busy: false, charge: AdmissionCharge::none() })
             .await
             .unwrap();
         let out = drain(&mut seen).await;
@@ -8396,7 +8408,7 @@ mod tests {
         let (_d, mut node, mut seen, _succ) = stem_node(0.0, Duration::from_secs(60));
         let tx = next_tx(node.hs.tip_ledger(), 5);
         let h = tx.hash();
-        node.on_verdict(Verdict { tx: tx.clone(), result: Ok(()), source: VerifySource::Stem(PeerId::random()), proof_key: None, busy: false })
+        node.on_verdict(Verdict { tx: tx.clone(), result: Ok(()), source: VerifySource::Stem(PeerId::random()), proof_key: None, busy: false, charge: AdmissionCharge::none() })
             .await
             .unwrap();
         drain(&mut seen).await;
@@ -8406,6 +8418,42 @@ mod tests {
         assert!(node.mempool.contains(&h));
         assert!(node.dandelion.stempool.is_empty() && node.dandelion.stempool.next_deadline().is_none(), "no embargo left");
         assert!(node.verify_queue.is_empty() && node.verify_in_flight == 0, "not verified again");
+    }
+
+    /// Issue #157 × #145: a stemmed transaction waits on the verify queue with its bytes charged
+    /// against the admission budget, like a gossiped or submitted one. Past the budget it is
+    /// dropped — nothing reported, cached or sent, so its peer is not penalised — and the charge
+    /// comes back once its verdict is handled, even while the transaction is still held on the
+    /// stem. No worker runs (no verify slots), so nothing here depends on timing.
+    #[tokio::test]
+    async fn a_stemmed_transaction_is_charged_and_shed_unpenalised_past_the_budget() {
+        let (_d, mut node, mut seen, succ) = stem_node(0.0, Duration::from_secs(60));
+        let ledger = node.hs.tip_ledger().clone();
+        let (first, second) = (next_tx(&ledger, 11), next_tx(&ledger, 12));
+        node.admission = AdmissionBudget::new(admission::charge_of(&first));
+        node.verify_limits = VerifyLimits { in_flight: 0, queue: 64 };
+        let pred = PeerId::random();
+
+        node.on_network_event(NetworkEvent::StemTx { from: pred, tx: first.clone() }).await.unwrap();
+        assert_eq!(node.verify_queue.len(), 1, "the first fits the budget exactly");
+        assert_eq!(node.admission.in_use(), node.admission.limit());
+
+        node.on_network_event(NetworkEvent::StemTx { from: pred, tx: second.clone() }).await.unwrap();
+        assert_eq!(node.verify_queue.len(), 1, "the second is not queued");
+        assert!(node.refused.get(&second.hash()).is_none(), "nothing cached against it");
+        assert!(drain(&mut seen).await.is_empty(), "nothing reported, stemmed or published");
+
+        // The first one's verdict: stemmed on, still held — and its charge is back.
+        let (tx, source, charge) = node.verify_queue.pop_front().unwrap();
+        node.on_verdict(Verdict { tx, result: Ok(()), source, proof_key: None, busy: false, charge }).await.unwrap();
+        assert_eq!(stems(&drain(&mut seen).await), vec![(succ, first.hash())]);
+        assert!(node.dandelion.stempool.contains(&first.hash()));
+        assert_eq!(node.admission.in_use(), 0, "released on its verdict, not when the stem ends");
+
+        // A later copy of the shed one is judged afresh.
+        let room = node.admission.limit() >= admission::charge_of(&second);
+        node.on_network_event(NetworkEvent::StemTx { from: pred, tx: second.clone() }).await.unwrap();
+        assert_eq!(node.verify_queue.len(), usize::from(room));
     }
 
     /// A stem that comes back to the node holding it is sent on by the edge's route without a
@@ -8420,7 +8468,7 @@ mod tests {
         let tx = next_tx(node.hs.tip_ledger(), 6);
         let h = tx.hash();
         let (reply, _answer) = oneshot::channel();
-        node.on_verdict(Verdict { tx: tx.clone(), result: Ok(()), source: VerifySource::Rpc(reply), proof_key: None, busy: false })
+        node.on_verdict(Verdict { tx: tx.clone(), result: Ok(()), source: VerifySource::Rpc(reply), proof_key: None, busy: false, charge: AdmissionCharge::none() })
             .await
             .unwrap();
         let first = stems(&drain(&mut seen).await);

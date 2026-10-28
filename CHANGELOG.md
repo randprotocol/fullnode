@@ -40,8 +40,10 @@ Node:
   the verify queue, gossiped and submitted. Past it `rand_sendTransaction` answers `-32005`
   (HTTP 503, `Retry-After: 1`) without reading the request into memory, and gossip sheds with
   `Ignore`. `rand_status` gains `admission_bytes` and `admission_budget_bytes`. The hash
-  `rand_sendTransaction` returns still means verified, pooled and handed to gossip, now
-  documented. The unit templates set `MemoryHigh=85%`; 4 GB is the validator minimum.
+  `rand_sendTransaction` returns means verified and then stemmed or broadcast (pooled and handed
+  to gossip), now documented; a stemmed transaction is charged on the verify queue like a gossiped
+  one and dropped, its peer unpenalised, past the budget. The unit templates set
+  `MemoryHigh=85%`; 4 GB is the validator minimum.
 
 Wallet (`rand`; client-only, no node or chain change):
 

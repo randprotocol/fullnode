@@ -2880,7 +2880,7 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
                 .await
                 .map_err(|_| RpcError::internal("node loop closed"))?;
             // Issue #157: the hash comes back only from `Node::on_verdict`, after the transaction
-            // verified, was pooled and was handed to gossip (`docs/rpc.md`, "What a hash means").
+            // verified and was stemmed or broadcast (`docs/rpc.md`, "What a hash means").
             match rx.await.map_err(|_| RpcError::internal("node loop dropped reply"))? {
                 Ok(h) => Ok(json!(h.to_hex())),
                 Err(MempoolError::AdmissionBusy(b)) => Err(RpcError::busy(b)),
