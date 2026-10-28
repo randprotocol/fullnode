@@ -16,6 +16,13 @@ v0.8.3 (not yet tagged):
 
 Node:
 
+- **RocksDB caps its open table files and merges small ones** (2026-10-28 incident): archives e
+  and obs1 crash-looped at open with `Too many open files` once they held ~67 000 table files
+  against the 65 536 soft limit — WAL-full flushes write the quiet height-keyed families
+  (`anchors`, `perp_inputs`, `notes`) a few KB at a time, and RocksDB only moves such files down,
+  never merges them. `max_open_files` is now 16 384 (a table cache instead of every file open),
+  and every 1 024 blocks a background pass force-compacts runs of small files, at most 256 MiB a
+  compaction and 1 GiB a pass, sharing the history compaction's one-at-a-time flag.
 - **Dandelion++ stem relay for transactions** (issue #145): a transaction submitted over RPC is
   sent to one stem successor over the new request-response protocol `/rand/<chain>/stem/1`, relays
   pass it on and fluff it (publish on gossip) with probability q, and an embargo timer on every

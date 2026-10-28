@@ -924,6 +924,28 @@ pub struct SafetyHalt {
 
 const MAX_TOTAL_WAL_BYTES: u64 = 256 * 1024 * 1024;
 
+/// Table files RocksDB keeps open at once (2026-10-28). The default (-1) holds every file open,
+/// and on 2026-10-28 archives e and obs1 crash-looped at open with `Too many open files` once
+/// they held ~67 000 of them against the 65 536 soft limit. A bounded table cache opens the
+/// rest on demand; this leaves the swarm's and the RPC's sockets ample room under 65 536.
+const MAX_OPEN_TABLE_FILES: i32 = 16_384;
+
+/// A table file under this size counts as small to [`Storage::tidy_small_files`]: a WAL-full
+/// flush writes the quiet families (`anchors`, `perp_inputs`, `notes`) a few kilobytes at a
+/// time, and with height-ordered keys RocksDB's own compactions only move such files down a
+/// level, never merge them — 22 000 files of 2 KB each in `anchors` on e after 16 days.
+const TIDY_SMALL_FILE_BYTES: u64 = 4 * 1024 * 1024;
+
+/// The most bytes one tidy compaction rewrites: what it can need in free disk at once.
+const TIDY_CHUNK_BYTES: u64 = 256 * 1024 * 1024;
+
+/// The fewest files a chunk must hold to be worth a rewrite.
+const TIDY_MIN_FILES: usize = 8;
+
+/// The bytes one [`Storage::tidy_small_files`] pass rewrites at most, so an archive with a
+/// backlog drains it over passes instead of one hours-long compaction.
+pub const TIDY_PASS_BYTES: u64 = 1024 * 1024 * 1024;
+
 /// `RegistryExt` as the `tokens_v2` key stores it: JSON, so a field this build knows but the
 /// writer did not reads as its default (audit v5 review note — the struct grew a field in v0.5.4
 /// and again in v0.5.5, and a positional blob stops decoding the moment one is appended). A
@@ -983,6 +1005,44 @@ impl From<RegistryExtDisk> for randprotocol_core::ledger::tokens::RegistryExt {
     }
 }
 
+/// One key range [`Storage::tidy_small_files`] compacts: the span of a run of table files.
+#[derive(Debug, PartialEq, Eq)]
+struct TidyChunk {
+    start: Vec<u8>,
+    end: Vec<u8>,
+    bytes: u64,
+}
+
+/// Cut one family's files, sorted by start key, into runs of at most [`TIDY_CHUNK_BYTES`] and
+/// keep the runs worth a rewrite: [`TIDY_MIN_FILES`] or more files averaging under
+/// [`TIDY_SMALL_FILE_BYTES`]. A family of full-size files yields nothing.
+fn tidy_chunks(files: &[rocksdb::LiveFile]) -> Vec<TidyChunk> {
+    let mut out = Vec::new();
+    let mut run: Vec<&rocksdb::LiveFile> = Vec::new();
+    let mut run_bytes = 0u64;
+    let mut close = |run: &mut Vec<&rocksdb::LiveFile>, run_bytes: &mut u64| {
+        if run.len() >= TIDY_MIN_FILES && *run_bytes / (run.len() as u64) < TIDY_SMALL_FILE_BYTES {
+            let start = run.iter().filter_map(|f| f.start_key.clone()).min();
+            let end = run.iter().filter_map(|f| f.end_key.clone()).max();
+            if let (Some(start), Some(end)) = (start, end) {
+                out.push(TidyChunk { start, end, bytes: *run_bytes });
+            }
+        }
+        run.clear();
+        *run_bytes = 0;
+    };
+    for f in files {
+        let size = f.size as u64;
+        if !run.is_empty() && run_bytes + size > TIDY_CHUNK_BYTES {
+            close(&mut run, &mut run_bytes);
+        }
+        run.push(f);
+        run_bytes += size;
+    }
+    close(&mut run, &mut run_bytes);
+    out
+}
+
 impl Storage {
     /// Open (creating if needed) the database at `<path>/db`.
     pub fn open(path: &Path) -> Result<Storage> {
@@ -999,6 +1059,7 @@ impl Storage {
         opts.create_if_missing(true);
         opts.create_missing_column_families(true);
         opts.set_max_total_wal_size(wal_cap);
+        opts.set_max_open_files(MAX_OPEN_TABLE_FILES);
         let cfs = ALL_CFS
             .iter()
             .map(|name| ColumnFamilyDescriptor::new(*name, Options::default()));
@@ -3018,6 +3079,34 @@ impl Storage {
         }
         self.db.compact_range_cf(self.cf(CF_BLOCKS), Some(height_key(1)), Some(height_key(floor)));
         Ok(())
+    }
+
+    /// Merge runs of small table files (2026-10-28). Each family's files, in key order, are cut
+    /// into chunks of at most [`TIDY_CHUNK_BYTES`]; a chunk of at least [`TIDY_MIN_FILES`] files
+    /// averaging under [`TIDY_SMALL_FILE_BYTES`] is compacted down to the bottom level, which
+    /// rewrites it as a few full-size files. Stops once `budget` bytes are rewritten (the first
+    /// chunk always runs, so a pass makes progress). Returns the bytes rewritten. Policy only:
+    /// the rows are unchanged, and a node killed mid-pass just leaves the rest for the next.
+    pub fn tidy_small_files(&self, budget: u64) -> Result<u64> {
+        let mut by_cf: BTreeMap<String, Vec<rocksdb::LiveFile>> = BTreeMap::new();
+        for f in self.db.live_files()? {
+            by_cf.entry(f.column_family_name.clone()).or_default().push(f);
+        }
+        let mut opts = rocksdb::CompactOptions::default();
+        opts.set_bottommost_level_compaction(rocksdb::BottommostLevelCompaction::Force);
+        let mut rewritten = 0u64;
+        for (name, mut files) in by_cf {
+            let Some(cf) = self.db.cf_handle(&name) else { continue };
+            files.sort_by(|a, b| a.start_key.cmp(&b.start_key));
+            for chunk in tidy_chunks(&files) {
+                if rewritten > 0 && rewritten + chunk.bytes > budget {
+                    return Ok(rewritten);
+                }
+                self.db.compact_range_cf_opt(cf, Some(&chunk.start), Some(&chunk.end), &opts);
+                rewritten += chunk.bytes;
+            }
+        }
+        Ok(rewritten)
     }
 
     /// Test hook: the seal and receipt rows a block would own after sealing and a call, written
@@ -6249,6 +6338,74 @@ mod tests {
             started.elapsed().as_secs_f64(),
             next - 4096,
         );
+    }
+
+    /// Write `n` height-keyed rows into `cf`, flushing after each, so every row lands in its
+    /// own table file — the shape a WAL-full flush leaves a quiet family in on an archive.
+    fn one_file_per_row(st: &Storage, cf: &str, n: u64) {
+        for h in 0..n {
+            st.db.put_cf(st.cf(cf), height_key(h), [7u8; 64]).unwrap();
+            st.db.flush_cf(st.cf(cf)).unwrap();
+        }
+    }
+
+    fn files_in(st: &Storage, cf: &str) -> usize {
+        st.db.live_files().unwrap().iter().filter(|f| f.column_family_name == cf).count()
+    }
+
+    #[test]
+    fn the_store_caps_its_open_table_files() {
+        // 2026-10-28: e and obs1 crash-looped at open with `Too many open files` once their
+        // archives held more table files than the 65 536 soft limit. A capped table cache keeps
+        // the descriptors under the limit however many files the store holds.
+        let dir = tempfile::tempdir().unwrap();
+        let _st = Storage::open(dir.path()).unwrap();
+        let options = std::fs::read_dir(dir.path().join("db"))
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .find(|p| p.file_name().unwrap().to_string_lossy().starts_with("OPTIONS-"))
+            .expect("RocksDB writes an OPTIONS file");
+        let text = std::fs::read_to_string(options).unwrap();
+        assert!(text.contains(&format!("max_open_files={MAX_OPEN_TABLE_FILES}")), "{text}");
+    }
+
+    #[test]
+    fn tidy_merges_a_family_of_tiny_files_and_keeps_every_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let st = Storage::open(dir.path()).unwrap();
+        one_file_per_row(&st, CF_ANCHORS, 200);
+        // Height-ordered keys never overlap, so RocksDB's own compactions only move these
+        // files down a level — the count stays where the flushes left it.
+        assert!(files_in(&st, CF_ANCHORS) > 100, "{} files", files_in(&st, CF_ANCHORS));
+        let rewritten = st.tidy_small_files(TIDY_PASS_BYTES).unwrap();
+        assert!(rewritten > 0);
+        assert!(files_in(&st, CF_ANCHORS) <= 2, "{} files after tidy", files_in(&st, CF_ANCHORS));
+        for h in 0..200 {
+            assert_eq!(st.db.get_cf(st.cf(CF_ANCHORS), height_key(h)).unwrap().as_deref(), Some(&[7u8; 64][..]));
+        }
+    }
+
+    #[test]
+    fn tidy_leaves_a_family_of_few_files_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let st = Storage::open(dir.path()).unwrap();
+        one_file_per_row(&st, CF_ANCHORS, 3);
+        let before = files_in(&st, CF_ANCHORS);
+        assert_eq!(st.tidy_small_files(TIDY_PASS_BYTES).unwrap(), 0);
+        assert_eq!(files_in(&st, CF_ANCHORS), before);
+    }
+
+    #[test]
+    fn tidy_stops_at_its_byte_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let st = Storage::open(dir.path()).unwrap();
+        one_file_per_row(&st, CF_ANCHORS, 200);
+        one_file_per_row(&st, CF_PERP_INPUTS, 200);
+        // A budget of one byte still lets the first chunk through (a pass always makes
+        // progress) and then stops: one family is merged, the other waits for the next pass.
+        st.tidy_small_files(1).unwrap();
+        let merged = [CF_ANCHORS, CF_PERP_INPUTS].iter().filter(|cf| files_in(&st, cf) <= 2).count();
+        assert_eq!(merged, 1);
     }
 
     #[test]
