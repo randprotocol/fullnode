@@ -2193,6 +2193,18 @@ fn should_compact(prune_passes: u64, compacting: &AtomicBool) -> bool {
     prune_passes.is_multiple_of(64) && compacting.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_ok()
 }
 
+/// Committed blocks between two small-file tidy passes ([`Storage::tidy_small_files`]): about
+/// 45 minutes at chain 21's pace, so an archive's ~1 400 new small files a day per quiet family
+/// never pile up, and a backlog drains [`crate::storage::TIDY_PASS_BYTES`] per pass.
+const TIDY_EVERY_BLOCKS: u64 = 1024;
+
+/// Whether this commit should start a small-file tidy pass (2026-10-28): every
+/// [`TIDY_EVERY_BLOCKS`] heights, and only when no compaction — tidy or history — is running.
+/// Flips `compacting` like [`should_compact`], so the two never run at once.
+fn should_tidy(head: u64, compacting: &AtomicBool) -> bool {
+    head.is_multiple_of(TIDY_EVERY_BLOCKS) && compacting.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_ok()
+}
+
 /// The background compaction's body: run `compact`, then mark the compaction finished — on a
 /// panic too (PR-3), through a drop guard, since a flag left set would make `should_compact`
 /// refuse every later compaction until a restart.
@@ -3935,6 +3947,19 @@ impl Node {
                     }
                 }
             }
+        }
+        // The small-file tidy pass, on every node (an archive most of all, which never prunes and
+        // so never reaches the history compaction above): fire-and-forget off the node loop.
+        if should_tidy(head, &self.compacting) {
+            let storage = self.storage.clone();
+            let compacting = self.compacting.clone();
+            tokio::task::spawn_blocking(move || {
+                run_compaction(&compacting, || match storage.tidy_small_files(crate::storage::TIDY_PASS_BYTES) {
+                    Ok(0) => {}
+                    Ok(bytes) => tracing::info!("tidied {} MiB of small table files at head {head}", bytes >> 20),
+                    Err(e) => tracing::warn!("small-file tidy failed: {e}"),
+                })
+            });
         }
         self.mempool.prune(self.hs.tip_ledger());
         self.publish_heads(&blocks);
@@ -6527,6 +6552,22 @@ mod tests {
         // Once the background task clears it, the next 64th pass fires again.
         compacting.store(false, Ordering::SeqCst);
         assert!(should_compact(192, &compacting));
+    }
+
+    #[test]
+    fn should_tidy_fires_every_tidy_interval_when_idle_and_shares_the_compaction_flag() {
+        let compacting = AtomicBool::new(false);
+        for head in [1, TIDY_EVERY_BLOCKS - 1, TIDY_EVERY_BLOCKS + 1] {
+            assert!(!should_tidy(head, &compacting));
+            assert!(!compacting.load(Ordering::SeqCst));
+        }
+        assert!(should_tidy(TIDY_EVERY_BLOCKS, &compacting));
+        assert!(compacting.load(Ordering::SeqCst));
+        // A history compaction (or the last tidy) still running: no second one on top of it.
+        assert!(!should_tidy(2 * TIDY_EVERY_BLOCKS, &compacting));
+        assert!(!should_compact(64, &compacting));
+        compacting.store(false, Ordering::SeqCst);
+        assert!(should_tidy(3 * TIDY_EVERY_BLOCKS, &compacting));
     }
 
     /// PR-2: the cutoff is measured from the earlier of the head's timestamp and this node's
