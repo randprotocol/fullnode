@@ -11,7 +11,7 @@ pub mod edge;
 pub mod wire;
 
 pub use edge::{MAX_ESTABLISHED_PER_RESERVED_PEER, MAX_PENDING_INCOMING_PER_ADDR};
-pub use wire::{CompactBlock, GossipMessage, PeerBinding, Status, SyncRequest, SyncResponse, TX_FETCH_BATCH};
+pub use wire::{CompactBlock, GossipMessage, PeerBinding, Status, StemRequest, StemResponse, SyncRequest, SyncResponse, TX_FETCH_BATCH};
 
 /// Re-exported so the node can name a verdict without depending on libp2p directly. It derives
 /// `Debug` and nothing else — see `admission::Acceptance` for the comparable copy the decision path
@@ -77,6 +77,26 @@ pub const SYNC_RESPONSE_WIRE_LIMIT: u64 = response_limit_for(SYNC_MAX_WIRE_BYTES
 
 /// The reader limit on a sync *request*. A request is a height and a count, or a block hash.
 pub const SYNC_REQUEST_WIRE_LIMIT: u64 = 64 << 10;
+
+/// The reader limit on a stem *response* (issue #145): a one-byte acknowledgement.
+pub const STEM_RESPONSE_WIRE_LIMIT: u64 = 64;
+
+/// How long a stem send waits for the successor's acknowledgement before it is reported failed
+/// ([`NetworkEvent::StemFailed`]). The successor acknowledges on receipt, before it verifies, so
+/// this is a round trip and the transfer of one transaction.
+pub const STEM_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Concurrent stem streams per connection, in either direction. An honest peer has one stem in
+/// flight to a node at a time, or a few in a burst; the request codec decodes a whole transaction
+/// before the node loop can meter its sender, so this bounds that unmetered work.
+pub const STEM_MAX_STREAMS: usize = 8;
+
+/// Dandelion++'s stem protocol (issue #145). A node that speaks it lists it in identify, which is
+/// how its peers learn they may stem to it; a node that predates it never lists it and so never
+/// receives a stem.
+pub fn stem_protocol(chain_id: u64) -> String {
+    format!("/rand/{chain_id}/stem/1")
+}
 
 /// gossipsub's own transmit-size ceiling on a default chain: the largest message (a gossiped
 /// transaction or proposal, wrapped in [`GossipMessage`]) any peer will forward rather than drop.
@@ -376,6 +396,12 @@ pub struct EdgeConfig {
     /// that predates the anonymous lane is left; until then a transaction published only
     /// anonymously never reaches them by gossip.
     pub anonymous_tx_only: bool,
+    /// Speak Dandelion++'s stem protocol (issue #145, `--dandelion`): register
+    /// `/rand/{chain}/stem/1`, so identify advertises it and stem-capable peers send this node
+    /// stems ([`NetworkEvent::StemTx`]), and report the peers that advertise it
+    /// ([`NetworkEvent::StemPeer`]). Off (the `Default`, for the network-only callers), no stem is
+    /// sent or received.
+    pub dandelion: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -425,12 +451,22 @@ pub enum NetworkEvent {
     SyncRequest { peer: PeerId, request: SyncRequest, channel: ResponseChannel<SyncResponse> },
     SyncResponse { peer: PeerId, request_id: OutboundRequestId, response: SyncResponse },
     SyncFailed { peer: PeerId, request_id: OutboundRequestId, error: String },
+    /// A connected peer advertises the stem protocol (issue #145; only under
+    /// [`EdgeConfig::dandelion`]). `outbound`: this node dialled it. Repeated whenever identify
+    /// runs again; the receiver dedups.
+    StemPeer { peer: PeerId, outbound: bool },
+    /// A transaction a peer stemmed to this node. Already acknowledged on the wire.
+    StemTx { from: PeerId, tx: randprotocol_core::Transaction },
+    /// A stem send that failed (the successor left, refused the stream or timed out).
+    StemFailed { peer: PeerId, hash: randprotocol_core::Hash },
 }
 
 #[allow(clippy::large_enum_variant)] // moved once, never stored in bulk: boxing buys nothing
 #[derive(Debug)]
 pub enum NetworkCommand {
     Broadcast(GossipMessage),
+    /// Stem one transaction to one peer (issue #145). A no-op without [`EdgeConfig::dandelion`].
+    Stem { peer: PeerId, tx: randprotocol_core::Transaction },
     SendSyncRequest { peer: PeerId, request: SyncRequest, reply: oneshot::Sender<OutboundRequestId> },
     SendSyncResponse { channel: ResponseChannel<SyncResponse>, response: SyncResponse },
     Dial(Multiaddr),
@@ -462,6 +498,11 @@ impl NetworkHandle {
 
     pub async fn broadcast(&self, msg: GossipMessage) {
         let _ = self.cmd.send(NetworkCommand::Broadcast(msg)).await;
+    }
+
+    /// Stem `tx` to `peer` (issue #145): a direct send, never gossip.
+    pub async fn stem(&self, peer: PeerId, tx: randprotocol_core::Transaction) {
+        let _ = self.cmd.send(NetworkCommand::Stem { peer, tx }).await;
     }
 
     pub async fn send_sync_request(&self, peer: PeerId, request: SyncRequest) -> Option<OutboundRequestId> {
@@ -564,6 +605,9 @@ impl Topics {
 struct ConnectedPeer {
     addrs: Vec<Multiaddr>,
     connected_at: Instant,
+    /// One of its connections is one this node dialled (Dandelion++ prefers such a peer as a stem
+    /// successor: an adversary can connect to a node at will, but cannot make it dial).
+    dialed: bool,
 }
 
 /// Build the swarm, listen, and spawn the event loop. Returns immediately. No reserved peers
@@ -587,13 +631,18 @@ pub async fn start_with(
 
     let topics = Topics::new(cfg.chain_id);
     let signed_mode = if edge.strict_gossip { ValidationMode::Strict } else { ValidationMode::Permissive };
-    let gossipsub_config = gossip_config(&cfg.limits, signed_mode, None, topics.status.hash())?;
+    // The signed lane keeps `flood_publish`: a vote or a proposal should reach every peer at once.
+    let gossipsub_config = gossip_config(&cfg.limits, signed_mode, None, true, topics.status.hash())?;
     let gossipsub = gossipsub::Behaviour::new(MessageAuthenticity::Signed(keypair.clone()), gossipsub_config)
         .map_err(|e| anyhow::anyhow!("gossipsub: {e}"))?;
     // The anonymous transaction lane (issue #146). `ValidationMode::Anonymous` refuses a message
     // that carries a source, sequence number or signature, so no relay on this lane can attach
     // an author either. `--strict-gossip` does not apply: there is no author to check.
-    let tx_config = gossip_config(&cfg.limits, ValidationMode::Anonymous, Some(tx_protocol_prefix(cfg.chain_id)), topics.status.hash())?;
+    // No `flood_publish` here (issue #145): a transaction this node publishes goes to its mesh
+    // peers, as one it relays does, not to every peer at once — the burst that made the first
+    // relayer of a transaction stand out as its source.
+    let tx_config =
+        gossip_config(&cfg.limits, ValidationMode::Anonymous, Some(tx_protocol_prefix(cfg.chain_id)), false, topics.status.hash())?;
     let tx_gossip = gossipsub::Behaviour::new(MessageAuthenticity::Anonymous, tx_config)
         .map_err(|e| anyhow::anyhow!("tx gossipsub: {e}"))?;
 
@@ -620,6 +669,18 @@ pub async fn start_with(
         [(StreamProtocol::try_from_owned(format!("/rand/{}/sync/1", cfg.chain_id))?, ProtocolSupport::Full)],
         request_response::Config::default().with_request_timeout(cfg.limits.sync_request_timeout),
     );
+
+    // Dandelion++'s stem (issue #145): requests carry one transaction, bounded like a gossip frame;
+    // the answer is an acknowledgement.
+    let stem_proto = StreamProtocol::try_from_owned(stem_protocol(cfg.chain_id))?;
+    let stem = edge.dandelion.then(|| {
+        request_response::Behaviour::with_codec(
+            codec::Codec::<StemRequest, StemResponse>::new(cfg.limits.gossip_max_transmit_size as u64, STEM_RESPONSE_WIRE_LIMIT),
+            [(stem_proto.clone(), ProtocolSupport::Full)],
+            // A stem request is decoded before the node can meter it; few at once per connection.
+            request_response::Config::default().with_request_timeout(STEM_REQUEST_TIMEOUT).with_max_concurrent_streams(STEM_MAX_STREAMS),
+        )
+    });
 
     let ping = libp2p::ping::Behaviour::new(libp2p::ping::Config::new().with_interval(Duration::from_secs(15)).with_timeout(Duration::from_secs(20)));
     // Inbound only, plus the per-peer bound: this node's own dials are never refused by its own
@@ -657,7 +718,8 @@ pub async fn start_with(
             guard.reserve_at(id, [a], edge::SourceKind::Configured);
         }
     }
-    let behaviour = RandBehaviour { limits, guard, gossipsub, tx_gossip, identify, kademlia, mdns: Toggle::from(mdns), sync, ping };
+    let behaviour =
+        RandBehaviour { limits, guard, gossipsub, tx_gossip, identify, kademlia, mdns: Toggle::from(mdns), sync, stem: Toggle::from(stem), ping };
 
     let mut swarm = libp2p::SwarmBuilder::with_existing_identity(keypair)
         .with_tokio()
@@ -682,7 +744,9 @@ pub async fn start_with(
 
     let (cmd_tx, cmd_rx) = mpsc::channel(4096);
     let (evt_tx, evt_rx) = mpsc::channel(4096);
-    tokio::spawn(run(swarm, cfg, pinned, topics, !edge.anonymous_tx_only, cmd_rx, evt_tx));
+    let stem_proto = edge.dandelion.then_some(stem_proto);
+    let tx_paths = TxPaths { legacy_tx: !edge.anonymous_tx_only, stem: stem_proto };
+    tokio::spawn(run(swarm, cfg, pinned, topics, tx_paths, cmd_rx, evt_tx));
     Ok((NetworkHandle { cmd: cmd_tx, local_peer_id }, evt_rx))
 }
 
@@ -692,11 +756,13 @@ fn gossip_config(
     limits: &WireLimits,
     mode: ValidationMode,
     protocol_prefix: Option<String>,
+    flood_publish: bool,
     status_topic: gossipsub::TopicHash,
 ) -> anyhow::Result<gossipsub::Config> {
     let mut b = gossipsub::ConfigBuilder::default();
     b.heartbeat_interval(Duration::from_millis(500))
         .validation_mode(mode)
+        .flood_publish(flood_publish)
         .max_transmit_size(limits.gossip_max_transmit_size)
         .message_id_fn(move |m: &gossipsub::Message| message_id(m, &status_topic))
         // Application-level validation: this node forwards a transaction only after it has
@@ -915,17 +981,25 @@ fn dial_bootstrap(swarm: &mut Swarm<RandBehaviour>, cfg: &NetworkConfig, peers: 
     }
 }
 
+/// How transactions leave this node besides the anonymous lane (issues #145, #146).
+struct TxPaths {
+    /// Publish and relay on the legacy signed topic too ([`EdgeConfig::anonymous_tx_only`] off).
+    legacy_tx: bool,
+    /// The stem protocol, under [`EdgeConfig::dandelion`].
+    stem: Option<StreamProtocol>,
+}
+
 async fn run(
     mut swarm: Swarm<RandBehaviour>,
     cfg: NetworkConfig,
     // Reserved for the life of the process: no `Unreserve` removes one (see [`EdgeConfig`]).
     pinned: HashSet<PeerId>,
     topics: Topics,
-    // Publish and relay transactions on the legacy signed topic too ([`EdgeConfig::anonymous_tx_only`] off).
-    legacy_tx: bool,
+    tx_paths: TxPaths,
     mut cmd_rx: mpsc::Receiver<NetworkCommand>,
     evt_tx: mpsc::Sender<NetworkEvent>,
 ) {
+    let TxPaths { legacy_tx, stem: stem_proto } = tx_paths;
     let mut peers: HashMap<PeerId, ConnectedPeer> = HashMap::new();
     // Dialable addresses of every peer we have ever connected to, so a dropped
     // link is re-established without waiting for mDNS or Kademlia to rediscover it.
@@ -938,6 +1012,9 @@ async fn run(
     // One transaction heard on both lanes (issue #146): only while there are two.
     let mut cross = TxCross::default();
     let mut cross_tick = tokio::time::interval(TX_CROSS_TTL / 2);
+    // The stem sends in flight, so a failure can name the transaction it lost (issue #145).
+    // Bounded by the request timeout: every entry leaves on its response or its failure.
+    let mut stem_out: HashMap<OutboundRequestId, randprotocol_core::Hash> = HashMap::new();
     cross_tick.tick().await;
     dial_bootstrap(&mut swarm, &cfg, &peers);
     if !cfg.bootstrap.is_empty() {
@@ -968,6 +1045,13 @@ async fn run(
                 let Some(cmd) = cmd else { break };
                 match cmd {
                     NetworkCommand::Broadcast(msg) => publish(&mut swarm, &topics, legacy_tx, &msg),
+                    NetworkCommand::Stem { peer, tx } => {
+                        if let Some(stem) = swarm.behaviour_mut().stem.as_mut() {
+                            let hash = tx.hash();
+                            let id = stem.send_request(&peer, StemRequest(tx));
+                            stem_out.insert(id, hash);
+                        }
+                    }
                     NetworkCommand::SendSyncRequest { peer, request, reply } => {
                         let id = swarm.behaviour_mut().sync.send_request(&peer, request);
                         let _ = reply.send(id);
@@ -1020,7 +1104,14 @@ async fn run(
                 }
             }
             event = swarm.select_next_some() => {
-                let mut gossip = GossipState { topics: &topics, frames: &mut frames, cross: &mut cross, legacy_tx };
+                let mut gossip = GossipState {
+                    topics: &topics,
+                    frames: &mut frames,
+                    cross: &mut cross,
+                    legacy_tx,
+                    stem_proto: stem_proto.as_ref(),
+                    stem_out: &mut stem_out,
+                };
                 handle_swarm_event(event, &mut swarm, &mut peers, &mut known, &mut lan_peers, &mut gossip, &evt_tx).await;
             }
         }
@@ -1065,6 +1156,9 @@ struct GossipState<'a> {
     frames: &'a mut FrameMeter,
     cross: &'a mut TxCross,
     legacy_tx: bool,
+    /// The stem protocol under [`EdgeConfig::dandelion`], and the stem sends in flight (issue #145).
+    stem_proto: Option<&'a StreamProtocol>,
+    stem_out: &'a mut HashMap<OutboundRequestId, randprotocol_core::Hash>,
 }
 
 async fn handle_swarm_event(
@@ -1087,7 +1181,9 @@ async fn handle_swarm_event(
             if endpoint.is_dialer() {
                 remember_addr(known, peer_id, addr.clone());
             }
-            let entry = peers.entry(peer_id).or_insert_with(|| ConnectedPeer { addrs: Vec::new(), connected_at: Instant::now() });
+            let entry =
+                peers.entry(peer_id).or_insert_with(|| ConnectedPeer { addrs: Vec::new(), connected_at: Instant::now(), dialed: false });
+            entry.dialed |= endpoint.is_dialer();
             if !entry.addrs.contains(&addr) {
                 entry.addrs.push(addr);
             }
@@ -1178,6 +1274,13 @@ async fn handle_swarm_event(
             // entry there does not merely waste a dial, it fails the sync request that needed the
             // connection (`is_dialable_advertised_addr`).
             let on_lan = lan_peers.contains(&peer_id);
+            // A peer that speaks the stem protocol may be a stem successor (issue #145).
+            if let Some(proto) = gossip.stem_proto {
+                if info.protocols.contains(proto) {
+                    let outbound = peers.get(&peer_id).is_some_and(|p| p.dialed);
+                    let _ = evt_tx.send(NetworkEvent::StemPeer { peer: peer_id, outbound }).await;
+                }
+            }
             for addr in info.listen_addrs {
                 if !is_dialable_advertised_addr(&addr, on_lan) {
                     tracing::trace!(%peer_id, %addr, "ignoring an unreachable advertised address");
@@ -1225,6 +1328,31 @@ async fn handle_swarm_event(
             }
             request_response::Event::InboundFailure { peer, error, .. } => {
                 tracing::debug!(%peer, "inbound sync failure: {error}");
+            }
+            request_response::Event::ResponseSent { .. } => {}
+        },
+        SwarmEvent::Behaviour(RandEvent::Stem(ev)) => match ev {
+            request_response::Event::Message { peer, message, .. } => match message {
+                // Acknowledged on receipt, before anything is judged: the answer is the same
+                // whatever this node holds, so it tells the sender nothing (issue #145).
+                request_response::Message::Request { request: StemRequest(tx), channel, .. } => {
+                    if let Some(stem) = swarm.behaviour_mut().stem.as_mut() {
+                        let _ = stem.send_response(channel, StemResponse::Ack);
+                    }
+                    let _ = evt_tx.send(NetworkEvent::StemTx { from: peer, tx }).await;
+                }
+                request_response::Message::Response { request_id, .. } => {
+                    gossip.stem_out.remove(&request_id);
+                }
+            },
+            request_response::Event::OutboundFailure { peer, request_id, error, .. } => {
+                tracing::debug!(%peer, "stem send failed: {error}");
+                if let Some(hash) = gossip.stem_out.remove(&request_id) {
+                    let _ = evt_tx.send(NetworkEvent::StemFailed { peer, hash }).await;
+                }
+            }
+            request_response::Event::InboundFailure { peer, error, .. } => {
+                tracing::debug!(%peer, "inbound stem failure: {error}");
             }
             request_response::Event::ResponseSent { .. } => {}
         },
@@ -1829,8 +1957,12 @@ mod tests {
     #[test]
     fn the_transaction_lane_is_anonymous_by_configuration() {
         let topics = Topics::new(7);
-        let cfg = gossip_config(&WireLimits::default(), ValidationMode::Anonymous, Some(tx_protocol_prefix(7)), topics.status.hash()).unwrap();
+        let cfg = gossip_config(&WireLimits::default(), ValidationMode::Anonymous, Some(tx_protocol_prefix(7)), false, topics.status.hash()).unwrap();
         assert!(matches!(cfg.validation_mode(), ValidationMode::Anonymous));
+        // Issue #145: a transaction this node publishes goes to its mesh, not to every peer.
+        assert!(!cfg.flood_publish(), "flood_publish is off on the transaction lane");
+        let signed = gossip_config(&WireLimits::default(), ValidationMode::Permissive, None, true, topics.status.hash()).unwrap();
+        assert!(signed.flood_publish(), "and stays on for consensus");
         assert!(gossipsub::Behaviour::<gossipsub::IdentityTransform, gossipsub::AllowAllSubscriptionFilter>::new(MessageAuthenticity::Anonymous, cfg.clone()).is_ok());
         let kp = identity::Keypair::generate_ed25519();
         assert!(
@@ -2434,6 +2566,7 @@ mod tests {
         assert!(e.bound.is_empty());
         assert!(!e.strict_gossip);
         assert!(!e.anonymous_tx_only, "both transaction lanes by default, for the rolling upgrade (#146)");
+        assert!(!e.dandelion, "a bare network speaks no stem unless asked (#145)");
     }
 
     /// The handle's commands, each one: every method sends the variant the swarm task matches
@@ -2449,6 +2582,9 @@ mod tests {
 
         h.broadcast(GossipMessage::Status(status.clone())).await;
         assert!(matches!(rx.recv().await, Some(NetworkCommand::Broadcast(GossipMessage::Status(s))) if s.height == 3 && s.floor == 1));
+
+        h.stem(peer, tx_of(5)).await;
+        assert!(matches!(rx.recv().await, Some(NetworkCommand::Stem { peer: p, tx }) if p == peer && tx.chain_id == 5));
 
         h.dial(addr("/ip4/203.0.113.7/tcp/30303")).await;
         assert!(matches!(rx.recv().await, Some(NetworkCommand::Dial(a)) if a == addr("/ip4/203.0.113.7/tcp/30303")));

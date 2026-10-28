@@ -402,6 +402,29 @@ seeded from `--bootstrap`, **identify**, optional **mDNS** for LAN discovery, **
 dialled or learnt through identify and redials disconnected known peers every 30 s, in addition to
 the bootstrap list.
 
+**Transactions take a stem first (Dandelion++, v0.8.3, issue #145; `crate::dandelion`).** A fourth
+request-response protocol, `/rand/<chain-id>/stem/1` (CBOR; the request is one transaction, the
+answer an acknowledgement sent on receipt), carries a transaction to one peer. Each node keeps two
+**stem successors** per 10-minute local epoch, drawn from the connected peers whose identify lists
+the stem protocol, preferring peers it dialled, and maps each incoming edge (each predecessor, and
+its own RPC) to one of them for the epoch, so its routes are consistent. A transaction from this
+node's RPC or from a peer's stem is verified on the ordinary verification queue and then, at a
+relay, **fluffed** with probability q (`--dandelion-fluff-prob`, 0.1): pooled and published on the
+anonymous transaction lane. Otherwise it is held in the **stempool** and sent to the edge's
+successor; the submitter never fluffs its own transaction on the coin. A stem that comes back to a
+node holding it is decided as a fresh arrival (the coin, then the edge's route) without a second
+verification, at most 32 sends per transaction per node. Every holder runs an **embargo** timer —
+b + min(Exp(mean b/4), b) at a relay, 2b + Exp(mean b/4) at the submitter, b = `--dandelion-embargo-ms`
+(3 s) — and publishes the transaction itself if it has not come back over gossip by then. A
+holder that sees it on gossip pools it from the stempool without verifying again. The stempool
+(1 024 transactions, 64 MiB) is invisible: `rand_getTransactionStatus` reads `unknown`,
+`rand_getMempoolInfo` does not count it, `SyncRequest::Transactions` does not serve it and no
+proposal includes it until it is fluffed. With no stem-capable peer a transaction is published at
+once, as before. The transaction lane's gossipsub runs without `flood_publish`, so a node publishes
+a transaction to its mesh as it would relay one, not to every peer at once; the signed lane keeps
+it for consensus. A peer's first-time stems are metered on a bucket of their own (32, refilling at
+8/s) before verification; returns of a held transaction are not, being bounded per transaction.
+
 Every node gossips its status (height, head hash, view) every 3 s. A node that sees a peer more than
 one block ahead sends a sync request for up to 100 committed blocks with their QCs; on the reply it
 verifies each QC against the validator set, checks linkage and leader, re-executes every block

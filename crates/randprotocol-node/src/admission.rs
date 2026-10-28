@@ -649,8 +649,12 @@ pub enum VerifySource {
     /// Gossip: the verdict decides the message's acceptance, so the transaction is propagated only
     /// once it has verified here.
     Gossip(GossipId),
-    /// RPC: the verdict is the caller's answer, and an accepted transaction is broadcast.
+    /// RPC: the verdict is the caller's answer, and an accepted transaction is stemmed, or
+    /// broadcast when there is no stem (issue #145).
     Rpc(oneshot::Sender<Result<Hash, MempoolError>>),
+    /// Dandelion++'s stem (issue #145): this peer stemmed it here. Nothing is reported to
+    /// anyone; an accepted transaction is stemmed on or fluffed.
+    Stem(libp2p::PeerId),
 }
 
 /// One finished verification, on its way back to the node loop.

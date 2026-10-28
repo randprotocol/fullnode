@@ -765,6 +765,23 @@ enum Cmd {
         /// runs v0.8.3 or later: an older node hears transactions on the legacy topic alone.
         #[arg(long)]
         anonymous_tx_only: bool,
+        /// Dandelion++ stem relay for transactions (issue #145): a transaction this node's RPC
+        /// accepts, or a peer stems to it, goes to one stem successor over a direct send instead of
+        /// being broadcast, and is fluffed onto gossip a few hops later, so the first node to
+        /// publish it is not the one it was submitted to. Only peers that advertise the stem
+        /// protocol (v0.8.3 and later) are ever sent a stem; with none, a transaction is published
+        /// at once, as before. `off`: no stem sent or accepted.
+        #[arg(long, value_name = "on|off", default_value = "on", value_parser = ["on", "off"])]
+        dandelion: String,
+        /// q: the probability that a stem relay fluffs (publishes on gossip) instead of passing
+        /// the transaction on. Expected stem length is 1/q relays.
+        #[arg(long, value_name = "Q", default_value_t = randprotocol_node::dandelion::DEFAULT_FLUFF_PROB, value_parser = parse_fluff_prob)]
+        dandelion_fluff_prob: f64,
+        /// The stem embargo's fixed part, b, in milliseconds: a node holding a stem transaction
+        /// fluffs it itself if it has not seen it on gossip after b + min(Exp(mean b/4), b) (2b +
+        /// Exp(mean b/4) at the submitting node). The fail-safe against a successor that drops it.
+        #[arg(long, value_name = "MS", default_value_t = randprotocol_node::dandelion::DEFAULT_EMBARGO.as_millis() as u64, value_parser = clap::value_parser!(u64).range(100..=600_000))]
+        dandelion_embargo_ms: u64,
         #[arg(long, default_value = "127.0.0.1:8545")]
         rpc: SocketAddr,
         /// Take part in consensus with this node's key. A key in no current epoch's validator
@@ -3007,6 +3024,9 @@ async fn main() -> Result<()> {
             reserved_peer,
             strict_gossip,
             anonymous_tx_only,
+            dandelion,
+            dandelion_fluff_prob,
+            dandelion_embargo_ms,
             rpc,
             validator,
             no_mdns,
@@ -3099,7 +3119,17 @@ async fn main() -> Result<()> {
                 prune_history,
                 gas_policy: randprotocol_core::gas::GasPolicy::from_prices(gas_price, byte_price),
                 msauth: randprotocol_node::msauth_key::MsauthKeyOptions { path: msauth_vk, build: build_msauth_key },
-            }, rpc_options, node::NetOptions { reserved_peers: reserved_peer, strict_gossip, anonymous_tx_only })
+            }, rpc_options, node::NetOptions {
+                reserved_peers: reserved_peer,
+                strict_gossip,
+                anonymous_tx_only,
+                dandelion: randprotocol_node::dandelion::DandelionConfig {
+                    enabled: dandelion == "on",
+                    fluff_prob: dandelion_fluff_prob,
+                    embargo: Duration::from_millis(dandelion_embargo_ms),
+                    ..Default::default()
+                },
+            })
             .await?;
             // The prover is served once the node's RPC is up and stops with the node; a prover
             // that exits stops the node too.
@@ -4357,6 +4387,14 @@ async fn aggregate_round(
 pub const MIN_PRUNE_HISTORY: Duration = Duration::from_secs(3600);
 
 /// `<n>m`, `<n>h` or `<n>d`.
+/// `--dandelion-fluff-prob`: a probability, in `[0, 1]`.
+pub fn parse_fluff_prob(s: &str) -> Result<f64, String> {
+    match s.parse::<f64>() {
+        Ok(q) if (0.0..=1.0).contains(&q) => Ok(q),
+        _ => Err(format!("{s:?} is not a probability in [0, 1]")),
+    }
+}
+
 pub fn parse_prune_history(s: &str) -> Result<Duration, String> {
     let usage = "prune-history takes <n>m, <n>h or <n>d";
     if !s.is_ascii() {
@@ -4502,6 +4540,35 @@ mod tests {
         }
         for args in [&["status"][..], &["keygen", "--out", "k.json"], &["address", "--key", "k.json"]] {
             assert!(!opens_storage(&cmd(args)), "`rand-node {}` opens no database", args.join(" "));
+        }
+    }
+
+    /// Issue #145: Dandelion++ is on by default at q = 0.1 and a 3 s embargo; each flag parses,
+    /// and a probability outside [0, 1], an unknown mode or an embargo under 100 ms is refused.
+    #[test]
+    fn the_dandelion_flags_default_on_and_refuse_nonsense() {
+        let run = |extra: &[&str]| {
+            let args = ["rand-node", "run", "--datadir", "d", "--key", "k.json"].into_iter().chain(extra.iter().copied());
+            match Cli::try_parse_from(args).map(|c| c.cmd) {
+                Ok(Cmd::Run { dandelion, dandelion_fluff_prob, dandelion_embargo_ms, .. }) => Ok((dandelion, dandelion_fluff_prob, dandelion_embargo_ms)),
+                Ok(_) => unreachable!("a run"),
+                Err(e) => Err(e.to_string()),
+            }
+        };
+        assert_eq!(run(&[]).unwrap(), ("on".to_string(), 0.1, 3000));
+        assert_eq!(
+            run(&["--dandelion", "off", "--dandelion-fluff-prob", "0.25", "--dandelion-embargo-ms", "8000"]).unwrap(),
+            ("off".to_string(), 0.25, 8000)
+        );
+        assert_eq!(run(&["--dandelion-fluff-prob", "1"]).unwrap().1, 1.0);
+        for bad in [
+            &["--dandelion", "maybe"][..],
+            &["--dandelion-fluff-prob", "1.5"],
+            &["--dandelion-fluff-prob", "-0.1"],
+            &["--dandelion-fluff-prob", "NaN"],
+            &["--dandelion-embargo-ms", "50"],
+        ] {
+            assert!(run(bad).is_err(), "{bad:?} accepted");
         }
     }
     use randprotocol_zkvm::machine::FriProfile;

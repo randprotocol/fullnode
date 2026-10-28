@@ -664,3 +664,77 @@ async fn an_operator_reserved_peer_survives_unreserve() {
         p.h.shutdown().await;
     }
 }
+
+/// Dandelion++'s stem protocol (issue #145) on the wire. Two nodes that speak it learn so of each
+/// other through identify (each told whether it dialled the other, which is how a node prefers
+/// peers it chose); a stem from one reaches the other as `StemTx` naming the sender. A node with
+/// Dandelion off advertises nothing, so it is never reported as a stem peer, and a stem sent to it
+/// anyway comes back as `StemFailed` with the transaction's hash — an older node is never handed
+/// a stem it cannot read.
+#[tokio::test]
+async fn the_stem_is_advertised_delivered_and_never_reaches_a_node_without_it() {
+    let on = EdgeConfig { dandelion: true, ..EdgeConfig::default() };
+    let mut a = start(61, CHAIN, vec![], WireLimits::default(), on.clone()).await;
+    let mut b = start(62, CHAIN, vec![a.full.clone()], WireLimits::default(), on).await;
+    let mut c = start(63, CHAIN, vec![a.full.clone()], WireLimits::default(), EdgeConfig::default()).await;
+    let (ia, ib, ic) = (a.h.local_peer_id, b.h.local_peer_id, c.h.local_peer_id);
+    assert!(b.connected(ia, Duration::from_secs(10)).await && c.connected(ia, Duration::from_secs(10)).await);
+
+    let mut saw_c = false;
+    let a_saw_b = a
+        .wait(Duration::from_secs(10), |e| match e {
+            NetworkEvent::StemPeer { peer, outbound } if peer == ib => Some(outbound),
+            NetworkEvent::StemPeer { peer, .. } if peer == ic => {
+                saw_c = true;
+                None
+            }
+            _ => None,
+        })
+        .await;
+    assert_eq!(a_saw_b, Some(false), "A learns B speaks the stem; B dialled A");
+    let b_saw_a = b
+        .wait(Duration::from_secs(10), |e| match e {
+            NetworkEvent::StemPeer { peer, outbound } if peer == ia => Some(outbound),
+            _ => None,
+        })
+        .await;
+    assert_eq!(b_saw_a, Some(true), "B learns A speaks the stem; B dialled it");
+
+    let sent = tx(145);
+    b.h.stem(ia, sent.clone()).await;
+    let got = a
+        .wait(Duration::from_secs(10), |e| match e {
+            NetworkEvent::StemTx { from, tx } if from == ib => Some(tx),
+            NetworkEvent::StemPeer { peer, .. } if peer == ic => {
+                saw_c = true;
+                None
+            }
+            _ => None,
+        })
+        .await
+        .expect("B's stem reaches A");
+    assert_eq!(got.hash(), sent.hash());
+
+    let refused = tx(146);
+    a.h.stem(ic, refused.clone()).await;
+    let failed = a
+        .wait(Duration::from_secs(15), |e| match e {
+            NetworkEvent::StemFailed { peer, hash } if peer == ic => Some(hash),
+            NetworkEvent::StemPeer { peer, .. } if peer == ic => {
+                saw_c = true;
+                None
+            }
+            _ => None,
+        })
+        .await
+        .expect("a stem to a node without the protocol fails back");
+    assert_eq!(failed, refused.hash());
+    assert!(!saw_c, "a node with Dandelion off was reported as a stem peer");
+    let c_got_one = c
+        .wait(Duration::from_millis(500), |e| matches!(e, NetworkEvent::StemTx { .. }).then_some(()))
+        .await;
+    assert!(c_got_one.is_none());
+    for p in [a, b, c] {
+        p.h.shutdown().await;
+    }
+}

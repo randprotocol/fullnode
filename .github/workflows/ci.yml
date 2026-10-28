@@ -147,6 +147,8 @@ jobs:
           cargo test -p randprotocol-client --release --test cli_scripts --test cli_rpc --test cli_perp --test cli_token_bridge --test rpc_methods
           cargo test -p randprotocol-node --release --test prover_hosted --test keygen_cli --test prover_flag --test network --test cli_multisig --test cli_staking --test cli_vesting --test cli_datadir --test cli_bridge_gov
           cargo test -p randprotocol-node --release --test genesis_cli -- --skip aggregation_tree_section
+          # Dandelion++ (issue #145): five proof-free nodes on loopback; about half a minute.
+          cargo test -p randprotocol-node --release --test dandelion -- --test-threads=1
           # The downstream repos' RPC contract (randscan, randbridge.org, randprotocol.org,
           # zusd.money): every field they read, by presence and JSON type. One validator, one
           # faucet mint, no proof.

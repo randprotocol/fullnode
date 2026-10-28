@@ -16,6 +16,19 @@ pub struct Status {
     pub floor: u64,
 }
 
+/// One transaction stemmed to a peer (Dandelion++, issue #145), on the request-response protocol
+/// `/rand/{chain}/stem/1`: a direct send to one successor, never gossip. The transaction alone —
+/// no hop count, no origin, nothing that says how far it has come.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct StemRequest(pub Transaction);
+
+/// The receiver's answer to a [`StemRequest`]: sent the moment the bytes decode, before the
+/// transaction is verified, so the answer says nothing about what the receiver holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum StemResponse {
+    Ack,
+}
+
 #[allow(clippy::large_enum_variant)] // moved once, never stored in bulk: boxing buys nothing
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum GossipMessage {
