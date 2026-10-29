@@ -64,6 +64,18 @@ Node:
   `rand_getEmission.faucet` are `true` only on a validator whose key is a faucet minter, and
   `rand_mint` on any other validator refuses up front, naming the minters.
 
+Deploy tooling (no node or chain change):
+
+- **`deploy/cut-chain22-genesis.sh`**: the chain-22 cut, derived from chain 21's script with chain
+  21 as the source, switching on v0.8.2's genesis-gated rules — `program_state.refuse_panics`
+  (PST-1, monorepo#15), `perps.bound_payouts` (PERP-6, #13), `perps.sparse_windows` with
+  `perps.max_window_heights` (PERP-101, #12), `perps.engine_program_log_height` 14 (CON-60),
+  `multisig.max_accounts` (MSA-4) and `tokens.incremental_root` — each asserted on the finished
+  file, field-probed into the genesis hash and read back by `check-limits`. `max_window_heights`,
+  `max_accounts` and the treasury's balance are the owner's (no default); chain 21's treasury
+  vault, perps exchange and program vaults are refused unless dropped knowingly and named on the
+  record. Not run: no cut was made (`docs/deploy.md`, "The next cut: chain 22").
+
 Wallet (`rand`; client-only, no node or chain change):
 
 - **`rand` no longer exits 1 after a successful submit** (#141): `submitted <kind> <hash>` is

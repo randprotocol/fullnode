@@ -1800,6 +1800,85 @@ it here and in the script together. Every chain-21 node needs the msauth verifie
 the `DRY_RUN` loopback node needs it
 too (`RAND_MSAUTH_VK=<the committed blob>`).
 
+## The next cut: chain 22 (audit v11 gated fields)
+
+**What it is.** v0.8.2 (299378d0; the audit/v10-node and audit/v10-perps merges d7358e90 and
+81b9a2c0) ships five genesis-gated rules that chain 21 cannot switch on in place (`CHANGELOG.md`
+v0.8.2). Each is optional, absent from every genesis through chain 21, and hashed under its own tag
+only when set, so chain 21's hash does not move under a v0.8.2 node. Three of them close audit-v11
+issues at the cut: randprotocol/monorepo#15 (PST-1), #13 (PERP-6) and #12 (PERP-101).
+
+| field | value at chain 22 | what it does | source |
+|---|---|---|---|
+| `program_state.refuse_panics` | `true` | an `Invoke` whose call proof publishes guest-sdk's panic sentinel (`0xdeadbeef` in output 7) is invalid (PST-1; pool policy refuses it now) | `docs/program-state.md` (`refuse_panics`), `rand-node genesis --program-state-refuse-panics` |
+| `perps.bound_payouts` | `true` | a state proof may pay out no more collateral than `initial_collateral + collateral_in − collateral_out` (PERP-6) | `docs/perps.md` field table |
+| `perps.initial_collateral` | absent (0) | the collateral a seeded engine starts with; chain 22's engine starts from `perp-prover genesis-state`, which holds none | `docs/perps.md` field table |
+| `perps.sparse_windows` + `perps.max_window_heights` | `true` + **the owner's value** | input-less blocks record no digest; one window spans at most `max_window_heights` heights, `max_window_blocks` (64) ..= 4096; it is also the heartbeat interval, and back-pressure holds new orders at 4 × it past the proved height (PERP-101) | `docs/perps.md` "Sparse windows" |
+| `perps.engine_program_log_height` | `14` | pins the engine's program height so an invalid proof is not re-proved at another shape (CON-60); `rand perp image-hc` prints it on stderr for the pinned image `f286a611…` | `docs/perps.md` field table |
+| `multisig.max_accounts` | **the owner's value** (≥ 1) | the most accounts the register ever holds, the seeded treasury counted; a `CreateMultisig` past it is refused (MSA-4) | `docs/multisig.md` (`max_accounts`) |
+| `tokens.incremental_root` | `true` | "Recommended: on, for the next cut" (above, audit v6 TOK-1); chain 21 did not carry it | this page, "The next cut: `tokens.incremental_root`" |
+
+Everything else is chain 21's, asserted equal: `fees` {burn_base, burn_floor}, `perps` (BTC-PERP on
+zUSD, the pinned engine, tier 18, 24 inputs — and its `genesis_root`, re-derived by perp-prover,
+must equal chain 21's `da0e3a53…`), `multisig` create fee 1 RAND with one treasury 2 of 3,
+`hc_auth_multisig` 9705f8e2…, 6 MiB proofs and 19 MiB blocks, and chain 20's shape before them.
+
+**Open — the owner's, before the cut** (`deploy/cut-chain22-genesis.sh`'s header, OPEN 1–7). The
+real cut takes no default for any of them:
+
+1. `perps.max_window_heights` — no documented value (the documented default, 0, is refused beside
+   `sparse_windows`). `PERPS_MAX_WINDOW_HEIGHTS`, 64..=4096.
+2. `multisig.max_accounts` — no documented value; absent is unbounded, which would not close MSA-4.
+   `MULTISIG_MAX_ACCOUNTS`, ≥ 1.
+3. The treasury. No document says how a multisig account crosses a cut: chain 21's treasury
+   (`d5fd1883…1958`, 100 000 RAND new issuance at its cut) is register state, not a note, so the
+   carry-over scan never sees it. The script seeds one treasury as chain 21's did — new issuance
+   from `TREASURY`, signers asserted equal to chain 21's — and refuses while chain 21's register
+   holds RAND (`rand_getSupply.multisig_rand_held`) unless `MULTISIG_NOT_CARRIED_OK=1` and the
+   record's `drops:` line names it. The chain-22 balance is `TREASURY`'s `balance` line.
+4. Chain 21's perps exchange. No carry is designed (engine state is proved off chain); the cut
+   refuses while `rand_getPerps` shows accounts, pending withdrawals or collateral unless
+   `PERPS_STATE_NOT_CARRIED_OK=1` and the record's `drops:` names it.
+5. zUSD held by the exchange: chain 21's zUSD supply does not move on a deposit, so the carry rule
+   (Σ `ZUSD_CARRY` == Σ locked == custody) still holds and the operator names, line by line, whose
+   note re-issues it.
+6. Not carried and not recommended by any page: `incremental_nullifier_root`, `staking.slashing`,
+   and the aggregation-only fields — each refused, as chain 21 refused them.
+7. `EXPECT_NODE_VERSION` — v0.8.2 is the first release with every field; v0.8.3 is untagged.
+
+RPL-2 program vaults are refused the same way (`rand_getSupply.program_rand_held`;
+`PROGRAM_VAULTS_DROPPED_OK=1`, the record's `drops:` naming them): chain 21's record dropped the
+programs' state, but its script never counted their RAND.
+
+**Rolling it out.** `deploy/cut-chain22-genesis.sh`, derived from chain 21's script with chain 21
+as the source (`snapshot` also reads `rand_getPerps`, `rand_getPerpAccounts` and the treasury's
+`rand_getMultisig`). It writes `refuse_panics` and `incremental_root` through the build's flags,
+`max_accounts` in the `--multisig` file, and the perps fields in the section it splices; derives
+`engine_program_log_height` from `rand perp image-hc` and refuses anything but 14; asserts each on
+the finished file (`initial_collateral` absent; `max_window_heights` and `max_accounts` equal to the
+operator's inputs; each in its struct's field order); and proves each is part of the genesis hash
+— seven variants, each a valid genesis without one field (or, for `max_window_heights`, at another
+value in range), each of which must hash differently. The real cut refuses a build without
+`--program-state-refuse-panics` or whose `rand perp image-hc` prints no
+`engine_program_log_height` (anything before v0.8.2); `DRY_RUN=1` skips them all on such a build,
+loudly (`AUDIT_V10 SKIPPED`), and puts in each operator input's lower bound (64; 1), loudly, as a
+placeholder. The cut record's `reason:` or `carries:` must name PST-1, PERP-6 and PERP-101 and the
+treasury. Every node — validators, archives, the RPC nodes the sites read — runs v0.8.2 or later
+from chain 22's first block: an older one refuses the file (`deny_unknown_fields` on the perps,
+multisig and program-state sections). durian.market's perp-prover must build sparse jobs
+(durian 28cebfb, PERP-101) before the first perps window on chain 22, and the prover host must fit
+a tier-18 proof (`rand perp prove` proves at the canonical shape once the pin is set).
+
+**After launch:** `NODE=… deploy/cut-chain22-genesis.sh check-limits <first node's RPC> <genesis
+file>` reads, beside every chain-21 value, `rand_getPerps` `bound_payouts` true,
+`initial_collateral` `"0"`, `sparse_windows` true, `max_window_heights`,
+`engine_program_log_height` 14, `accounts`/`pending_withdrawals` 0 and the collateral counters
+`"0"`; `rand_getLimits.multisig.max_accounts`; and `rand_getTokens.incremental_root` true. Run it
+before the first deposit and state proof. **No RPC serves `program_state.refuse_panics`**
+(`rand_getLimits.program_state` is the cell fee and three bounds): it is read back only through the
+genesis hash the node serves, which the field probe showed moves without it. Serving it is a node
+follow-up.
+
 ## The next cut: the proposer/aggregator split (`fees.proposer_share_bps`, `fees.prove_base`; unreleased)
 
 **What it is.** Two optional numbers in the same `fees` section (`docs/fees.md` §1.3,
