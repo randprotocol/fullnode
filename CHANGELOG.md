@@ -12,7 +12,9 @@ stopped at v0.4 until 2026-09-30, when the entries v0.5 to v0.6.7 were written f
 
 ## Unreleased
 
-v0.8.3 (not yet tagged):
+Nothing yet.
+
+## v0.8.3 — 2026-11-01 (chain 21, node-only; rolled to end the 2026-10-31 halt at 644660)
 
 Node:
 
