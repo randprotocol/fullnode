@@ -2050,6 +2050,43 @@ impl Storage {
         Ok(Some(perps))
     }
 
+    /// The perps state without its digest rows: what a reader that needs neither the root nor the
+    /// log asks for, so a public RPC call does not walk a row per block.
+    pub fn perps_head(&self) -> Result<Option<randprotocol_core::ledger::perps::Perps>> {
+        self.get_meta_raw(META_PERPS)?
+            .map(|row| {
+                randprotocol_core::ledger::perps::Perps::decode_persisted(&row)
+                    .map_err(|e| StorageError::Corrupt(format!("perps state: {e}")))
+            })
+            .transpose()
+    }
+
+    /// `D_h` while `height` is pending: one row read.
+    pub fn perp_digest(&self, height: u64) -> Result<Option<randprotocol_core::notes::Word8>> {
+        match self.db.get_cf(self.cf(CF_META), Self::perp_digest_key(height))? {
+            Some(value) => Ok(Some(bincode::deserialize(&value).map_err(|e| StorageError::Corrupt(format!("perp digest {height}: {e}")))?)),
+            // A store from before the rows, until its first commit moves them.
+            None => Ok(self.perps_head()?.and_then(|p| p.digest(height))),
+        }
+    }
+
+    /// The lowest `limit` pending heights, ascending, and whether more follow them.
+    pub fn perp_pending_heights(&self, limit: usize) -> Result<(Vec<u64>, bool)> {
+        let mut heights: Vec<u64> = self.perps_head()?.map(|p| p.pending_heights()).unwrap_or_default();
+        heights.truncate(limit.saturating_add(1));
+        let start = IteratorMode::From(META_PERP_DIGEST_PREFIX, rocksdb::Direction::Forward);
+        for item in self.db.iterator_cf(self.cf(CF_META), start) {
+            if heights.len() > limit {
+                break;
+            }
+            let Some(height) = Self::perp_digest_height(&item?.0) else { break };
+            heights.push(height);
+        }
+        let more = heights.len() > limit;
+        heights.truncate(limit);
+        Ok((heights, more))
+    }
+
     fn perp_digest_key(height: u64) -> Vec<u8> {
         let mut key = META_PERP_DIGEST_PREFIX.to_vec();
         key.extend_from_slice(&height.to_be_bytes());
@@ -9882,6 +9919,26 @@ mod tests {
         assert!(s.commit(std::slice::from_ref(&torn), &probe, &[], &StubExecutor).is_err());
         let reloaded = crate::node::reload_ledger(&s, &gs, &StubExecutor).unwrap();
         assert_eq!(reloaded.perps(), ledger.perps());
+    }
+
+    #[test]
+    fn perp_readers_take_only_what_they_ask_for() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Storage::open(dir.path()).unwrap();
+        let gs = perps_genesis(7);
+        s.init_genesis(&gs).unwrap();
+        let (mut ledger, mut parent) = (gs.ledger.clone(), gs.block.clone());
+        for _ in 0..5 {
+            let cb = make_perps_block(&parent, &mut ledger, vec![], &key(1));
+            s.commit(std::slice::from_ref(&cb), &ledger, &[], &StubExecutor).unwrap();
+            parent = cb.block.clone();
+        }
+        assert_eq!(s.perp_pending_heights(3).unwrap(), (vec![1, 2, 3], true));
+        assert_eq!(s.perp_pending_heights(5).unwrap(), (vec![1, 2, 3, 4, 5], false));
+        assert_eq!(s.perp_pending_heights(9).unwrap(), (vec![1, 2, 3, 4, 5], false));
+        assert_eq!(s.perp_digest(4).unwrap(), ledger.perps().unwrap().digest(4));
+        assert_eq!(s.perp_digest(6).unwrap(), None);
+        assert!(s.perps_head().unwrap().unwrap().digest_log().is_empty(), "the head row carries no digests");
     }
 
     #[test]

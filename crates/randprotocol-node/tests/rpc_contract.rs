@@ -1058,7 +1058,7 @@ async fn perps_reads_under_a_perps_section() {
             ("markets.0.id", Int), ("markets.0.symbol", Str), ("markets.0.lot", Int), ("markets.0.tick", Int),
             ("markets.0.max_leverage", Int), ("markets.0.maintenance_bps", Int), ("markets.0.taker_fee_bps", Int),
             ("markets.0.maker_fee_bps", Int),
-            ("proved_root", Hex), ("proved_height", Int), ("head_height", Int), ("pending_heights", Arr),
+            ("proved_root", Hex), ("proved_height", Int), ("head_height", Int), ("pending_heights", Arr), ("pending_heights_more", Bool),
             ("medians", Arr), ("medians.0.market", Int), ("medians.0.price", Dec),
             ("accounts", Int), ("pending_withdrawals", Int),
         ]),

@@ -602,6 +602,9 @@ pub fn head_summary(storage: &Storage, status: &RwLock<NodeStatus>) -> crate::st
     Ok(HeadSummary { height: head.height, hash: head.hash.to_hex(), view })
 }
 
+/// The fewest pending heights `rand_getPerps` lists when more wait (`pending_heights_more`).
+const MIN_PENDING_HEIGHTS_SHOWN: usize = 4096;
+
 #[derive(Clone)]
 pub struct RpcState {
     pub storage: Arc<Storage>,
@@ -3244,10 +3247,15 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
         "rand_getPerps" => {
             let storage = st.storage.clone();
             let (perps, head) =
-                blocking(st, move || crate::storage::Result::Ok((storage.perps()?, storage.head()?.height))).await?;
+                blocking(st, move || crate::storage::Result::Ok((storage.perps_head()?, storage.head()?.height))).await?;
             let Some(p) = perps else {
                 return Ok(json!({ "enabled": false }));
             };
+            // The lowest heights, which are what a state proof covers next: a chain nobody proves
+            // on has a pending height per block, too many to walk and serve on a public call.
+            let shown = (p.config.max_window_blocks as usize).max(MIN_PENDING_HEIGHTS_SHOWN);
+            let storage = st.storage.clone();
+            let (pending_heights, pending_more) = blocking(st, move || storage.perp_pending_heights(shown)).await?;
             let c = &p.config;
             Ok(json!({
                 "enabled": true,
@@ -3269,7 +3277,8 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
                 "proved_root": word8_to_hex(&p.proved_root),
                 "proved_height": p.proved_height,
                 "head_height": head,
-                "pending_heights": p.pending_heights(),
+                "pending_heights": pending_heights,
+                "pending_heights_more": pending_more,
                 "medians": c
                     .markets
                     .iter()
@@ -3292,7 +3301,7 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
             let id =
                 parse_cell_key(p.get(0).ok_or_else(|| RpcError::invalid_params("missing param account"))?, "account")?;
             let storage = st.storage.clone();
-            let Some(perps) = blocking(st, move || storage.perps()).await? else {
+            let Some(perps) = blocking(st, move || storage.perps_head()).await? else {
                 return Ok(Value::Null);
             };
             Ok(perps.account(&id).map(|a| perp_account_json(&perps, &id, a)).unwrap_or(Value::Null))
@@ -3324,7 +3333,7 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
                 }
             };
             let storage = st.storage.clone();
-            let Some(perps) = blocking(st, move || storage.perps()).await? else {
+            let Some(perps) = blocking(st, move || storage.perps_head()).await? else {
                 return Ok(json!({ "accounts": [], "next": null }));
             };
             // One past the page, to know whether anything follows it.
@@ -3345,13 +3354,13 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
         "rand_getPerpInputs" => {
             let height: u64 = param(p, 0, "height")?;
             let storage = st.storage.clone();
-            let (words, perps) =
-                blocking(st, move || crate::storage::Result::Ok((storage.perp_inputs(height)?, storage.perps()?)))
+            let (words, recorded) =
+                blocking(st, move || crate::storage::Result::Ok((storage.perp_inputs(height)?, storage.perp_digest(height)?)))
                     .await?;
             let Some(words) = words else {
                 return Ok(Value::Null);
             };
-            let digest = perps.and_then(|p| p.digest(height)).unwrap_or_else(|| {
+            let digest = recorded.unwrap_or_else(|| {
                 use randprotocol_core::ledger::perps::{domain, perp_digest};
                 perp_digest(st.executor.as_ref(), domain::BLOCK, &words)
             });
@@ -4309,7 +4318,7 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
             };
             // RPL-3: the exchange's RAND is the identity's fifth term (`Ledger::audit`): a RAND
             // deposit's `burn_r` is inside `burned`, and what proofs paid back out is in the pool.
-            let audit = match st.storage.perps().map_err(RpcError::internal)? {
+            let audit = match st.storage.perps_head().map_err(RpcError::internal)? {
                 Some(p) => audit
                     .with_perps(p.rand_in, p.rand_out)
                     .with_perps_collateral(p.config.initial_collateral, p.collateral_in, p.collateral_out),
@@ -8400,6 +8409,7 @@ pub(crate) mod tests {
                 "proved_height": 0,
                 "head_height": 3,
                 "pending_heights": [1, 2, 3],
+                "pending_heights_more": false,
                 "medians": [{ "market": 0, "price": "1000000" }],
                 "accounts": 1,
                 "pending_withdrawals": 1,
