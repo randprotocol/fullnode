@@ -2155,8 +2155,9 @@ impl Storage {
         let wanted_top = log.last_height().unwrap_or(0);
         // Below the rows too: a ledger restored by a truncation can hold heights a later state
         // proof had removed from the store.
-        let below = bounds.and_then(|(low, _)| low.checked_sub(1)).map_or(1..=0, |top| 0..=top);
-        for (height, digest) in log.range(stored_top.saturating_add(1)..=u64::MAX).chain(log.range(below)) {
+        let below = bounds.and_then(|(low, _)| low.checked_sub(1));
+        let missing_below = below.into_iter().flat_map(|top| log.range(0..=top));
+        for (height, digest) in log.range(stored_top.saturating_add(1)..=u64::MAX).chain(missing_below) {
             batch.put_cf(self.cf(CF_META), Self::perp_digest_key(height), bincode::serialize(digest)?);
         }
         if let Some((low, high)) = bounds {
