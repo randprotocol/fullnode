@@ -16,6 +16,7 @@ mod bind_tests;
 pub mod bridge_gov;
 pub mod bridge_notes;
 pub mod call_envelope;
+pub mod digest_log;
 pub mod fees;
 pub mod multisig;
 pub mod nullifier_mmr;

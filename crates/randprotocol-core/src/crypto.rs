@@ -98,17 +98,17 @@ pub fn merkle_root(leaves: &[Hash]) -> Hash {
             let last = *level.last().unwrap();
             level.push(last);
         }
-        level = level
-            .chunks(2)
-            .map(|pair| {
-                let mut buf = [0u8; 64];
-                buf[..32].copy_from_slice(&pair[0].0);
-                buf[32..].copy_from_slice(&pair[1].0);
-                Hash::digest_domain(b"rand-merkle-node", &buf)
-            })
-            .collect();
+        level = level.chunks(2).map(|pair| merkle_node(&pair[0], &pair[1])).collect();
     }
     level[0]
+}
+
+/// One inner node of [`merkle_root`]'s tree.
+pub(crate) fn merkle_node(left: &Hash, right: &Hash) -> Hash {
+    let mut buf = [0u8; 64];
+    buf[..32].copy_from_slice(&left.0);
+    buf[32..].copy_from_slice(&right.0);
+    Hash::digest_domain(b"rand-merkle-node", &buf)
 }
 
 // ---------------------------------------------------------------------------

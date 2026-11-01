@@ -18,6 +18,7 @@
 //!
 //! The gate is the genesis `perps` section: without it the chain has no [`Perps`] at all.
 
+use super::digest_log::DigestLog;
 use super::{Ledger, TxError};
 use crate::confidential::{ConfidentialError, ConfidentialExecutor};
 use crate::crypto::{merkle_root, Address, Hash, PublicKey, Signature};
@@ -588,7 +589,7 @@ pub struct Perps {
     /// The height that root is at.
     pub proved_height: u64,
     /// `D_h` of every closed block above `proved_height`: what the next state proof must cover.
-    digests: BTreeMap<u64, Word8>,
+    digests: DigestLog,
     /// Pending withdrawals by request id.
     withdrawals: BTreeMap<Word8, PendingWithdrawal>,
     /// Σ RAND ever deposited into the exchange (a RAND `PerpDeposit`'s `burn_r`), and Σ RAND
@@ -650,7 +651,7 @@ struct PerpsV0 {
     oracle_nonces: BTreeMap<Address, u64>,
     proved_root: Word8,
     proved_height: u64,
-    digests: BTreeMap<u64, Word8>,
+    digests: DigestLog,
     withdrawals: BTreeMap<Word8, PendingWithdrawal>,
     rand_in: u64,
     rand_out: u64,
@@ -665,7 +666,7 @@ struct PerpsV0Ref<'a> {
     oracle_nonces: &'a BTreeMap<Address, u64>,
     proved_root: &'a Word8,
     proved_height: u64,
-    digests: &'a BTreeMap<u64, Word8>,
+    digests: &'a DigestLog,
     withdrawals: &'a BTreeMap<Word8, PendingWithdrawal>,
     rand_in: u64,
     rand_out: u64,
@@ -710,7 +711,7 @@ impl Perps {
             oracle_nonces: BTreeMap::new(),
             proved_root: c.genesis_root,
             proved_height: 0,
-            digests: BTreeMap::new(),
+            digests: DigestLog::new(),
             withdrawals: BTreeMap::new(),
             rand_in: 0,
             rand_out: 0,
@@ -727,6 +728,26 @@ impl Perps {
     /// bincode of [`PerpsExt`]. v0.8.x reads the row with `bincode::deserialize`, which ignores
     /// trailing bytes, so the trailer is invisible to it.
     pub fn encode_persisted(&self) -> Vec<u8> {
+        self.encode_with_digests(&self.digests)
+    }
+
+    /// [`Self::encode_persisted`] with no digests in the row: a node keeps them as one row per
+    /// height beside it, so a commit writes what changed rather than the whole log.
+    pub fn encode_persisted_head(&self) -> Vec<u8> {
+        self.encode_with_digests(&DigestLog::new())
+    }
+
+    /// The recorded digests, in height order.
+    pub fn digest_log(&self) -> &DigestLog {
+        &self.digests
+    }
+
+    /// Put back the digests a node read from its per-height rows.
+    pub fn set_digest_log(&mut self, digests: DigestLog) {
+        self.digests = digests;
+    }
+
+    fn encode_with_digests(&self, digests: &DigestLog) -> Vec<u8> {
         let c = &self.config;
         let v0 = PerpsV0Ref {
             config: PerpsConfigV0 {
@@ -744,7 +765,7 @@ impl Perps {
             oracle_nonces: &self.oracle_nonces,
             proved_root: &self.proved_root,
             proved_height: self.proved_height,
-            digests: &self.digests,
+            digests,
             withdrawals: &self.withdrawals,
             rand_in: self.rand_in,
             rand_out: self.rand_out,
@@ -868,16 +889,6 @@ impl Perps {
                 Hash::digest_domain(b"rand-perp-oracle-nonce-1", &buf)
             })
             .collect();
-        let digests: Vec<Hash> = self
-            .digests
-            .iter()
-            .map(|(height, d)| {
-                let mut buf = Vec::with_capacity(40);
-                buf.extend_from_slice(&height.to_be_bytes());
-                buf.extend_from_slice(&word8_to_bytes(d));
-                Hash::digest_domain(b"rand-perp-digest-1", &buf)
-            })
-            .collect();
         let withdrawals: Vec<Hash> = self
             .withdrawals
             .iter()
@@ -892,7 +903,7 @@ impl Perps {
         buf.extend_from_slice(merkle_root(&accounts).as_bytes());
         buf.extend_from_slice(merkle_root(&oracle).as_bytes());
         buf.extend_from_slice(merkle_root(&oracle_nonces).as_bytes());
-        buf.extend_from_slice(merkle_root(&digests).as_bytes());
+        buf.extend_from_slice(self.digests.merkle_root().as_bytes());
         buf.extend_from_slice(merkle_root(&withdrawals).as_bytes());
         Hash::digest_domain(b"rand-perps-1", &buf)
     }
@@ -913,25 +924,25 @@ impl Perps {
 
     /// `D_h`, while block `height` is above the proved height.
     pub fn digest(&self, height: u64) -> Option<Word8> {
-        self.digests.get(&height).copied()
+        self.digests.get(height).copied()
     }
 
     /// The closed heights no state proof has covered yet, ascending.
     pub fn pending_heights(&self) -> Vec<u64> {
-        self.digests.keys().copied().collect()
+        self.digests.iter().map(|(h, _)| h).collect()
     }
 
     /// The highest height with a recorded digest, or the proved height when none waits: what a
     /// sparse chain's heartbeat counts from (PERP-101, [`PerpsConfig::sparse_windows`]).
     pub fn last_recorded_height(&self) -> u64 {
-        self.digests.keys().next_back().copied().unwrap_or(self.proved_height)
+        self.digests.last_height().unwrap_or(self.proved_height)
     }
 
     /// The recorded digests a state proof over `from+1..=to` runs the engine over, in height
     /// order: every height of the span on a dense chain (where each one is recorded), only the
     /// recorded ones under `sparse_windows` (PERP-101).
     pub fn window_heights(&self, from: u64, to: u64) -> impl Iterator<Item = u64> + '_ {
-        self.digests.range(from.saturating_add(1)..=to).map(|(h, _)| *h)
+        self.digests.range(from.saturating_add(1)..=to).map(|(h, _)| h)
     }
 
     /// How many recorded digests no state proof has covered yet — [`Self::pending_heights`]'s
@@ -1353,7 +1364,7 @@ fn check_state_proof(p: &Perps, from: u64, to: u64, payouts: &[PerpPayout]) -> R
         if from != p.proved_height || to <= from || to - from > max {
             return Err(PerpError::WindowMismatch { from, to, proved: p.proved_height, max });
         }
-        if !p.digests.contains_key(&to) {
+        if !p.digests.contains(to) {
             return Err(PerpError::MissingDigest(to));
         }
         let blocks = p.window_heights(from, to).count() as u64;
@@ -1365,7 +1376,7 @@ fn check_state_proof(p: &Perps, from: u64, to: u64, payouts: &[PerpPayout]) -> R
         if from != p.proved_height || to <= from || to - from > max {
             return Err(PerpError::WindowMismatch { from, to, proved: p.proved_height, max });
         }
-        if let Some(h) = (from + 1..=to).find(|h| !p.digests.contains_key(h)) {
+        if let Some(h) = (from + 1..=to).find(|h| !p.digests.contains(*h)) {
             return Err(PerpError::MissingDigest(h));
         }
     }
@@ -1472,10 +1483,10 @@ fn state_segment(
     let digests = if p.config.sparse_windows {
         // PERP-101: the recorded digests inside the span, in height order; the heights the
         // ledger elided (no input, no heartbeat) are not run.
-        p.digests.range(from + 1..=to).map(|(_, d)| *d).collect::<Vec<_>>()
+        p.digests.range(from.saturating_add(1)..=to).map(|(_, d)| *d).collect::<Vec<_>>()
     } else {
         (from + 1..=to)
-            .map(|h| p.digests.get(&h).copied().ok_or(PerpError::MissingDigest(h)))
+            .map(|h| p.digests.get(h).copied().ok_or(PerpError::MissingDigest(h)))
             .collect::<Result<Vec<_>, _>>()?
     };
     Ok(state_proof_segment(from, to, &p.proved_root, new_root, &payouts_digest(executor, payouts), fees, &digests))
@@ -1735,7 +1746,7 @@ pub(super) fn apply(
             p.collateral_out = collateral_out;
             p.proved_root = *new_root;
             p.proved_height = to;
-            p.digests.retain(|h, _| *h > to);
+            p.digests.drop_through(to);
             for po in payouts {
                 p.withdrawals.remove(&po.request);
             }

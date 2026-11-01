@@ -287,6 +287,10 @@ const META_PROGRAM_STATE: &str = "program_state";
 /// replay-audited, bincode (the transient per-block fields are `#[serde(skip)]`). Absent on
 /// every chain without a `perps` section.
 const META_PERPS: &str = "perps";
+/// One recorded perps digest per row, in `CF_META` under this prefix and the height big-endian:
+/// a commit writes the new heights, not the whole log. A `META_PERPS` row from before v0.8.4 holds
+/// them inline; the first commit moves them here in the same batch.
+const META_PERP_DIGEST_PREFIX: &[u8] = b"perp-digest/";
 /// CON-60: `bincode(Vec<ProofShape>)`, the state-proof shapes this node has seen verify or
 /// commit, most recent last — what the startup warm builds and pins. A node cache, never
 /// consensus; a build that does not know the key ignores it.
@@ -2034,21 +2038,97 @@ impl Storage {
     pub fn perps(&self) -> Result<Option<randprotocol_core::ledger::perps::Perps>> {
         // `decode_persisted` (audit v10, PERP-6): a row this build wrote, or the pre-v10 shape a
         // chain-21 node wrote before the roll, its collateral counters starting at 0.
-        self.get_meta_raw(META_PERPS)?
-            .map(|b| {
-                randprotocol_core::ledger::perps::Perps::decode_persisted(&b)
-                    .map_err(|e| StorageError::Corrupt(format!("perps state: {e}")))
-            })
-            .transpose()
+        let Some(row) = self.get_meta_raw(META_PERPS)? else { return Ok(None) };
+        let mut perps = randprotocol_core::ledger::perps::Perps::decode_persisted(&row)
+            .map_err(|e| StorageError::Corrupt(format!("perps state: {e}")))?;
+        let rows = self.perp_digest_rows()?;
+        if !rows.is_empty() {
+            // Inline digests are from before the rows existed, so they sort first.
+            let inline = perps.digest_log().iter().map(|(h, d)| (h, *d));
+            perps.set_digest_log(inline.chain(rows).collect());
+        }
+        Ok(Some(perps))
+    }
+
+    fn perp_digest_key(height: u64) -> Vec<u8> {
+        let mut key = META_PERP_DIGEST_PREFIX.to_vec();
+        key.extend_from_slice(&height.to_be_bytes());
+        key
+    }
+
+    fn perp_digest_height(key: &[u8]) -> Option<u64> {
+        let tail = key.strip_prefix(META_PERP_DIGEST_PREFIX)?;
+        Some(u64::from_be_bytes(tail.try_into().ok()?))
+    }
+
+    /// Every stored digest row, ascending.
+    fn perp_digest_rows(&self) -> Result<Vec<(u64, randprotocol_core::notes::Word8)>> {
+        let start = IteratorMode::From(META_PERP_DIGEST_PREFIX, rocksdb::Direction::Forward);
+        let mut rows = Vec::new();
+        for item in self.db.iterator_cf(self.cf(CF_META), start) {
+            let (key, value) = item?;
+            let Some(height) = Self::perp_digest_height(&key) else { break };
+            let digest = bincode::deserialize(&value).map_err(|e| StorageError::Corrupt(format!("perp digest {height}: {e}")))?;
+            rows.push((height, digest));
+        }
+        Ok(rows)
+    }
+
+    /// The stored digest rows' lowest and highest heights, read without walking the rows between.
+    fn perp_digest_bounds(&self) -> Result<Option<(u64, u64)>> {
+        let first = IteratorMode::From(META_PERP_DIGEST_PREFIX, rocksdb::Direction::Forward);
+        let Some(item) = self.db.iterator_cf(self.cf(CF_META), first).next() else { return Ok(None) };
+        let Some(low) = Self::perp_digest_height(&item?.0) else { return Ok(None) };
+        let top = Self::perp_digest_key(u64::MAX);
+        let last = IteratorMode::From(&top, rocksdb::Direction::Reverse);
+        let Some(item) = self.db.iterator_cf(self.cf(CF_META), last).next() else { return Ok(None) };
+        Ok(Self::perp_digest_height(&item?.0).map(|high| (low, high)))
+    }
+
+    /// Stage the rows of `heights` for deletion, walking only what is stored there.
+    fn stage_delete_perp_digests(&self, batch: &mut WriteBatch, from: u64, to: u64) -> Result<()> {
+        let start = Self::perp_digest_key(from);
+        for item in self.db.iterator_cf(self.cf(CF_META), IteratorMode::From(&start, rocksdb::Direction::Forward)) {
+            let (key, _) = item?;
+            match Self::perp_digest_height(&key) {
+                Some(height) if height <= to => batch.delete_cf(self.cf(CF_META), key),
+                _ => break,
+            }
+        }
+        Ok(())
     }
 
     /// Write it beside the rest of the head's state — present when the chain has the section,
-    /// deleted otherwise (`put_program_state`'s rule).
+    /// deleted otherwise (`put_program_state`'s rule). The digests go as rows, and only the ones
+    /// the store lacks: this runs at every commit and the log grows by a row per block. Rows a
+    /// state proof covered, or above the ledger after a truncation, go in the same batch.
     fn put_perps(&self, batch: &mut WriteBatch, p: Option<&randprotocol_core::ledger::perps::Perps>) -> Result<()> {
-        match p {
-            // I-2: v0.8.x's bincode, plus a trailer it ignores (`Perps::encode_persisted`).
-            Some(p) => batch.put_cf(self.cf(CF_META), META_PERPS, p.encode_persisted()),
-            None => batch.delete_cf(self.cf(CF_META), META_PERPS),
+        let bounds = self.perp_digest_bounds()?;
+        let Some(p) = p else {
+            batch.delete_cf(self.cf(CF_META), META_PERPS);
+            if let Some((low, high)) = bounds {
+                self.stage_delete_perp_digests(batch, low, high)?;
+            }
+            return Ok(());
+        };
+        // I-2: v0.8.x's bincode, plus a trailer it ignores (`Perps::encode_persisted`).
+        batch.put_cf(self.cf(CF_META), META_PERPS, p.encode_persisted_head());
+        let log = p.digest_log();
+        let stored_top = bounds.map_or(0, |(_, high)| high);
+        let wanted_top = log.last_height().unwrap_or(0);
+        // Below the rows too: a ledger restored by a truncation can hold heights a later state
+        // proof had removed from the store.
+        let below = bounds.and_then(|(low, _)| low.checked_sub(1)).map_or(1..=0, |top| 0..=top);
+        for (height, digest) in log.range(stored_top.saturating_add(1)..=u64::MAX).chain(log.range(below)) {
+            batch.put_cf(self.cf(CF_META), Self::perp_digest_key(height), bincode::serialize(digest)?);
+        }
+        if let Some((low, high)) = bounds {
+            if low <= p.proved_height {
+                self.stage_delete_perp_digests(batch, low, p.proved_height)?;
+            }
+            if high > wanted_top {
+                self.stage_delete_perp_digests(batch, wanted_top.saturating_add(1), high)?;
+            }
         }
         Ok(())
     }
@@ -9802,6 +9882,58 @@ mod tests {
         assert!(s.commit(std::slice::from_ref(&torn), &probe, &[], &StubExecutor).is_err());
         let reloaded = crate::node::reload_ledger(&s, &gs, &StubExecutor).unwrap();
         assert_eq!(reloaded.perps(), ledger.perps());
+    }
+
+    #[test]
+    fn perp_digests_are_rows_and_a_commit_writes_only_what_is_new() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Storage::open(dir.path()).unwrap();
+        let gs = perps_genesis(7);
+        s.init_genesis(&gs).unwrap();
+        let (mut ledger, mut parent) = (gs.ledger.clone(), gs.block.clone());
+        let mut heads = Vec::new();
+        for _ in 0..20 {
+            let cb = make_perps_block(&parent, &mut ledger, vec![], &key(1));
+            s.commit(std::slice::from_ref(&cb), &ledger, &[], &StubExecutor).unwrap();
+            parent = cb.block.clone();
+            heads.push(s.get_meta_raw(META_PERPS).unwrap().unwrap().len());
+        }
+        assert_eq!(heads.iter().min(), heads.iter().max(), "the head row does not grow with the log: {heads:?}");
+        let perps = ledger.perps().unwrap();
+        assert_eq!(perps.pending_digests(), 20);
+        assert_eq!(s.perp_digest_rows().unwrap().len(), 20);
+        assert_eq!(s.perps().unwrap().as_ref(), Some(perps));
+        assert_eq!(s.perps().unwrap().unwrap().root(), perps.root());
+    }
+
+    /// A store a pre-v0.8.4 node wrote holds the digests inline. It must read as the same state,
+    /// and the next commit must move them to rows in one batch.
+    #[test]
+    fn inline_perp_digests_from_before_the_rows_are_read_then_moved() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Storage::open(dir.path()).unwrap();
+        let gs = perps_genesis(7);
+        s.init_genesis(&gs).unwrap();
+        let (mut ledger, mut parent) = (gs.ledger.clone(), gs.block.clone());
+        for _ in 0..5 {
+            let cb = make_perps_block(&parent, &mut ledger, vec![], &key(1));
+            s.commit(std::slice::from_ref(&cb), &ledger, &[], &StubExecutor).unwrap();
+            parent = cb.block.clone();
+        }
+        // The old layout: everything inline, no rows.
+        let mut old = WriteBatch::default();
+        s.stage_delete_perp_digests(&mut old, 0, u64::MAX).unwrap();
+        old.put_cf(s.cf(CF_META), META_PERPS, ledger.perps().unwrap().encode_persisted());
+        s.db.write_opt(old, &sync_opts()).unwrap();
+        assert!(s.perp_digest_rows().unwrap().is_empty());
+        assert_eq!(s.perps().unwrap().as_ref(), ledger.perps(), "inline digests read as before");
+
+        let cb = make_perps_block(&parent, &mut ledger, vec![], &key(1));
+        s.commit(std::slice::from_ref(&cb), &ledger, &[], &StubExecutor).unwrap();
+        assert_eq!(s.perp_digest_rows().unwrap().len(), 6, "moved, with the new block's");
+        let head = s.get_meta_raw(META_PERPS).unwrap().unwrap();
+        assert!(randprotocol_core::ledger::perps::Perps::decode_persisted(&head).unwrap().digest_log().is_empty());
+        assert_eq!(s.perps().unwrap().as_ref(), ledger.perps());
     }
 
     #[test]
