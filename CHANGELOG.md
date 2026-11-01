@@ -14,6 +14,21 @@ stopped at v0.4 until 2026-09-30, when the entries v0.5 to v0.6.7 were written f
 
 Nothing yet.
 
+## v0.8.4 — 2026-11-01 (chain 21, node-only; rolled to end the 2026-11-01 OOM kills and commit stalls)
+
+- **Perps digests no longer cost per block in proportion to the chain's length.** A chain nobody
+  proves on keeps one digest per block: at height 654 000 on chain 21 every `Ledger` clone copied
+  25 MB, every state root rehashed them all and every commit rewrote a 26 MB row. `DigestLog` holds
+  them in shared chunks with cached Merkle roots; the root and the serialized bytes are unchanged,
+  so this is not a consensus change and needs no cut.
+- **Storage:** digests are stored as one `CF_META` row per height (`perp-digest/<height>`). The
+  first commit moves them out of the `META_PERPS` row in one batch. **A node that has committed on
+  v0.8.4 cannot go back to an older build on the same database:** the older build would read no
+  digests. Keep a copy of the datadir if a rollback must stay open.
+- **RPC:** `rand_getPerps.pending_heights` lists the lowest heights (at least 4 096 and at least
+  `max_window_blocks`), with `pending_heights_more` set when more wait. The other perps reads no
+  longer load the log.
+
 ## v0.8.3 — 2026-11-01 (chain 21, node-only; rolled to end the 2026-10-31 halt at 644660)
 
 Node:
