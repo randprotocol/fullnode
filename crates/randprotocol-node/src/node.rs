@@ -2552,6 +2552,9 @@ pub struct NetOptions {
     /// Gossip transactions on the anonymous lane only (`--anonymous-tx-only`, issue #146): see
     /// [`network::EdgeConfig::anonymous_tx_only`].
     pub anonymous_tx_only: bool,
+    /// Publish this node's transactions signed on the legacy topic too (`--legacy-tx-publish`;
+    /// audit v12, PRIV-601): [`network::EdgeConfig::legacy_tx_publish`]. Off by default.
+    pub legacy_tx_publish: bool,
     /// Dandelion++'s stem relay for transactions (`--dandelion`, `--dandelion-fluff-prob`,
     /// `--dandelion-embargo-ms`, issue #145). On by default: only peers that advertise the stem
     /// protocol are ever sent a stem, so it rolls onto a mixed fleet node by node.
@@ -2704,6 +2707,7 @@ pub async fn start_with(cfg: NodeConfig, rpc_options: RpcOptions, net_options: N
             bound_sources,
             strict_gossip: net_options.strict_gossip,
             anonymous_tx_only: net_options.anonymous_tx_only,
+            legacy_tx_publish: net_options.legacy_tx_publish,
             dandelion: net_options.dandelion.enabled,
         },
     )

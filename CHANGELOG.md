@@ -20,6 +20,14 @@ Node (audit v12 network and privacy rows; node-only, no wire or consensus change
   before the first connection at the next start. Their 24 h expiry runs on across the stop. A
   fleet-wide restart no longer leaves the reserved pending slots serving only the bootstraps'
   hosts. A build that predates the row ignores it.
+- **No signed legacy copy of a node's own transactions by default** (PRIV-601): v0.8.3 and v0.8.4
+  published every fluffed transaction on the signed legacy topic `rand/<chain>/tx` as well as the
+  anonymous lane unless `--anonymous-tx-only`, which no deploy template set, so every fluff named
+  its fluffer. A node now publishes only on the anonymous lane; it still subscribes to and relays
+  the legacy topic, so transactions from nodes before v0.8.3 still arrive. `--legacy-tx-publish`
+  brings the signed copy back for a chain that still needs it. **Transaction origin hiding remains
+  design intent, not a measured property, until the first-spy test is re-run** against a fleet
+  running these fixes.
 
 ## v0.8.4 — 2026-11-01 (chain 21, node-only; rolled to end the 2026-11-01 OOM kills and commit stalls)
 

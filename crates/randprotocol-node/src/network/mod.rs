@@ -397,12 +397,18 @@ pub struct EdgeConfig {
     pub strict_gossip: bool,
     /// Gossip transactions on the anonymous lane only (issue #146, `--anonymous-tx-only`): no
     /// subscription to the legacy signed topic `rand/{chain}/tx`, and nothing published there. Off
-    /// by default for the rolling upgrade: a node then publishes each transaction on both lanes —
-    /// the anonymous `rand/{chain}/tx/2` and, for nodes that predate it, the signed legacy topic,
-    /// which still names this node as the author — and relays on both. Turn it on once no node
-    /// that predates the anonymous lane is left; until then a transaction published only
-    /// anonymously never reaches them by gossip.
+    /// by default for the rolling upgrade: a node then subscribes both lanes and relays on both,
+    /// so a transaction a node from before the anonymous lane published still reaches everyone.
+    /// What it publishes itself goes on the anonymous lane only unless
+    /// [`EdgeConfig::legacy_tx_publish`] (audit v12, PRIV-601).
     pub anonymous_tx_only: bool,
+    /// Publish this node's transactions on the legacy signed topic as well (audit v12, PRIV-601;
+    /// `--legacy-tx-publish`). Off by default: each copy there is signed by, and so names, the
+    /// node that published it — the fluffing node, and so the submitter whenever it fluffs its own
+    /// transaction. The topic is still subscribed and relayed (copies keep their original
+    /// author), so a node from before the anonymous lane still reaches every node; only turn
+    /// this on while such a node must also *hear* this node's transactions over gossip.
+    pub legacy_tx_publish: bool,
     /// Speak Dandelion++'s stem protocol (issue #145, `--dandelion`): register
     /// `/rand/{chain}/stem/1`, so identify advertises it and stem-capable peers send this node
     /// stems ([`NetworkEvent::StemTx`]), and report the peers that advertise it
@@ -771,7 +777,11 @@ pub async fn start_with(
     let (cmd_tx, cmd_rx) = mpsc::channel(4096);
     let (evt_tx, evt_rx) = mpsc::channel(4096);
     let stem_proto = edge.dandelion.then_some(stem_proto);
-    let tx_paths = TxPaths { legacy_tx: !edge.anonymous_tx_only, stem: stem_proto };
+    let tx_paths = TxPaths {
+        legacy_tx: !edge.anonymous_tx_only,
+        legacy_publish: !edge.anonymous_tx_only && edge.legacy_tx_publish,
+        stem: stem_proto,
+    };
     tokio::spawn(run(swarm, cfg, pinned, topics, tx_paths, cmd_rx, evt_tx));
     Ok((NetworkHandle { cmd: cmd_tx, local_peer_id }, evt_rx))
 }
@@ -1009,8 +1019,11 @@ fn dial_bootstrap(swarm: &mut Swarm<RandBehaviour>, cfg: &NetworkConfig, peers: 
 
 /// How transactions leave this node besides the anonymous lane (issues #145, #146).
 struct TxPaths {
-    /// Publish and relay on the legacy signed topic too ([`EdgeConfig::anonymous_tx_only`] off).
+    /// Subscribe and relay on the legacy signed topic too ([`EdgeConfig::anonymous_tx_only`] off).
     legacy_tx: bool,
+    /// Publish this node's own transactions there, signed ([`EdgeConfig::legacy_tx_publish`];
+    /// PRIV-601). Never without `legacy_tx`.
+    legacy_publish: bool,
     /// The stem protocol, under [`EdgeConfig::dandelion`].
     stem: Option<StreamProtocol>,
 }
@@ -1025,7 +1038,7 @@ async fn run(
     mut cmd_rx: mpsc::Receiver<NetworkCommand>,
     evt_tx: mpsc::Sender<NetworkEvent>,
 ) {
-    let TxPaths { legacy_tx, stem: stem_proto } = tx_paths;
+    let TxPaths { legacy_tx, legacy_publish, stem: stem_proto } = tx_paths;
     let mut peers: HashMap<PeerId, ConnectedPeer> = HashMap::new();
     // Dialable addresses of every peer we have ever connected to, so a dropped
     // link is re-established without waiting for mDNS or Kademlia to rediscover it.
@@ -1070,7 +1083,7 @@ async fn run(
             cmd = cmd_rx.recv() => {
                 let Some(cmd) = cmd else { break };
                 match cmd {
-                    NetworkCommand::Broadcast(msg) => publish(&mut swarm, &topics, legacy_tx, &msg),
+                    NetworkCommand::Broadcast(msg) => publish(&mut swarm, &topics, legacy_publish, &msg),
                     NetworkCommand::Stem { peer, tx } => {
                         if let Some(stem) = swarm.behaviour_mut().stem.as_mut() {
                             let hash = tx.hash();
@@ -1149,7 +1162,8 @@ async fn run(
 }
 
 /// Publish one message: a transaction on the anonymous lane, and on the legacy signed topic too
-/// while `legacy_tx` (issue #146); everything else on the signed lane, on its own topic.
+/// while `legacy_tx` (issue #146; [`TxPaths::legacy_publish`], off by default since PRIV-601);
+/// everything else on the signed lane, on its own topic.
 fn publish(swarm: &mut Swarm<RandBehaviour>, topics: &Topics, legacy_tx: bool, msg: &GossipMessage) {
     let data = match bincode::serialize(msg) {
         Ok(data) => data,
@@ -1836,13 +1850,16 @@ mod tests {
     }
 
     /// Issue #146: a transaction gossiped on the anonymous lane carries no `source` and no
-    /// sequence number — nothing that names the node that published it. A node that predates the
-    /// lane still gets it, signed, on the legacy topic, unless `--anonymous-tx-only`.
+    /// sequence number — nothing that names the node that published it. Audit v12, PRIV-601: by
+    /// default nothing this node publishes goes on the legacy signed topic, whose copy names it;
+    /// only `--legacy-tx-publish` (for a chain that still has nodes from before the lane) puts a
+    /// signed copy there, and `--anonymous-tx-only` leaves the topic altogether.
     #[tokio::test]
     async fn a_gossiped_transaction_carries_no_author_and_the_legacy_copy_follows_the_flag() {
-        for anonymous_tx_only in [false, true] {
-            let edge = EdgeConfig { anonymous_tx_only, ..EdgeConfig::default() };
-            let (n, _rx, n_addr) = listening(if anonymous_tx_only { 81 } else { 80 }, edge).await;
+        for (seed, legacy_tx_publish, anonymous_tx_only) in [(80u8, false, false), (79, true, false), (81, false, true)] {
+            let legacy = legacy_tx_publish && !anonymous_tx_only;
+            let edge = EdgeConfig { anonymous_tx_only, legacy_tx_publish, ..EdgeConfig::default() };
+            let (n, _rx, n_addr) = listening(seed, edge).await;
             let (mut anon, _) = sniffer(true);
             let (mut old, _) = sniffer(false);
             anon.dial(n_addr.clone()).unwrap();
@@ -1855,7 +1872,7 @@ mod tests {
                 let (a, o) = tokio::join!(sniff(&mut anon, Duration::from_millis(250)), sniff(&mut old, Duration::from_millis(250)));
                 on_anon.extend(a);
                 on_old.extend(o);
-                if !on_anon.is_empty() && (anonymous_tx_only || !on_old.is_empty()) && k >= 4 {
+                if !on_anon.is_empty() && (!legacy || !on_old.is_empty()) && k >= 4 {
                     break;
                 }
             }
@@ -1866,8 +1883,8 @@ mod tests {
                 assert_eq!(m.topic, IdentTopic::new("rand/7/tx/2").hash());
                 assert!(matches!(bincode::deserialize::<GossipMessage>(&m.data), Ok(GossipMessage::Transaction(_))));
             }
-            if anonymous_tx_only {
-                assert!(on_old.is_empty(), "--anonymous-tx-only published on the legacy signed topic");
+            if !legacy {
+                assert!(on_old.is_empty(), "published on the legacy signed topic (legacy_tx_publish = {legacy_tx_publish}, anonymous_tx_only = {anonymous_tx_only})");
             } else {
                 assert!(!on_old.is_empty(), "a node that predates the lane got no transaction");
                 assert!(on_old.iter().all(|m| m.source == Some(n.local_peer_id)), "the legacy copy is the signed one");
@@ -1876,7 +1893,8 @@ mod tests {
         }
     }
 
-    /// Issue #146, the rolling upgrade: B publishes on both lanes, A hears each transaction twice
+    /// Issue #146, the rolling upgrade: B publishes on both lanes (`--legacy-tx-publish`, as every
+    /// v0.8.3 and v0.8.4 node did by default), A hears each transaction twice
     /// (once per lane) and its node loop sees it **once**, and when A accepts it, A relays the
     /// held legacy copy too — so C, a node that predates the lane and is connected to A alone,
     /// still gets every transaction. Without the hold, the second copy would reach A's node loop,
@@ -1884,7 +1902,8 @@ mod tests {
     #[tokio::test]
     async fn during_the_roll_a_transaction_is_judged_once_and_relayed_on_both_lanes() {
         let (a, mut a_rx, a_addr) = listening(82, EdgeConfig::default()).await;
-        let (b, _b_rx) = start(loopback_cfg(vec![a_addr.clone()], WireLimits::default()), [83u8; 32]).await.unwrap();
+        let b_edge = EdgeConfig { legacy_tx_publish: true, ..EdgeConfig::default() };
+        let (b, _b_rx) = start_with(loopback_cfg(vec![a_addr.clone()], WireLimits::default()), [83u8; 32], b_edge).await.unwrap();
         assert!(wait_for(&mut a_rx, Duration::from_secs(10), |e| matches!(e, NetworkEvent::PeerConnected(p) if p == b.local_peer_id).then_some(())).await.is_some());
         let (mut c, _) = sniffer(false);
         c.dial(a_addr).unwrap();
@@ -2616,7 +2635,8 @@ mod tests {
         assert!(e.bound.is_empty());
         assert!(e.bound_sources.is_empty());
         assert!(!e.strict_gossip);
-        assert!(!e.anonymous_tx_only, "both transaction lanes by default, for the rolling upgrade (#146)");
+        assert!(!e.anonymous_tx_only, "both transaction lanes subscribed by default, for the rolling upgrade (#146)");
+        assert!(!e.legacy_tx_publish, "but nothing published signed on the legacy one unless asked (PRIV-601)");
         assert!(!e.dandelion, "a bare network speaks no stem unless asked (#145)");
     }
 
