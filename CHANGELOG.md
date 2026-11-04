@@ -41,6 +41,13 @@ Node (audit v12 network and privacy rows; node-only, no wire or consensus change
   waited for its verification. Both now take the ordinary verify queue and are answered on the
   verdict; the gossip copy's verdict also ends the embargo. Costs one extra verification per
   holder per such copy.
+- **One embargo distribution, and a silent successor is routed around** (PRIV-604): the
+  submitter's embargo was `2b + Exp(b/4)`, never under a relay's `b + min(Exp(b/4), b)`, so the
+  delay before a fluff told a successor that dropped the stem whether its predecessor was the
+  origin. Every holder now draws `b + min(Exp(b/4), b)`. The stem acknowledgement timeout drops
+  from 10 s to 1.5 s, under the 3 s default embargo, so a successor that never answers is dropped
+  and the transaction rerouted to the other successor before any embargo fires. (A successor
+  that acknowledges and then drops is still covered only by the embargo.)
 
 ## v0.8.4 — 2026-11-01 (chain 21, node-only; rolled to end the 2026-11-01 OOM kills and commit stalls)
 

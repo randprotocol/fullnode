@@ -418,8 +418,10 @@ anonymous transaction lane. Otherwise it is held in the **stempool** and sent to
 successor; the submitter never fluffs its own transaction on the coin. A stem that comes back to a
 node holding it is decided as a fresh arrival (the coin, then the edge's route) without a second
 verification, at most 32 sends per transaction per node. Every holder runs an **embargo** timer —
-b + min(Exp(mean b/4), b) at a relay, 2b + Exp(mean b/4) at the submitter, b = `--dandelion-embargo-ms`
-(3 s) — and publishes the transaction itself if it has not come back over gossip by then. A holder that sees it on gossip judges that copy as it would an unknown transaction — the verify
+b + min(Exp(mean b/4), b) at the submitter and at every relay alike (audit v12, PRIV-604), b = `--dandelion-embargo-ms`
+(3 s) — and publishes the transaction itself if it has not come back over gossip by then. A stem
+send not acknowledged within 1.5 s fails and the transaction goes to the edge's other successor.
+A holder that sees it on gossip judges that copy as it would an unknown transaction — the verify
 queue, then the report — and only then pools it and drops its embargo (PRIV-603); a resubmission
 of a held transaction over RPC likewise waits for a verification before its `Ok`. The stempool
 (1 024 transactions, 64 MiB) is invisible: `rand_getTransactionStatus` reads `unknown`,

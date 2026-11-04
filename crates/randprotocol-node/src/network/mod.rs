@@ -83,8 +83,11 @@ pub const STEM_RESPONSE_WIRE_LIMIT: u64 = 64;
 
 /// How long a stem send waits for the successor's acknowledgement before it is reported failed
 /// ([`NetworkEvent::StemFailed`]). The successor acknowledges on receipt, before it verifies, so
-/// this is a round trip and the transfer of one transaction.
-pub const STEM_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+/// this is a round trip and the transfer of one transaction. Audit v12, PRIV-604: under half the
+/// default embargo (3 s), so a silent successor is dropped and the transaction rerouted to the
+/// edge's other successor before any holder's embargo can fire; it was 10 s, longer than every
+/// embargo, so a silent successor was never rerouted around.
+pub const STEM_REQUEST_TIMEOUT: Duration = Duration::from_millis(1500);
 
 /// Concurrent stem streams per connection, in either direction. An honest peer has one stem in
 /// flight to a node at a time, or a few in a burst; the request codec decodes a whole transaction

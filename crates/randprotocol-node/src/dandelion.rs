@@ -21,8 +21,11 @@
 //!   [`DandelionConfig::fluff_prob`] (q, default 0.1): it pools the transaction and publishes it on
 //!   the anonymous gossip lane. The submitting node itself never fluffs by the coin.
 //! - **Embargo.** Every node holding a stem transaction runs a timer
-//!   ([`Dandelion::embargo_for`]); if the transaction has not come back to it over gossip by then,
-//!   it fluffs it itself. That is the fail-safe against a successor that drops it (a black hole).
+//!   ([`Dandelion::embargo_for`], one distribution at the submitter and at every relay); if the
+//!   transaction has not come back to it over gossip by then, it fluffs it itself. That is the
+//!   fail-safe against a successor that drops it (a black hole). A successor that does not
+//!   acknowledge a stem within [`crate::network::STEM_REQUEST_TIMEOUT`] — under the embargo — is
+//!   dropped and the transaction rerouted to the edge's other successor.
 //! - **Loops.** A stem that comes back to a node already holding it is treated as a fresh
 //!   arrival on that edge — the q coin, then the edge's successor — without a second verification
 //!   ([`Dandelion::on_loop`]). In a fleet of 25 the walk revisits a node within a handful of hops;
@@ -92,8 +95,8 @@ pub struct DandelionConfig {
     pub enabled: bool,
     /// q, in `[0, 1]`.
     pub fluff_prob: f64,
-    /// The embargo's fixed part, `b`: a relay waits `b + min(Exp(mean b/4), b)`, the submitter
-    /// `2b + Exp(mean b/4)` ([`Dandelion::embargo_for`]).
+    /// The embargo's fixed part, `b`: every holder, the submitter included, waits
+    /// `b + min(Exp(mean b/4), b)` ([`Dandelion::embargo_for`]).
     pub embargo: Duration,
     /// How long one epoch lasts ([`EPOCH`]). Configurable for tests only.
     pub epoch: Duration,
@@ -463,25 +466,22 @@ impl Dandelion {
         self.rng.gen_bool(q)
     }
 
-    /// How long a node holding a stem transaction from `origin` waits before fluffing it itself,
-    /// where `b` is [`DandelionConfig::embargo`]: `b + min(Exp(mean b/4), b)` at a relay, so in
-    /// `[b, 2b]`, and `2b + Exp(mean b/4)` at the submitter.
+    /// How long a node holding a stem transaction waits before fluffing it itself, where `b` is
+    /// [`DandelionConfig::embargo`]: `b + min(Exp(mean b/4), b)`, so in `[b, 2b]`, wherever the
+    /// transaction came from (audit v12, PRIV-604).
     ///
-    /// Random, so the relay whose timer fires first is a random node of the stem, not the one
-    /// that started first. The submitter's is never shorter than any relay's: when every timer
-    /// runs (a stem that ended without a fluff), a relay one hop on, which started one hop later,
-    /// fires first unless that hop took most of `b`. The submitter fires first only when no relay
-    /// holds the transaction — its successor dropped it — and that black hole costs the submitter
-    /// its cover, as in Dandelion++.
-    pub fn embargo_for(&mut self, origin: Edge) -> Duration {
+    /// Random, so the holder whose timer fires first is a random node of the stem, not the one
+    /// that started first. The submitter draws from the same distribution as every relay: before,
+    /// its embargo was `2b + Exp(b/4)`, never under any relay's, so a successor that dropped the
+    /// stem could tell from the delay alone whether the node that fluffed it was the origin. Now
+    /// the windows coincide and the delay says nothing about it. `origin` is kept for the caller's
+    /// bookkeeping; it no longer changes the draw.
+    pub fn embargo_for(&mut self, _origin: Edge) -> Duration {
         let b = self.cfg.embargo;
         // Exp(1) by inversion; `gen::<f64>()` is in [0, 1), so `1 - u` is in (0, 1].
         let u: f64 = self.rng.gen();
         let exp = -(1.0 - u).ln() * (b.as_secs_f64() / 4.0);
-        match origin {
-            Edge::Local => 2 * b + Duration::from_secs_f64(exp.min(3600.0)),
-            Edge::Peer(_) => b + Duration::from_secs_f64(exp.min(b.as_secs_f64())),
-        }
+        b + Duration::from_secs_f64(exp.min(b.as_secs_f64()))
     }
 
     /// Hold a verified stem transaction from `origin` under a fresh embargo. `false`: the
@@ -744,27 +744,64 @@ mod tests {
         assert_eq!(off.decide(Edge::Local, t), Decision::Fluff(FluffReason::NoRoute));
     }
 
-    /// The embargo: a relay's in `[b, 2b]`, about `1.25 b` on average; the submitter's never
-    /// under `2b`, about `2.25 b` on average, so never shorter than a relay's; reproducible from
-    /// the seed.
+    /// The embargo (audit v12, PRIV-604): one distribution at the submitter and at a relay,
+    /// `b + min(Exp(b/4), b)`, so in `[b, 2b]` and about `1.25 b` on average at both;
+    /// reproducible from the seed.
     #[test]
-    fn the_embargo_is_base_plus_an_exponential_and_longer_at_the_submitter() {
+    fn the_embargo_is_base_plus_a_capped_exponential_everywhere() {
         let b = Duration::from_millis(2000);
         let mut d = Dandelion::new(DandelionConfig { embargo: b, seed: Some(5), ..Default::default() });
         let n = 20_000;
         let relay: Vec<Duration> = (0..n).map(|_| d.embargo_for(Edge::Peer(PeerId::random()))).collect();
         let local: Vec<Duration> = (0..n).map(|_| d.embargo_for(Edge::Local)).collect();
         assert!(relay.iter().all(|w| *w >= b && *w <= 2 * b), "a relay's embargo is in [b, 2b]");
-        assert!(local.iter().all(|w| *w >= 2 * b), "the submitter's is never under 2b");
+        assert!(local.iter().all(|w| *w >= b && *w <= 2 * b), "the submitter's is in [b, 2b] too");
         let mean = |v: &[Duration]| v.iter().map(|w| w.as_secs_f64()).sum::<f64>() / v.len() as f64;
-        // b + (b/4)(1 - e^-4) at a relay; 2b + b/4 at the submitter.
+        // b + (b/4)(1 - e^-4) at both.
         assert!((2.46..2.52).contains(&mean(&relay)), "relay mean {}", mean(&relay));
-        assert!((4.47..4.53).contains(&mean(&local)), "submitter mean {}", mean(&local));
-        // P(Exp(b/4) < b/4) = 1 - 1/e: most relays fire in the first quarter of the window.
+        assert!((2.46..2.52).contains(&mean(&local)), "submitter mean {}", mean(&local));
+        // P(Exp(b/4) < b/4) = 1 - 1/e: most fire in the first quarter of the window.
         assert!(relay.iter().filter(|w| **w < Duration::from_millis(2500)).count() > n / 2, "most relays fire early in the window");
         let mut a = Dandelion::new(DandelionConfig { embargo: b, seed: Some(5), ..Default::default() });
         let mut c = Dandelion::new(DandelionConfig { embargo: b, seed: Some(5), ..Default::default() });
         assert_eq!(a.embargo_for(Edge::Local), c.embargo_for(Edge::Local));
+    }
+
+    /// Audit v12, PRIV-604: the submitter's and a relay's embargo windows overlap entirely, so the
+    /// time from a stem leaving a node to that node's own fluff does not say whether the node was
+    /// the origin. Before, a relay fired in `[b, 2b]` and the submitter never under `2b`: a
+    /// successor that dropped the stem could tell the two apart by the clock. Every decile of the
+    /// two empirical distributions agrees to within 2% of `b`.
+    #[test]
+    fn the_submitter_and_relay_embargoes_overlap() {
+        let b = Duration::from_millis(3000);
+        let mut d = Dandelion::new(DandelionConfig { embargo: b, seed: Some(9), ..Default::default() });
+        let n = 20_000;
+        let mut relay: Vec<f64> = (0..n).map(|_| d.embargo_for(Edge::Peer(PeerId::random())).as_secs_f64()).collect();
+        let mut local: Vec<f64> = (0..n).map(|_| d.embargo_for(Edge::Local).as_secs_f64()).collect();
+        relay.sort_by(f64::total_cmp);
+        local.sort_by(f64::total_cmp);
+        for q in 1..10 {
+            let i = n * q / 10;
+            let gap = (relay[i] - local[i]).abs();
+            assert!(gap < 0.02 * b.as_secs_f64(), "decile {q}: relay {:.3} s, submitter {:.3} s", relay[i], local[i]);
+        }
+        // Half the submitter's draws are under 1.25 b, where most relay draws also fall.
+        let under = local.iter().filter(|w| **w < 1.25 * b.as_secs_f64()).count();
+        assert!(under > n / 2, "only {under} of {n} submitter embargoes under 1.25 b");
+    }
+
+    /// Audit v12, PRIV-604: a stem send that is not acknowledged fails, and the node reroutes it
+    /// to the edge's other successor, well before the shortest embargo (`b`) would have fluffed it:
+    /// the acknowledgement timeout is under the default `b` with room for the second send.
+    #[test]
+    fn a_silent_successor_times_out_before_the_embargo() {
+        assert!(
+            crate::network::STEM_REQUEST_TIMEOUT * 2 <= DEFAULT_EMBARGO,
+            "ack timeout {:?} leaves no time to reroute inside the {:?} embargo",
+            crate::network::STEM_REQUEST_TIMEOUT,
+            DEFAULT_EMBARGO
+        );
     }
 
     /// The embargo fail-safe in the stempool: a held transaction comes out exactly when its timer

@@ -785,9 +785,11 @@ enum Cmd {
         /// the transaction on. Expected stem length is 1/q relays.
         #[arg(long, value_name = "Q", default_value_t = randprotocol_node::dandelion::DEFAULT_FLUFF_PROB, value_parser = parse_fluff_prob)]
         dandelion_fluff_prob: f64,
-        /// The stem embargo's fixed part, b, in milliseconds: a node holding a stem transaction
-        /// fluffs it itself if it has not seen it on gossip after b + min(Exp(mean b/4), b) (2b +
-        /// Exp(mean b/4) at the submitting node). The fail-safe against a successor that drops it.
+        /// The stem embargo's fixed part, b, in milliseconds: a node holding a stem transaction,
+        /// the submitting node included, fluffs it itself if it has not seen it on gossip after
+        /// b + min(Exp(mean b/4), b). The fail-safe against a successor that drops it. Below
+        /// 3000 ms (twice the 1.5 s stem acknowledgement timeout) a successor that never answers
+        /// may not be rerouted around before the embargo fires.
         #[arg(long, value_name = "MS", default_value_t = randprotocol_node::dandelion::DEFAULT_EMBARGO.as_millis() as u64, value_parser = clap::value_parser!(u64).range(100..=600_000))]
         dandelion_embargo_ms: u64,
         #[arg(long, default_value = "127.0.0.1:8545")]

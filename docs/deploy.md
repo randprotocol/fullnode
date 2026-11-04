@@ -228,7 +228,7 @@ fluff no node shows it over RPC, serves it to a peer or proposes it (`docs/archi
 |---|---|---|
 | `--dandelion on\|off` | `on` | stem at all; `off` neither sends nor accepts stems and does not advertise the protocol |
 | `--dandelion-fluff-prob` | `0.1` | q; a stem runs about 1/q relays |
-| `--dandelion-embargo-ms` | `3000` | b; a relay waits b + min(Exp(b/4), b), the submitter 2b + Exp(b/4) |
+| `--dandelion-embargo-ms` | `3000` | b; every holder, the submitter included, waits b + min(Exp(b/4), b) (audit v12, PRIV-604); keep it at or above 3000, twice the 1.5 s stem acknowledgement timeout |
 
 **Origin hiding is design intent until it is measured again.** The first-spy test that found the
 submitter first in 27 of 27 traces has not been re-run against v0.8.3 or later, and until audit v12
