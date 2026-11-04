@@ -125,6 +125,12 @@ jobs:
       - name: The pinned prover pool is the live pool
         working-directory: fullnode
         run: cargo test -p randprotocol-client --release --lib prover::tests::the_trusted_provers
+      # PROC-601: the roll scripts write the service's limits drop-in (MemoryHigh, LimitNOFILE).
+      - name: Deploy script self-tests
+        working-directory: fullnode
+        run: |
+          SELFTEST=1 bash deploy/lib/unit-limits.sh
+          SELFTEST=1 bash deploy/lib/fleet-env.sh
       # VK-10: the prover pool router's tests (stdlib only).
       - name: The prover pool router
         working-directory: fullnode/deploy/prover

@@ -85,8 +85,10 @@ Rules that follow from these numbers:
   (~1.4 GB resident), but the 2026-10-27 overnight run OOM-killed the 2 GB validators 24 times in
   8 h, each after a burst of eight ~2.9 MB transactions; the one 4 GB node in a burst survived
   it. v0.8.3 bounds admission memory (`--admission-budget-mb`, 1/16 of RAM by default, ~117 MiB
-  on a 2 GB host), and the unit templates (`deploy/vps-setup.sh`, `deploy/cutover-droplet-rand.sh`)
-  set `MemoryHigh=85%` so the kernel reclaims and throttles before it kills. A 2 GB host that has
+  on a 2 GB host), and every setup and roll (`deploy/vps-setup.sh`, `deploy/update-droplet.sh`,
+  `deploy/roll-all.sh`) writes the drop-in `rand-node.service.d/50-limits.conf` from
+  `deploy/lib/unit-limits.sh` (PROC-601) with `MemoryHigh=85%`, so the kernel reclaims and
+  throttles before it kills. A 2 GB host that has
   to stay on needs both, plus swap (the fleet's have 1 GB).
 - **Disk, not RAM, is the limit.** Keep at least 20 GB free for builds (`docs/block-space.md` §5)
   and delete a retired chain's data dir after a cut-over (`deploy/retire-chain-dirs.sh`). A
