@@ -386,7 +386,9 @@ pub fn is_permanent(e: &TxError) -> bool {
             | P::BlockFull
             | P::AccountBlockFull
             | P::WithdrawalPending
-            | P::RequestOutsideWindow { .. } => false,
+            | P::RequestOutsideWindow { .. }
+            // PERP-5: the log drains with the next proof.
+            | P::DigestLogFull { .. } => false,
         };
     }
     // The Dilithium2 co-signature's verdicts (bridge hardening B3). Every other bridge verdict

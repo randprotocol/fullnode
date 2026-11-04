@@ -5179,6 +5179,7 @@ mod tests {
             "sparse_windows",
             "max_window_heights",
             "engine_program_log_height",
+            "max_pending_digests",
             "refuse_panics",
             "max_accounts",
         ] {

@@ -474,6 +474,7 @@ without a `perps` section:
 { "enabled": true,
   "collateral_asset": 0, "max_tier": 18, "max_window_blocks": 64,
   "sparse_windows": false, "max_window_heights": 0, "engine_program_log_height": 0,
+  "max_pending_digests": 0,
   "max_block_inputs": 8, "min_deposit": "1000000",
   "engine_hc": "<64 hex>", "genesis_root": "<64 hex>",
   "markets": [{ "id": 0, "symbol": "BTC-PERP", "lot": 1000000, "tick": 1000000,
@@ -498,6 +499,11 @@ listed, and `initial_collateral + in − out`, decimal strings (`docs/perps.md`,
 number, `0` on a chain without it (chain 21; chain 22 on sets it). A node that predates the field
 omits it: read absent, `null` or `0` as unpinned. `rand perp prove` proves at the canonical
 state-proof shape by default only on a pinned chain (`docs/perps.md`).
+
+`max_pending_digests` (PERP-5) is the genesis cap on recorded digests no state proof has
+covered, a JSON number, `0` (off) on a chain without it (chain 21). While `pending_heights` holds
+that many, deposits, orders, cancels and withdrawal requests are refused `DigestLogFull` until a
+proof lands. A node that predates the field omits it: read absent as `0`.
 
 The three commitments are 64 lowercase hex characters (a `Word8`, its eight words little-endian).
 `pending_heights` are the closed heights no state proof has covered, ascending: the digests the

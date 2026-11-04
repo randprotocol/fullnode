@@ -25,6 +25,13 @@ stopped at v0.4 until 2026-09-30, when the entries v0.5 to v0.6.7 were written f
   wrong structure (commit rounds, proof-of-work words and openings of unequal counts, no round,
   an arity out of range, another query count, another final-polynomial length) before the key;
   each is a check the verifier makes after the key, so no verdict moves.
+- **PERP-5 (genesis-gated, off on chain 21):** `perps.max_pending_digests` (requires
+  `sparse_windows`; `max_window_blocks..=1 048 576`). While that many recorded digests wait on a
+  state proof, deposits, orders, cancels and withdrawal requests are refused `DigestLogFull`
+  (retryable) until a proof drains the log; only the sparse-window heartbeat keeps recording.
+  Absent, the section's genesis bytes, JSON and stored row are unchanged (chain 21 replays byte
+  for byte); set, the stored row carries a second trailer version (`rand-perps-ext-2`), which an
+  older build cannot read. `rand_getPerps` reports `max_pending_digests` (0 when unset).
 
 ## v0.8.4 — 2026-11-01 (chain 21, node-only; rolled to end the 2026-11-01 OOM kills and commit stalls)
 

@@ -101,6 +101,10 @@
 #      chain 21 refused it.
 #   7. EXPECT_NODE_VERSION has no default: v0.8.2 is the first release with every field above;
 #      v0.8.3 (rc1 9443de63, main 97bcf4b1) is untagged. Set it to the release the cut runs.
+#   8. perps.max_pending_digests (PERP-5, audit v12). No documented value and NOT SET here (off):
+#      with sparse_windows on, chain 22's log already grows only with input blocks and heartbeats;
+#      the cap bounds the input part when no prover runs. Needs a build with the field (after
+#      v0.8.4) and a value in max_window_blocks..=1048576 — the owner's call.
 #
 # Known gap (not a decision): no RPC serves `program_state.refuse_panics` (rand_getLimits'
 # program_state object is cell_fee/max_reads/max_writes/max_payouts). `check-limits` therefore
@@ -365,6 +369,13 @@ PERP_GENESIS_ROOT=${PERP_GENESIS_ROOT:-}                     # set by the cut (p
 #   - engine_program_log_height (CON-60): the pinned image's program height, which `rand perp image-hc`
 #     prints on stderr — derived at the cut and refused unless it is EXPECT_ENGINE_PROGRAM_LOG_HEIGHT.
 #     14 is what v0.8.2's `rand perp image-hc` prints for f286a611… (read 2026-10-29).
+#   - max_pending_digests (PERP-5, audit v12; docs/perps.md genesis table): NOT SET by this cut — the
+#     field is genesis-gated and off when absent. Set, it caps the recorded digests no state proof
+#     has covered (deposits, orders, cancels and withdrawal requests are refused `DigestLogFull`
+#     while the log is full); it needs sparse_windows and max_window_blocks..=1048576. Whether
+#     chain 22 sets it, and at what value, is an OWNER DECISION not yet taken (OPEN 8): adding it
+#     means a value here, in py_perps' section, in V10_FIELDS' order check and in the hash-variant
+#     list, together. Until then `want_keys` below refuses a section that carries it.
 # shellcheck disable=SC2089  # JSON text in a string, exported whole, never word-split
 PERPS_V10_JSON='{"bound_payouts": true, "sparse_windows": true}'
 PERPS_MAX_WINDOW_HEIGHTS=${PERPS_MAX_WINDOW_HEIGHTS:-}       # OPEN 1: the operator's, no default (DRY_RUN/SELFTEST: 64, a PLACEHOLDER)
@@ -927,7 +938,7 @@ def need(cond, msg):
 need(snap["genesis_hash"] == E["CHAIN21_HASH"], "the snapshot is not of chain 21")
 need(not g21.get("vesting"), "chain 21's genesis has a vesting section — this script carries none")
 need(g21.get("chain_id") == 21 and "fees" in g21 and "perps" in g21 and "multisig" in g21 and "hc_auth_multisig" in g21
-     and not {"bound_payouts", "initial_collateral", "sparse_windows", "max_window_heights", "engine_program_log_height"} & set(g21["perps"])
+     and not {"bound_payouts", "initial_collateral", "sparse_windows", "max_window_heights", "engine_program_log_height", "max_pending_digests"} & set(g21["perps"])
      and "max_accounts" not in g21["multisig"] and "refuse_panics" not in g21["program_state"] and "incremental_root" not in g21["tokens"],
      "CHAIN21_GENESIS is not chain 21's (chain id 21 with fees, perps, multisig and hc_auth_multisig; none of the fields chain 22 adds)")
 b21 = g21["bridge"]
