@@ -1373,6 +1373,9 @@ struct Node {
     /// ([`crate::peer_bindings::announce_due`]).
     binding_announced_at: Option<Instant>,
     binding_announce_wanted: bool,
+    /// When the guard's learned sources were last written (audit v12, NET-601;
+    /// [`crate::peer_bindings::SOURCES_PERSIST_EVERY`]).
+    sources_persisted_at: Instant,
     /// The policy over every peer's `sync_bucket` (see [`admit_sync_request`]).
     sync_limiter: admission::PeerLimiter,
     /// This validator's signed not-held answers, re-served to repeated by-hash requests (SW-2).
@@ -2673,6 +2676,18 @@ pub async fn start_with(cfg: NodeConfig, rpc_options: RpcOptions, net_options: N
     if !peer_bindings.is_empty() {
         tracing::info!(bound = peer_bindings.len(), "validator peer bindings restored from the last run");
     }
+    // And the hosts those validators were seen at (audit v12, NET-601), so their reconnects take
+    // reserved pending slots before any of them has connected in this run.
+    let bound_sources = peer_bindings.restored_sources(
+        storage.reserved_sources().unwrap_or_else(|e| {
+            tracing::warn!("persisted reserved sources unreadable, starting without them: {e}");
+            Default::default()
+        }),
+        now_ms(),
+    );
+    if !bound_sources.is_empty() {
+        tracing::info!(peers = bound_sources.len(), "validators' reserved sources restored from the last run");
+    }
     let dandelion_stats = Arc::new(DandelionStats::default());
     let (net, mut events) = network::start_with(
         NetworkConfig {
@@ -2686,6 +2701,7 @@ pub async fn start_with(cfg: NodeConfig, rpc_options: RpcOptions, net_options: N
         network::EdgeConfig {
             reserved: net_options.reserved_peers.clone(),
             bound: peer_bindings.bound_peers(),
+            bound_sources,
             strict_gossip: net_options.strict_gossip,
             anonymous_tx_only: net_options.anonymous_tx_only,
             dandelion: net_options.dandelion.enabled,
@@ -2987,6 +3003,7 @@ pub async fn start_with(cfg: NodeConfig, rpc_options: RpcOptions, net_options: N
         binding_signer,
         binding_announced_at: None,
         binding_announce_wanted: false,
+        sources_persisted_at: Instant::now(),
         sync_limiter: admission::PeerLimiter::new(SYNC_REQUEST_BURST, SYNC_REQUEST_PER_SEC),
         not_held_signed: NotHeldCache::default(),
         peer_memory: PeerMemory::default(),
@@ -3102,6 +3119,7 @@ impl Node {
                     self.check_disk();
                     self.broadcast_status().await;
                     self.announce_binding().await;
+                    self.persist_reserved_sources().await;
                     self.expire_parked_requests().await;
                 }
                 _ = sync_tick.tick() => self.maybe_sync().await,
@@ -3725,6 +3743,26 @@ impl Node {
         self.binding_announced_at = Some(now);
         self.binding_announce_wanted = false;
         self.net.broadcast(GossipMessage::PeerBinding(binding)).await;
+    }
+
+    /// Write the guard's learned sources for the validators' peers (audit v12, NET-601), every
+    /// [`crate::peer_bindings::SOURCES_PERSIST_EVERY`], so a restart — the whole fleet's at once
+    /// included — reserves every validator's host from the start. The swarm is asked with a
+    /// deadline: the loop never waits on a busy network task for a cache.
+    async fn persist_reserved_sources(&mut self) {
+        let now = Instant::now();
+        if now.saturating_duration_since(self.sources_persisted_at) < crate::peer_bindings::SOURCES_PERSIST_EVERY {
+            return;
+        }
+        self.sources_persisted_at = now;
+        let Ok(learned) = tokio::time::timeout(Duration::from_secs(1), self.net.learned_sources()).await else {
+            tracing::debug!("learned sources: the network task did not answer in time");
+            return;
+        };
+        let rows = self.peer_bindings.source_rows(&learned, now_ms());
+        if let Err(e) = self.storage.put_reserved_sources(&rows) {
+            tracing::warn!("persisting reserved sources: {e}");
+        }
     }
 
     /// Do what a binding offer asked for (audit v6, NET-1): reserve, un-reserve, persist.
@@ -7921,6 +7959,7 @@ mod tests {
             binding_signer: None,
             binding_announced_at: None,
             binding_announce_wanted: false,
+            sources_persisted_at: Instant::now(),
             sync_limiter: admission::PeerLimiter::new(SYNC_REQUEST_BURST, SYNC_REQUEST_PER_SEC),
             not_held_signed: NotHeldCache::default(),
             peer_memory: PeerMemory::default(),

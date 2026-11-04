@@ -380,6 +380,13 @@ pub struct EdgeConfig {
     /// node learned over gossip before its last restart (`node`'s persisted peer bindings),
     /// handed over here so they are reserved before the first connection is accepted.
     pub bound: Vec<PeerId>,
+    /// The sources those peers were learned at before the last restart (audit v12, NET-601;
+    /// `node`'s persisted [`edge::LearnedSource`]s, with their ages), put back in the guard before
+    /// the first connection is accepted, so every validator seen in the last
+    /// [`edge::RESERVED_SOURCE_TTL`] has its host on the reserved pending slots from the start —
+    /// not only the bootstraps' hosts. Taken only for a peer in `bound`, `reserved` or the
+    /// bootstraps.
+    pub bound_sources: Vec<(PeerId, Vec<edge::LearnedSource>)>,
     /// gossipsub's `ValidationMode::Strict` instead of `Permissive` (audit v6, CH-7;
     /// `--strict-gossip`): every delivered message must carry a valid author signature, sequence
     /// number and source, so an unsigned message claiming any author is dropped by gossipsub
@@ -478,6 +485,9 @@ pub enum NetworkCommand {
     /// Stop reserving a peer reserved through [`NetworkCommand::Reserve`] or
     /// [`EdgeConfig::bound`]; a bootstrap or `--reserved-peer` identity stays reserved.
     Unreserve(PeerId),
+    /// The reserved peers' learned sources, for persisting (NET-601): see
+    /// [`NetworkHandle::learned_sources`].
+    LearnedSources(oneshot::Sender<Vec<(PeerId, Vec<edge::LearnedSource>)>>),
     Shutdown,
 }
 
@@ -533,6 +543,17 @@ impl NetworkHandle {
     /// A no-op for a bootstrap or `--reserved-peer` identity. Connections it already holds stay.
     pub async fn unreserve_peer(&self, peer: PeerId) {
         let _ = self.cmd.send(NetworkCommand::Unreserve(peer)).await;
+    }
+
+    /// Every reserved peer's advertised and observed sources with their ages (audit v12,
+    /// NET-601): what the node persists so the next start restores them
+    /// ([`EdgeConfig::bound_sources`]). Empty when the swarm task is gone.
+    pub async fn learned_sources(&self) -> Vec<(PeerId, Vec<edge::LearnedSource>)> {
+        let (tx, rx) = oneshot::channel();
+        if self.cmd.send(NetworkCommand::LearnedSources(tx)).await.is_err() {
+            return Vec::new();
+        }
+        rx.await.unwrap_or_default()
     }
 
     pub async fn dial(&self, addr: Multiaddr) {
@@ -717,6 +738,11 @@ pub async fn start_with(
         if let Some(id) = peer_id_of(a) {
             guard.reserve_at(id, [a], edge::SourceKind::Configured);
         }
+    }
+    // And every other reserved peer's hosts as they were known before the restart (NET-601):
+    // the guard takes them for reserved peers only, under the same 24 h expiry.
+    for (id, learned) in &edge.bound_sources {
+        guard.restore_sources(*id, learned.iter().copied());
     }
     let behaviour =
         RandBehaviour { limits, guard, gossipsub, tx_gossip, identify, kademlia, mdns: Toggle::from(mdns), sync, stem: Toggle::from(stem), ping };
@@ -1099,6 +1125,9 @@ async fn run(
                             b.limits.remove_peer_id(&id);
                             b.guard.unreserve(&id);
                         }
+                    }
+                    NetworkCommand::LearnedSources(reply) => {
+                        let _ = reply.send(swarm.behaviour().guard.learned_sources());
                     }
                     NetworkCommand::Shutdown => break,
                 }
@@ -2034,6 +2063,27 @@ mod tests {
         PeerId::from(identity::Keypair::ed25519_from_bytes([seed; 32]).unwrap().public())
     }
 
+    /// Audit v12, NET-601: the sources a node learned for its validators before a restart
+    /// (`EdgeConfig::bound_sources`, read from the store) are in the guard as soon as the swarm
+    /// exists — before any connection — and come back out of [`NetworkHandle::learned_sources`],
+    /// what the node persists. Sources for a peer that is neither bound nor pinned are not taken.
+    #[tokio::test]
+    async fn learned_sources_are_restored_before_the_first_connection() {
+        let v = PeerId::random();
+        let other = PeerId::random();
+        let host = edge::Source::V4(std::net::Ipv4Addr::new(198, 51, 100, 50));
+        let learned = edge::LearnedSource { source: host, kind: edge::SourceKind::Observed, age: Duration::from_secs(3600) };
+        let edge = EdgeConfig { bound: vec![v], bound_sources: vec![(v, vec![learned]), (other, vec![learned])], ..EdgeConfig::default() };
+        let (n, _rx) = start_with(loopback_cfg(vec![], WireLimits::default()), [96u8; 32], edge).await.unwrap();
+        let got = n.learned_sources().await;
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(got[0].0, v);
+        assert_eq!(got[0].1.len(), 1);
+        assert_eq!((got[0].1[0].source, got[0].1[0].kind), (host, edge::SourceKind::Observed));
+        assert!(got[0].1[0].age >= Duration::from_secs(3600), "restored with its age: {:?}", got[0].1[0].age);
+        n.shutdown().await;
+    }
+
     /// Audit v6, NET-1: with the inbound cap full of strangers, a further stranger is refused —
     /// and a reserved peer is still admitted. Before, the cap was first come, first served, and a
     /// validator restarting into a host whose slots strangers held could not get back in.
@@ -2564,6 +2614,7 @@ mod tests {
         let e = EdgeConfig::default();
         assert!(e.reserved.is_empty());
         assert!(e.bound.is_empty());
+        assert!(e.bound_sources.is_empty());
         assert!(!e.strict_gossip);
         assert!(!e.anonymous_tx_only, "both transaction lanes by default, for the rolling upgrade (#146)");
         assert!(!e.dandelion, "a bare network speaks no stem unless asked (#145)");
@@ -2593,6 +2644,17 @@ mod tests {
         assert!(matches!(rx.recv().await, Some(NetworkCommand::Reserve(p)) if p == peer));
         h.unreserve_peer(peer).await;
         assert!(matches!(rx.recv().await, Some(NetworkCommand::Unreserve(p)) if p == peer));
+
+        // `learned_sources` waits for the swarm's answer (NET-601).
+        let learned = tokio::spawn({
+            let h = h.clone();
+            async move { h.learned_sources().await }
+        });
+        match rx.recv().await {
+            Some(NetworkCommand::LearnedSources(reply)) => reply.send(vec![(peer, vec![])]).unwrap(),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(learned.await.unwrap().len(), 1);
 
         let id = GossipId { message_id: MessageId::from(vec![1, 2, 3]), propagation_source: peer, lane: GossipLane::AnonymousTx };
         h.report_validation(id.clone(), MessageAcceptance::Reject).await;
@@ -2642,6 +2704,7 @@ mod tests {
         h.reserve_peer(peer).await;
         h.report_validation(id, MessageAcceptance::Accept).await;
         assert!(h.peers().await.is_empty());
+        assert!(h.learned_sources().await.is_empty());
         assert!(h.send_sync_request(peer, SyncRequest::BlockByHash(Hash::ZERO)).await.is_none());
         h.shutdown().await;
     }

@@ -12,7 +12,14 @@ stopped at v0.4 until 2026-09-30, when the entries v0.5 to v0.6.7 were written f
 
 ## Unreleased
 
-Nothing yet.
+Node (audit v12 network and privacy rows; node-only, no wire or consensus change):
+
+- **Validators' hosts stay reserved across a restart** (NET-601): the source addresses the
+  connection guard learned for validators' peers are written to the store every five minutes
+  (`reserved_sources`, beside the peer bindings) with the time each was last seen, and put back
+  before the first connection at the next start. Their 24 h expiry runs on across the stop. A
+  fleet-wide restart no longer leaves the reserved pending slots serving only the bootstraps'
+  hosts. A build that predates the row ignores it.
 
 ## v0.8.4 — 2026-11-01 (chain 21, node-only; rolled to end the 2026-11-01 OOM kills and commit stalls)
 
