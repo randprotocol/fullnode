@@ -21,6 +21,8 @@
 #    copy's sha256 equals the expected one (the release tag's), keeping the previous rand-node
 #    beside it as /root/rand-node.prev; nothing restarts yet;
 # 2. stops node A (launchd) and every droplet's rand-node together;
+#    and writes or refreshes each droplet's limits drop-in (MemoryHigh, LimitNOFILE;
+#    deploy/lib/unit-limits.sh, PROC-601) with a daemon-reload, so the restart applies it;
 # 3. starts them all together, A last.
 #
 # The release's signature is checked before anything is copied (audit v6, PROC-5;
@@ -47,6 +49,7 @@ elif [ "${NO_MSAUTH_VK:-}" != 1 ]; then
   echo "no msauth-vk-production.bin (fifth argument or MSAUTH_VK): a v0.8.0+ node on a chain naming hc_auth_multisig refuses to start without it; pass it, or NO_MSAUTH_VK=1 for a chain without multisig"; exit 1
 fi
 . deploy/lib/verify-release.sh
+. deploy/lib/unit-limits.sh
 if [ -n "${RELEASE_SUMS:-}" ] || [ -n "${RELEASE_SIG:-}" ]; then
   { [ -n "${RELEASE_SUMS:-}" ] && [ -n "${RELEASE_SIG:-}" ]; } || { echo "RELEASE_SUMS and RELEASE_SIG go together: the release's SHA256SUMS and its SHA256SUMS.sig"; exit 1; }
   verify_release_sums "$RELEASE_SUMS" "$RELEASE_SIG" || exit 1
@@ -99,12 +102,16 @@ VK_STEP="if [ -f /usr/local/bin/msauth-vk-production.bin ]; then vk_got=\$(/root
 if [ -n "$MSAUTH_VK" ]; then
   VK_STEP="[ \"\$(sha256sum /root/msauth-vk-production.bin.new | cut -d' ' -f1)\" = \"$VK_SHA\" ] && vk_got=\$(/root/rand-node.new keygen-msauth-vk --check /root/msauth-vk-production.bin.new) && vk_pin=\$(/root/rand-node.new keygen-msauth-vk --print-pinned production) && [ \"\$vk_got\" = \"\$vk_pin\" ] || { echo \"   msauth key blob is not the pinned \${vk_pin:-?} (has \${vk_got:-?}), skipping\"; rm -f /root/rand-node.new /root/rand.new /root/msauth-vk-production.bin.new; exit 1; }; install -m 644 /root/msauth-vk-production.bin.new /usr/local/bin/msauth-vk-production.bin; rm -f /root/msauth-vk-production.bin.new;"
 fi
+# PROC-601: the limits drop-in, written on the host after the binaries and before the restart.
+LIMITS_STEP=$(unit_limits_install_script rand-node)
 for ip in $IPS; do
   scp -q -o ConnectTimeout=15 -o BatchMode=yes "$NODE_BIN" root@$ip:/root/rand-node.new && scp -q -o ConnectTimeout=15 -o BatchMode=yes "$WALLET_BIN" root@$ip:/root/rand.new || { echo "   $ip: copy failed"; ssh -o ConnectTimeout=15 -o BatchMode=yes root@$ip 'rm -f /root/rand-node.new /root/rand.new /root/msauth-vk-production.bin.new' 2>/dev/null; continue; }
   if [ -n "$MSAUTH_VK" ]; then
     scp -q -o ConnectTimeout=15 -o BatchMode=yes "$MSAUTH_VK" root@$ip:/root/msauth-vk-production.bin.new || { echo "   $ip: msauth key copy failed"; ssh -o ConnectTimeout=15 -o BatchMode=yes root@$ip 'rm -f /root/rand-node.new /root/rand.new /root/msauth-vk-production.bin.new' 2>/dev/null; continue; }
   fi
-  ssh -o ConnectTimeout=15 -o BatchMode=yes root@$ip "set -e; [ \"\$(sha256sum /root/rand-node.new | cut -d' ' -f1)\" = \"$WANT\" ] && [ \"\$(sha256sum /root/rand.new | cut -d' ' -f1)\" = \"$WANT_WALLET\" ] || { echo '   sha mismatch, skipping'; rm -f /root/rand-node.new /root/rand.new /root/msauth-vk-production.bin.new; exit 1; }; chmod 755 /root/rand-node.new; $VK_STEP cp -f /usr/local/bin/rand-node /root/rand-node.prev; install -m 755 /root/rand-node.new /usr/local/bin/rand-node; install -m 755 /root/rand.new /usr/local/bin/rand; rm -f /root/rand-node.new /root/rand.new; echo \"   \$(hostname): installed \$(/usr/local/bin/rand-node --version)\"" 2>&1 | tail -1
+  ssh -o ConnectTimeout=15 -o BatchMode=yes root@$ip "set -e; [ \"\$(sha256sum /root/rand-node.new | cut -d' ' -f1)\" = \"$WANT\" ] && [ \"\$(sha256sum /root/rand.new | cut -d' ' -f1)\" = \"$WANT_WALLET\" ] || { echo '   sha mismatch, skipping'; rm -f /root/rand-node.new /root/rand.new /root/msauth-vk-production.bin.new; exit 1; }; chmod 755 /root/rand-node.new; $VK_STEP cp -f /usr/local/bin/rand-node /root/rand-node.prev; install -m 755 /root/rand-node.new /usr/local/bin/rand-node; install -m 755 /root/rand.new /usr/local/bin/rand; rm -f /root/rand-node.new /root/rand.new
+$LIMITS_STEP
+echo \"   \$(hostname): installed \$(/usr/local/bin/rand-node --version)\"" 2>&1 | tail -1
 done
 # Node A on this Mac, when its launchd job is installed (retired to the droplet rand-node-a since
 # 2026-09-27; run-a.sh refuses without RAND_NODE_A_ON_LAPTOP=1): the blob goes beside the binary

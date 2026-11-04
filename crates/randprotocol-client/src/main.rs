@@ -990,6 +990,15 @@ enum MultisigPrivateCmd {
         /// nothing is signed.
         #[arg(long = "expect-to", value_name = "ADDR[:AMOUNT]")]
         expect_to: Vec<String>,
+        /// The most fee this signer signs for, in RAND (audit v12, MSC-2; the apps' signer-profile
+        /// limit, 0.1 RAND unless set). A proposal whose fee is over it, or over the RAND it pays
+        /// out, is refused: the chain has no fee ceiling.
+        #[arg(long, default_value = "0.1", value_name = "RAND")]
+        max_fee: String,
+        /// Sign a proposal the fee rule refuses (MSC-2): the explicit override. Every other check
+        /// still runs.
+        #[arg(long)]
+        allow_high_fee: bool,
     },
     /// Check a proposal against the policy and print what it pays; signs nothing.
     Check {
@@ -1554,11 +1563,22 @@ async fn multisig_private_cmd(prover: bool, cpu: bool, key: &Path, max_prover_fe
                 None => println!("ok (no node answered: expiry not compared with the head)"),
             }
         }
-        MultisigPrivateCmd::Sign { proposal, policy, key, expect_to } => {
+        MultisigPrivateCmd::Sign { proposal, policy, key, expect_to, max_fee, allow_high_fee } => {
             let expect_to = parse_expect_to(&expect_to)?;
+            // MSC-2: the limit is read even under the override, so a typo is never silently ignored.
+            let limit = parse_amount(&max_fee).with_context(|| format!("--max-fee {max_fee:?}"))?;
             let (proposal, policy) = (mp::load_proposal(&proposal)?, Policy::load(&policy)?);
             let keypair = wallet::load_authority_key(&key)?;
-            let (share, lines) = mp::sign(&proposal, &policy, &keypair, &expect_to)?;
+            if allow_high_fee {
+                eprintln!("warning: --allow-high-fee: the fee rule (over --max-fee, or over the RAND paid out) is NOT applied");
+            }
+            if !allow_high_fee {
+                // The rule's refusal named with the flags that change it; `mp::sign` applies it too.
+                if let Some(e) = randprotocol_msig::fee_refusal(&mp::check(&proposal, &policy, &expect_to)?, limit) {
+                    return Err(anyhow!("{e} (--max-fee {max_fee}; pass --allow-high-fee to sign anyway)"));
+                }
+            }
+            let (share, lines) = mp::sign(&proposal, &policy, &keypair, &expect_to, (!allow_high_fee).then_some(limit))?;
             for line in lines {
                 eprintln!("{line}");
             }
@@ -4136,6 +4156,49 @@ mod tests {
         }
     }
 
+    /// MSC-2: `sign` applies the five apps' fee rule — refused over `--max-fee` (default 0.1
+    /// RAND) or over the RAND the proposal pays out — and `--allow-high-fee` is the explicit
+    /// override. The committed valid proposal pays 10 RAND with a 0.001 RAND fee.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sign_refuses_a_fee_over_the_signers_limit_unless_overridden() {
+        use std::os::unix::fs::PermissionsExt;
+        let parse = |args: &[&str]| Cli::try_parse_from(std::iter::once("rand").chain(args.iter().copied())).map(|c| c.cmd);
+        let defaults = parse(&["multisig-private", "sign", "--proposal", "x", "--policy", "p", "--key", "k"]);
+        let Ok(Cmd::MultisigPrivate(MultisigPrivateCmd::Sign { max_fee, allow_high_fee, .. })) = defaults else { panic!() };
+        assert_eq!((max_fee.as_str(), allow_high_fee), ("0.1", false), "the apps' default limit");
+        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("../randprotocol-msig/tests/fixtures");
+        let dir = tempfile::tempdir().unwrap();
+        let copy = |name: &str| {
+            let to = dir.path().join(name);
+            std::fs::copy(fixtures.join(name), &to).unwrap();
+            std::fs::set_permissions(&to, std::fs::Permissions::from_mode(0o600)).unwrap();
+            to
+        };
+        let (policy, valid) = (copy("policy.json"), copy("proposal-valid.json"));
+        let expected: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(fixtures.join("expected.json")).unwrap()).unwrap();
+        let seeds: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(fixtures.join("signer-seeds.json")).unwrap()).unwrap();
+        let seed: [u8; 32] = hex::decode(seeds["members"][0].as_str().unwrap()).unwrap().try_into().unwrap();
+        let key = dir.path().join("signer.key.json");
+        wallet::write_authority_key(&Keypair::from_seed(seed).unwrap(), &key).unwrap();
+        let to = expected["recipient"].as_str().unwrap().to_string();
+        let rpc = RpcClient::new("http://127.0.0.1:1".to_string());
+        let run = |cmd| multisig_private_cmd(false, false, Path::new("k"), "1", &rpc, cmd);
+        let sign = |max_fee: &str, allow_high_fee: bool| MultisigPrivateCmd::Sign {
+            proposal: valid.clone(),
+            policy: policy.clone(),
+            key: key.clone(),
+            expect_to: vec![to.clone()],
+            max_fee: max_fee.into(),
+            allow_high_fee,
+        };
+        run(sign("0.1", false)).await.expect("0.001 RAND is within the default limit");
+        let e = run(sign("0.0001", false)).await.unwrap_err().to_string();
+        assert!(e.contains("more than this signer allows (0.0001 RAND)") && e.contains("--allow-high-fee"), "{e}");
+        run(sign("0.0001", true)).await.expect("--allow-high-fee is the explicit override");
+        assert!(run(sign("nope", false)).await.is_err(), "an unreadable limit is refused, not defaulted");
+    }
+
     /// `check` and `sign --expect-to`, offline, over the signer-check crate's committed vectors:
     /// the real recipient passes and signs; the coordinator's substituted payee (every §6.5 check
     /// passing) is refused by both under the expectation; `sign` without one still signs; a bad
@@ -4162,7 +4225,7 @@ mod tests {
         let rpc = RpcClient::new("http://127.0.0.1:1".to_string());
         let run = |cmd| multisig_private_cmd(false, false, Path::new("k"), "1", &rpc, cmd);
         let check = |proposal: &PathBuf, expect_to: Vec<String>| MultisigPrivateCmd::Check { proposal: proposal.clone(), policy: policy.clone(), expect_to };
-        let sign = |proposal: &PathBuf, expect_to: Vec<String>| MultisigPrivateCmd::Sign { proposal: proposal.clone(), policy: policy.clone(), key: key.clone(), expect_to };
+        let sign = |proposal: &PathBuf, expect_to: Vec<String>| MultisigPrivateCmd::Sign { proposal: proposal.clone(), policy: policy.clone(), key: key.clone(), expect_to, max_fee: "0.1".into(), allow_high_fee: false };
         run(check(&valid, vec![to.clone()])).await.unwrap();
         run(sign(&valid, vec![to.clone()])).await.unwrap();
         let want = expected["substituted_refusal"].as_str().unwrap();

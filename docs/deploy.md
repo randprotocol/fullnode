@@ -292,6 +292,23 @@ publishes them with `SHA256SUMS` and a build attestation; the release notes name
 binaries come from that release, not from a hand build ("Release trust", below). The workflow has
 not yet produced a release: the first tag after 2026-09-30 is its first run.
 
+**A merged fleet fix must name its roll (audit v12, PROC-601).** The open-files fix (#159) sat
+merged three days and rolled only under the 31 Oct halt; `MemoryHigh=85%` (#157) was merged into
+two unit templates no roll script writes, so 0 of 26 hosts carried it. Before a fleet-affecting fix
+(a unit setting, a drop-in, a limit, a flag a host must pass, a binary fix for a live incident) is
+called done:
+
+- [ ] it is reachable by the roll path: a unit or limit lives in `deploy/lib/unit-limits.sh` (or
+      a script `deploy/update-droplet.sh` and `deploy/roll-all.sh` run), never only in a template
+      a fresh host gets (`SELFTEST=1 bash deploy/lib/unit-limits.sh` asserts both roll scripts
+      write the drop-in and no other script spells the values);
+- [ ] the PR or issue names the roll that ships it — the tag, and `update-droplet.sh` one at a
+      time or `roll-all.sh` — and a date, within a day of the incident it answers;
+- [ ] after the roll, the fix is read back from every host (`systemctl show rand-node -p
+      MemoryHigh -p LimitNOFILE`, `rand-node --version`), and the fleet snapshot in the
+      configuration repository is refreshed;
+- [ ] the issue is closed only with the roll record linked, not on merge alone.
+
 3. `deploy/rebuild-vps.sh <ip>` per server, staggered so that more than 2/3 of stake stays up. A
    restart costs a node a few seconds; it resumes from its persisted head, verifies the chain, and
    batch-syncs what it missed. Do not leave nodes on different builds for long: a node still on the
@@ -372,6 +389,10 @@ filesystem (`--min-free-disk-mb`, default 1024, names the directory and the flag
 tick with a warning in the log — the 2026-09-24 stall was seven full disks and a health check that
 said `ok` right up to the crash loop. A roll waits on `ok`, so a droplet near full now stops the
 roll at that node instead of at the next one that fills.
+Since audit v12 (OPS-601) the node also warns early: under 16 GB free (16 × the minimum) it logs
+`disk_warn` once an hour with its measured growth and days to `disk_low`, and `rand_getHealth`
+carries `disk_warn`, `disk_bytes_per_day` and `disk_days_left` beside an unchanged status word.
+An unpruned chain-21 archive grows 5–6 GB a day; size it by `docs/node-hardware.md`.
 
 ## The compact-blocks flag day
 

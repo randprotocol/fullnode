@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Same-chain binary update of one droplet — no genesis change, data dir kept, and the unit edited
-# only to append PRUNE_ARGS (when given) and to drop a chain number from its Description (#143):
+# only to append PRUNE_ARGS (when given) and to drop a chain number from its Description (#143);
+# the service's limits drop-in (MemoryHigh, LimitNOFILE: deploy/lib/unit-limits.sh, PROC-601) is
+# written or refreshed on every run, even when the binaries are already current:
 #
 #   deploy/update-droplet.sh <ip> [build-host]
 #
@@ -33,6 +35,7 @@ BIN_WALLET=${BIN_WALLET:-rand}
 BUILD_DIR=${BUILD_DIR:-/root/fullnode/target/release}
 . "$(dirname "$0")/lib/relay-binaries.sh"
 . "$(dirname "$0")/lib/verify-release.sh"
+. "$(dirname "$0")/lib/unit-limits.sh"
 SSH="ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=20 root@$IP"
 
 # The signature, before anything else is asked of any host (PROC-5). The allowed signers are
@@ -82,7 +85,18 @@ else
 fi
 HAVE=$($SSH "sha256sum /usr/local/bin/$BIN_NODE | cut -d' ' -f1")
 HAVE_WALLET=$($SSH "sha256sum /usr/local/bin/$BIN_WALLET 2>/dev/null | cut -d' ' -f1")
-if [ "$WANT" = "$HAVE" ] && [ "$WANT_WALLET" = "$HAVE_WALLET" ]; then echo "$IP: already on ${WANT:0:8}"; exit 0; fi
+if [ "$WANT" = "$HAVE" ] && [ "$WANT_WALLET" = "$HAVE_WALLET" ]; then
+  # Already on the binary: the limits drop-in is still the roll's to apply (PROC-601: a merged fleet
+  # fix reaches the hosts at the next roll, not only when the binary changes). A changed drop-in
+  # restarts the node so LimitNOFILE applies — one host at a time, like every run of this script.
+  LIMITS=$($SSH "set -e
+  $(unit_limits_install_script "$SERVICE")")
+  echo "$IP: $LIMITS"
+  case "$LIMITS" in
+    "limits: written"*) $SSH "systemctl restart $SERVICE; sleep 4; systemctl is-active $SERVICE" ;;
+  esac
+  echo "$IP: already on ${WANT:0:8}"; exit 0
+fi
 
 relay_binaries "$IP"
 $SSH "set -e
@@ -99,6 +113,8 @@ $SSH "set -e
     sed -i 's/^Description=RAND full node (\(.*\), chain [0-9]*)\$/Description=RAND full node (\1)/' /etc/systemd/system/$SERVICE.service
     systemctl daemon-reload
   fi
+  # PROC-601: the limits drop-in (deploy/lib/unit-limits.sh), written before the restart below.
+  $(unit_limits_install_script "$SERVICE")
   systemctl restart $SERVICE
   sleep 4
   systemctl is-active $SERVICE

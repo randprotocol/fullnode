@@ -1348,6 +1348,10 @@ struct Node {
     /// Free space on the data directory's filesystem, measured at startup and on every status
     /// tick; what `NodeStatus::disk_free_bytes` and `disk_low` publish (audit v4 OPS-3).
     disk_free_bytes: u64,
+    /// The data directory's measured growth (audit v12, OPS-601), and when the early warning was
+    /// last logged (once an hour while it holds).
+    disk_trend: crate::disk::DiskTrend,
+    disk_warned_at: Option<Instant>,
     /// Transaction hashes this node has already refused for a reason about their bytes, so a
     /// re-gossiped copy costs a hash lookup instead of a proof verification.
     refused: admission::RefusedCache,
@@ -2538,6 +2542,9 @@ pub struct RpcOptions {
     /// ([`AdmissionBudget::default_for`]). Here rather than in [`NodeConfig`] so the many literal
     /// `NodeConfig`s stay untouched.
     pub admission_budget: Option<usize>,
+    /// `--disable-scan-leaves` (audit v12, RPC-201): `rand_getScanLeaves` refused on both
+    /// listeners. Off by default until the next minor, so wallets before v0.8.3 keep scanning.
+    pub disable_scan_leaves: bool,
 }
 
 /// What [`start_with`] adds to the network beyond [`NodeConfig`] (audit v6, NET-1): its own
@@ -2809,6 +2816,7 @@ pub async fn start_with(cfg: NodeConfig, rpc_options: RpcOptions, net_options: N
             refusals: refusals.clone(),
             ws_conns: ws_conns.clone(),
             viewing,
+            scan_leaves: !rpc_options.disable_scan_leaves,
     };
     let public_rpc = match rpc_options.public_addr {
         Some(addr) => Some(rpc::serve(addr, rpc_state.for_public_listener()).await.with_context(|| format!("binding --public-rpc {addr}"))?),
@@ -3020,6 +3028,8 @@ pub async fn start_with(cfg: NodeConfig, rpc_options: RpcOptions, net_options: N
         no_peer_warned_at: None,
         highest_proposal_seen: 0,
         disk_free_bytes,
+        disk_trend: crate::disk::DiskTrend::default(),
+        disk_warned_at: None,
         refused: admission::RefusedCache::new(admission::REFUSED_CACHE_ENTRIES),
         proof_refused: admission::ProofRefusedCache::new(admission::PROOF_REFUSED_ENTRIES),
         limiter: admission::PeerLimiter::new(admission::PEER_TX_BURST, admission::PEER_TX_PER_SEC),
@@ -3174,6 +3184,11 @@ impl Node {
             Ok(free) => self.disk_free_bytes = free,
             Err(e) => tracing::warn!("free space of {}: {e}", self.cfg.datadir.display()),
         }
+        let now_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        self.disk_trend.observe(now_secs, self.disk_free_bytes);
         if self.disk_low() {
             tracing::warn!(
                 "{} has {} MB free, under {} MB: disk_low (audit v4 OPS-3)",
@@ -3181,7 +3196,31 @@ impl Node {
                 self.disk_free_bytes / (1 << 20),
                 self.cfg.min_free_disk_bytes.saturating_mul(crate::disk::DISK_LOW_FACTOR) / (1 << 20)
             );
+        } else if self.disk_warn() && self.disk_warned_at.is_none_or(|t| t.elapsed() >= Duration::from_secs(3600)) {
+            // OPS-601: an unpruned archive grows >= 5 GB/day; this is the days-ahead warning,
+            // once an hour (disk_low above warns every tick).
+            self.disk_warned_at = Some(Instant::now());
+            let rate = self.disk_trend.bytes_per_day();
+            tracing::warn!(
+                free_mb = self.disk_free_bytes / (1 << 20),
+                warn_mb = self.cfg.min_free_disk_bytes.saturating_mul(crate::disk::DISK_WARN_FACTOR) / (1 << 20),
+                mb_per_day = rate.map(|r| r / (1 << 20)),
+                days_to_disk_low = self.disk_days_left(),
+                "{} is running low on disk: disk_warn (OPS-601; prune with --prune-history or resize, docs/node-hardware.md)",
+                self.cfg.datadir.display(),
+            );
         }
+    }
+
+    /// Free space under `DISK_WARN_FACTOR` times the startup minimum (audit v12, OPS-601).
+    fn disk_warn(&self) -> bool {
+        crate::disk::disk_warn(self.disk_free_bytes, self.cfg.min_free_disk_bytes)
+    }
+
+    /// Days until `disk_low` at the measured growth (OPS-601).
+    fn disk_days_left(&self) -> Option<f64> {
+        let floor = self.cfg.min_free_disk_bytes.saturating_mul(crate::disk::DISK_LOW_FACTOR);
+        self.disk_trend.days_until(self.disk_free_bytes, floor)
     }
 
     /// `Storage::prune_floor`, defaulting to 0 (an archive's floor) and logging when the meta
@@ -3199,6 +3238,9 @@ impl Node {
         s.height = self.hs.committed_height();
         s.disk_free_bytes = self.disk_free_bytes;
         s.disk_low = self.disk_low();
+        s.disk_warn = self.disk_warn();
+        s.disk_bytes_per_day = self.disk_trend.bytes_per_day();
+        s.disk_days_left = self.disk_days_left();
         s.prune_floor = self.prune_floor_or_zero();
         s.prune_history_secs = self.cfg.prune_history.map(|d| d.as_secs());
         s.head_hash = self.hs.committed_hash().to_hex();
@@ -7974,6 +8016,8 @@ mod tests {
             no_peer_warned_at: None,
             highest_proposal_seen: 0,
             disk_free_bytes: u64::MAX,
+            disk_trend: crate::disk::DiskTrend::default(),
+            disk_warned_at: None,
             refused: admission::RefusedCache::new(16),
             proof_refused: admission::ProofRefusedCache::new(16),
             limiter: admission::PeerLimiter::new(admission::PEER_TX_BURST, admission::PEER_TX_PER_SEC),
@@ -9551,6 +9595,59 @@ mod tests {
         let (reply, _rx) = oneshot::channel();
         node.submit_tx(third.clone(), reply).await;
         assert_eq!(node.verify_queue.len(), usize::from(room));
+    }
+
+    /// Audit v12, OPS-602, the node's half: a burst of RPC submissions at once against a budget
+    /// that holds three. Every submission is answered exactly once; the ones past the budget hear
+    /// `AdmissionBusy` (`-32005`) before anything is queued, and every one answered `Ok` is in the
+    /// pool (or the stempool) when its caller hears it — the node never acknowledges a submission
+    /// it then drops. The budget's bytes in use never exceed its limit at any step.
+    #[tokio::test]
+    async fn a_submission_burst_is_either_pooled_or_told_busy_never_acknowledged_and_dropped() {
+        const BURST: u32 = 8;
+        const HELD: usize = 3;
+        let (_d, storage, gs, hs) = replica_past_a_boundary();
+        let (mut node, _seen) = bare_node(storage, gs, hs);
+        let ledger = node.hs.tip_ledger().clone();
+        let txs: Vec<Transaction> = (1..=BURST).map(|i| next_tx(&ledger, i)).collect();
+        let each = admission::charge_of(&txs[0]);
+        assert!(txs.iter().all(|t| admission::charge_of(t) == each), "equal sizes, as the 27 Oct burst");
+        node.admission = AdmissionBudget::new(HELD * each);
+        node.verify_limits = VerifyLimits { in_flight: 0, queue: 64 };
+
+        let mut replies = Vec::new();
+        for tx in &txs {
+            let (reply, rx) = oneshot::channel();
+            node.submit_tx(tx.clone(), reply).await;
+            assert!(node.admission.in_use() <= node.admission.limit());
+            replies.push((tx.hash(), rx));
+        }
+        assert_eq!(node.verify_queue.len(), HELD, "three queued, the rest refused at once");
+        // The verdicts, as the workers would hand them back.
+        while let Some((tx, source, charge)) = node.verify_queue.pop_front() {
+            node.on_verdict(Verdict { tx, result: Ok(()), source, proof_key: None, busy: false, charge }).await.unwrap();
+            assert!(node.admission.in_use() <= node.admission.limit());
+        }
+        let (mut acked, mut busy) = (0, 0);
+        for (hash, mut rx) in replies {
+            match rx.try_recv().expect("every submission is answered") {
+                Ok(h) => {
+                    assert_eq!(h, hash);
+                    assert!(
+                        node.mempool.contains(&hash) || node.dandelion.stempool.contains(&hash),
+                        "acknowledged {hash} is held by this node"
+                    );
+                    acked += 1;
+                }
+                Err(e) => {
+                    assert!(matches!(e, MempoolError::AdmissionBusy(_)) && e.is_retryable(), "{e}");
+                    assert!(!node.mempool.contains(&hash));
+                    busy += 1;
+                }
+            }
+        }
+        assert_eq!((acked, busy), (HELD, BURST as usize - HELD));
+        assert_eq!(node.admission.in_use(), 0, "every charge back once its verdict is handled");
     }
 
     /// A connected forwarder whose transaction allowance is spent, under a limiter that does not

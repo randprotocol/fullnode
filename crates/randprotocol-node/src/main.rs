@@ -894,6 +894,12 @@ enum Cmd {
         /// largest transaction (body cap plus block cap); a value under that is refused.
         #[arg(long, value_name = "MIB", value_parser = clap::value_parser!(u64).range(1..))]
         admission_budget_mb: Option<u64>,
+        /// Refuse `rand_getScanLeaves` on both listeners (audit v12, RPC-201). A wallet before
+        /// v0.8.3 scans with it and then fetches only its own leaves, which tells this node which
+        /// leaves it owns; `rand` v0.8.3+ never calls it. Served by default until the next minor,
+        /// which flips the default.
+        #[arg(long)]
+        disable_scan_leaves: bool,
         /// Apply incoming proposals on the consensus loop, as before v0.8.0, instead of on a
         /// blocking worker (spec 2026-10-11 off-loop apply §4.5): the kill switch. The by-hash
         /// fetch answer binding is a separate fix and stays on.
@@ -3077,6 +3083,7 @@ async fn main() -> Result<()> {
             verify_workers,
             max_state_proof_tier,
             admission_budget_mb,
+            disable_scan_leaves,
             apply_proposals_inline,
             prover_skip_memory_check,
             prover_allow_origin,
@@ -3130,7 +3137,7 @@ async fn main() -> Result<()> {
             let admission_budget = admission_budget_mb
                 .map(|mb| usize::try_from(mb).ok().and_then(|mb| mb.checked_mul(1 << 20)).ok_or_else(|| anyhow::anyhow!("--admission-budget-mb {mb} is too large")))
                 .transpose()?;
-            let rpc_options = node::RpcOptions { public_addr: public_rpc, viewing_token, admission_budget };
+            let rpc_options = node::RpcOptions { public_addr: public_rpc, viewing_token, admission_budget, disable_scan_leaves };
             let handle = node::start_with(NodeConfig {
                 viewing_open: rpc_viewing_open,
                 datadir,
@@ -7111,5 +7118,18 @@ mod prune_flag_tests {
         let cli = Cli::try_parse_from(["rand-node", "run", "--datadir", "/tmp/x", "--key", "/tmp/k", "--gas-price", "0", "--byte-price", "0"]).unwrap();
         let Cmd::Run { gas_price, byte_price, .. } = cli.cmd else { panic!("run") };
         assert_eq!(randprotocol_core::gas::GasPolicy::from_prices(gas_price, byte_price), None);
+    }
+
+    /// RPC-201: `--disable-scan-leaves` parses, and its absence serves the method (the default
+    /// until the next minor).
+    #[test]
+    fn disable_scan_leaves_is_off_by_default_and_parses() {
+        use clap::Parser;
+        let cli = Cli::try_parse_from(["rand-node", "run", "--datadir", "/tmp/x", "--key", "/tmp/k"]).unwrap();
+        let Cmd::Run { disable_scan_leaves, .. } = cli.cmd else { panic!("run") };
+        assert!(!disable_scan_leaves);
+        let cli = Cli::try_parse_from(["rand-node", "run", "--datadir", "/tmp/x", "--key", "/tmp/k", "--disable-scan-leaves"]).unwrap();
+        let Cmd::Run { disable_scan_leaves, .. } = cli.cmd else { panic!("run") };
+        assert!(disable_scan_leaves);
     }
 }

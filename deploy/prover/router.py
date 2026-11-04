@@ -32,9 +32,13 @@ Python 3 standard library only. Configuration, all environment:
   PROVER_BACKENDS   the shared-key backends behind `/`, comma-separated base URLs
   PROVER_MEMBERS    the members behind `/m/<name>`, comma-separated name=url
   SUBMIT_BURST      submits one address may make at once (default 2)
-  SUBMIT_PER_MIN    and their refill per minute (default 1)
-                    (sized for a two-member pool, VK-10: two members prove ~1.2 jobs a minute,
-                    so one address at 1 a minute cannot hold the pool; raise both with the pool)
+  SUBMIT_SHARE      one address's refill as a fraction of the pool's measured capacity
+                    (default 0.3; VK-10, audit v12): with the burst, one address gets under a
+                    third of what the pool clears in an hour, however many members are up
+  MEMBER_JOBS_PER_MIN  one member's throughput (default 0.6: ~70 s a bundle on a c-8); the
+                    capacity is this times the members the two-second poll finds up
+  SUBMIT_PER_MIN    optional ceiling on the per-address refill per minute (unset: none); it
+                    caps the share, it never raises it
   ROUTER_LISTEN     ip:port to listen on (default 127.0.0.1:8650)
 
 The client address is nginx's X-Real-IP (the router listens on loopback only).
@@ -76,25 +80,77 @@ FORWARDED_REQUEST_HEADERS = (
 )
 
 
+class PoolCapacity:
+    """What the pool clears, in jobs a minute (VK-10, audit v12): the members the poll last found
+    up, times one member's throughput. A member proves one bundle at a time in ~70 s on a c-8
+    (README, "A short line"), so ~0.6 a minute; MEMBER_JOBS_PER_MIN overrides it when the class
+    of droplet changes. Nothing up reads as one member: a poll blip must not starve every address
+    down to its burst."""
+
+    DEFAULT_MEMBER_JOBS_PER_MIN = 0.6
+
+    def __init__(self, live_members, member_jobs_per_min=DEFAULT_MEMBER_JOBS_PER_MIN):
+        if not member_jobs_per_min > 0:
+            raise ValueError("MEMBER_JOBS_PER_MIN must be above 0")
+        self.live_members = live_members
+        self.member_jobs_per_min = float(member_jobs_per_min)
+
+    @classmethod
+    def of_members(cls, poller, member_jobs_per_min=DEFAULT_MEMBER_JOBS_PER_MIN):
+        """The capacity of the backends `poller` (a Pool) polls."""
+
+        def live():
+            with poller.lock:
+                return sum(1 for b in poller.backends if b.up)
+
+        return cls(live, member_jobs_per_min)
+
+    def live(self):
+        return self.live_members()
+
+    def jobs_per_min(self):
+        return max(1, self.live()) * self.member_jobs_per_min
+
+
 class SubmitMeter:
-    """A token bucket per client address for `prover_submit` (VK-10). Bounded: past MAX_CLIENTS
-    addresses the stalest half is dropped, which can only ever be generous."""
+    """A token bucket per client address for `prover_submit` (VK-10). The refill is SHARE of the
+    pool's measured capacity ([`PoolCapacity`]), so one address holds at most that fraction of
+    what the pool clears however many members are up; a fixed `per_min` (SUBMIT_PER_MIN) is a
+    ceiling on it, never an override. Without a capacity, `per_min` alone is the refill (tests).
+    Bounded: past MAX_CLIENTS addresses the stalest half is dropped, which can only ever be
+    generous."""
 
     MAX_CLIENTS = 100_000
     DEFAULT_BURST = 2
-    DEFAULT_PER_MIN = 1.0
+    # Audit v12, VK-10: the old fixed 1 a minute let one address take ~85% of a two-member pool.
+    # 0.3 of capacity plus the burst of 2 keeps one address to under a third of an hour's jobs.
+    DEFAULT_SHARE = 0.3
 
-    def __init__(self, burst, per_min):
+    def __init__(self, burst, per_min=None, share=DEFAULT_SHARE, capacity=None):
+        if not 0 < share <= 1:
+            raise ValueError("SUBMIT_SHARE must be in (0, 1]")
+        if capacity is None and per_min is None:
+            raise ValueError("a SubmitMeter needs a pool capacity or a fixed per-minute rate")
         self.burst = float(burst)
-        self.rate = per_min / 60.0
+        self.per_min = None if per_min is None else float(per_min)
+        self.share = float(share)
+        self.capacity = capacity
         self.lock = threading.Lock()
         self.buckets = {}  # address -> (tokens, last)
 
+    def rate_per_min(self):
+        """One address's refill now: SHARE of the measured capacity, capped by SUBMIT_PER_MIN."""
+        if self.capacity is None:
+            return self.per_min
+        rate = self.share * self.capacity.jobs_per_min()
+        return rate if self.per_min is None else min(rate, self.per_min)
+
     def allow(self, address, now=None):
         now = time.monotonic() if now is None else now
+        rate = self.rate_per_min() / 60.0
         with self.lock:
             tokens, last = self.buckets.get(address, (self.burst, now))
-            tokens = min(self.burst, tokens + (now - last) * self.rate)
+            tokens = min(self.burst, tokens + (now - last) * rate)
             if tokens < 1.0:
                 self.buckets[address] = (tokens, now)
                 return False
@@ -404,7 +460,21 @@ def main():
     pool = Pool(urls)
     pool.poll_once()
     threading.Thread(target=pool.poll_forever, daemon=True).start()
-    meter = SubmitMeter(int(os.environ.get("SUBMIT_BURST", SubmitMeter.DEFAULT_BURST)), float(os.environ.get("SUBMIT_PER_MIN", SubmitMeter.DEFAULT_PER_MIN)))
+    # VK-10 (audit v12): the members are polled too, so the submit meter's refill follows the
+    # members actually up. Polling sets only their load fields; `/m/<name>` still goes to its member.
+    member_poller = Pool([])
+    member_poller.backends = list(members.values()) or list(pool.backends)
+    if members:
+        member_poller.poll_once()
+        threading.Thread(target=member_poller.poll_forever, daemon=True).start()
+    capacity = PoolCapacity.of_members(member_poller, float(os.environ.get("MEMBER_JOBS_PER_MIN", PoolCapacity.DEFAULT_MEMBER_JOBS_PER_MIN)))
+    per_min = os.environ.get("SUBMIT_PER_MIN")
+    meter = SubmitMeter(
+        int(os.environ.get("SUBMIT_BURST", SubmitMeter.DEFAULT_BURST)),
+        per_min=float(per_min) if per_min else None,
+        share=float(os.environ.get("SUBMIT_SHARE", SubmitMeter.DEFAULT_SHARE)),
+        capacity=capacity,
+    )
     server = ThreadingHTTPServer((host, int(port)), make_handler(pool, members, meter))
     server.daemon_threads = True
     print(f"routing {len(urls)} shared-key prover(s) and {len(members)} member(s) on {host}:{port}", file=sys.stderr, flush=True)

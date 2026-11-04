@@ -85,8 +85,10 @@ Rules that follow from these numbers:
   (~1.4 GB resident), but the 2026-10-27 overnight run OOM-killed the 2 GB validators 24 times in
   8 h, each after a burst of eight ~2.9 MB transactions; the one 4 GB node in a burst survived
   it. v0.8.3 bounds admission memory (`--admission-budget-mb`, 1/16 of RAM by default, ~117 MiB
-  on a 2 GB host), and the unit templates (`deploy/vps-setup.sh`, `deploy/cutover-droplet-rand.sh`)
-  set `MemoryHigh=85%` so the kernel reclaims and throttles before it kills. A 2 GB host that has
+  on a 2 GB host), and every setup and roll (`deploy/vps-setup.sh`, `deploy/update-droplet.sh`,
+  `deploy/roll-all.sh`) writes the drop-in `rand-node.service.d/50-limits.conf` from
+  `deploy/lib/unit-limits.sh` (PROC-601) with `MemoryHigh=85%`, so the kernel reclaims and
+  throttles before it kills. A 2 GB host that has
   to stay on needs both, plus swap (the fleet's have 1 GB).
 - **A perps state-proof key build is the largest single allocation a node makes** (CON-601):
   ~1 GiB at tier 16, ~4 GiB at tier 18 (3.56 GB resident measured), ~16 GiB at tier 20. Chain 21
@@ -100,7 +102,20 @@ Rules that follow from these numbers:
   and delete a retired chain's data dir after a cut-over (`deploy/retire-chain-dirs.sh`). A
   validator runs `--prune-history 24h`; a node refuses to start under 1 GB free and
   `rand_getHealth` answers `disk_low` under 4 GB (`docs/deploy.md`, "Disk guard"). Chain 14
-  stalled on full 48 GB disks on 2026-09-24.
+  stalled on full 48 GB disks on 2026-09-24. Under 16 GB (16 × the minimum) the node logs a
+  `disk_warn` once an hour and `rand_getHealth` carries `"disk_warn": true` beside its status word,
+  with the measured `disk_bytes_per_day` and `disk_days_left` to `disk_low` (audit v12, OPS-601).
+- **Size an archive for its growth (OPS-601).** Every header carries its parent's QC: at least 18
+  Dilithium2 votes of 3 788 bytes, ~68 KB of certificate, ~72 KB on disk per empty block. At
+  chain 21's ~1.15 s blocks that is ~75 000 blocks and **5.1–5.4 GB a day unpruned** (5.8 GB/day
+  measured on the public RPC's upstream archive after the 1 Nov roll), ~160 GB a month. An
+  unpruned archive therefore needs: today's data dir + 20 GB build headroom + at least 30 days
+  of growth (~160 GB) before its next resize, and a monitor on `disk_warn` / `disk_days_left`
+  that pages at 3 days. The arithmetic for a disk of `D` GB with `U` GB used is
+  `(D - U - 4) / 5.4` days to `disk_low`. A node that does not have to serve history runs
+  `--prune-history` (validators 24h, observers 7d) and stays flat. The three archive roles are the
+  only unpruned hosts; losing one costs no quorum, but the public RPC's upstream archive going
+  full takes the public RPC off the chain.
 - **Do not build on a 2 GB droplet.** Build once on the 8 GB build host and copy the binaries
   (`deploy/update-droplet.sh`, `deploy/cutover-droplet.sh`). Copying 36 MB per node from a laptop
   uplink takes minutes each; droplet-to-droplet takes under a minute for all 15.
