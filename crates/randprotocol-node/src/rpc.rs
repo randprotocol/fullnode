@@ -9154,6 +9154,128 @@ pub(crate) mod tests {
         task.abort();
     }
 
+    /// Audit v12, OPS-602: the 27 Oct burst shape re-run against the v0.8.3 byte budget, in
+    /// process. Bursts of ~2.9 MB transactions (5.8 MB hex bodies) are sent at once to an RPC whose
+    /// budget is the default on a 1 967 MB validator (`default_for`: RAM/16, floored at one largest
+    /// submission). The stand-in node loop applies `Node::submit_tx`'s rule — the decoded
+    /// transaction charged against the same budget, `AdmissionBusy` when it does not fit — and
+    /// pools a held transaction before answering, as the node's verdict does.
+    ///
+    /// Asserted: the bytes in flight never exceed the budget (sampled throughout); every
+    /// submission is answered either with its hash or with `-32005`, never reset or lost; and every
+    /// hash acknowledged is one the node pooled — nothing is acknowledged and then dropped. The
+    /// 27 Oct burst of eight fits the 2 GB default outright (~8.7 MB counted each, ~70 MB of
+    /// ~117 MiB): the budget bounds counted bytes, not RSS, which is why MemoryHigh (PROC-601) and
+    /// the 4 GB validator minimum stand beside it. A burst twice that size is cut at the budget.
+    #[tokio::test]
+    async fn the_27_oct_burst_shape_stays_inside_the_2gb_default_budget() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let gs = genesis_with(7, vec![alloc_note(20, 1_000)]);
+        let (_dir, st) = state_for(&gs);
+        // ~2.9 MB encoded: 725 000 four-byte words.
+        let tx = |i: u32| Transaction {
+            chain_id: gs.chain_id,
+            bundle: None,
+            action: Action::Deploy { base_pc: i, words: vec![0x13; 725_000], public: vec![] },
+        };
+        let tx_len = tx(0).encoded_len();
+        assert!((2_850_000..2_950_000).contains(&tx_len), "a 27 Oct-sized transaction: {tx_len} B");
+        let body = |i: u32| serde_json::to_vec(&json!({ "jsonrpc": "2.0", "id": i, "method": "rand_sendTransaction", "params": [hex::encode(tx(i).encode())] })).unwrap();
+        assert!(body(0).len() <= st.max_body_bytes, "the body fits the RPC's cap");
+        const HOST_RAM: u64 = 1_967 * 1_000_000;
+        let limit = crate::admission::AdmissionBudget::default_for(
+            HOST_RAM,
+            crate::admission::AdmissionBudget::floor_for(st.max_body_bytes, st.limits.max_block_bytes),
+        );
+        let per_submission = body(0).len() + crate::admission::charge_of(&tx(0));
+
+        for burst in [8usize, 16] {
+            let budget = crate::admission::AdmissionBudget::new(limit);
+            let (node_tx, mut node_rx) = mpsc::channel(burst);
+            let st = RpcState { admission: budget.clone(), node: node_tx, ..st.clone() };
+            let (addr, task) = serve("127.0.0.1:0".parse().unwrap(), st).await.unwrap();
+
+            // A sampler that watches the budget for the whole burst.
+            let (peak, stop) = (std::sync::Arc::new(AtomicUsize::new(0)), std::sync::Arc::new(AtomicBool::new(false)));
+            let sampler = {
+                let (budget, peak, stop) = (budget.clone(), peak.clone(), stop.clone());
+                tokio::spawn(async move {
+                    while !stop.load(Ordering::Relaxed) {
+                        peak.fetch_max(budget.in_use(), Ordering::Relaxed);
+                        tokio::task::yield_now().await;
+                    }
+                })
+            };
+
+            let (done_tx, mut done) = mpsc::unbounded_channel();
+            for i in 0..burst as u32 {
+                let (raw, done_tx) = (body(i), done_tx.clone());
+                tokio::spawn(async move {
+                    let answer = async {
+                        let resp = reqwest::Client::new().post(format!("http://{addr}")).header("content-type", "application/json").body(raw).send().await?;
+                        let status = resp.status();
+                        Ok::<_, reqwest::Error>((status, resp.json::<Value>().await?))
+                    };
+                    let _ = done_tx.send(answer.await.map_err(|e| e.to_string()));
+                });
+            }
+
+            // Until every submission is either held by the node or answered.
+            let (mut held, mut answers) = (Vec::new(), Vec::new());
+            while held.len() + answers.len() < burst {
+                tokio::select! {
+                    Some(cmd) = node_rx.recv() => {
+                        let NodeCommand::SubmitTx { tx, reply } = cmd else { panic!("only submissions are sent") };
+                        match budget.try_charge(crate::admission::charge_of(&tx)) {
+                            Ok(charge) => held.push((tx, reply, charge)),
+                            Err(busy) => { let _ = reply.send(Err(MempoolError::AdmissionBusy(busy))); }
+                        }
+                        peak.fetch_max(budget.in_use(), Ordering::Relaxed);
+                    }
+                    Some(a) = done.recv() => answers.push(a.expect("every refusal is answered, not reset")),
+                }
+            }
+            assert!(budget.in_use() <= budget.limit());
+            // The verdicts: each held transaction is pooled, then its caller hears its hash.
+            let mut pooled = std::collections::HashSet::new();
+            for (tx, reply, charge) in held.drain(..) {
+                pooled.insert(tx.hash().to_hex());
+                drop(charge);
+                reply.send(Ok(tx.hash())).unwrap();
+            }
+            while answers.len() < burst {
+                answers.push(done.recv().await.unwrap().expect("answered"));
+            }
+            stop.store(true, Ordering::Relaxed);
+            sampler.await.unwrap();
+
+            let mut acked = std::collections::HashSet::new();
+            let mut busy = 0;
+            for (status, v) in &answers {
+                if let Some(h) = v["result"].as_str() {
+                    assert_eq!(*status, reqwest::StatusCode::OK);
+                    acked.insert(h.to_string());
+                } else {
+                    assert_eq!(v["error"]["code"], json!(BUSY_CODE), "anything not acknowledged is -32005: {v}");
+                    busy += 1;
+                }
+            }
+            assert_eq!(acked, pooled, "burst {burst}: every acknowledged transaction was pooled, none acknowledged and dropped");
+            assert_eq!(acked.len() + busy, burst);
+            let peak = peak.load(Ordering::Relaxed);
+            assert!(peak <= limit, "burst {burst}: {peak} bytes in flight over the {limit} budget");
+            assert_eq!(budget.in_use(), 0, "every charge is back");
+            let fits = limit / per_submission;
+            if burst <= fits {
+                assert_eq!(busy, 0, "the 27 Oct burst of {burst} fits a 2 GB host's default budget ({fits} would)");
+            } else {
+                assert!(busy >= burst - fits, "burst {burst}: at most {fits} admitted, {busy} told to retry");
+                assert!(acked.len() <= fits);
+            }
+            task.abort();
+        }
+    }
+
     /// A body within the limit still reaches the dispatcher, and a malformed one answers JSON too.
     #[tokio::test]
     async fn a_malformed_body_answers_json_rather_than_plain_text() {

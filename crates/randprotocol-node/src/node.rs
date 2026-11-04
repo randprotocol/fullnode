@@ -9431,6 +9431,59 @@ mod tests {
         assert_eq!(node.verify_queue.len(), usize::from(room));
     }
 
+    /// Audit v12, OPS-602, the node's half: a burst of RPC submissions at once against a budget
+    /// that holds three. Every submission is answered exactly once; the ones past the budget hear
+    /// `AdmissionBusy` (`-32005`) before anything is queued, and every one answered `Ok` is in the
+    /// pool (or the stempool) when its caller hears it — the node never acknowledges a submission
+    /// it then drops. The budget's bytes in use never exceed its limit at any step.
+    #[tokio::test]
+    async fn a_submission_burst_is_either_pooled_or_told_busy_never_acknowledged_and_dropped() {
+        const BURST: u32 = 8;
+        const HELD: usize = 3;
+        let (_d, storage, gs, hs) = replica_past_a_boundary();
+        let (mut node, _seen) = bare_node(storage, gs, hs);
+        let ledger = node.hs.tip_ledger().clone();
+        let txs: Vec<Transaction> = (1..=BURST).map(|i| next_tx(&ledger, i)).collect();
+        let each = admission::charge_of(&txs[0]);
+        assert!(txs.iter().all(|t| admission::charge_of(t) == each), "equal sizes, as the 27 Oct burst");
+        node.admission = AdmissionBudget::new(HELD * each);
+        node.verify_limits = VerifyLimits { in_flight: 0, queue: 64 };
+
+        let mut replies = Vec::new();
+        for tx in &txs {
+            let (reply, rx) = oneshot::channel();
+            node.submit_tx(tx.clone(), reply).await;
+            assert!(node.admission.in_use() <= node.admission.limit());
+            replies.push((tx.hash(), rx));
+        }
+        assert_eq!(node.verify_queue.len(), HELD, "three queued, the rest refused at once");
+        // The verdicts, as the workers would hand them back.
+        while let Some((tx, source, charge)) = node.verify_queue.pop_front() {
+            node.on_verdict(Verdict { tx, result: Ok(()), source, proof_key: None, busy: false, charge }).await.unwrap();
+            assert!(node.admission.in_use() <= node.admission.limit());
+        }
+        let (mut acked, mut busy) = (0, 0);
+        for (hash, mut rx) in replies {
+            match rx.try_recv().expect("every submission is answered") {
+                Ok(h) => {
+                    assert_eq!(h, hash);
+                    assert!(
+                        node.mempool.contains(&hash) || node.dandelion.stempool.contains(&hash),
+                        "acknowledged {hash} is held by this node"
+                    );
+                    acked += 1;
+                }
+                Err(e) => {
+                    assert!(matches!(e, MempoolError::AdmissionBusy(_)) && e.is_retryable(), "{e}");
+                    assert!(!node.mempool.contains(&hash));
+                    busy += 1;
+                }
+            }
+        }
+        assert_eq!((acked, busy), (HELD, BURST as usize - HELD));
+        assert_eq!(node.admission.in_use(), 0, "every charge back once its verdict is handled");
+    }
+
     /// A connected forwarder whose transaction allowance is spent, under a limiter that does not
     /// refill, so every delivery it forwards in the test is the limiter's refusal.
     fn over_its_allowance(node: &mut Node) -> PeerId {
