@@ -33,7 +33,7 @@ pub const DISK_LOW_FACTOR: u64 = 4;
 
 /// Free space under this many times the startup minimum raises the early warning (audit v12,
 /// OPS-601): 16 GB at the default 1 GB minimum, three days of an unpruned chain-21 archive's
-/// >= 5 GB/day, where `disk_low` (4 GB) is under one. A warning, not a health state: the node's
+/// at least 5 GB/day, where `disk_low` (4 GB) is under one. A warning, not a health state: the node's
 /// `rand_getHealth` status word is unchanged and gains `disk_warn` beside it, so a roll waiting on
 /// `ok` is not stopped by it, but a monitor reading the field has days, not hours.
 pub const DISK_WARN_FACTOR: u64 = 16;
