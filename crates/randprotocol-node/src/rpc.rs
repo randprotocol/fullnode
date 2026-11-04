@@ -3269,6 +3269,8 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
                 // CON-60: the genesis engine program-height pin, 0 when unset (chain 21); a
                 // prover proves at the canonical shape by default only when it is set.
                 "engine_program_log_height": c.engine_program_log_height,
+                // PERP-5: the genesis cap on unproved digests, 0 when unset (chain 21).
+                "max_pending_digests": c.max_pending_digests,
                 "max_block_inputs": c.max_block_inputs,
                 "min_deposit": c.min_deposit.to_string(),
                 "engine_hc": word8_to_hex(&c.engine_hc),
@@ -8397,6 +8399,7 @@ pub(crate) mod tests {
                 "sparse_windows": false,
                 "max_window_heights": 0,
                 "engine_program_log_height": 0,
+                "max_pending_digests": 0,
                 "max_block_inputs": 8,
                 "min_deposit": "1000",
                 "engine_hc": word8_to_hex(&cfg.engine_hc),

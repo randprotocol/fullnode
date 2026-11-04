@@ -561,6 +561,49 @@ pub fn hash_bearing_mem_log_height_ceiling_with_modq(tier: Tier, keccak_log_heig
     tier.min_mem_log_height().max(needed).min(crate::machine::MAX_MEM_LOG_HEIGHT)
 }
 
+/// CON-601: the first rule of the FRI transcript's *structure* a proof breaks, named — `None` for
+/// a proof whose counts and lengths are the ones `p3_fri::verifier::verify_fri` requires. Every
+/// rule here is one `verify_fri` itself applies, unconditionally and with no key, transcript or
+/// state behind it, so a proof refused here is refused by `Machine::verify` too and the verdict
+/// never moves; what moves is *when*: `verify_fri` runs after `Machine::verify` has built (or
+/// fetched) the verifier key, and a state-proof key build at tier 18 is gigabytes. The rules
+/// (`verify_fri`'s errors in brackets):
+///
+/// - as many commit-phase openings as commitments (`CommitPhaseOpeningsCountMismatch`), and as
+///   many commit-phase proof-of-work words as commitments (`CommitPowWitnessCountMismatch`) —
+///   `Machine::check_pre_key` pins each word to zero but not their count;
+/// - at least one commit round. With none the fold's height is `log_blowup + log_final_poly_len`,
+///   while every table's committed domain holds at least two points, so the input's height is
+///   larger and `GlobalMaxHeightMismatch` refuses it;
+/// - every round's `log_arity` in `1..=max_log_arity` (`InvalidLogArity`);
+/// - every round opening exactly the profile's `num_queries` (`CommitPhaseQueryCountMismatch`);
+/// - a final polynomial of `2^log_final_poly_len` coefficients (`FinalPolyLengthMismatch`).
+pub fn fri_structure_violation(proof: &Proof, num_queries: usize) -> Option<String> {
+    let fri = &proof.batch.opening_proof.1;
+    let rounds = fri.commit_phase_commits.len();
+    if rounds == 0 {
+        return Some("FRI transcript with no commit round".into());
+    }
+    if fri.commit_phase_openings.len() != rounds {
+        return Some(format!("{} FRI commit-phase openings for {rounds} commitments", fri.commit_phase_openings.len()));
+    }
+    if fri.commit_pow_witnesses.len() != rounds {
+        return Some(format!("{} FRI commit-phase proof-of-work words for {rounds} commitments", fri.commit_pow_witnesses.len()));
+    }
+    for (round, step) in fri.commit_phase_openings.iter().enumerate() {
+        if step.checked_log_arity(FRI_MAX_LOG_ARITY).is_none() {
+            return Some(format!("FRI round {round} folds at log arity {}, outside 1..={FRI_MAX_LOG_ARITY}", step.log_arity));
+        }
+        if step.sibling_values.len() != num_queries {
+            return Some(format!("FRI round {round} opens {} queries where the profile samples {num_queries}", step.sibling_values.len()));
+        }
+    }
+    if fri.final_poly.len() != 1 << FRI_LOG_FINAL_POLY_LEN {
+        return Some(format!("FRI final polynomial of {} coefficients where {} are folded to", fri.final_poly.len(), 1 << FRI_LOG_FINAL_POLY_LEN));
+    }
+    None
+}
+
 /// The FRI parameters `machine::build_config` proves and verifies with — `log_blowup`,
 /// `log_final_poly_len`, `max_log_arity` — and the hiding PCS's random-codeword count
 /// (`HidingFriPcs::new(.., 4, ..)`). `machine.rs` keeps them as literals inside a private
@@ -798,6 +841,9 @@ pub struct ZkExecutor {
     /// tested by.
     warms_in_flight: std::sync::atomic::AtomicUsize,
     peak_warms: std::sync::atomic::AtomicUsize,
+    /// CON-601: the FRI profile every machine here verifies under — what the pre-key FRI
+    /// structure rule ([`fri_structure_violation`]) reads the query count from.
+    profile: FriProfile,
 }
 
 impl ZkExecutor {
@@ -833,6 +879,7 @@ impl ZkExecutor {
             warm_lock: std::sync::Mutex::new(()),
             warms_in_flight: std::sync::atomic::AtomicUsize::new(0),
             peak_warms: std::sync::atomic::AtomicUsize::new(0),
+            profile,
         }
     }
 
@@ -1854,6 +1901,10 @@ impl ZkExecutor {
         let proof = self.perp_header(max_tier, segment.len(), bytes)?;
         Self::perp_public_digest_matches(segment, &proof)?;
         self.perp_machine.check_pre_key(engine_hc, &proof).map_err(|e| ConfidentialError::InvalidProof(format!("{e:?}")))?;
+        // CON-601: the FRI transcript's structure, which `verify_fri` checks only after the key.
+        if let Some(why) = fri_structure_violation(&proof, self.profile.num_queries()) {
+            return Err(ConfidentialError::InvalidProof(why));
+        }
         Ok(proof)
     }
 
@@ -4283,6 +4334,72 @@ mod tests {
         assert_eq!(zk.perp_key_builds(), 0, "nothing built");
         // Admitted, then verified: one build.
         zk.check_perp(&hc, 20, seg, &bytes, true).expect("the honest proof verifies as a state proof");
+        assert_eq!(zk.perp_key_builds(), 1);
+    }
+
+    /// CON-601: a state proof whose FRI transcript has the wrong *structure* — commit-phase
+    /// proof-of-work words, commitments and openings of unequal counts, no commit round at all,
+    /// a folding arity outside `1..=max`, a round opening another number of queries than the
+    /// profile samples, a final polynomial of another length — is refused before any verifier key
+    /// is built, by the pool's `perp_proof_admissible` and by `verify_perp` alike. Each rule is
+    /// one `verify_fri` itself applies after the key, so the verdict does not move: the old order
+    /// (header, then `Machine::verify_public`, which builds the key first) refuses every one too.
+    #[test]
+    fn con601_a_structurally_forged_fri_transcript_builds_no_key_and_keeps_its_verdict() {
+        use super::*;
+        use crate::machine::{FriProfile, Val};
+        use p3_field::PrimeCharacteristicRing;
+        let program = crate::guests::fib(10);
+        let hc = program.digest();
+        let segment: Vec<u32> = (0..40).collect();
+        let (bytes, _, _) = prove_perp(FriProfile::Test, &program, &[], &segment, None).unwrap();
+        let edit = |f: &dyn Fn(&mut Proof)| {
+            let mut p = decode_canonical(&bytes).unwrap();
+            f(&mut p);
+            p.to_bytes()
+        };
+        let forged: Vec<(&str, Vec<u8>)> = vec![
+            ("no commit PoW words", edit(&|p| p.batch.opening_proof.1.commit_pow_witnesses.clear())),
+            ("one commit PoW word short", edit(&|p| {
+                p.batch.opening_proof.1.commit_pow_witnesses.pop();
+            })),
+            ("one commit PoW word extra", edit(&|p| p.batch.opening_proof.1.commit_pow_witnesses.push(Val::ZERO))),
+            ("no commit round at all", edit(&|p| {
+                let fri = &mut p.batch.opening_proof.1;
+                fri.commit_pow_witnesses.clear();
+                fri.commit_phase_commits.clear();
+                fri.commit_phase_openings.clear();
+            })),
+            ("one commitment short", edit(&|p| {
+                p.batch.opening_proof.1.commit_phase_commits.pop();
+            })),
+            ("arity 0", edit(&|p| p.batch.opening_proof.1.commit_phase_openings[0].log_arity = 0)),
+            ("arity past the maximum", edit(&|p| p.batch.opening_proof.1.commit_phase_openings[0].log_arity = 9)),
+            ("a round opens one query short", edit(&|p| {
+                p.batch.opening_proof.1.commit_phase_openings[0].sibling_values.pop();
+            })),
+            ("a final polynomial too long", edit(&|p| {
+                let extra = p.batch.opening_proof.1.final_poly[0];
+                p.batch.opening_proof.1.final_poly.push(extra);
+            })),
+            ("an empty final polynomial", edit(&|p| p.batch.opening_proof.1.final_poly.clear())),
+        ];
+        let zk = ZkExecutor::new(FriProfile::Test);
+        let old_machine = Machine::new(FriProfile::Test);
+        for (name, p) in &forged {
+            assert_eq!(proof_shape(p), proof_shape(&bytes), "{name}: the same header");
+            assert!(!zk.perp_proof_admissible(p, &hc, 20, &segment, 0), "{name}: the pool refuses it for free");
+            assert!(zk.verify_perp(&hc, 20, &segment, p).is_err(), "{name}");
+            assert_eq!(zk.perp_key_builds(), 0, "{name}: verifying it built a key");
+            // The verdict the full verifier gives the same bytes (it builds the key first).
+            let old = zk
+                .perp_header(20, segment.len(), p)
+                .and_then(|proof| old_machine.verify_public(&hc, &segment, &proof).map_err(|e| ConfidentialError::InvalidProof(format!("{e:?}"))));
+            assert!(old.is_err(), "{name}: the full verifier accepts it — this rule would move a verdict");
+        }
+        // The honest proof still passes the pre-key rules and verifies under one build.
+        assert!(zk.perp_proof_admissible(&bytes, &hc, 20, &segment, 0));
+        assert!(zk.verify_perp(&hc, 20, &segment, &bytes).is_ok());
         assert_eq!(zk.perp_key_builds(), 1);
     }
 

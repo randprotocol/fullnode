@@ -12,7 +12,26 @@ stopped at v0.4 until 2026-09-30, when the entries v0.5 to v0.6.7 were written f
 
 ## Unreleased
 
-Nothing yet.
+- **CON-601 (node policy, every chain; consensus unchanged):** `rand-node run
+  --max-state-proof-tier <T>` caps the perps state-proof tier a node verifies for its pool when it
+  holds no verifier key for the proof's shape. A cold proof above it is refused at the pool's
+  pre-screen, before the ledger's segment, the executor's pre-key rules, a cold-build token or a
+  key build, so it is not verified, pooled, relayed or proposed there
+  (`StateProofAboveNodeTier`: not cached, no peer penalised). The default is the highest tier
+  whose documented key-build peak fits in three quarters of the host's RAM: 16 on 2 GB and 4 GB
+  hosts, 18 on 8 GB, 20 from about 22 GB. The startup warm skips shapes above the cap too. A
+  block carrying such a proof still applies and builds its key: that residual waits for chain
+  22's genesis engine pin. Also, the state-proof pre-key checks now refuse a FRI transcript of the
+  wrong structure (commit rounds, proof-of-work words and openings of unequal counts, no round,
+  an arity out of range, another query count, another final-polynomial length) before the key;
+  each is a check the verifier makes after the key, so no verdict moves.
+- **PERP-5 (genesis-gated, off on chain 21):** `perps.max_pending_digests` (requires
+  `sparse_windows`; `max_window_blocks..=1 048 576`). While that many recorded digests wait on a
+  state proof, deposits, orders, cancels and withdrawal requests are refused `DigestLogFull`
+  (retryable) until a proof drains the log; only the sparse-window heartbeat keeps recording.
+  Absent, the section's genesis bytes, JSON and stored row are unchanged (chain 21 replays byte
+  for byte); set, the stored row carries a second trailer version (`rand-perps-ext-2`), which an
+  older build cannot read. `rand_getPerps` reports `max_pending_digests` (0 when unset).
 
 ## v0.8.4 — 2026-11-01 (chain 21, node-only; rolled to end the 2026-11-01 OOM kills and commit stalls)
 

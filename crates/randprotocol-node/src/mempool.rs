@@ -92,6 +92,14 @@ pub enum MempoolError {
     /// the node has a key for always passes.
     #[error("this node is at its limit of verifier-key builds for new state-proof shapes; retry later")]
     StateProofBusy,
+    /// CON-601: a state proof above this node's tier cap ([`Mempool::set_state_proof_tier_cap`],
+    /// `--max-state-proof-tier`, by default sized from the host's memory) whose shape this node
+    /// holds no verifier key for. The key build alone would take more memory than the node
+    /// allows it, so the proof is refused before any work on it: not verified, pooled, relayed
+    /// or proposed here. A statement about this node, never the proof: not cached, no peer
+    /// penalised; a node with more memory admits it, and a block carrying it applies as always.
+    #[error("this node admits no state proof above tier {cap} to its pool (a tier-{tier} verifier-key build exceeds its memory); submit it to a node with more memory")]
+    StateProofAboveNodeTier { tier: u8, cap: u8 },
     /// Issue #157: the admission byte budget ([`crate::admission::AdmissionBudget`]) cannot take
     /// this transaction now. Retryable, never cached, no peer penalised; `rand_sendTransaction`
     /// answers it as `-32005`.
@@ -442,6 +450,9 @@ pub struct Mempool {
     /// CON-60: the cost the gate just computed, keyed by transaction hash and the tip's height,
     /// for the `state_proof_queued` that follows it ([`Mempool::cost_once`]).
     last_cost: std::sync::Mutex<Option<(Hash, u64, ProofCost)>>,
+    /// CON-601: the highest state-proof tier this node verifies for its pool when the key is not
+    /// built ([`MempoolError::StateProofAboveNodeTier`]); `u8::MAX`, no cap, unless set.
+    state_proof_tier_cap: u8,
 }
 
 /// CON-60 (b): the burst of verifier-key builds for state-proof shapes this node has no key for
@@ -451,6 +462,35 @@ pub struct Mempool {
 pub const COLD_KEY_BUILD_BURST: u32 = 2;
 /// CON-60 (b): the refill interval of [`COLD_KEY_BUILD_BURST`]'s bucket.
 pub const COLD_KEY_BUILD_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// CON-601: the heap one state-proof verifier-key build at `tier` peaks at, as documented and
+/// rounded up: 14 MB at tier 10, 53 MB at 12, 209 MB at 14, ~0.84 GB at 16 (a counting
+/// allocator), 3.3–4 GB at 18 (3.56 GB resident measured; msauth's tier-18 build 4.0 GB), growing
+/// 4× a tier step — so 16 MiB · 4^((tier − 10) / 2), which is 1 GiB at 16, 4 GiB at 18 and 16 GiB
+/// at 20 (`docs/perps.md`, "State-proof verifier keys"; `executor::PERP_GENERAL_KEYS`).
+pub fn state_proof_key_build_peak_bytes(tier: u8) -> u64 {
+    let steps = u32::from(tier.saturating_sub(10) / 2);
+    (16u64 << 20).saturating_mul(4u64.saturating_pow(steps))
+}
+
+/// CON-601: the share of the host's memory one state-proof key build may take,
+/// [`default_state_proof_tier_cap`]'s budget: three quarters. A node is ~1.4 GB resident at rest
+/// on a 2 GB host, so even that leans on swap at tier 16; past it the kernel kills the node.
+pub const STATE_PROOF_KEY_BUILD_RAM_SHARE: (u64, u64) = (3, 4);
+
+/// CON-601: the default `--max-state-proof-tier`: the highest perps proof tier whose key build
+/// ([`state_proof_key_build_peak_bytes`]) fits in [`STATE_PROOF_KEY_BUILD_RAM_SHARE`] of
+/// `total_ram_bytes` — 16 on a 2 GB or 4 GB host, 18 on 8 GB, 20 from about 22 GB — and never
+/// below the lowest tier. `0` (the OS did not say) sets no cap (`u8::MAX`).
+pub fn default_state_proof_tier_cap(total_ram_bytes: u64) -> u8 {
+    if total_ram_bytes == 0 {
+        return u8::MAX;
+    }
+    let (num, den) = STATE_PROOF_KEY_BUILD_RAM_SHARE;
+    let budget = (u128::from(total_ram_bytes) * u128::from(num) / u128::from(den)) as u64;
+    let tiers = randprotocol_core::ledger::perps::TIERS;
+    tiers.iter().copied().filter(|t| state_proof_key_build_peak_bytes(*t) <= budget).max().unwrap_or(tiers[0])
+}
 
 /// CON-60 (b): what verifying a transaction costs in verifier-key builds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -553,7 +593,32 @@ impl Mempool {
             cold_keys: ColdKeyBudget::default(),
             lineage_keys: ColdKeyBudget::default(),
             last_cost: std::sync::Mutex::new(None),
+            state_proof_tier_cap: u8::MAX,
         }
+    }
+
+    /// CON-601: refuse, at the pre-screen, every state proof above `tier` whose key this node has
+    /// not built ([`MempoolError::StateProofAboveNodeTier`]). Node policy, never a validity rule.
+    pub fn set_state_proof_tier_cap(&mut self, tier: u8) {
+        self.state_proof_tier_cap = tier;
+    }
+
+    /// CON-601: the cap [`Self::set_state_proof_tier_cap`] set (`u8::MAX` for none).
+    pub fn state_proof_tier_cap(&self) -> u8 {
+        self.state_proof_tier_cap
+    }
+
+    /// CON-601: `Err` for a state proof whose declared tier — read off its header alone, no
+    /// ledger, segment or verifier work — is above this node's cap while its shape has no key
+    /// built here. First in [`Self::precheck`], so such a proof never reaches the cold-build gate,
+    /// the verify queue or a key build.
+    fn state_proof_tier_gate(&self, tx: &Transaction, executor: &dyn ConfidentialExecutor) -> Result<(), MempoolError> {
+        let Action::PerpStateProof { proof, .. } = &tx.action else { return Ok(()) };
+        let Some(shape) = executor.perp_proof_shape(proof) else { return Ok(()) };
+        if shape.tier > self.state_proof_tier_cap && !executor.perp_key_ready(&shape) {
+            return Err(MempoolError::StateProofAboveNodeTier { tier: shape.tier, cap: self.state_proof_tier_cap });
+        }
+        Ok(())
     }
 
     /// CON-60 (b): what verifying `tx` would cost this node in verifier keys ([`ProofCost`]).
@@ -1033,6 +1098,7 @@ impl Mempool {
         ledger: &Ledger,
         executor: &dyn ConfidentialExecutor,
     ) -> Result<Claims, MempoolError> {
+        self.state_proof_tier_gate(tx, executor)?;
         let c = self.pool_conflicts(tx, ledger, executor)?;
         Self::applies(tx, &c.commitments, c.claim, ledger).map_err(MempoolError::Invalid)?;
         self.pool_policy(tx, ledger).map_err(MempoolError::Invalid)?;
@@ -4701,6 +4767,77 @@ mod tests {
         // the order still passes — back-pressure is a sparse-chain policy (I-3).
         let (_, dense) = run(false);
         assert!(m.precheck(&order, &dense, &StubExecutor).is_ok());
+    }
+
+    /// CON-601: a node's state-proof tier cap refuses a cold proof above it at the pool's
+    /// pre-screen — before the ledger's segment, the executor's pre-key rules or a cold-build
+    /// token — so it is never queued for verification (the only road to a key build), pooled,
+    /// relayed or proposed. The refusal is about this node, never the transaction: `Ignore` to
+    /// gossip, not cached. A proof at or under the cap proceeds, and a proof whose key this node
+    /// already holds passes at any tier (verifying it builds nothing).
+    #[test]
+    fn con601_a_cold_state_proof_above_the_node_tier_cap_is_refused_before_any_key_work() {
+        use fixtures::{key, make_perps_block, perp_deposit_tx, perp_state_proof_tx};
+        let gs = fixtures::perps_genesis(7);
+        let mut l = gs.ledger.clone();
+        let deposit = perp_deposit_tx(&l, &key(50), 300, 5_000_000);
+        let b1 = make_perps_block(&gs.block, &mut l, vec![deposit], &key(1));
+        make_perps_block(&b1, &mut l, vec![], &key(1));
+        let honest = perp_state_proof_tx(&l, 2, [7; 8], vec![], 0);
+        let patched = |tier: u8, h: [u8; 4], salt: u64| {
+            let mut tx = honest.clone();
+            let Action::PerpStateProof { proof, .. } = &mut tx.action else { unreachable!() };
+            proof[4] = tier;
+            proof[37..41].copy_from_slice(&h);
+            proof[29..37].copy_from_slice(&salt.to_le_bytes());
+            tx
+        };
+        let ex = &StubExecutor;
+        let mut m = Mempool::new(100);
+        assert_eq!(m.state_proof_tier_cap(), u8::MAX, "no cap unless the node sets one");
+        m.set_state_proof_tier_cap(14);
+        // Tier 16 (the chain's max_tier), a shape the stub has no key for: refused, and nothing
+        // past the header was asked — no token taken, no cost remembered.
+        let cold16 = patched(16, [0, 9, 0, 0], 1);
+        let refusal = m.precheck(&cold16, &l, ex).unwrap_err();
+        assert_eq!(refusal, MempoolError::StateProofAboveNodeTier { tier: 16, cap: 14 });
+        let mut refused = crate::admission::RefusedCache::new(8);
+        assert_eq!(crate::admission::acceptance_for_pool(&refusal, cold16.hash(), &mut refused), crate::admission::Acceptance::Ignore);
+        assert!(refused.get(&cold16.hash()).is_none(), "not cached");
+        assert!(m.last_cost.lock().unwrap().is_none(), "the cold-build gate never ran");
+        let t0 = Instant::now();
+        assert!(m.cold_keys_mut().available(t0) && m.lineage_keys_mut().available(t0), "no token moved");
+        // Re-salted, any number of times: each refused the same way, the buckets untouched.
+        for salt in 2..50 {
+            assert!(matches!(m.precheck(&patched(16, [0, 9, 0, 0], salt), &l, ex), Err(MempoolError::StateProofAboveNodeTier { .. })));
+        }
+        assert!(m.cold_keys_mut().available(t0 + Duration::from_millis(1)));
+        // At the cap: proceeds to the usual gate (a cold shape takes its token there).
+        let cold14 = patched(14, [0, 9, 0, 0], 60);
+        assert!(m.precheck(&cold14, &l, ex).is_ok(), "a tier within the cap proceeds");
+        // A shape whose key is built (the stub's honest shape) passes above the cap: verifying it
+        // builds nothing, so the cap has nothing to save.
+        assert!(m.precheck(&honest, &l, ex).is_ok());
+        // Unset, the pool behaves as before.
+        let open = Mempool::new(100);
+        assert!(open.precheck(&cold16, &l, ex).is_ok());
+    }
+
+    /// CON-601: the host default — the highest tier whose documented key-build peak fits in three
+    /// quarters of the host's memory — on the fleet's sizes, and the documented peaks themselves.
+    #[test]
+    fn con601_the_default_state_proof_tier_cap_follows_host_memory() {
+        const GIB: u64 = 1 << 30;
+        assert_eq!(state_proof_key_build_peak_bytes(16), GIB);
+        assert_eq!(state_proof_key_build_peak_bytes(18), 4 * GIB);
+        // A 2 GB droplet reports a little under 2 GiB.
+        assert_eq!(default_state_proof_tier_cap(1_985_000_000), 16);
+        assert_eq!(default_state_proof_tier_cap(4 * GIB - 100 * (1 << 20)), 16, "a 4 GB guardian cannot build tier 18");
+        assert_eq!(default_state_proof_tier_cap(8 * GIB - 200 * (1 << 20)), 18, "the 8 GB build host can");
+        assert_eq!(default_state_proof_tier_cap(48 * GIB), 20);
+        assert_eq!(default_state_proof_tier_cap(GIB), 14);
+        assert_eq!(default_state_proof_tier_cap(64 << 20), 10, "never below the lowest tier");
+        assert_eq!(default_state_proof_tier_cap(0), u8::MAX, "an unknown size sets no cap");
     }
 
     /// CON-60 (b): junk state proofs — of fresh shapes and of the engine's own — never delay an
