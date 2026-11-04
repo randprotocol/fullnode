@@ -3346,6 +3346,11 @@ impl Node {
             // verified and then lost a pool conflict is still a valid message, and another node's
             // pool may have room for it.
             VerifySource::Gossip(id) => {
+                // One this node held on the stem was fluffed elsewhere: its embargo is off
+                // (PRIV-603: taken here, on the verdict, not when the copy arrived).
+                if !self.dandelion.stempool.is_empty() {
+                    self.dandelion.stempool.take(&hash);
+                }
                 if v.result.is_ok() {
                     let _ = self.mempool.insert_verified(v.tx, self.hs.tip_ledger(), self.executor.as_ref());
                 }
@@ -3564,24 +3569,12 @@ impl Node {
             self.report(id, outcome).await;
             return Ok(());
         }
-        // Dandelion++ (issue #145): a transaction this node holds on the stem came back fluffed by
-        // another node. It verified here already: pooled, accepted (so relayed), and its embargo
-        // is off; a park waiting for it is filled as from any gossiped body. The hash is taken
-        // only while the stempool holds anything.
-        if !self.dandelion.stempool.is_empty() {
-            let hash = tx.hash();
-            if let Some(held) = self.dandelion.stempool.take(&hash) {
-                let a = match self.mempool.insert_verified(held, self.hs.tip_ledger(), self.executor.as_ref()) {
-                    Ok(_) => admission::Acceptance::Accept,
-                    Err(e) => admission::acceptance_for_pool(&e, hash, &mut self.refused),
-                };
-                self.report(id, GossipOutcome::Report(a)).await;
-                if self.parked.values().any(|p| p.wants(&hash)) {
-                    self.fill_parks(tx).await?;
-                }
-                return Ok(());
-            }
-        }
+        // Dandelion++ (issue #145): a transaction this node holds on the stem may come back here,
+        // fluffed by another node. It is judged exactly as one this node never saw — the same
+        // pre-screen, the same verify queue, reported (and so relayed) only on its verdict — and
+        // only the verdict takes it out of the stempool (`on_verdict`). Answering a held one at
+        // once let a peer that published a copy time this node's relay and find the stem path
+        // (audit v12, PRIV-603). The cost is a second verification per holder.
         // I1: a state proof this node already refused over the segment the tip builds for it is
         // not verified again. Not a byte verdict (the segment is state), so an `Ignore`.
         if self.cached_proof_refusal(&tx).is_some() {
@@ -3683,12 +3676,10 @@ impl Node {
     /// bounded by `RpcState::max_body_bytes`.
     async fn submit_tx(&mut self, tx: Transaction, reply: oneshot::Sender<Result<Hash, MempoolError>>) {
         let hash = tx.hash();
-        // Dandelion++ (issue #145): one already on the stem from here is not stemmed again. The
-        // answer is the one a first submission gets, so it says nothing about the stempool.
-        if self.dandelion.stempool.contains(&hash) {
-            let _ = reply.send(Ok(hash));
-            return;
-        }
+        // Dandelion++ (issue #145): one already on the stem from here is not stemmed again — but
+        // it is not answered early either (audit v12, PRIV-603). It takes the pre-screen and the
+        // verify queue like any submission, and its verdict finds it held (`route_verified`) and
+        // answers `Ok`, the answer a first submission gets, after the same wait.
         let outcome = GossipOutcome::for_transaction(
             &tx,
             None,
@@ -8425,7 +8416,9 @@ mod tests {
 
     /// The node's own RPC submission takes the stem: the caller hears `Ok`, the successor gets
     /// the transaction, nothing is published. The same bytes submitted again are answered alike
-    /// and neither verified nor stemmed a second time.
+    /// and not stemmed a second time — and, audit v12 PRIV-603, not answered before a
+    /// verification either: a held transaction waits on the verify queue as an unknown one does,
+    /// so the answer's timing does not say the node holds it.
     #[tokio::test]
     async fn an_rpc_submission_is_stemmed_once_and_a_resubmission_answered_alike() {
         let (_d, mut node, mut seen, succ) = stem_node(1.0, Duration::from_secs(60));
@@ -8441,12 +8434,17 @@ mod tests {
         assert_eq!(broadcast_txs(&out), vec![]);
         assert_eq!(tx_status(&mut node, h).await, rpc::PoolStatus::Unknown);
 
-        let (reply, answer) = oneshot::channel();
+        node.verify_limits = VerifyLimits { in_flight: 0, queue: 64 };
+        let (reply, mut answer) = oneshot::channel();
         node.submit_tx(tx.clone(), reply).await;
+        assert!(answer.try_recv().is_err(), "a held transaction is not answered before its verification");
+        assert_eq!(node.verify_queue.len(), 1, "queued for verification, as an unknown one is");
+        let (vtx, source, charge) = node.verify_queue.pop_front().unwrap();
+        node.on_verdict(Verdict { tx: vtx, result: Ok(()), source, proof_key: None, busy: false, charge }).await.unwrap();
         assert_eq!(answer.await.unwrap(), Ok(h), "a resubmission hears what the first submission heard");
-        assert!(node.verify_queue.is_empty() && node.verify_in_flight == 0, "not verified again");
         assert!(drain(&mut seen).await.is_empty(), "not stemmed again");
         assert_eq!(node.dandelion_stats.get(|s| &s.stem_sent), 1);
+        assert!(node.dandelion.stempool.contains(&h), "still held for its embargo");
     }
 
     /// With no stem-capable peer (a fleet of older nodes) or Dandelion off, a submission is
@@ -8491,23 +8489,36 @@ mod tests {
         assert_eq!(node.dandelion_stats.get(|s| &s.fluff_coin), 1);
     }
 
-    /// A transaction held on the stem that comes back fluffed over gossip is pooled from the
-    /// stempool — accepted, so relayed, without a second verification — and its embargo is off.
+    /// A transaction held on the stem that comes back fluffed over gossip is judged as one this
+    /// node never saw (audit v12, PRIV-603): queued for verification and reported — so relayed —
+    /// only on its verdict, exactly as an unknown transaction delivered beside it. Answering the
+    /// held one at once let a peer read the stem path off the relay delay. On the verdict it is
+    /// pooled, accepted, and its embargo is off.
     #[tokio::test]
-    async fn a_held_transaction_seen_on_gossip_is_pooled_without_verifying_again() {
+    async fn a_held_transaction_seen_on_gossip_waits_for_a_verification_like_an_unknown_one() {
         let (_d, mut node, mut seen, _succ) = stem_node(0.0, Duration::from_secs(60));
-        let tx = next_tx(node.hs.tip_ledger(), 5);
-        let h = tx.hash();
-        node.on_verdict(Verdict { tx: tx.clone(), result: Ok(()), source: VerifySource::Stem(PeerId::random()), proof_key: None, busy: false, charge: AdmissionCharge::none() })
+        node.verify_limits = VerifyLimits { in_flight: 0, queue: 64 };
+        let ledger = node.hs.tip_ledger().clone();
+        let (held, unknown) = (next_tx(&ledger, 5), next_tx(&ledger, 8));
+        let h = held.hash();
+        node.on_verdict(Verdict { tx: held.clone(), result: Ok(()), source: VerifySource::Stem(PeerId::random()), proof_key: None, busy: false, charge: AdmissionCharge::none() })
             .await
             .unwrap();
         drain(&mut seen).await;
-        node.on_gossiped_tx(tx, gossip_id()).await.unwrap();
+        assert!(node.dandelion.stempool.contains(&h));
+        node.on_gossiped_tx(held, gossip_id()).await.unwrap();
+        node.on_gossiped_tx(unknown.clone(), gossip_id()).await.unwrap();
+        assert!(drain(&mut seen).await.is_empty(), "neither is reported before its verification");
+        assert_eq!(node.verify_queue.len(), 2, "both wait on the verify queue");
+        for _ in 0..2 {
+            let (tx, source, charge) = node.verify_queue.pop_front().unwrap();
+            node.on_verdict(Verdict { tx, result: Ok(()), source, proof_key: None, busy: false, charge }).await.unwrap();
+        }
         let out = drain(&mut seen).await;
-        assert!(out.iter().any(|s| matches!(s, Seen::Report(libp2p::gossipsub::MessageAcceptance::Accept))), "accepted: relayed on");
-        assert!(node.mempool.contains(&h));
+        let accepts = out.iter().filter(|s| matches!(s, Seen::Report(libp2p::gossipsub::MessageAcceptance::Accept))).count();
+        assert_eq!(accepts, 2, "both accepted on their verdicts");
+        assert!(node.mempool.contains(&h) && node.mempool.contains(&unknown.hash()));
         assert!(node.dandelion.stempool.is_empty() && node.dandelion.stempool.next_deadline().is_none(), "no embargo left");
-        assert!(node.verify_queue.is_empty() && node.verify_in_flight == 0, "not verified again");
     }
 
     /// Issue #157 × #145: a stemmed transaction waits on the verify queue with its bytes charged

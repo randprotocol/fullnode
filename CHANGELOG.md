@@ -35,6 +35,12 @@ Node (audit v12 network and privacy rows; node-only, no wire or consensus change
   one candidate and holds at most one of the two successor slots however many identities it runs.
   In the router simulation, 24 identities on one host against 12 honest hosts take the
   submitter's route in about 1/13 of epochs instead of 65%.
+- **A held stem transaction is answered like an unknown one** (PRIV-603): a copy of a
+  transaction this node holds on the stem, arriving over gossip, used to be accepted (and so
+  relayed) at once, and an RPC resubmission of one answered `Ok` at once, while an unknown one
+  waited for its verification. Both now take the ordinary verify queue and are answered on the
+  verdict; the gossip copy's verdict also ends the embargo. Costs one extra verification per
+  holder per such copy.
 
 ## v0.8.4 — 2026-11-01 (chain 21, node-only; rolled to end the 2026-11-01 OOM kills and commit stalls)
 
