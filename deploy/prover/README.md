@@ -33,11 +33,19 @@ meters submits per address. Verified: one real chain-20 transfer through each me
 router (a `e89e2cc4…`, archive2 `7c404236…`, nyc3 `bdc88a53…`, sfo3 `f925b4cd…`), and `--trusted`
 `9042a402…`. Window: #118.
 
-**Submit limit (VK-10).** The router meters `prover_submit` per client address: burst
-`SUBMIT_BURST` (default 2), refill `SUBMIT_PER_MIN` (default 1) — sized for two members, which clear
-about 1.2 bundles a minute between them, so one address cannot hold the pool. Set both in
-`/etc/rand-prover-pool/router.env` and restart `rand-prover-router` when members are added
-(the old defaults, 6 and 3, fitted four members).
+**Submit limit (VK-10).** The router meters `prover_submit` per client address: a burst of
+`SUBMIT_BURST` (default 2), refilled at `SUBMIT_SHARE` (default 0.3) of the pool's **measured**
+capacity — the members the router's two-second poll finds up, times `MEMBER_JOBS_PER_MIN`
+(default 0.6, one bundle in ~70 s on a c-8). With two members up that is 0.36 a minute: one
+address is admitted at most ~23 submits an hour against the ~72 the pool clears, under a third,
+and the refill rises and falls with the members that answer. `SUBMIT_PER_MIN`, if set, is only a
+ceiling on that refill. **What this does not do:** it bounds one address, not the pool — three
+addresses at their full share still take ~95% of it, and an attacker with many addresses (the
+meter keys on nginx's `X-Real-IP`) can hold the pool; each member's own slots (`--max-queue 1`) and
+nginx's per-address limit are what remain. The figures before audit v12 (fixed 2 + 1 a minute)
+let one address take ~61 of the 72 (~85%), which this README then called "cannot hold the pool".
+Set the variables in `/etc/rand-prover-pool/router.env` (an old `SUBMIT_PER_MIN=1` there is now a
+harmless ceiling) and restart `rand-prover-router`.
 
 ## What the pool is
 

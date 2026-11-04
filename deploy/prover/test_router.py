@@ -320,13 +320,57 @@ class MemberRouteTest(unittest.TestCase):
             _, r = self.call("/m/a", "prover_info", ip="198.51.100.7")
             self.assertIn("result", r)
 
-    def test_the_default_limit_fits_a_two_member_pool(self):
-        # VK-10: burst 2, 1 a minute. Over ten minutes one address gets 2 + 10 = 12 submits at
-        # most, against the pool's ~11.7 jobs in that time; the old 6 + 3/min let 36 through.
-        m = router.SubmitMeter(router.SubmitMeter.DEFAULT_BURST, router.SubmitMeter.DEFAULT_PER_MIN)
-        admitted = sum(1 for t in range(0, 600) if m.allow("x", now=float(t)))
-        self.assertLessEqual(admitted, 12)
-        self.assertGreaterEqual(admitted, 11)
+    def test_the_default_limit_keeps_one_address_to_a_third_of_a_two_member_pool(self):
+        # VK-10 (audit v12): the old fixed 2 + 1/min admitted 61 an hour against the ~72 jobs two
+        # members clear (~85%). The refill is now a share of the measured capacity: two members
+        # up at ~0.6 jobs a minute each, so one address gets at most a third of an hour's 72.
+        cap = router.PoolCapacity(lambda: 2)
+        m = router.SubmitMeter(router.SubmitMeter.DEFAULT_BURST, capacity=cap)
+        admitted = sum(1 for t in range(0, 3600) if m.allow("x", now=float(t)))
+        pool_per_hour = 2 * router.PoolCapacity.DEFAULT_MEMBER_JOBS_PER_MIN * 60
+        self.assertAlmostEqual(pool_per_hour, 72.0)
+        self.assertLessEqual(admitted, pool_per_hour / 3)
+        self.assertGreaterEqual(admitted, 20, "an honest wallet still gets a send every few minutes")
+        # and over a day the share converges on SUBMIT_SHARE, under a third
+        day = sum(1 for t in range(0, 86400, 5) if m.allow("y", now=float(t)))
+        self.assertLessEqual(day / (pool_per_hour * 24), 1 / 3)
+
+    def test_the_per_address_rate_follows_the_measured_capacity(self):
+        live = [2]
+        m = router.SubmitMeter(burst=1, capacity=router.PoolCapacity(lambda: live[0]))
+        two = m.rate_per_min()
+        live[0] = 4
+        self.assertAlmostEqual(m.rate_per_min(), 2 * two, msg="four members up: twice the rate")
+        live[0] = 0
+        self.assertAlmostEqual(m.rate_per_min(), two / 2, msg="nothing up reads as one member, never zero")
+        self.assertAlmostEqual(two, router.SubmitMeter.DEFAULT_SHARE * 2 * router.PoolCapacity.DEFAULT_MEMBER_JOBS_PER_MIN)
+
+    def test_a_configured_per_minute_rate_is_a_ceiling_not_an_override(self):
+        # A router.env still carrying the old SUBMIT_PER_MIN=1 must not undo the share.
+        m = router.SubmitMeter(burst=2, per_min=1.0, capacity=router.PoolCapacity(lambda: 2))
+        self.assertAlmostEqual(m.rate_per_min(), router.SubmitMeter.DEFAULT_SHARE * 1.2)
+        m = router.SubmitMeter(burst=2, per_min=0.1, capacity=router.PoolCapacity(lambda: 2))
+        self.assertAlmostEqual(m.rate_per_min(), 0.1)
+
+    def test_the_share_is_configurable_and_bounded(self):
+        m = router.SubmitMeter(burst=1, share=0.5, capacity=router.PoolCapacity(lambda: 2))
+        self.assertAlmostEqual(m.rate_per_min(), 0.6)
+        with self.assertRaises(ValueError):
+            router.SubmitMeter(burst=1, share=0.0, capacity=router.PoolCapacity(lambda: 2))
+        with self.assertRaises(ValueError):
+            router.SubmitMeter(burst=1, share=1.5, capacity=router.PoolCapacity(lambda: 2))
+
+    def test_live_members_are_counted_from_the_poll(self):
+        members = {"a": router.Backend(self.a.url), "b": router.Backend(self.b.url)}
+        poller = router.Pool([])
+        poller.backends = list(members.values())
+        poller.poll_once()
+        cap = router.PoolCapacity.of_members(poller)
+        self.assertEqual(cap.live(), 2)
+        self.b.stop()
+        poller.poll_once()
+        self.assertEqual(cap.live(), 1)
+        self.assertAlmostEqual(cap.jobs_per_min(), router.PoolCapacity.DEFAULT_MEMBER_JOBS_PER_MIN)
 
     def test_the_meter_refills(self):
         m = router.SubmitMeter(burst=1, per_min=60)
