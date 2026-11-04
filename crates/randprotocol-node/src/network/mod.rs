@@ -83,8 +83,11 @@ pub const STEM_RESPONSE_WIRE_LIMIT: u64 = 64;
 
 /// How long a stem send waits for the successor's acknowledgement before it is reported failed
 /// ([`NetworkEvent::StemFailed`]). The successor acknowledges on receipt, before it verifies, so
-/// this is a round trip and the transfer of one transaction.
-pub const STEM_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+/// this is a round trip and the transfer of one transaction. Audit v12, PRIV-604: under half the
+/// default embargo (3 s), so a silent successor is dropped and the transaction rerouted to the
+/// edge's other successor before any holder's embargo can fire; it was 10 s, longer than every
+/// embargo, so a silent successor was never rerouted around.
+pub const STEM_REQUEST_TIMEOUT: Duration = Duration::from_millis(1500);
 
 /// Concurrent stem streams per connection, in either direction. An honest peer has one stem in
 /// flight to a node at a time, or a few in a burst; the request codec decodes a whole transaction
@@ -380,6 +383,13 @@ pub struct EdgeConfig {
     /// node learned over gossip before its last restart (`node`'s persisted peer bindings),
     /// handed over here so they are reserved before the first connection is accepted.
     pub bound: Vec<PeerId>,
+    /// The sources those peers were learned at before the last restart (audit v12, NET-601;
+    /// `node`'s persisted [`edge::LearnedSource`]s, with their ages), put back in the guard before
+    /// the first connection is accepted, so every validator seen in the last
+    /// [`edge::RESERVED_SOURCE_TTL`] has its host on the reserved pending slots from the start —
+    /// not only the bootstraps' hosts. Taken only for a peer in `bound`, `reserved` or the
+    /// bootstraps.
+    pub bound_sources: Vec<(PeerId, Vec<edge::LearnedSource>)>,
     /// gossipsub's `ValidationMode::Strict` instead of `Permissive` (audit v6, CH-7;
     /// `--strict-gossip`): every delivered message must carry a valid author signature, sequence
     /// number and source, so an unsigned message claiming any author is dropped by gossipsub
@@ -390,12 +400,18 @@ pub struct EdgeConfig {
     pub strict_gossip: bool,
     /// Gossip transactions on the anonymous lane only (issue #146, `--anonymous-tx-only`): no
     /// subscription to the legacy signed topic `rand/{chain}/tx`, and nothing published there. Off
-    /// by default for the rolling upgrade: a node then publishes each transaction on both lanes —
-    /// the anonymous `rand/{chain}/tx/2` and, for nodes that predate it, the signed legacy topic,
-    /// which still names this node as the author — and relays on both. Turn it on once no node
-    /// that predates the anonymous lane is left; until then a transaction published only
-    /// anonymously never reaches them by gossip.
+    /// by default for the rolling upgrade: a node then subscribes both lanes and relays on both,
+    /// so a transaction a node from before the anonymous lane published still reaches everyone.
+    /// What it publishes itself goes on the anonymous lane only unless
+    /// [`EdgeConfig::legacy_tx_publish`] (audit v12, PRIV-601).
     pub anonymous_tx_only: bool,
+    /// Publish this node's transactions on the legacy signed topic as well (audit v12, PRIV-601;
+    /// `--legacy-tx-publish`). Off by default: each copy there is signed by, and so names, the
+    /// node that published it — the fluffing node, and so the submitter whenever it fluffs its own
+    /// transaction. The topic is still subscribed and relayed (copies keep their original
+    /// author), so a node from before the anonymous lane still reaches every node; only turn
+    /// this on while such a node must also *hear* this node's transactions over gossip.
+    pub legacy_tx_publish: bool,
     /// Speak Dandelion++'s stem protocol (issue #145, `--dandelion`): register
     /// `/rand/{chain}/stem/1`, so identify advertises it and stem-capable peers send this node
     /// stems ([`NetworkEvent::StemTx`]), and report the peers that advertise it
@@ -452,9 +468,12 @@ pub enum NetworkEvent {
     SyncResponse { peer: PeerId, request_id: OutboundRequestId, response: SyncResponse },
     SyncFailed { peer: PeerId, request_id: OutboundRequestId, error: String },
     /// A connected peer advertises the stem protocol (issue #145; only under
-    /// [`EdgeConfig::dandelion`]). `outbound`: this node dialled it. Repeated whenever identify
-    /// runs again; the receiver dedups.
-    StemPeer { peer: PeerId, outbound: bool },
+    /// [`EdgeConfig::dandelion`]). `host`: the public host its connection comes from, `None` when
+    /// it has no global address (loopback, a private network) — the router takes one successor
+    /// per host (audit v12, PRIV-602). Whether this node dialled it is deliberately not reported:
+    /// identify-advertised addresses are redialled, so it says nothing about who the peer is.
+    /// Repeated whenever identify runs again; the receiver dedups.
+    StemPeer { peer: PeerId, host: Option<edge::Source> },
     /// A transaction a peer stemmed to this node. Already acknowledged on the wire.
     StemTx { from: PeerId, tx: randprotocol_core::Transaction },
     /// A stem send that failed (the successor left, refused the stream or timed out).
@@ -478,6 +497,9 @@ pub enum NetworkCommand {
     /// Stop reserving a peer reserved through [`NetworkCommand::Reserve`] or
     /// [`EdgeConfig::bound`]; a bootstrap or `--reserved-peer` identity stays reserved.
     Unreserve(PeerId),
+    /// The reserved peers' learned sources, for persisting (NET-601): see
+    /// [`NetworkHandle::learned_sources`].
+    LearnedSources(oneshot::Sender<Vec<(PeerId, Vec<edge::LearnedSource>)>>),
     Shutdown,
 }
 
@@ -533,6 +555,17 @@ impl NetworkHandle {
     /// A no-op for a bootstrap or `--reserved-peer` identity. Connections it already holds stay.
     pub async fn unreserve_peer(&self, peer: PeerId) {
         let _ = self.cmd.send(NetworkCommand::Unreserve(peer)).await;
+    }
+
+    /// Every reserved peer's advertised and observed sources with their ages (audit v12,
+    /// NET-601): what the node persists so the next start restores them
+    /// ([`EdgeConfig::bound_sources`]). Empty when the swarm task is gone.
+    pub async fn learned_sources(&self) -> Vec<(PeerId, Vec<edge::LearnedSource>)> {
+        let (tx, rx) = oneshot::channel();
+        if self.cmd.send(NetworkCommand::LearnedSources(tx)).await.is_err() {
+            return Vec::new();
+        }
+        rx.await.unwrap_or_default()
     }
 
     pub async fn dial(&self, addr: Multiaddr) {
@@ -605,9 +638,14 @@ impl Topics {
 struct ConnectedPeer {
     addrs: Vec<Multiaddr>,
     connected_at: Instant,
-    /// One of its connections is one this node dialled (Dandelion++ prefers such a peer as a stem
-    /// successor: an adversary can connect to a node at will, but cannot make it dial).
-    dialed: bool,
+}
+
+impl ConnectedPeer {
+    /// The public host this peer is connected from (audit v12, PRIV-602): the source of its
+    /// first connection address that is global. `None` when none is (loopback, a LAN).
+    fn public_host(&self) -> Option<edge::Source> {
+        self.addrs.iter().find(|a| addr_scope(a) == AddrScope::Global).map(edge::source_of).filter(|s| *s != edge::Source::Unknown)
+    }
 }
 
 /// Build the swarm, listen, and spawn the event loop. Returns immediately. No reserved peers
@@ -718,6 +756,11 @@ pub async fn start_with(
             guard.reserve_at(id, [a], edge::SourceKind::Configured);
         }
     }
+    // And every other reserved peer's hosts as they were known before the restart (NET-601):
+    // the guard takes them for reserved peers only, under the same 24 h expiry.
+    for (id, learned) in &edge.bound_sources {
+        guard.restore_sources(*id, learned.iter().copied());
+    }
     let behaviour =
         RandBehaviour { limits, guard, gossipsub, tx_gossip, identify, kademlia, mdns: Toggle::from(mdns), sync, stem: Toggle::from(stem), ping };
 
@@ -745,7 +788,11 @@ pub async fn start_with(
     let (cmd_tx, cmd_rx) = mpsc::channel(4096);
     let (evt_tx, evt_rx) = mpsc::channel(4096);
     let stem_proto = edge.dandelion.then_some(stem_proto);
-    let tx_paths = TxPaths { legacy_tx: !edge.anonymous_tx_only, stem: stem_proto };
+    let tx_paths = TxPaths {
+        legacy_tx: !edge.anonymous_tx_only,
+        legacy_publish: !edge.anonymous_tx_only && edge.legacy_tx_publish,
+        stem: stem_proto,
+    };
     tokio::spawn(run(swarm, cfg, pinned, topics, tx_paths, cmd_rx, evt_tx));
     Ok((NetworkHandle { cmd: cmd_tx, local_peer_id }, evt_rx))
 }
@@ -983,8 +1030,11 @@ fn dial_bootstrap(swarm: &mut Swarm<RandBehaviour>, cfg: &NetworkConfig, peers: 
 
 /// How transactions leave this node besides the anonymous lane (issues #145, #146).
 struct TxPaths {
-    /// Publish and relay on the legacy signed topic too ([`EdgeConfig::anonymous_tx_only`] off).
+    /// Subscribe and relay on the legacy signed topic too ([`EdgeConfig::anonymous_tx_only`] off).
     legacy_tx: bool,
+    /// Publish this node's own transactions there, signed ([`EdgeConfig::legacy_tx_publish`];
+    /// PRIV-601). Never without `legacy_tx`.
+    legacy_publish: bool,
     /// The stem protocol, under [`EdgeConfig::dandelion`].
     stem: Option<StreamProtocol>,
 }
@@ -999,7 +1049,7 @@ async fn run(
     mut cmd_rx: mpsc::Receiver<NetworkCommand>,
     evt_tx: mpsc::Sender<NetworkEvent>,
 ) {
-    let TxPaths { legacy_tx, stem: stem_proto } = tx_paths;
+    let TxPaths { legacy_tx, legacy_publish, stem: stem_proto } = tx_paths;
     let mut peers: HashMap<PeerId, ConnectedPeer> = HashMap::new();
     // Dialable addresses of every peer we have ever connected to, so a dropped
     // link is re-established without waiting for mDNS or Kademlia to rediscover it.
@@ -1044,7 +1094,7 @@ async fn run(
             cmd = cmd_rx.recv() => {
                 let Some(cmd) = cmd else { break };
                 match cmd {
-                    NetworkCommand::Broadcast(msg) => publish(&mut swarm, &topics, legacy_tx, &msg),
+                    NetworkCommand::Broadcast(msg) => publish(&mut swarm, &topics, legacy_publish, &msg),
                     NetworkCommand::Stem { peer, tx } => {
                         if let Some(stem) = swarm.behaviour_mut().stem.as_mut() {
                             let hash = tx.hash();
@@ -1100,6 +1150,9 @@ async fn run(
                             b.guard.unreserve(&id);
                         }
                     }
+                    NetworkCommand::LearnedSources(reply) => {
+                        let _ = reply.send(swarm.behaviour().guard.learned_sources());
+                    }
                     NetworkCommand::Shutdown => break,
                 }
             }
@@ -1120,7 +1173,8 @@ async fn run(
 }
 
 /// Publish one message: a transaction on the anonymous lane, and on the legacy signed topic too
-/// while `legacy_tx` (issue #146); everything else on the signed lane, on its own topic.
+/// while `legacy_tx` (issue #146; [`TxPaths::legacy_publish`], off by default since PRIV-601);
+/// everything else on the signed lane, on its own topic.
 fn publish(swarm: &mut Swarm<RandBehaviour>, topics: &Topics, legacy_tx: bool, msg: &GossipMessage) {
     let data = match bincode::serialize(msg) {
         Ok(data) => data,
@@ -1182,8 +1236,7 @@ async fn handle_swarm_event(
                 remember_addr(known, peer_id, addr.clone());
             }
             let entry =
-                peers.entry(peer_id).or_insert_with(|| ConnectedPeer { addrs: Vec::new(), connected_at: Instant::now(), dialed: false });
-            entry.dialed |= endpoint.is_dialer();
+                peers.entry(peer_id).or_insert_with(|| ConnectedPeer { addrs: Vec::new(), connected_at: Instant::now() });
             if !entry.addrs.contains(&addr) {
                 entry.addrs.push(addr);
             }
@@ -1277,8 +1330,8 @@ async fn handle_swarm_event(
             // A peer that speaks the stem protocol may be a stem successor (issue #145).
             if let Some(proto) = gossip.stem_proto {
                 if info.protocols.contains(proto) {
-                    let outbound = peers.get(&peer_id).is_some_and(|p| p.dialed);
-                    let _ = evt_tx.send(NetworkEvent::StemPeer { peer: peer_id, outbound }).await;
+                    let host = peers.get(&peer_id).and_then(ConnectedPeer::public_host);
+                    let _ = evt_tx.send(NetworkEvent::StemPeer { peer: peer_id, host }).await;
                 }
             }
             for addr in info.listen_addrs {
@@ -1807,13 +1860,16 @@ mod tests {
     }
 
     /// Issue #146: a transaction gossiped on the anonymous lane carries no `source` and no
-    /// sequence number — nothing that names the node that published it. A node that predates the
-    /// lane still gets it, signed, on the legacy topic, unless `--anonymous-tx-only`.
+    /// sequence number — nothing that names the node that published it. Audit v12, PRIV-601: by
+    /// default nothing this node publishes goes on the legacy signed topic, whose copy names it;
+    /// only `--legacy-tx-publish` (for a chain that still has nodes from before the lane) puts a
+    /// signed copy there, and `--anonymous-tx-only` leaves the topic altogether.
     #[tokio::test]
     async fn a_gossiped_transaction_carries_no_author_and_the_legacy_copy_follows_the_flag() {
-        for anonymous_tx_only in [false, true] {
-            let edge = EdgeConfig { anonymous_tx_only, ..EdgeConfig::default() };
-            let (n, _rx, n_addr) = listening(if anonymous_tx_only { 81 } else { 80 }, edge).await;
+        for (seed, legacy_tx_publish, anonymous_tx_only) in [(80u8, false, false), (79, true, false), (81, false, true)] {
+            let legacy = legacy_tx_publish && !anonymous_tx_only;
+            let edge = EdgeConfig { anonymous_tx_only, legacy_tx_publish, ..EdgeConfig::default() };
+            let (n, _rx, n_addr) = listening(seed, edge).await;
             let (mut anon, _) = sniffer(true);
             let (mut old, _) = sniffer(false);
             anon.dial(n_addr.clone()).unwrap();
@@ -1826,7 +1882,7 @@ mod tests {
                 let (a, o) = tokio::join!(sniff(&mut anon, Duration::from_millis(250)), sniff(&mut old, Duration::from_millis(250)));
                 on_anon.extend(a);
                 on_old.extend(o);
-                if !on_anon.is_empty() && (anonymous_tx_only || !on_old.is_empty()) && k >= 4 {
+                if !on_anon.is_empty() && (!legacy || !on_old.is_empty()) && k >= 4 {
                     break;
                 }
             }
@@ -1837,8 +1893,8 @@ mod tests {
                 assert_eq!(m.topic, IdentTopic::new("rand/7/tx/2").hash());
                 assert!(matches!(bincode::deserialize::<GossipMessage>(&m.data), Ok(GossipMessage::Transaction(_))));
             }
-            if anonymous_tx_only {
-                assert!(on_old.is_empty(), "--anonymous-tx-only published on the legacy signed topic");
+            if !legacy {
+                assert!(on_old.is_empty(), "published on the legacy signed topic (legacy_tx_publish = {legacy_tx_publish}, anonymous_tx_only = {anonymous_tx_only})");
             } else {
                 assert!(!on_old.is_empty(), "a node that predates the lane got no transaction");
                 assert!(on_old.iter().all(|m| m.source == Some(n.local_peer_id)), "the legacy copy is the signed one");
@@ -1847,7 +1903,8 @@ mod tests {
         }
     }
 
-    /// Issue #146, the rolling upgrade: B publishes on both lanes, A hears each transaction twice
+    /// Issue #146, the rolling upgrade: B publishes on both lanes (`--legacy-tx-publish`, as every
+    /// v0.8.3 and v0.8.4 node did by default), A hears each transaction twice
     /// (once per lane) and its node loop sees it **once**, and when A accepts it, A relays the
     /// held legacy copy too — so C, a node that predates the lane and is connected to A alone,
     /// still gets every transaction. Without the hold, the second copy would reach A's node loop,
@@ -1855,7 +1912,8 @@ mod tests {
     #[tokio::test]
     async fn during_the_roll_a_transaction_is_judged_once_and_relayed_on_both_lanes() {
         let (a, mut a_rx, a_addr) = listening(82, EdgeConfig::default()).await;
-        let (b, _b_rx) = start(loopback_cfg(vec![a_addr.clone()], WireLimits::default()), [83u8; 32]).await.unwrap();
+        let b_edge = EdgeConfig { legacy_tx_publish: true, ..EdgeConfig::default() };
+        let (b, _b_rx) = start_with(loopback_cfg(vec![a_addr.clone()], WireLimits::default()), [83u8; 32], b_edge).await.unwrap();
         assert!(wait_for(&mut a_rx, Duration::from_secs(10), |e| matches!(e, NetworkEvent::PeerConnected(p) if p == b.local_peer_id).then_some(())).await.is_some());
         let (mut c, _) = sniffer(false);
         c.dial(a_addr).unwrap();
@@ -2032,6 +2090,27 @@ mod tests {
 
     fn peer_of_seed(seed: u8) -> PeerId {
         PeerId::from(identity::Keypair::ed25519_from_bytes([seed; 32]).unwrap().public())
+    }
+
+    /// Audit v12, NET-601: the sources a node learned for its validators before a restart
+    /// (`EdgeConfig::bound_sources`, read from the store) are in the guard as soon as the swarm
+    /// exists — before any connection — and come back out of [`NetworkHandle::learned_sources`],
+    /// what the node persists. Sources for a peer that is neither bound nor pinned are not taken.
+    #[tokio::test]
+    async fn learned_sources_are_restored_before_the_first_connection() {
+        let v = PeerId::random();
+        let other = PeerId::random();
+        let host = edge::Source::V4(std::net::Ipv4Addr::new(198, 51, 100, 50));
+        let learned = edge::LearnedSource { source: host, kind: edge::SourceKind::Observed, age: Duration::from_secs(3600) };
+        let edge = EdgeConfig { bound: vec![v], bound_sources: vec![(v, vec![learned]), (other, vec![learned])], ..EdgeConfig::default() };
+        let (n, _rx) = start_with(loopback_cfg(vec![], WireLimits::default()), [96u8; 32], edge).await.unwrap();
+        let got = n.learned_sources().await;
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(got[0].0, v);
+        assert_eq!(got[0].1.len(), 1);
+        assert_eq!((got[0].1[0].source, got[0].1[0].kind), (host, edge::SourceKind::Observed));
+        assert!(got[0].1[0].age >= Duration::from_secs(3600), "restored with its age: {:?}", got[0].1[0].age);
+        n.shutdown().await;
     }
 
     /// Audit v6, NET-1: with the inbound cap full of strangers, a further stranger is refused —
@@ -2564,8 +2643,10 @@ mod tests {
         let e = EdgeConfig::default();
         assert!(e.reserved.is_empty());
         assert!(e.bound.is_empty());
+        assert!(e.bound_sources.is_empty());
         assert!(!e.strict_gossip);
-        assert!(!e.anonymous_tx_only, "both transaction lanes by default, for the rolling upgrade (#146)");
+        assert!(!e.anonymous_tx_only, "both transaction lanes subscribed by default, for the rolling upgrade (#146)");
+        assert!(!e.legacy_tx_publish, "but nothing published signed on the legacy one unless asked (PRIV-601)");
         assert!(!e.dandelion, "a bare network speaks no stem unless asked (#145)");
     }
 
@@ -2593,6 +2674,17 @@ mod tests {
         assert!(matches!(rx.recv().await, Some(NetworkCommand::Reserve(p)) if p == peer));
         h.unreserve_peer(peer).await;
         assert!(matches!(rx.recv().await, Some(NetworkCommand::Unreserve(p)) if p == peer));
+
+        // `learned_sources` waits for the swarm's answer (NET-601).
+        let learned = tokio::spawn({
+            let h = h.clone();
+            async move { h.learned_sources().await }
+        });
+        match rx.recv().await {
+            Some(NetworkCommand::LearnedSources(reply)) => reply.send(vec![(peer, vec![])]).unwrap(),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(learned.await.unwrap().len(), 1);
 
         let id = GossipId { message_id: MessageId::from(vec![1, 2, 3]), propagation_source: peer, lane: GossipLane::AnonymousTx };
         h.report_validation(id.clone(), MessageAcceptance::Reject).await;
@@ -2642,6 +2734,7 @@ mod tests {
         h.reserve_peer(peer).await;
         h.report_validation(id, MessageAcceptance::Accept).await;
         assert!(h.peers().await.is_empty());
+        assert!(h.learned_sources().await.is_empty());
         assert!(h.send_sync_request(peer, SyncRequest::BlockByHash(Hash::ZERO)).await.is_none());
         h.shutdown().await;
     }

@@ -666,8 +666,8 @@ async fn an_operator_reserved_peer_survives_unreserve() {
 }
 
 /// Dandelion++'s stem protocol (issue #145) on the wire. Two nodes that speak it learn so of each
-/// other through identify (each told whether it dialled the other, which is how a node prefers
-/// peers it chose); a stem from one reaches the other as `StemTx` naming the sender. A node with
+/// other through identify (each told the public host the other connects from — none, on
+/// loopback — not whether it dialled it: audit v12, PRIV-602); a stem from one reaches the other as `StemTx` naming the sender. A node with
 /// Dandelion off advertises nothing, so it is never reported as a stem peer, and a stem sent to it
 /// anyway comes back as `StemFailed` with the transaction's hash — an older node is never handed
 /// a stem it cannot read.
@@ -683,7 +683,7 @@ async fn the_stem_is_advertised_delivered_and_never_reaches_a_node_without_it() 
     let mut saw_c = false;
     let a_saw_b = a
         .wait(Duration::from_secs(10), |e| match e {
-            NetworkEvent::StemPeer { peer, outbound } if peer == ib => Some(outbound),
+            NetworkEvent::StemPeer { peer, host } if peer == ib => Some(host),
             NetworkEvent::StemPeer { peer, .. } if peer == ic => {
                 saw_c = true;
                 None
@@ -691,14 +691,14 @@ async fn the_stem_is_advertised_delivered_and_never_reaches_a_node_without_it() 
             _ => None,
         })
         .await;
-    assert_eq!(a_saw_b, Some(false), "A learns B speaks the stem; B dialled A");
+    assert_eq!(a_saw_b, Some(None), "A learns B speaks the stem; loopback is no public host");
     let b_saw_a = b
         .wait(Duration::from_secs(10), |e| match e {
-            NetworkEvent::StemPeer { peer, outbound } if peer == ia => Some(outbound),
+            NetworkEvent::StemPeer { peer, host } if peer == ia => Some(host),
             _ => None,
         })
         .await;
-    assert_eq!(b_saw_a, Some(true), "B learns A speaks the stem; B dialled it");
+    assert_eq!(b_saw_a, Some(None), "B learns A speaks the stem");
 
     let sent = tx(145);
     b.h.stem(ia, sent.clone()).await;

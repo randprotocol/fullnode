@@ -760,11 +760,19 @@ enum Cmd {
         #[arg(long)]
         strict_gossip: bool,
         /// Gossip transactions only on the anonymous lane `rand/{chain}/tx/2` (issue #146): stop
-        /// subscribing to and publishing on the legacy signed topic `rand/{chain}/tx`, whose
-        /// messages name the node that first published them. Only once every node on the chain
-        /// runs v0.8.3 or later: an older node hears transactions on the legacy topic alone.
+        /// subscribing to and relaying on the legacy signed topic `rand/{chain}/tx` as well.
+        /// Since audit v12 (PRIV-601) a node never publishes its own transactions there unless
+        /// `--legacy-tx-publish`; this flag also stops it hearing and relaying older nodes' copies.
         #[arg(long)]
         anonymous_tx_only: bool,
+        /// Also publish this node's transactions, signed, on the legacy topic `rand/{chain}/tx`
+        /// (audit v12, PRIV-601). Each copy there names this node as its publisher, which is what
+        /// the anonymous lane and the stem exist to hide, so it is off by default. Only for a
+        /// chain that still runs nodes from before v0.8.3 that must hear this node's transactions
+        /// over gossip (they still get them in blocks without it). Ignored under
+        /// `--anonymous-tx-only`.
+        #[arg(long)]
+        legacy_tx_publish: bool,
         /// Dandelion++ stem relay for transactions (issue #145): a transaction this node's RPC
         /// accepts, or a peer stems to it, goes to one stem successor over a direct send instead of
         /// being broadcast, and is fluffed onto gossip a few hops later, so the first node to
@@ -777,9 +785,11 @@ enum Cmd {
         /// the transaction on. Expected stem length is 1/q relays.
         #[arg(long, value_name = "Q", default_value_t = randprotocol_node::dandelion::DEFAULT_FLUFF_PROB, value_parser = parse_fluff_prob)]
         dandelion_fluff_prob: f64,
-        /// The stem embargo's fixed part, b, in milliseconds: a node holding a stem transaction
-        /// fluffs it itself if it has not seen it on gossip after b + min(Exp(mean b/4), b) (2b +
-        /// Exp(mean b/4) at the submitting node). The fail-safe against a successor that drops it.
+        /// The stem embargo's fixed part, b, in milliseconds: a node holding a stem transaction,
+        /// the submitting node included, fluffs it itself if it has not seen it on gossip after
+        /// b + min(Exp(mean b/4), b). The fail-safe against a successor that drops it. Below
+        /// 3000 ms (twice the 1.5 s stem acknowledgement timeout) a successor that never answers
+        /// may not be rerouted around before the embargo fires.
         #[arg(long, value_name = "MS", default_value_t = randprotocol_node::dandelion::DEFAULT_EMBARGO.as_millis() as u64, value_parser = clap::value_parser!(u64).range(100..=600_000))]
         dandelion_embargo_ms: u64,
         #[arg(long, default_value = "127.0.0.1:8545")]
@@ -3040,6 +3050,7 @@ async fn main() -> Result<()> {
             reserved_peer,
             strict_gossip,
             anonymous_tx_only,
+            legacy_tx_publish,
             dandelion,
             dandelion_fluff_prob,
             dandelion_embargo_ms,
@@ -3145,6 +3156,7 @@ async fn main() -> Result<()> {
                 reserved_peers: reserved_peer,
                 strict_gossip,
                 anonymous_tx_only,
+                legacy_tx_publish,
                 dandelion: randprotocol_node::dandelion::DandelionConfig {
                     enabled: dandelion == "on",
                     fluff_prob: dandelion_fluff_prob,
@@ -4596,6 +4608,23 @@ mod tests {
         }
         assert_eq!(parse_state_proof_tier("18"), Ok(18));
         assert!(parse_state_proof_tier("17").unwrap_err().contains("10, 12, 14, 16, 18, 20"));
+    }
+
+    /// Audit v12, PRIV-601: a node publishes its transactions on the anonymous lane only unless
+    /// `--legacy-tx-publish` asks for the signed legacy copy too; `--anonymous-tx-only` stays its
+    /// own flag.
+    #[test]
+    fn the_legacy_signed_copy_is_opt_in() {
+        let run = |extra: &[&str]| {
+            let args = ["rand-node", "run", "--datadir", "d", "--key", "k.json"].into_iter().chain(extra.iter().copied());
+            match Cli::try_parse_from(args).map(|c| c.cmd) {
+                Ok(Cmd::Run { legacy_tx_publish, anonymous_tx_only, .. }) => (legacy_tx_publish, anonymous_tx_only),
+                _ => unreachable!("a run"),
+            }
+        };
+        assert_eq!(run(&[]), (false, false), "no signed legacy copy by default");
+        assert_eq!(run(&["--legacy-tx-publish"]), (true, false));
+        assert_eq!(run(&["--anonymous-tx-only"]), (false, true));
     }
 
     /// Issue #145: Dandelion++ is on by default at q = 0.1 and a 3 s embargo; each flag parses,

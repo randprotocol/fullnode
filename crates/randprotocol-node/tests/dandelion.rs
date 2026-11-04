@@ -271,9 +271,10 @@ async fn at_q_zero_the_stem_is_invisible_until_an_embargo_fluffs_it_into_every_m
 
 /// The fail-safe against a black hole: the submitter's only stem-capable peer takes the stem and
 /// drops it (a bare network node that acknowledges and does nothing else). The other four nodes
-/// run with Dandelion off, so they are never sent a stem. The submitter's own embargo (`2b +
-/// Exp(b/4)`) fluffs it — it is the only node that published it — and every mempool gets it, none
-/// before that embargo could fire.
+/// run with Dandelion off, so they are never sent a stem. The submitter's own embargo fluffs it —
+/// it is the only node that published it — and every mempool gets it, none before that embargo
+/// could fire. Since audit v12 (PRIV-604) the submitter's embargo is a relay's, `b + min(Exp(b/4),
+/// b)`, so the fluff lands in the window a relay's would.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_stem_dropped_by_its_successor_is_fluffed_by_the_submitters_embargo() {
     let b = 1000;
@@ -313,7 +314,7 @@ async fn a_stem_dropped_by_its_successor_is_fluffed_by_the_submitters_embargo() 
     eprintln!("black hole, embargo {b} ms: published by {by:?}; first mempool at {:?}, all by {:?}", at.iter().min().unwrap(), at.iter().max().unwrap());
     assert_eq!(by, vec![a], "only the submitter published it");
     assert_eq!(net.stat(a, |d| &d.fluff_embargo), 1, "on its embargo");
-    assert!(*at.iter().min().unwrap() >= Duration::from_millis(2 * b), "a mempool held it before the submitter's embargo: {at:?}");
+    assert!(*at.iter().min().unwrap() >= Duration::from_millis(b), "a mempool held it before the submitter's embargo: {at:?}");
     for i in 1..5 {
         assert_eq!(net.stat(i, |d| &d.stem_received), 0, "node {i} has Dandelion off and was stemmed");
     }

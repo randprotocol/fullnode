@@ -33,6 +33,43 @@ stopped at v0.4 until 2026-09-30, when the entries v0.5 to v0.6.7 were written f
   for byte); set, the stored row carries a second trailer version (`rand-perps-ext-2`), which an
   older build cannot read. `rand_getPerps` reports `max_pending_digests` (0 when unset).
 
+Node (audit v12 network and privacy rows; node-only, no wire or consensus change):
+
+- **Validators' hosts stay reserved across a restart** (NET-601): the source addresses the
+  connection guard learned for validators' peers are written to the store every five minutes
+  (`reserved_sources`, beside the peer bindings) with the time each was last seen, and put back
+  before the first connection at the next start. Their 24 h expiry runs on across the stop. A
+  fleet-wide restart no longer leaves the reserved pending slots serving only the bootstraps'
+  hosts. A build that predates the row ignores it.
+- **No signed legacy copy of a node's own transactions by default** (PRIV-601): v0.8.3 and v0.8.4
+  published every fluffed transaction on the signed legacy topic `rand/<chain>/tx` as well as the
+  anonymous lane unless `--anonymous-tx-only`, which no deploy template set, so every fluff named
+  its fluffer. A node now publishes only on the anonymous lane; it still subscribes to and relays
+  the legacy topic, so transactions from nodes before v0.8.3 still arrive. `--legacy-tx-publish`
+  brings the signed copy back for a chain that still needs it. **Transaction origin hiding remains
+  design intent, not a measured property, until the first-spy test is re-run** against a fleet
+  running these fixes.
+- **Stem successors are chosen by trust and host, not by who dialled whom** (PRIV-602): the
+  router preferred peers this node had dialled, but identify-advertised addresses are redialled
+  every 30 s, so any peer that connected once became one. Successors now come first from trusted
+  peers (validators by their signed binding, bootstraps, `--reserved-peer`), and a public host is
+  one candidate and holds at most one of the two successor slots however many identities it runs.
+  In the router simulation, 24 identities on one host against 12 honest hosts take the
+  submitter's route in about 1/13 of epochs instead of 65%.
+- **A held stem transaction is answered like an unknown one** (PRIV-603): a copy of a
+  transaction this node holds on the stem, arriving over gossip, used to be accepted (and so
+  relayed) at once, and an RPC resubmission of one answered `Ok` at once, while an unknown one
+  waited for its verification. Both now take the ordinary verify queue and are answered on the
+  verdict; the gossip copy's verdict also ends the embargo. Costs one extra verification per
+  holder per such copy.
+- **One embargo distribution, and a silent successor is routed around** (PRIV-604): the
+  submitter's embargo was `2b + Exp(b/4)`, never under a relay's `b + min(Exp(b/4), b)`, so the
+  delay before a fluff told a successor that dropped the stem whether its predecessor was the
+  origin. Every holder now draws `b + min(Exp(b/4), b)`. The stem acknowledgement timeout drops
+  from 10 s to 1.5 s, under the 3 s default embargo, so a successor that never answers is dropped
+  and the transaction rerouted to the other successor before any embargo fires. (A successor
+  that acknowledges and then drops is still covered only by the embargo.)
+
 ## v0.8.4 — 2026-11-01 (chain 21, node-only; rolled to end the 2026-11-01 OOM kills and commit stalls)
 
 - **Perps digests no longer cost per block in proportion to the chain's length.** A chain nobody

@@ -183,7 +183,13 @@ A message there has no source, sequence number or signature, and one that carrie
 Consensus, status and peer bindings stay signed. Rate limiting is unchanged: it always keyed on
 the forwarder (`propagation_source`), never the author.
 
-The two lanes cannot share a topic or a protocol, so the roll runs both, then drops the old one:
+The two lanes cannot share a topic or a protocol, so the roll runs both, then drops the old one.
+**Since audit v12 (PRIV-601) a node no longer publishes its own transactions on the legacy topic
+by default:** it still subscribes and relays there (a relayed copy keeps its original author), but
+the signed copy that named the publishing node — on chain 21, every fluffing node, so the
+submitter whenever the stem ended at it — is only sent under `--legacy-tx-publish`. No deploy
+template or unit file needs a flag for this: the default is the private one. The phases below
+describe the v0.8.3/v0.8.4 roll, when that copy was still on by default.
 
 1. **Roll v0.8.3 everywhere, flag off (the default).** A v0.8.3 node subscribes both topics,
    publishes each transaction on both, and relays on both: a copy heard on one lane is held for
@@ -200,6 +206,10 @@ The two lanes cannot share a topic or a protocol, so the roll runs both, then dr
    publishes on both. A node from before v0.8.3 left on the chain would stop hearing the flagged
    nodes' transactions (it would still get them in blocks).
 3. The next release can make `--anonymous-tx-only` the default and drop the legacy topic.
+   (Audit v12 made the step in between: the legacy topic is still subscribed and relayed by
+   default, but a node's own transactions go there only under `--legacy-tx-publish`. A node from
+   before v0.8.3 left on the chain then hears a new node's transactions in blocks, and over gossip
+   only from nodes that run that flag.)
 
 The lane does not hide timing: the first node to relay a transaction is still the likeliest
 author to a well-connected observer. That is the Dandelion++ issue's to close (next section).
@@ -218,7 +228,12 @@ fluff no node shows it over RPC, serves it to a peer or proposes it (`docs/archi
 |---|---|---|
 | `--dandelion on\|off` | `on` | stem at all; `off` neither sends nor accepts stems and does not advertise the protocol |
 | `--dandelion-fluff-prob` | `0.1` | q; a stem runs about 1/q relays |
-| `--dandelion-embargo-ms` | `3000` | b; a relay waits b + min(Exp(b/4), b), the submitter 2b + Exp(b/4) |
+| `--dandelion-embargo-ms` | `3000` | b; every holder, the submitter included, waits b + min(Exp(b/4), b) (audit v12, PRIV-604); keep it at or above 3000, twice the 1.5 s stem acknowledgement timeout |
+
+**Origin hiding is design intent until it is measured again.** The first-spy test that found the
+submitter first in 27 of 27 traces has not been re-run against v0.8.3 or later, and until audit v12
+every fluff was also published on the signed legacy topic, naming its fluffer (PRIV-601). Treat
+the stem's protection as unmeasured until that test is re-run on a fleet with the v12 fixes.
 
 **Rollout.** Nothing to coordinate: it is on by default and rolls with the binary, in any order.
 A node sends a stem only to a peer whose identify lists the stem protocol, so a node that predates
