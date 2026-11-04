@@ -1364,6 +1364,8 @@ pub fn acceptance_for_pool(e: &MempoolError, hash: Hash, refused: &mut RefusedCa
         | MempoolError::PerpHeightBackpressure { .. }
         | MempoolError::PerpCancelUnknownOrder(_)
         | MempoolError::StateProofBusy
+        // CON-601: this node's memory, never the proof's fault.
+        | MempoolError::StateProofAboveNodeTier { .. }
         | MempoolError::AdmissionBusy(_) => Acceptance::Ignore,
     }
 }

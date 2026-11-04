@@ -81,6 +81,10 @@ pub struct NodeConfig {
     /// Proof-verification workers (`--verify-workers`); `None` sizes them to the host
     /// ([`VerifyLimits::for_host`], spec 2026-10-05 §6).
     pub verify_workers: Option<usize>,
+    /// CON-601: the highest state-proof tier this node verifies for its pool without a built key
+    /// (`--max-state-proof-tier`); `None` sizes it to the host
+    /// ([`crate::mempool::default_state_proof_tier_cap`]).
+    pub state_proof_tier_cap: Option<u8>,
     /// Apply incoming proposals on the consensus loop, as before (`--apply-proposals-inline`,
     /// spec 2026-10-11 off-loop apply §4.5); `false`, the default, applies them on a blocking
     /// worker ([`OFFLOOP_APPLIES`]).
@@ -2812,6 +2816,26 @@ pub async fn start_with(cfg: NodeConfig, rpc_options: RpcOptions, net_options: N
         hs.is_validator()
     );
 
+    // CON-601: the highest state-proof tier this node builds a verifier key for outside a block
+    // — its pool and its startup warm. Node policy: a block carrying a proof above it still
+    // applies and builds the key (chain 22's genesis engine pin is the consensus fix).
+    let state_proof_tier_cap = cfg
+        .state_proof_tier_cap
+        .unwrap_or_else(|| crate::mempool::default_state_proof_tier_cap(randprotocol_prover::memory::total_bytes()));
+    if let Some(p) = hs.committed_ledger().perps() {
+        if p.config.max_tier > state_proof_tier_cap {
+            tracing::warn!(
+                "state proofs: this chain allows tier {} but this node verifies none above tier {state_proof_tier_cap} for its pool \
+                 (a tier-{} key build needs ~{} MiB; --max-state-proof-tier); a block carrying one still builds its key",
+                p.config.max_tier,
+                p.config.max_tier,
+                crate::mempool::state_proof_key_build_peak_bytes(p.config.max_tier) >> 20
+            );
+        } else {
+            tracing::info!("state proofs: up to the chain's tier {} verified for the pool", p.config.max_tier);
+        }
+    }
+
     // Warm verifier keys off the consensus thread: the bundle guest's always (every block can
     // carry bundles, so the first one must not pay for the key), every program already on
     // chain, and — on a chain with an aggregation section — the aggregate program and its rVM
@@ -2882,7 +2906,10 @@ pub async fn start_with(cfg: NodeConfig, rpc_options: RpcOptions, net_options: N
             }
             ex.warm_bundle();
             tracing::info!("bundle verifier key warmed");
-            // Then the engine's keys (after the bundle's, which every block needs).
+            // Then the engine's keys (after the bundle's, which every block needs) — none above
+            // the node's tier cap (CON-601): a key build there is past this host's memory, and a
+            // node that died warming one would die again at every restart.
+            let perp_shapes: Vec<_> = perp_shapes.into_iter().filter(|s| s.tier <= state_proof_tier_cap).collect();
             for shape in &perp_shapes {
                 ex.warm_perp(shape);
             }
@@ -2926,6 +2953,7 @@ pub async fn start_with(cfg: NodeConfig, rpc_options: RpcOptions, net_options: N
     // RESCAN-LEDGER-1: this pool admits faucet mints from the genesis's minters only.
     let mut mempool = Mempool::new(10_000);
     mempool.set_faucet_minters(admission::faucet_minters(&gs));
+    mempool.set_state_proof_tier_cap(state_proof_tier_cap);
     if let Some(p) = cfg.gas_policy {
         mempool.set_gas_policy(p);
     }
@@ -7859,6 +7887,7 @@ mod tests {
             min_free_disk_bytes: 0,
             verify_workers: None,
             apply_inline: false,
+            state_proof_tier_cap: None,
             prune_history: None,
             gas_policy: None,
             msauth: Default::default(),
@@ -8107,6 +8136,46 @@ mod tests {
             assert_eq!(zk.perp_key_builds(), 1, "{other_side}: S's key is built once");
             assert!(zk.perp_key_ready(&shape));
         }
+    }
+
+    /// CON-601: through the node's own submission path, a cold state proof above the node's tier
+    /// cap is answered `StateProofAboveNodeTier` and never queued for verification — the only
+    /// road to a key build — nor pooled or cached; one within the cap is queued as before.
+    #[tokio::test]
+    async fn con601_a_cold_state_proof_above_the_tier_cap_never_reaches_verification() {
+        use crate::storage::fixtures::{make_perps_block, perp_state_proof_tx, perps_genesis};
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
+        let gs = perps_genesis(7);
+        storage.init_genesis(&gs).unwrap();
+        let mut ledger = gs.ledger.clone();
+        let mut b1 = make_perps_block(&gs.block, &mut ledger, vec![], &key(1));
+        b1.qc.votes = vec![Vote::sign(&randprotocol_core::consensus::SigningDomain::v0(Hash::ZERO), b1.qc.view, b1.qc.block_hash, &key(1))];
+        storage.commit(std::slice::from_ref(&b1), &ledger, &[], &StubExecutor).unwrap();
+        let hs = resume_consensus(&storage, &gs, Some(key(1)), Duration::from_secs(1), Duration::from_secs(8), Arc::new(StubExecutor)).unwrap();
+        let (mut node, _seen) = bare_node(storage, gs.clone(), hs);
+        node.mempool.set_state_proof_tier_cap(14);
+
+        let honest = perp_state_proof_tx(&ledger, 1, [7; 8], vec![], 0);
+        let cold = |tier: u8| {
+            let mut tx = honest.clone();
+            let randprotocol_core::Action::PerpStateProof { proof, .. } = &mut tx.action else { unreachable!() };
+            proof[4] = tier;
+            proof[38] = 5; // input height 5: a shape the stub holds no key for
+            tx
+        };
+        let over = cold(16);
+        let (reply, answer) = oneshot::channel();
+        node.submit_tx(over.clone(), reply).await;
+        assert_eq!(answer.await.unwrap().unwrap_err(), MempoolError::StateProofAboveNodeTier { tier: 16, cap: 14 });
+        assert_eq!((node.verify_in_flight, node.verify_queue.len()), (0, 0), "never queued for verification: no key build can start");
+        assert!(node.refused.get(&over.hash()).is_none(), "not cached as a refusal");
+        assert!(node.mempool.get(&over.hash()).is_none(), "not pooled");
+
+        let within = cold(14);
+        let (reply, _answer) = oneshot::channel();
+        node.submit_tx(within, reply).await;
+        assert_eq!(node.verify_in_flight + node.verify_queue.len(), 1, "a tier within the cap is verified as before");
     }
 
     /// CON-60 (review): a pool verification of a state proof whose key is not built never waits

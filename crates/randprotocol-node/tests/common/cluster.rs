@@ -145,6 +145,7 @@ pub async fn start_in_verify(
         min_free_disk_bytes: 0,
         verify_workers: None,
         apply_inline: false,
+        state_proof_tier_cap: None,
         prune_history,
         gas_policy: None,
         msauth: Default::default(),

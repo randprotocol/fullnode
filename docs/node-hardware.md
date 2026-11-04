@@ -88,6 +88,14 @@ Rules that follow from these numbers:
   on a 2 GB host), and the unit templates (`deploy/vps-setup.sh`, `deploy/cutover-droplet-rand.sh`)
   set `MemoryHigh=85%` so the kernel reclaims and throttles before it kills. A 2 GB host that has
   to stay on needs both, plus swap (the fleet's have 1 GB).
+- **A perps state-proof key build is the largest single allocation a node makes** (CON-601):
+  ~1 GiB at tier 16, ~4 GiB at tier 18 (3.56 GB resident measured), ~16 GiB at tier 20. Chain 21
+  allows tier 18, which neither a 2 GB nor a 4 GB host can build. The node caps the tier it
+  builds keys for outside a block at the highest one fitting three quarters of its RAM (16 on
+  2–4 GB, 18 on 8 GB; `--max-state-proof-tier` overrides it), so such a proof is not pooled,
+  relayed or proposed there. A block that carries one still makes every validator build the key;
+  until chain 22 pins the engine shape, a validator that must survive that needs 8 GB
+  (`docs/perps.md`, "the node's tier cap").
 - **Disk, not RAM, is the limit.** Keep at least 20 GB free for builds (`docs/block-space.md` §5)
   and delete a retired chain's data dir after a cut-over (`deploy/retire-chain-dirs.sh`). A
   validator runs `--prune-history 24h`; a node refuses to start under 1 GB free and

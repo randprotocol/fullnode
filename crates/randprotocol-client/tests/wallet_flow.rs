@@ -175,6 +175,7 @@ async fn start_configured(dir: &tempfile::TempDir, key: &Keypair, genesis: Genes
         min_free_disk_bytes: 0,
         verify_workers: None,
         apply_inline: false,
+        state_proof_tier_cap: None,
         prune_history: None,
         // Final review I2: the node runs the default gas policy (what `rand-node run` carries
         // unless told `--gas-price 0 --byte-price 0`), so every real call proof in these flows is

@@ -868,6 +868,15 @@ enum Cmd {
         /// Proof-verification workers (default: the cores minus two, at least four — spec 2026-10-05 §6).
         #[arg(long, value_name = "N")]
         verify_workers: Option<usize>,
+        /// The highest perps state-proof tier this node verifies for its pool when it holds no
+        /// verifier key for the proof's shape (CON-601): a key build at tier 18 peaks at ~4 GB
+        /// and at 20 ~16 GB, so a cold proof above this is refused before any work — not
+        /// verified, pooled, relayed or proposed here. Node policy only: a block carrying such a
+        /// proof still applies (and builds its key). One of 10, 12, 14, 16, 18, 20. Default: the
+        /// highest tier whose build fits in three quarters of the host's RAM (16 on 2–4 GB, 18
+        /// on 8 GB, 20 from ~22 GB).
+        #[arg(long, value_name = "TIER", value_parser = parse_state_proof_tier)]
+        max_state_proof_tier: Option<u8>,
         /// Admission memory budget in MiB (issue #157): one byte budget over RPC request bodies
         /// and transactions waiting for verification, gossiped or submitted. Past it,
         /// `rand_sendTransaction` answers -32005 (busy, retry) and gossiped transactions are shed
@@ -3055,6 +3064,7 @@ async fn main() -> Result<()> {
             prover_cpu,
             prover_threads,
             verify_workers,
+            max_state_proof_tier,
             admission_budget_mb,
             apply_proposals_inline,
             prover_skip_memory_check,
@@ -3126,6 +3136,7 @@ async fn main() -> Result<()> {
                 keep_raw_proofs,
                 min_free_disk_bytes: min_free_disk_mb << 20,
                 verify_workers,
+                state_proof_tier_cap: max_state_proof_tier,
                 apply_inline: apply_proposals_inline,
                 prune_history,
                 gas_policy: randprotocol_core::gas::GasPolicy::from_prices(gas_price, byte_price),
@@ -4406,6 +4417,16 @@ pub fn parse_fluff_prob(s: &str) -> Result<f64, String> {
     }
 }
 
+/// CON-601: `--max-state-proof-tier`, a perps proof tier (`ledger::perps::TIERS`).
+pub fn parse_state_proof_tier(s: &str) -> Result<u8, String> {
+    let tiers = randprotocol_core::ledger::perps::TIERS;
+    let list = tiers.iter().map(|t| t.to_string()).collect::<Vec<_>>().join(", ");
+    match s.parse::<u8>() {
+        Ok(t) if tiers.contains(&t) => Ok(t),
+        _ => Err(format!("max-state-proof-tier takes a proof tier: one of {list}")),
+    }
+}
+
 pub fn parse_prune_history(s: &str) -> Result<Duration, String> {
     let usage = "prune-history takes <n>m, <n>h or <n>d";
     if !s.is_ascii() {
@@ -4552,6 +4573,29 @@ mod tests {
         for args in [&["status"][..], &["keygen", "--out", "k.json"], &["address", "--key", "k.json"]] {
             assert!(!opens_storage(&cmd(args)), "`rand-node {}` opens no database", args.join(" "));
         }
+    }
+
+    /// CON-601: `--max-state-proof-tier` is unset by default (the node sizes the cap from its
+    /// memory) and takes a perps proof tier, nothing else.
+    #[test]
+    fn con601_the_state_proof_tier_flag_takes_a_proof_tier() {
+        let run = |extra: &[&str]| {
+            let args = ["rand-node", "run", "--datadir", "d", "--key", "k.json"].into_iter().chain(extra.iter().copied());
+            match Cli::try_parse_from(args).map(|c| c.cmd) {
+                Ok(Cmd::Run { max_state_proof_tier, .. }) => Ok(max_state_proof_tier),
+                Ok(_) => unreachable!("a run"),
+                Err(e) => Err(e.to_string()),
+            }
+        };
+        assert_eq!(run(&[]).unwrap(), None, "default: sized from the host");
+        assert_eq!(run(&["--max-state-proof-tier", "16"]).unwrap(), Some(16));
+        assert_eq!(run(&["--max-state-proof-tier", "20"]).unwrap(), Some(20));
+        for bad in ["15", "22", "0", "x", "256", ""] {
+            let e = run(&["--max-state-proof-tier", bad]).unwrap_err();
+            assert!(e.contains("max-state-proof-tier"), "{bad:?}: {e}");
+        }
+        assert_eq!(parse_state_proof_tier("18"), Ok(18));
+        assert!(parse_state_proof_tier("17").unwrap_err().contains("10, 12, 14, 16, 18, 20"));
     }
 
     /// Issue #145: Dandelion++ is on by default at q = 0.1 and a 3 s embargo; each flag parses,
