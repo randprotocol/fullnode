@@ -157,6 +157,7 @@ pub async fn start_one_validator_shaped(edit: impl FnOnce(&mut Genesis)) -> Test
         min_free_disk_bytes: 0,
         verify_workers: None,
         apply_inline: false,
+        state_proof_tier_cap: None,
         prune_history: None,
         gas_policy: None,
         msauth: Default::default(),
@@ -240,6 +241,7 @@ async fn serve_genesis_seeded_with(
         ws_conns: Arc::new(AtomicUsize::new(0)),
         viewing: Arc::new(RwLock::new(randprotocol_node::viewing::Registry::default())),
         admission: randprotocol_node::admission::AdmissionBudget::new(randprotocol_node::admission::AdmissionBudget::DEFAULT_MAX),
+        scan_leaves: true,
     };
     let ws_conns = state.ws_conns.clone();
     let status = state.status.clone();

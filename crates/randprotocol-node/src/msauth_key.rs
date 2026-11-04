@@ -434,6 +434,7 @@ mod tests {
             min_free_disk_bytes: 0,
             verify_workers: None,
             apply_inline: false,
+            state_proof_tier_cap: None,
             prune_history: None,
             gas_policy: None,
             msauth,

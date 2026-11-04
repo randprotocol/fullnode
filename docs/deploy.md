@@ -183,7 +183,13 @@ A message there has no source, sequence number or signature, and one that carrie
 Consensus, status and peer bindings stay signed. Rate limiting is unchanged: it always keyed on
 the forwarder (`propagation_source`), never the author.
 
-The two lanes cannot share a topic or a protocol, so the roll runs both, then drops the old one:
+The two lanes cannot share a topic or a protocol, so the roll runs both, then drops the old one.
+**Since audit v12 (PRIV-601) a node no longer publishes its own transactions on the legacy topic
+by default:** it still subscribes and relays there (a relayed copy keeps its original author), but
+the signed copy that named the publishing node — on chain 21, every fluffing node, so the
+submitter whenever the stem ended at it — is only sent under `--legacy-tx-publish`. No deploy
+template or unit file needs a flag for this: the default is the private one. The phases below
+describe the v0.8.3/v0.8.4 roll, when that copy was still on by default.
 
 1. **Roll v0.8.3 everywhere, flag off (the default).** A v0.8.3 node subscribes both topics,
    publishes each transaction on both, and relays on both: a copy heard on one lane is held for
@@ -200,6 +206,10 @@ The two lanes cannot share a topic or a protocol, so the roll runs both, then dr
    publishes on both. A node from before v0.8.3 left on the chain would stop hearing the flagged
    nodes' transactions (it would still get them in blocks).
 3. The next release can make `--anonymous-tx-only` the default and drop the legacy topic.
+   (Audit v12 made the step in between: the legacy topic is still subscribed and relayed by
+   default, but a node's own transactions go there only under `--legacy-tx-publish`. A node from
+   before v0.8.3 left on the chain then hears a new node's transactions in blocks, and over gossip
+   only from nodes that run that flag.)
 
 The lane does not hide timing: the first node to relay a transaction is still the likeliest
 author to a well-connected observer. That is the Dandelion++ issue's to close (next section).
@@ -218,7 +228,12 @@ fluff no node shows it over RPC, serves it to a peer or proposes it (`docs/archi
 |---|---|---|
 | `--dandelion on\|off` | `on` | stem at all; `off` neither sends nor accepts stems and does not advertise the protocol |
 | `--dandelion-fluff-prob` | `0.1` | q; a stem runs about 1/q relays |
-| `--dandelion-embargo-ms` | `3000` | b; a relay waits b + min(Exp(b/4), b), the submitter 2b + Exp(b/4) |
+| `--dandelion-embargo-ms` | `3000` | b; every holder, the submitter included, waits b + min(Exp(b/4), b) (audit v12, PRIV-604); keep it at or above 3000, twice the 1.5 s stem acknowledgement timeout |
+
+**Origin hiding is design intent until it is measured again.** The first-spy test that found the
+submitter first in 27 of 27 traces has not been re-run against v0.8.3 or later, and until audit v12
+every fluff was also published on the signed legacy topic, naming its fluffer (PRIV-601). Treat
+the stem's protection as unmeasured until that test is re-run on a fleet with the v12 fixes.
 
 **Rollout.** Nothing to coordinate: it is on by default and rolls with the binary, in any order.
 A node sends a stem only to a peer whose identify lists the stem protocol, so a node that predates
@@ -276,6 +291,23 @@ into the release notes, not a default. It then builds the three binaries on a cl
 publishes them with `SHA256SUMS` and a build attestation; the release notes name the CI run. Fleet
 binaries come from that release, not from a hand build ("Release trust", below). The workflow has
 not yet produced a release: the first tag after 2026-09-30 is its first run.
+
+**A merged fleet fix must name its roll (audit v12, PROC-601).** The open-files fix (#159) sat
+merged three days and rolled only under the 31 Oct halt; `MemoryHigh=85%` (#157) was merged into
+two unit templates no roll script writes, so 0 of 26 hosts carried it. Before a fleet-affecting fix
+(a unit setting, a drop-in, a limit, a flag a host must pass, a binary fix for a live incident) is
+called done:
+
+- [ ] it is reachable by the roll path: a unit or limit lives in `deploy/lib/unit-limits.sh` (or
+      a script `deploy/update-droplet.sh` and `deploy/roll-all.sh` run), never only in a template
+      a fresh host gets (`SELFTEST=1 bash deploy/lib/unit-limits.sh` asserts both roll scripts
+      write the drop-in and no other script spells the values);
+- [ ] the PR or issue names the roll that ships it — the tag, and `update-droplet.sh` one at a
+      time or `roll-all.sh` — and a date, within a day of the incident it answers;
+- [ ] after the roll, the fix is read back from every host (`systemctl show rand-node -p
+      MemoryHigh -p LimitNOFILE`, `rand-node --version`), and the fleet snapshot in the
+      configuration repository is refreshed;
+- [ ] the issue is closed only with the roll record linked, not on merge alone.
 
 3. `deploy/rebuild-vps.sh <ip>` per server, staggered so that more than 2/3 of stake stays up. A
    restart costs a node a few seconds; it resumes from its persisted head, verifies the chain, and
@@ -357,6 +389,10 @@ filesystem (`--min-free-disk-mb`, default 1024, names the directory and the flag
 tick with a warning in the log — the 2026-09-24 stall was seven full disks and a health check that
 said `ok` right up to the crash loop. A roll waits on `ok`, so a droplet near full now stops the
 roll at that node instead of at the next one that fills.
+Since audit v12 (OPS-601) the node also warns early: under 16 GB free (16 × the minimum) it logs
+`disk_warn` once an hour with its measured growth and days to `disk_low`, and `rand_getHealth`
+carries `disk_warn`, `disk_bytes_per_day` and `disk_days_left` beside an unchanged status word.
+An unpruned chain-21 archive grows 5–6 GB a day; size it by `docs/node-hardware.md`.
 
 ## The compact-blocks flag day
 

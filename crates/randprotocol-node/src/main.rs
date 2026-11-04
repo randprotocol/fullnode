@@ -760,11 +760,19 @@ enum Cmd {
         #[arg(long)]
         strict_gossip: bool,
         /// Gossip transactions only on the anonymous lane `rand/{chain}/tx/2` (issue #146): stop
-        /// subscribing to and publishing on the legacy signed topic `rand/{chain}/tx`, whose
-        /// messages name the node that first published them. Only once every node on the chain
-        /// runs v0.8.3 or later: an older node hears transactions on the legacy topic alone.
+        /// subscribing to and relaying on the legacy signed topic `rand/{chain}/tx` as well.
+        /// Since audit v12 (PRIV-601) a node never publishes its own transactions there unless
+        /// `--legacy-tx-publish`; this flag also stops it hearing and relaying older nodes' copies.
         #[arg(long)]
         anonymous_tx_only: bool,
+        /// Also publish this node's transactions, signed, on the legacy topic `rand/{chain}/tx`
+        /// (audit v12, PRIV-601). Each copy there names this node as its publisher, which is what
+        /// the anonymous lane and the stem exist to hide, so it is off by default. Only for a
+        /// chain that still runs nodes from before v0.8.3 that must hear this node's transactions
+        /// over gossip (they still get them in blocks without it). Ignored under
+        /// `--anonymous-tx-only`.
+        #[arg(long)]
+        legacy_tx_publish: bool,
         /// Dandelion++ stem relay for transactions (issue #145): a transaction this node's RPC
         /// accepts, or a peer stems to it, goes to one stem successor over a direct send instead of
         /// being broadcast, and is fluffed onto gossip a few hops later, so the first node to
@@ -777,9 +785,11 @@ enum Cmd {
         /// the transaction on. Expected stem length is 1/q relays.
         #[arg(long, value_name = "Q", default_value_t = randprotocol_node::dandelion::DEFAULT_FLUFF_PROB, value_parser = parse_fluff_prob)]
         dandelion_fluff_prob: f64,
-        /// The stem embargo's fixed part, b, in milliseconds: a node holding a stem transaction
-        /// fluffs it itself if it has not seen it on gossip after b + min(Exp(mean b/4), b) (2b +
-        /// Exp(mean b/4) at the submitting node). The fail-safe against a successor that drops it.
+        /// The stem embargo's fixed part, b, in milliseconds: a node holding a stem transaction,
+        /// the submitting node included, fluffs it itself if it has not seen it on gossip after
+        /// b + min(Exp(mean b/4), b). The fail-safe against a successor that drops it. Below
+        /// 3000 ms (twice the 1.5 s stem acknowledgement timeout) a successor that never answers
+        /// may not be rerouted around before the embargo fires.
         #[arg(long, value_name = "MS", default_value_t = randprotocol_node::dandelion::DEFAULT_EMBARGO.as_millis() as u64, value_parser = clap::value_parser!(u64).range(100..=600_000))]
         dandelion_embargo_ms: u64,
         #[arg(long, default_value = "127.0.0.1:8545")]
@@ -868,6 +878,15 @@ enum Cmd {
         /// Proof-verification workers (default: the cores minus two, at least four — spec 2026-10-05 §6).
         #[arg(long, value_name = "N")]
         verify_workers: Option<usize>,
+        /// The highest perps state-proof tier this node verifies for its pool when it holds no
+        /// verifier key for the proof's shape (CON-601): a key build at tier 18 peaks at ~4 GB
+        /// and at 20 ~16 GB, so a cold proof above this is refused before any work — not
+        /// verified, pooled, relayed or proposed here. Node policy only: a block carrying such a
+        /// proof still applies (and builds its key). One of 10, 12, 14, 16, 18, 20. Default: the
+        /// highest tier whose build fits in three quarters of the host's RAM (16 on 2–4 GB, 18
+        /// on 8 GB, 20 from ~22 GB).
+        #[arg(long, value_name = "TIER", value_parser = parse_state_proof_tier)]
+        max_state_proof_tier: Option<u8>,
         /// Admission memory budget in MiB (issue #157): one byte budget over RPC request bodies
         /// and transactions waiting for verification, gossiped or submitted. Past it,
         /// `rand_sendTransaction` answers -32005 (busy, retry) and gossiped transactions are shed
@@ -875,6 +894,12 @@ enum Cmd {
         /// largest transaction (body cap plus block cap); a value under that is refused.
         #[arg(long, value_name = "MIB", value_parser = clap::value_parser!(u64).range(1..))]
         admission_budget_mb: Option<u64>,
+        /// Refuse `rand_getScanLeaves` on both listeners (audit v12, RPC-201). A wallet before
+        /// v0.8.3 scans with it and then fetches only its own leaves, which tells this node which
+        /// leaves it owns; `rand` v0.8.3+ never calls it. Served by default until the next minor,
+        /// which flips the default.
+        #[arg(long)]
+        disable_scan_leaves: bool,
         /// Apply incoming proposals on the consensus loop, as before v0.8.0, instead of on a
         /// blocking worker (spec 2026-10-11 off-loop apply §4.5): the kill switch. The by-hash
         /// fetch answer binding is a separate fix and stays on.
@@ -3031,6 +3056,7 @@ async fn main() -> Result<()> {
             reserved_peer,
             strict_gossip,
             anonymous_tx_only,
+            legacy_tx_publish,
             dandelion,
             dandelion_fluff_prob,
             dandelion_embargo_ms,
@@ -3055,7 +3081,9 @@ async fn main() -> Result<()> {
             prover_cpu,
             prover_threads,
             verify_workers,
+            max_state_proof_tier,
             admission_budget_mb,
+            disable_scan_leaves,
             apply_proposals_inline,
             prover_skip_memory_check,
             prover_allow_origin,
@@ -3109,7 +3137,7 @@ async fn main() -> Result<()> {
             let admission_budget = admission_budget_mb
                 .map(|mb| usize::try_from(mb).ok().and_then(|mb| mb.checked_mul(1 << 20)).ok_or_else(|| anyhow::anyhow!("--admission-budget-mb {mb} is too large")))
                 .transpose()?;
-            let rpc_options = node::RpcOptions { public_addr: public_rpc, viewing_token, admission_budget };
+            let rpc_options = node::RpcOptions { public_addr: public_rpc, viewing_token, admission_budget, disable_scan_leaves };
             let handle = node::start_with(NodeConfig {
                 viewing_open: rpc_viewing_open,
                 datadir,
@@ -3126,6 +3154,7 @@ async fn main() -> Result<()> {
                 keep_raw_proofs,
                 min_free_disk_bytes: min_free_disk_mb << 20,
                 verify_workers,
+                state_proof_tier_cap: max_state_proof_tier,
                 apply_inline: apply_proposals_inline,
                 prune_history,
                 gas_policy: randprotocol_core::gas::GasPolicy::from_prices(gas_price, byte_price),
@@ -3134,6 +3163,7 @@ async fn main() -> Result<()> {
                 reserved_peers: reserved_peer,
                 strict_gossip,
                 anonymous_tx_only,
+                legacy_tx_publish,
                 dandelion: randprotocol_node::dandelion::DandelionConfig {
                     enabled: dandelion == "on",
                     fluff_prob: dandelion_fluff_prob,
@@ -4406,6 +4436,16 @@ pub fn parse_fluff_prob(s: &str) -> Result<f64, String> {
     }
 }
 
+/// CON-601: `--max-state-proof-tier`, a perps proof tier (`ledger::perps::TIERS`).
+pub fn parse_state_proof_tier(s: &str) -> Result<u8, String> {
+    let tiers = randprotocol_core::ledger::perps::TIERS;
+    let list = tiers.iter().map(|t| t.to_string()).collect::<Vec<_>>().join(", ");
+    match s.parse::<u8>() {
+        Ok(t) if tiers.contains(&t) => Ok(t),
+        _ => Err(format!("max-state-proof-tier takes a proof tier: one of {list}")),
+    }
+}
+
 pub fn parse_prune_history(s: &str) -> Result<Duration, String> {
     let usage = "prune-history takes <n>m, <n>h or <n>d";
     if !s.is_ascii() {
@@ -4552,6 +4592,46 @@ mod tests {
         for args in [&["status"][..], &["keygen", "--out", "k.json"], &["address", "--key", "k.json"]] {
             assert!(!opens_storage(&cmd(args)), "`rand-node {}` opens no database", args.join(" "));
         }
+    }
+
+    /// CON-601: `--max-state-proof-tier` is unset by default (the node sizes the cap from its
+    /// memory) and takes a perps proof tier, nothing else.
+    #[test]
+    fn con601_the_state_proof_tier_flag_takes_a_proof_tier() {
+        let run = |extra: &[&str]| {
+            let args = ["rand-node", "run", "--datadir", "d", "--key", "k.json"].into_iter().chain(extra.iter().copied());
+            match Cli::try_parse_from(args).map(|c| c.cmd) {
+                Ok(Cmd::Run { max_state_proof_tier, .. }) => Ok(max_state_proof_tier),
+                Ok(_) => unreachable!("a run"),
+                Err(e) => Err(e.to_string()),
+            }
+        };
+        assert_eq!(run(&[]).unwrap(), None, "default: sized from the host");
+        assert_eq!(run(&["--max-state-proof-tier", "16"]).unwrap(), Some(16));
+        assert_eq!(run(&["--max-state-proof-tier", "20"]).unwrap(), Some(20));
+        for bad in ["15", "22", "0", "x", "256", ""] {
+            let e = run(&["--max-state-proof-tier", bad]).unwrap_err();
+            assert!(e.contains("max-state-proof-tier"), "{bad:?}: {e}");
+        }
+        assert_eq!(parse_state_proof_tier("18"), Ok(18));
+        assert!(parse_state_proof_tier("17").unwrap_err().contains("10, 12, 14, 16, 18, 20"));
+    }
+
+    /// Audit v12, PRIV-601: a node publishes its transactions on the anonymous lane only unless
+    /// `--legacy-tx-publish` asks for the signed legacy copy too; `--anonymous-tx-only` stays its
+    /// own flag.
+    #[test]
+    fn the_legacy_signed_copy_is_opt_in() {
+        let run = |extra: &[&str]| {
+            let args = ["rand-node", "run", "--datadir", "d", "--key", "k.json"].into_iter().chain(extra.iter().copied());
+            match Cli::try_parse_from(args).map(|c| c.cmd) {
+                Ok(Cmd::Run { legacy_tx_publish, anonymous_tx_only, .. }) => (legacy_tx_publish, anonymous_tx_only),
+                _ => unreachable!("a run"),
+            }
+        };
+        assert_eq!(run(&[]), (false, false), "no signed legacy copy by default");
+        assert_eq!(run(&["--legacy-tx-publish"]), (true, false));
+        assert_eq!(run(&["--anonymous-tx-only"]), (false, true));
     }
 
     /// Issue #145: Dandelion++ is on by default at q = 0.1 and a 3 s embargo; each flag parses,
@@ -5135,6 +5215,7 @@ mod tests {
             "sparse_windows",
             "max_window_heights",
             "engine_program_log_height",
+            "max_pending_digests",
             "refuse_panics",
             "max_accounts",
         ] {
@@ -7037,5 +7118,18 @@ mod prune_flag_tests {
         let cli = Cli::try_parse_from(["rand-node", "run", "--datadir", "/tmp/x", "--key", "/tmp/k", "--gas-price", "0", "--byte-price", "0"]).unwrap();
         let Cmd::Run { gas_price, byte_price, .. } = cli.cmd else { panic!("run") };
         assert_eq!(randprotocol_core::gas::GasPolicy::from_prices(gas_price, byte_price), None);
+    }
+
+    /// RPC-201: `--disable-scan-leaves` parses, and its absence serves the method (the default
+    /// until the next minor).
+    #[test]
+    fn disable_scan_leaves_is_off_by_default_and_parses() {
+        use clap::Parser;
+        let cli = Cli::try_parse_from(["rand-node", "run", "--datadir", "/tmp/x", "--key", "/tmp/k"]).unwrap();
+        let Cmd::Run { disable_scan_leaves, .. } = cli.cmd else { panic!("run") };
+        assert!(!disable_scan_leaves);
+        let cli = Cli::try_parse_from(["rand-node", "run", "--datadir", "/tmp/x", "--key", "/tmp/k", "--disable-scan-leaves"]).unwrap();
+        let Cmd::Run { disable_scan_leaves, .. } = cli.cmd else { panic!("run") };
+        assert!(disable_scan_leaves);
     }
 }

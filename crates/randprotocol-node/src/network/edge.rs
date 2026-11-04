@@ -91,6 +91,28 @@ pub fn source_of(addr: &Multiaddr) -> Source {
     Source::Unknown
 }
 
+impl Source {
+    /// The text the store keeps for a source (audit v12, NET-601): `4:a.b.c.d` for an IPv4 host,
+    /// `6:` and sixteen hex digits for an IPv6 /64. `None` for [`Source::Unknown`], which is
+    /// never trusted and so never kept.
+    pub fn to_text(&self) -> Option<String> {
+        match self {
+            Source::V4(ip) => Some(format!("4:{ip}")),
+            Source::V6Prefix(p) => Some(format!("6:{p:016x}")),
+            Source::Unknown => None,
+        }
+    }
+
+    /// [`Source::to_text`] read back; `None` for anything else.
+    pub fn from_text(text: &str) -> Option<Source> {
+        match text.split_once(':')? {
+            ("4", ip) => ip.parse().ok().map(Source::V4),
+            ("6", hex) if hex.len() == 16 => u64::from_str_radix(hex, 16).ok().map(Source::V6Prefix),
+            _ => None,
+        }
+    }
+}
+
 /// The most source addresses one reserved peer is remembered at ([`ReservedSources`]): a host
 /// with an IPv4 and an IPv6 address, plus a move or two. A new one past it evicts an advertised
 /// source first, then the least recently seen observed one; configured ones are never evicted.
@@ -120,6 +142,37 @@ pub enum SourceKind {
     Configured,
 }
 
+impl SourceKind {
+    /// The text the store keeps (NET-601).
+    pub fn as_text(self) -> &'static str {
+        match self {
+            SourceKind::Advertised => "advertised",
+            SourceKind::Observed => "observed",
+            SourceKind::Configured => "configured",
+        }
+    }
+
+    pub fn from_text(text: &str) -> Option<SourceKind> {
+        match text {
+            "advertised" => Some(SourceKind::Advertised),
+            "observed" => Some(SourceKind::Observed),
+            "configured" => Some(SourceKind::Configured),
+            _ => None,
+        }
+    }
+}
+
+/// One source a reserved peer was learned at, as it leaves the guard to be persisted and comes
+/// back at the next start (audit v12, NET-601): `age` is how long ago it was last seen (zero for
+/// one with a connection open), so the [`RESERVED_SOURCE_TTL`] runs on across the restart
+/// instead of starting over.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LearnedSource {
+    pub source: Source,
+    pub kind: SourceKind,
+    pub age: std::time::Duration,
+}
+
 #[derive(Clone, Copy, Debug)]
 struct Known {
     source: Source,
@@ -128,6 +181,19 @@ struct Known {
     /// Connections the peer holds from this source right now: a source in use never expires,
     /// and its `seen` is refreshed again when the last one closes (NET-1 re-review, N1).
     open: u32,
+    /// Age it already had when restored from the store at this start (NET-601), on top of the
+    /// time since `seen`; zero once it is seen again in this process.
+    carried: std::time::Duration,
+}
+
+impl Known {
+    /// How long ago the source was last seen, across a restart.
+    fn age(&self, now: std::time::Instant) -> std::time::Duration {
+        if self.open > 0 {
+            return std::time::Duration::ZERO;
+        }
+        now.saturating_duration_since(self.seen) + self.carried
+    }
 }
 
 /// The source addresses reserved peers are known at (audit v10, NET-1): what lets a handshake
@@ -150,6 +216,7 @@ impl ReservedSources {
         if let Some(k) = list.iter_mut().find(|k| k.source == source) {
             k.kind = k.kind.max(kind);
             k.seen = now;
+            k.carried = std::time::Duration::ZERO;
             return;
         }
         if kind == SourceKind::Advertised && list.iter().any(|k| k.kind == SourceKind::Advertised) {
@@ -162,7 +229,7 @@ impl ReservedSources {
                 .iter()
                 .enumerate()
                 .filter(|(_, k)| k.kind != SourceKind::Configured && k.open == 0 && k.kind <= kind)
-                .min_by_key(|(_, k)| (k.kind, k.seen))
+                .min_by_key(|(_, k)| (k.kind, std::cmp::Reverse(k.age(now))))
                 .map(|(i, _)| i);
             match victim {
                 Some(i) => {
@@ -171,7 +238,44 @@ impl ReservedSources {
                 None => return,
             }
         }
-        list.push(Known { source, kind, seen: now, open: 0 });
+        list.push(Known { source, kind, seen: now, open: 0, carried: std::time::Duration::ZERO });
+    }
+
+    /// Put back a source persisted before a restart (NET-601), `age` old at `now`. Never a
+    /// configured one (those come from the operator's flags at every start), nor one of no host,
+    /// nor one already past the TTL. A source this process has seen since keeps its own, fresher
+    /// age.
+    pub fn restore(&mut self, peer: PeerId, learned: LearnedSource, now: std::time::Instant) {
+        if learned.kind == SourceKind::Configured || learned.source == Source::Unknown || learned.age >= RESERVED_SOURCE_TTL {
+            return;
+        }
+        let fresh = !self.by_peer.get(&peer).is_some_and(|l| l.iter().any(|k| k.source == learned.source));
+        self.add(peer, learned.source, learned.kind, now);
+        if fresh {
+            if let Some(k) = self.by_peer.get_mut(&peer).and_then(|l| l.iter_mut().find(|k| k.source == learned.source)) {
+                k.carried = learned.age;
+            }
+        }
+    }
+
+    /// Every live advertised and observed source, with its age at `now`, for persisting (NET-601).
+    /// Configured ones are left out: the next start has them from its flags.
+    pub fn learned(&self, now: std::time::Instant) -> Vec<(PeerId, Vec<LearnedSource>)> {
+        let mut out: Vec<(PeerId, Vec<LearnedSource>)> = self
+            .by_peer
+            .iter()
+            .map(|(p, l)| {
+                let list = l
+                    .iter()
+                    .filter(|k| k.kind != SourceKind::Configured && Self::live(k, now))
+                    .map(|k| LearnedSource { source: k.source, kind: k.kind, age: k.age(now) })
+                    .collect::<Vec<_>>();
+                (*p, list)
+            })
+            .filter(|(_, l)| !l.is_empty())
+            .collect();
+        out.sort_by_key(|(p, _)| *p);
+        out
     }
 
     /// `peer` holds a connection from `source` (seen, so [`SourceKind::Observed`] at least): the
@@ -189,12 +293,13 @@ impl ReservedSources {
         if let Some(k) = self.by_peer.get_mut(peer).and_then(|l| l.iter_mut().find(|k| k.source == source)) {
             k.open = k.open.saturating_sub(1);
             k.seen = now;
+            k.carried = std::time::Duration::ZERO;
         }
     }
 
     /// Whether `k` is still trusted at `now`: configured, in use, or seen within the TTL.
     fn live(k: &Known, now: std::time::Instant) -> bool {
-        k.kind == SourceKind::Configured || k.open > 0 || now.saturating_duration_since(k.seen) < RESERVED_SOURCE_TTL
+        k.kind == SourceKind::Configured || k.open > 0 || k.age(now) < RESERVED_SOURCE_TTL
     }
 
     /// Forget every source of `peer` (it stopped being reserved).
@@ -538,6 +643,26 @@ impl Guard {
         let now = self.now();
         self.sources.expire(now);
         self.sources.peers_at(source, now).into_iter().find(|p| self.pending.reserved_for(p) < MAX_RESERVED_PENDING_PER_PEER)
+    }
+
+    /// Put back the sources `peer` was learned at before this process started (audit v12,
+    /// NET-601), so a validator's host takes a reserved pending slot before its first connection
+    /// of this run. Only for a peer already reserved — its persisted binding, a bootstrap or the
+    /// operator's list — and each under [`ReservedSources::restore`]'s rules.
+    pub fn restore_sources(&mut self, peer: PeerId, learned: impl IntoIterator<Item = LearnedSource>) {
+        if !self.established.is_reserved(&peer) {
+            return;
+        }
+        let now = self.now();
+        for l in learned {
+            self.sources.restore(peer, l, now);
+        }
+    }
+
+    /// What [`Guard::restore_sources`] takes back at the next start: every reserved peer's live
+    /// advertised and observed sources with their ages (NET-601).
+    pub fn learned_sources(&self) -> Vec<(PeerId, Vec<LearnedSource>)> {
+        self.sources.learned(self.now())
     }
 
     pub fn unreserve(&mut self, peer: &PeerId) {
@@ -1255,6 +1380,62 @@ mod tests {
         established_outbound(&mut g, 0, peer).unwrap();
         connection_established(&mut g, 0, peer, &listener_point("/ip4/203.0.113.7/tcp/1"), 0);
         assert!(matches!(g.poll(&mut cx), Poll::Pending));
+    }
+
+    /// Audit v12, NET-601: what the guard learned about a reserved peer's sources survives a
+    /// restart. A validator seen at a host before the stop is reserved at that host in a fresh
+    /// guard before any connection, so its reconnect takes a reserved pending slot while
+    /// strangers hold their whole share; the snapshot goes through its text form (what the store
+    /// keeps); and the restored source keeps its age, so the 24 h expiry runs from when it was
+    /// last seen before the stop, not from the restart.
+    #[test]
+    fn learned_reserved_sources_survive_a_restart_with_their_age() {
+        use super::super::{MAX_PENDING_INCOMING, RESERVED_PENDING_INCOMING};
+        let v = PeerId::random();
+        let mut before = guard();
+        before.reserve(v);
+        let point = listener_point("/ip4/198.51.100.40/tcp/30303");
+        connection_established(&mut before, 1, v, &point, 0);
+        connection_closed(&mut before, 1, v, &point, 0);
+        // Twenty hours later the node stops.
+        before.skew = std::time::Duration::from_secs(20 * 3600);
+        let snapshot = before.learned_sources();
+        assert_eq!(snapshot.len(), 1, "{snapshot:?}");
+        let (peer, list) = &snapshot[0];
+        assert_eq!(*peer, v);
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].kind, SourceKind::Observed);
+        assert!(list[0].age >= std::time::Duration::from_secs(20 * 3600), "the age is carried: {:?}", list[0].age);
+        // Through the text the store keeps.
+        let text = list[0].source.to_text().expect("an IP source has a text form");
+        assert_eq!(Source::from_text(&text), Some(list[0].source));
+        assert_eq!(SourceKind::from_text(list[0].kind.as_text()), Some(SourceKind::Observed));
+
+        // The restart: a fresh guard, the peer reserved from its persisted binding, its sources
+        // restored — and no connection yet.
+        let mut after = guard();
+        after.reserve(v);
+        after.restore_sources(v, list.iter().copied());
+        for i in 0..(MAX_PENDING_INCOMING - RESERVED_PENDING_INCOMING) as usize {
+            pending(&mut after, 100 + i, &format!("/ip4/203.0.{}.{}/tcp/1", i / 4 / 200, (i / 4) % 200 + 1)).unwrap();
+        }
+        pending(&mut after, 10, "/ip4/198.51.100.40/tcp/7").expect("the validator's host is reserved before it connects");
+        assert_eq!(after.pending.reserved_for(&v), 1);
+        listen_failure(&mut after, 10, "/ip4/198.51.100.40/tcp/7");
+        // Four hours on, it is 24 h since it was last seen: it lapses as if there were no restart.
+        after.skew = std::time::Duration::from_secs(4 * 3600 + 1);
+        assert_eq!(denied(pending(&mut after, 11, "/ip4/198.51.100.40/tcp/8")).kind, Kind::PendingIncomingUnreserved);
+        // A source restored already past its TTL, or for a peer that is not reserved, or of no
+        // host, is not restored; a configured kind is never restored from the store.
+        let mut g = guard();
+        let stale = LearnedSource { source: Source::V4(std::net::Ipv4Addr::new(198, 51, 100, 41)), kind: SourceKind::Observed, age: RESERVED_SOURCE_TTL };
+        let stranger = PeerId::random();
+        g.restore_sources(stranger, [LearnedSource { age: std::time::Duration::ZERO, ..stale }]);
+        g.reserve(v);
+        g.restore_sources(v, [stale, LearnedSource { source: Source::Unknown, age: std::time::Duration::ZERO, ..stale }]);
+        g.restore_sources(v, [LearnedSource { kind: SourceKind::Configured, age: std::time::Duration::ZERO, ..stale }]);
+        assert!(g.learned_sources().is_empty(), "{:?}", g.learned_sources());
+        assert!(g.sources.sources_of(&stranger).is_empty());
     }
 
     /// Every `Denied` displays its limit and the thing it limits, so a log line about a refused

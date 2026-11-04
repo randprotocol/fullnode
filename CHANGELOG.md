@@ -14,6 +14,97 @@ stopped at v0.4 until 2026-09-30, when the entries v0.5 to v0.6.7 were written f
 
 Nothing yet.
 
+## v0.8.5 — 2026-11-04 (chain 21, node-only; audit v12 rows; no wire or consensus change)
+
+Node (audit v12 consensus-adjacent rows):
+
+- **CON-601 (node policy, every chain; consensus unchanged):** `rand-node run
+  --max-state-proof-tier <T>` caps the perps state-proof tier a node verifies for its pool when it
+  holds no verifier key for the proof's shape. A cold proof above it is refused at the pool's
+  pre-screen, before the ledger's segment, the executor's pre-key rules, a cold-build token or a
+  key build, so it is not verified, pooled, relayed or proposed there
+  (`StateProofAboveNodeTier`: not cached, no peer penalised). The default is the highest tier
+  whose documented key-build peak fits in three quarters of the host's RAM: 16 on 2 GB and 4 GB
+  hosts, 18 on 8 GB, 20 from about 22 GB. The startup warm skips shapes above the cap too. A
+  block carrying such a proof still applies and builds its key: that residual waits for chain
+  22's genesis engine pin. Also, the state-proof pre-key checks now refuse a FRI transcript of the
+  wrong structure (commit rounds, proof-of-work words and openings of unequal counts, no round,
+  an arity out of range, another query count, another final-polynomial length) before the key;
+  each is a check the verifier makes after the key, so no verdict moves.
+- **PERP-5 (genesis-gated, off on chain 21):** `perps.max_pending_digests` (requires
+  `sparse_windows`; `max_window_blocks..=1 048 576`). While that many recorded digests wait on a
+  state proof, deposits, orders, cancels and withdrawal requests are refused `DigestLogFull`
+  (retryable) until a proof drains the log; only the sparse-window heartbeat keeps recording.
+  Absent, the section's genesis bytes, JSON and stored row are unchanged (chain 21 replays byte
+  for byte); set, the stored row carries a second trailer version (`rand-perps-ext-2`), which an
+  older build cannot read. `rand_getPerps` reports `max_pending_digests` (0 when unset).
+
+Node (audit v12 network and privacy rows; node-only, no wire or consensus change):
+
+- **Validators' hosts stay reserved across a restart** (NET-601): the source addresses the
+  connection guard learned for validators' peers are written to the store every five minutes
+  (`reserved_sources`, beside the peer bindings) with the time each was last seen, and put back
+  before the first connection at the next start. Their 24 h expiry runs on across the stop. A
+  fleet-wide restart no longer leaves the reserved pending slots serving only the bootstraps'
+  hosts. A build that predates the row ignores it.
+- **No signed legacy copy of a node's own transactions by default** (PRIV-601): v0.8.3 and v0.8.4
+  published every fluffed transaction on the signed legacy topic `rand/<chain>/tx` as well as the
+  anonymous lane unless `--anonymous-tx-only`, which no deploy template set, so every fluff named
+  its fluffer. A node now publishes only on the anonymous lane; it still subscribes to and relays
+  the legacy topic, so transactions from nodes before v0.8.3 still arrive. `--legacy-tx-publish`
+  brings the signed copy back for a chain that still needs it. **Transaction origin hiding remains
+  design intent, not a measured property, until the first-spy test is re-run** against a fleet
+  running these fixes.
+- **Stem successors are chosen by trust and host, not by who dialled whom** (PRIV-602): the
+  router preferred peers this node had dialled, but identify-advertised addresses are redialled
+  every 30 s, so any peer that connected once became one. Successors now come first from trusted
+  peers (validators by their signed binding, bootstraps, `--reserved-peer`), and a public host is
+  one candidate and holds at most one of the two successor slots however many identities it runs.
+  In the router simulation, 24 identities on one host against 12 honest hosts take the
+  submitter's route in about 1/13 of epochs instead of 65%.
+- **A held stem transaction is answered like an unknown one** (PRIV-603): a copy of a
+  transaction this node holds on the stem, arriving over gossip, used to be accepted (and so
+  relayed) at once, and an RPC resubmission of one answered `Ok` at once, while an unknown one
+  waited for its verification. Both now take the ordinary verify queue and are answered on the
+  verdict; the gossip copy's verdict also ends the embargo. Costs one extra verification per
+  holder per such copy.
+- **One embargo distribution, and a silent successor is routed around** (PRIV-604): the
+  submitter's embargo was `2b + Exp(b/4)`, never under a relay's `b + min(Exp(b/4), b)`, so the
+  delay before a fluff told a successor that dropped the stem whether its predecessor was the
+  origin. Every holder now draws `b + min(Exp(b/4), b)`. The stem acknowledgement timeout drops
+  from 10 s to 1.5 s, under the 3 s default embargo, so a successor that never answers is dropped
+  and the transaction rerouted to the other successor before any embargo fires. (A successor
+  that acknowledges and then drops is still covered only by the embargo.)
+
+Node and deploy (audit v12 operations rows):
+
+- **Every roll writes the service's limits** (PROC-601): `deploy/lib/unit-limits.sh` writes
+  `rand-node.service.d/50-limits.conf` (`MemoryHigh=85%`, `LimitNOFILE=524288:524288`)
+  idempotently. `update-droplet.sh`, `roll-all.sh` and `vps-setup.sh` all call it, so the
+  `MemoryHigh` of #157, which lived only in two unit templates and reached 0 of 26 hosts, is on
+  every host after this roll. `SELFTEST=1 bash deploy/lib/unit-limits.sh` runs in CI.
+- **Early low-disk warning** (OPS-601): under 16 × the startup minimum (16 GB by default) the
+  node logs `disk_warn` hourly with the measured growth rate and the days left to `disk_low`;
+  `rand_getHealth` carries `disk_warn`, `free_bytes`, `disk_bytes_per_day` and
+  `disk_days_left` beside an unchanged status word. Archive sizing is in
+  `docs/node-hardware.md` (about 5 GB a day unpruned).
+- **The 27 Oct burst, re-run in process** (OPS-602): tests only. The admission byte budget bounds
+  counted bytes, not RSS, so on 2 GB hosts `MemoryHigh` and the 4 GB validator minimum remain the
+  OOM protection (`docs/rpc.md`).
+- **`--disable-scan-leaves`** (RPC-201): refuses `rand_getScanLeaves` on both listeners with
+  `-32601` naming the flag. Off by default, since wallets before v0.8.3 still scan with it.
+
+Client and prover pool:
+
+- **`rand multisig-private sign` applies the apps' fee rule** (MSC-2): it refuses a fee over
+  `--max-fee` (default 0.1 RAND) or over the RAND the proposal pays out; `--allow-high-fee`
+  overrides. `randprotocol-msig` gains `DEFAULT_MAX_FEE`, `fee_refusal` and
+  `sign_expecting_within_fee`.
+- **The router's per-address submit rate follows the pool's capacity** (VK-10): one address's
+  refill is `SUBMIT_SHARE` (default 0.3) of the members' measured capacity, so one address gets
+  about a third of the pool's jobs instead of about 85%. A set `SUBMIT_PER_MIN` is a ceiling, not
+  an override.
+
 ## v0.8.4 — 2026-11-01 (chain 21, node-only; rolled to end the 2026-11-01 OOM kills and commit stalls)
 
 - **Perps digests no longer cost per block in proportion to the chain's length.** A chain nobody

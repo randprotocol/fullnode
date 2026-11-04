@@ -81,6 +81,10 @@ pub struct NodeConfig {
     /// Proof-verification workers (`--verify-workers`); `None` sizes them to the host
     /// ([`VerifyLimits::for_host`], spec 2026-10-05 §6).
     pub verify_workers: Option<usize>,
+    /// CON-601: the highest state-proof tier this node verifies for its pool without a built key
+    /// (`--max-state-proof-tier`); `None` sizes it to the host
+    /// ([`crate::mempool::default_state_proof_tier_cap`]).
+    pub state_proof_tier_cap: Option<u8>,
     /// Apply incoming proposals on the consensus loop, as before (`--apply-proposals-inline`,
     /// spec 2026-10-11 off-loop apply §4.5); `false`, the default, applies them on a blocking
     /// worker ([`OFFLOOP_APPLIES`]).
@@ -1344,6 +1348,10 @@ struct Node {
     /// Free space on the data directory's filesystem, measured at startup and on every status
     /// tick; what `NodeStatus::disk_free_bytes` and `disk_low` publish (audit v4 OPS-3).
     disk_free_bytes: u64,
+    /// The data directory's measured growth (audit v12, OPS-601), and when the early warning was
+    /// last logged (once an hour while it holds).
+    disk_trend: crate::disk::DiskTrend,
+    disk_warned_at: Option<Instant>,
     /// Transaction hashes this node has already refused for a reason about their bytes, so a
     /// re-gossiped copy costs a hash lookup instead of a proof verification.
     refused: admission::RefusedCache,
@@ -1373,6 +1381,9 @@ struct Node {
     /// ([`crate::peer_bindings::announce_due`]).
     binding_announced_at: Option<Instant>,
     binding_announce_wanted: bool,
+    /// When the guard's learned sources were last written (audit v12, NET-601;
+    /// [`crate::peer_bindings::SOURCES_PERSIST_EVERY`]).
+    sources_persisted_at: Instant,
     /// The policy over every peer's `sync_bucket` (see [`admit_sync_request`]).
     sync_limiter: admission::PeerLimiter,
     /// This validator's signed not-held answers, re-served to repeated by-hash requests (SW-2).
@@ -2531,6 +2542,9 @@ pub struct RpcOptions {
     /// ([`AdmissionBudget::default_for`]). Here rather than in [`NodeConfig`] so the many literal
     /// `NodeConfig`s stay untouched.
     pub admission_budget: Option<usize>,
+    /// `--disable-scan-leaves` (audit v12, RPC-201): `rand_getScanLeaves` refused on both
+    /// listeners. Off by default until the next minor, so wallets before v0.8.3 keep scanning.
+    pub disable_scan_leaves: bool,
 }
 
 /// What [`start_with`] adds to the network beyond [`NodeConfig`] (audit v6, NET-1): its own
@@ -2549,6 +2563,9 @@ pub struct NetOptions {
     /// Gossip transactions on the anonymous lane only (`--anonymous-tx-only`, issue #146): see
     /// [`network::EdgeConfig::anonymous_tx_only`].
     pub anonymous_tx_only: bool,
+    /// Publish this node's transactions signed on the legacy topic too (`--legacy-tx-publish`;
+    /// audit v12, PRIV-601): [`network::EdgeConfig::legacy_tx_publish`]. Off by default.
+    pub legacy_tx_publish: bool,
     /// Dandelion++'s stem relay for transactions (`--dandelion`, `--dandelion-fluff-prob`,
     /// `--dandelion-embargo-ms`, issue #145). On by default: only peers that advertise the stem
     /// protocol are ever sent a stem, so it rolls onto a mixed fleet node by node.
@@ -2673,6 +2690,18 @@ pub async fn start_with(cfg: NodeConfig, rpc_options: RpcOptions, net_options: N
     if !peer_bindings.is_empty() {
         tracing::info!(bound = peer_bindings.len(), "validator peer bindings restored from the last run");
     }
+    // And the hosts those validators were seen at (audit v12, NET-601), so their reconnects take
+    // reserved pending slots before any of them has connected in this run.
+    let bound_sources = peer_bindings.restored_sources(
+        storage.reserved_sources().unwrap_or_else(|e| {
+            tracing::warn!("persisted reserved sources unreadable, starting without them: {e}");
+            Default::default()
+        }),
+        now_ms(),
+    );
+    if !bound_sources.is_empty() {
+        tracing::info!(peers = bound_sources.len(), "validators' reserved sources restored from the last run");
+    }
     let dandelion_stats = Arc::new(DandelionStats::default());
     let (net, mut events) = network::start_with(
         NetworkConfig {
@@ -2686,8 +2715,10 @@ pub async fn start_with(cfg: NodeConfig, rpc_options: RpcOptions, net_options: N
         network::EdgeConfig {
             reserved: net_options.reserved_peers.clone(),
             bound: peer_bindings.bound_peers(),
+            bound_sources,
             strict_gossip: net_options.strict_gossip,
             anonymous_tx_only: net_options.anonymous_tx_only,
+            legacy_tx_publish: net_options.legacy_tx_publish,
             dandelion: net_options.dandelion.enabled,
         },
     )
@@ -2785,6 +2816,7 @@ pub async fn start_with(cfg: NodeConfig, rpc_options: RpcOptions, net_options: N
             refusals: refusals.clone(),
             ws_conns: ws_conns.clone(),
             viewing,
+            scan_leaves: !rpc_options.disable_scan_leaves,
     };
     let public_rpc = match rpc_options.public_addr {
         Some(addr) => Some(rpc::serve(addr, rpc_state.for_public_listener()).await.with_context(|| format!("binding --public-rpc {addr}"))?),
@@ -2811,6 +2843,26 @@ pub async fn start_with(cfg: NodeConfig, rpc_options: RpcOptions, net_options: N
         hs.view(),
         hs.is_validator()
     );
+
+    // CON-601: the highest state-proof tier this node builds a verifier key for outside a block
+    // — its pool and its startup warm. Node policy: a block carrying a proof above it still
+    // applies and builds the key (chain 22's genesis engine pin is the consensus fix).
+    let state_proof_tier_cap = cfg
+        .state_proof_tier_cap
+        .unwrap_or_else(|| crate::mempool::default_state_proof_tier_cap(randprotocol_prover::memory::total_bytes()));
+    if let Some(p) = hs.committed_ledger().perps() {
+        if p.config.max_tier > state_proof_tier_cap {
+            tracing::warn!(
+                "state proofs: this chain allows tier {} but this node verifies none above tier {state_proof_tier_cap} for its pool \
+                 (a tier-{} key build needs ~{} MiB; --max-state-proof-tier); a block carrying one still builds its key",
+                p.config.max_tier,
+                p.config.max_tier,
+                crate::mempool::state_proof_key_build_peak_bytes(p.config.max_tier) >> 20
+            );
+        } else {
+            tracing::info!("state proofs: up to the chain's tier {} verified for the pool", p.config.max_tier);
+        }
+    }
 
     // Warm verifier keys off the consensus thread: the bundle guest's always (every block can
     // carry bundles, so the first one must not pay for the key), every program already on
@@ -2882,7 +2934,10 @@ pub async fn start_with(cfg: NodeConfig, rpc_options: RpcOptions, net_options: N
             }
             ex.warm_bundle();
             tracing::info!("bundle verifier key warmed");
-            // Then the engine's keys (after the bundle's, which every block needs).
+            // Then the engine's keys (after the bundle's, which every block needs) — none above
+            // the node's tier cap (CON-601): a key build there is past this host's memory, and a
+            // node that died warming one would die again at every restart.
+            let perp_shapes: Vec<_> = perp_shapes.into_iter().filter(|s| s.tier <= state_proof_tier_cap).collect();
             for shape in &perp_shapes {
                 ex.warm_perp(shape);
             }
@@ -2926,6 +2981,7 @@ pub async fn start_with(cfg: NodeConfig, rpc_options: RpcOptions, net_options: N
     // RESCAN-LEDGER-1: this pool admits faucet mints from the genesis's minters only.
     let mut mempool = Mempool::new(10_000);
     mempool.set_faucet_minters(admission::faucet_minters(&gs));
+    mempool.set_state_proof_tier_cap(state_proof_tier_cap);
     if let Some(p) = cfg.gas_policy {
         mempool.set_gas_policy(p);
     }
@@ -2972,6 +3028,8 @@ pub async fn start_with(cfg: NodeConfig, rpc_options: RpcOptions, net_options: N
         no_peer_warned_at: None,
         highest_proposal_seen: 0,
         disk_free_bytes,
+        disk_trend: crate::disk::DiskTrend::default(),
+        disk_warned_at: None,
         refused: admission::RefusedCache::new(admission::REFUSED_CACHE_ENTRIES),
         proof_refused: admission::ProofRefusedCache::new(admission::PROOF_REFUSED_ENTRIES),
         limiter: admission::PeerLimiter::new(admission::PEER_TX_BURST, admission::PEER_TX_PER_SEC),
@@ -2987,6 +3045,7 @@ pub async fn start_with(cfg: NodeConfig, rpc_options: RpcOptions, net_options: N
         binding_signer,
         binding_announced_at: None,
         binding_announce_wanted: false,
+        sources_persisted_at: Instant::now(),
         sync_limiter: admission::PeerLimiter::new(SYNC_REQUEST_BURST, SYNC_REQUEST_PER_SEC),
         not_held_signed: NotHeldCache::default(),
         peer_memory: PeerMemory::default(),
@@ -3102,6 +3161,7 @@ impl Node {
                     self.check_disk();
                     self.broadcast_status().await;
                     self.announce_binding().await;
+                    self.persist_reserved_sources().await;
                     self.expire_parked_requests().await;
                 }
                 _ = sync_tick.tick() => self.maybe_sync().await,
@@ -3124,6 +3184,11 @@ impl Node {
             Ok(free) => self.disk_free_bytes = free,
             Err(e) => tracing::warn!("free space of {}: {e}", self.cfg.datadir.display()),
         }
+        let now_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        self.disk_trend.observe(now_secs, self.disk_free_bytes);
         if self.disk_low() {
             tracing::warn!(
                 "{} has {} MB free, under {} MB: disk_low (audit v4 OPS-3)",
@@ -3131,7 +3196,31 @@ impl Node {
                 self.disk_free_bytes / (1 << 20),
                 self.cfg.min_free_disk_bytes.saturating_mul(crate::disk::DISK_LOW_FACTOR) / (1 << 20)
             );
+        } else if self.disk_warn() && self.disk_warned_at.is_none_or(|t| t.elapsed() >= Duration::from_secs(3600)) {
+            // OPS-601: an unpruned archive grows >= 5 GB/day; this is the days-ahead warning,
+            // once an hour (disk_low above warns every tick).
+            self.disk_warned_at = Some(Instant::now());
+            let rate = self.disk_trend.bytes_per_day();
+            tracing::warn!(
+                free_mb = self.disk_free_bytes / (1 << 20),
+                warn_mb = self.cfg.min_free_disk_bytes.saturating_mul(crate::disk::DISK_WARN_FACTOR) / (1 << 20),
+                mb_per_day = rate.map(|r| r / (1 << 20)),
+                days_to_disk_low = self.disk_days_left(),
+                "{} is running low on disk: disk_warn (OPS-601; prune with --prune-history or resize, docs/node-hardware.md)",
+                self.cfg.datadir.display(),
+            );
         }
+    }
+
+    /// Free space under `DISK_WARN_FACTOR` times the startup minimum (audit v12, OPS-601).
+    fn disk_warn(&self) -> bool {
+        crate::disk::disk_warn(self.disk_free_bytes, self.cfg.min_free_disk_bytes)
+    }
+
+    /// Days until `disk_low` at the measured growth (OPS-601).
+    fn disk_days_left(&self) -> Option<f64> {
+        let floor = self.cfg.min_free_disk_bytes.saturating_mul(crate::disk::DISK_LOW_FACTOR);
+        self.disk_trend.days_until(self.disk_free_bytes, floor)
     }
 
     /// `Storage::prune_floor`, defaulting to 0 (an archive's floor) and logging when the meta
@@ -3149,6 +3238,9 @@ impl Node {
         s.height = self.hs.committed_height();
         s.disk_free_bytes = self.disk_free_bytes;
         s.disk_low = self.disk_low();
+        s.disk_warn = self.disk_warn();
+        s.disk_bytes_per_day = self.disk_trend.bytes_per_day();
+        s.disk_days_left = self.disk_days_left();
         s.prune_floor = self.prune_floor_or_zero();
         s.prune_history_secs = self.cfg.prune_history.map(|d| d.as_secs());
         s.head_hash = self.hs.committed_hash().to_hex();
@@ -3324,6 +3416,11 @@ impl Node {
             // verified and then lost a pool conflict is still a valid message, and another node's
             // pool may have room for it.
             VerifySource::Gossip(id) => {
+                // One this node held on the stem was fluffed elsewhere: its embargo is off
+                // (PRIV-603: taken here, on the verdict, not when the copy arrived).
+                if !self.dandelion.stempool.is_empty() {
+                    self.dandelion.stempool.take(&hash);
+                }
                 if v.result.is_ok() {
                     let _ = self.mempool.insert_verified(v.tx, self.hs.tip_ledger(), self.executor.as_ref());
                 }
@@ -3542,24 +3639,12 @@ impl Node {
             self.report(id, outcome).await;
             return Ok(());
         }
-        // Dandelion++ (issue #145): a transaction this node holds on the stem came back fluffed by
-        // another node. It verified here already: pooled, accepted (so relayed), and its embargo
-        // is off; a park waiting for it is filled as from any gossiped body. The hash is taken
-        // only while the stempool holds anything.
-        if !self.dandelion.stempool.is_empty() {
-            let hash = tx.hash();
-            if let Some(held) = self.dandelion.stempool.take(&hash) {
-                let a = match self.mempool.insert_verified(held, self.hs.tip_ledger(), self.executor.as_ref()) {
-                    Ok(_) => admission::Acceptance::Accept,
-                    Err(e) => admission::acceptance_for_pool(&e, hash, &mut self.refused),
-                };
-                self.report(id, GossipOutcome::Report(a)).await;
-                if self.parked.values().any(|p| p.wants(&hash)) {
-                    self.fill_parks(tx).await?;
-                }
-                return Ok(());
-            }
-        }
+        // Dandelion++ (issue #145): a transaction this node holds on the stem may come back here,
+        // fluffed by another node. It is judged exactly as one this node never saw — the same
+        // pre-screen, the same verify queue, reported (and so relayed) only on its verdict — and
+        // only the verdict takes it out of the stempool (`on_verdict`). Answering a held one at
+        // once let a peer that published a copy time this node's relay and find the stem path
+        // (audit v12, PRIV-603). The cost is a second verification per holder.
         // I1: a state proof this node already refused over the segment the tip builds for it is
         // not verified again. Not a byte verdict (the segment is state), so an `Ignore`.
         if self.cached_proof_refusal(&tx).is_some() {
@@ -3661,12 +3746,10 @@ impl Node {
     /// bounded by `RpcState::max_body_bytes`.
     async fn submit_tx(&mut self, tx: Transaction, reply: oneshot::Sender<Result<Hash, MempoolError>>) {
         let hash = tx.hash();
-        // Dandelion++ (issue #145): one already on the stem from here is not stemmed again. The
-        // answer is the one a first submission gets, so it says nothing about the stempool.
-        if self.dandelion.stempool.contains(&hash) {
-            let _ = reply.send(Ok(hash));
-            return;
-        }
+        // Dandelion++ (issue #145): one already on the stem from here is not stemmed again — but
+        // it is not answered early either (audit v12, PRIV-603). It takes the pre-screen and the
+        // verify queue like any submission, and its verdict finds it held (`route_verified`) and
+        // answers `Ok`, the answer a first submission gets, after the same wait.
         let outcome = GossipOutcome::for_transaction(
             &tx,
             None,
@@ -3727,14 +3810,37 @@ impl Node {
         self.net.broadcast(GossipMessage::PeerBinding(binding)).await;
     }
 
+    /// Write the guard's learned sources for the validators' peers (audit v12, NET-601), every
+    /// [`crate::peer_bindings::SOURCES_PERSIST_EVERY`], so a restart — the whole fleet's at once
+    /// included — reserves every validator's host from the start. The swarm is asked with a
+    /// deadline: the loop never waits on a busy network task for a cache.
+    async fn persist_reserved_sources(&mut self) {
+        let now = Instant::now();
+        if now.saturating_duration_since(self.sources_persisted_at) < crate::peer_bindings::SOURCES_PERSIST_EVERY {
+            return;
+        }
+        self.sources_persisted_at = now;
+        let Ok(learned) = tokio::time::timeout(Duration::from_secs(1), self.net.learned_sources()).await else {
+            tracing::debug!("learned sources: the network task did not answer in time");
+            return;
+        };
+        let rows = self.peer_bindings.source_rows(&learned, now_ms());
+        if let Err(e) = self.storage.put_reserved_sources(&rows) {
+            tracing::warn!("persisting reserved sources: {e}");
+        }
+    }
+
     /// Do what a binding offer asked for (audit v6, NET-1): reserve, un-reserve, persist.
     async fn apply_binding_change(&mut self, change: crate::peer_bindings::BindingChange) {
         for p in change.unreserve {
             self.net.unreserve_peer(p).await;
+            self.dandelion.router.set_trusted(&p, false);
         }
         if let Some(p) = change.reserve {
             tracing::info!(peer = %p, "validator peer binding recorded; peer reserved");
             self.net.reserve_peer(p).await;
+            // A stem successor candidate from now on (PRIV-602).
+            self.dandelion.router.set_trusted(&p, true);
         }
         if change.persist {
             if let Err(e) = self.storage.put_peer_bindings(&self.peer_bindings.rows()) {
@@ -4335,9 +4441,12 @@ impl Node {
                 self.on_sync_response(peer, request_id, response).await?;
             }
             // Dandelion++ (issue #145).
-            NetworkEvent::StemPeer { peer, outbound } => {
+            NetworkEvent::StemPeer { peer, host } => {
                 if self.dandelion.cfg.enabled {
-                    self.dandelion.router.add_peer(peer, outbound, &mut self.dandelion.rng);
+                    // Trusted by its binding (or the operator's flags), never by how it connected
+                    // (audit v12, PRIV-602).
+                    let trusted = self.peer_bindings.is_validator_peer(&peer);
+                    self.dandelion.router.add_peer(peer, trusted, host, &mut self.dandelion.rng);
                     self.dandelion_stats.stem_peers.store(self.dandelion.router.capable(), Ordering::Relaxed);
                 }
             }
@@ -7859,6 +7968,7 @@ mod tests {
             min_free_disk_bytes: 0,
             verify_workers: None,
             apply_inline: false,
+            state_proof_tier_cap: None,
             prune_history: None,
             gas_policy: None,
             msauth: Default::default(),
@@ -7906,6 +8016,8 @@ mod tests {
             no_peer_warned_at: None,
             highest_proposal_seen: 0,
             disk_free_bytes: u64::MAX,
+            disk_trend: crate::disk::DiskTrend::default(),
+            disk_warned_at: None,
             refused: admission::RefusedCache::new(16),
             proof_refused: admission::ProofRefusedCache::new(16),
             limiter: admission::PeerLimiter::new(admission::PEER_TX_BURST, admission::PEER_TX_PER_SEC),
@@ -7921,6 +8033,7 @@ mod tests {
             binding_signer: None,
             binding_announced_at: None,
             binding_announce_wanted: false,
+            sources_persisted_at: Instant::now(),
             sync_limiter: admission::PeerLimiter::new(SYNC_REQUEST_BURST, SYNC_REQUEST_PER_SEC),
             not_held_signed: NotHeldCache::default(),
             peer_memory: PeerMemory::default(),
@@ -8107,6 +8220,46 @@ mod tests {
             assert_eq!(zk.perp_key_builds(), 1, "{other_side}: S's key is built once");
             assert!(zk.perp_key_ready(&shape));
         }
+    }
+
+    /// CON-601: through the node's own submission path, a cold state proof above the node's tier
+    /// cap is answered `StateProofAboveNodeTier` and never queued for verification — the only
+    /// road to a key build — nor pooled or cached; one within the cap is queued as before.
+    #[tokio::test]
+    async fn con601_a_cold_state_proof_above_the_tier_cap_never_reaches_verification() {
+        use crate::storage::fixtures::{make_perps_block, perp_state_proof_tx, perps_genesis};
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
+        let gs = perps_genesis(7);
+        storage.init_genesis(&gs).unwrap();
+        let mut ledger = gs.ledger.clone();
+        let mut b1 = make_perps_block(&gs.block, &mut ledger, vec![], &key(1));
+        b1.qc.votes = vec![Vote::sign(&randprotocol_core::consensus::SigningDomain::v0(Hash::ZERO), b1.qc.view, b1.qc.block_hash, &key(1))];
+        storage.commit(std::slice::from_ref(&b1), &ledger, &[], &StubExecutor).unwrap();
+        let hs = resume_consensus(&storage, &gs, Some(key(1)), Duration::from_secs(1), Duration::from_secs(8), Arc::new(StubExecutor)).unwrap();
+        let (mut node, _seen) = bare_node(storage, gs.clone(), hs);
+        node.mempool.set_state_proof_tier_cap(14);
+
+        let honest = perp_state_proof_tx(&ledger, 1, [7; 8], vec![], 0);
+        let cold = |tier: u8| {
+            let mut tx = honest.clone();
+            let randprotocol_core::Action::PerpStateProof { proof, .. } = &mut tx.action else { unreachable!() };
+            proof[4] = tier;
+            proof[38] = 5; // input height 5: a shape the stub holds no key for
+            tx
+        };
+        let over = cold(16);
+        let (reply, answer) = oneshot::channel();
+        node.submit_tx(over.clone(), reply).await;
+        assert_eq!(answer.await.unwrap().unwrap_err(), MempoolError::StateProofAboveNodeTier { tier: 16, cap: 14 });
+        assert_eq!((node.verify_in_flight, node.verify_queue.len()), (0, 0), "never queued for verification: no key build can start");
+        assert!(node.refused.get(&over.hash()).is_none(), "not cached as a refusal");
+        assert!(node.mempool.get(&over.hash()).is_none(), "not pooled");
+
+        let within = cold(14);
+        let (reply, _answer) = oneshot::channel();
+        node.submit_tx(within, reply).await;
+        assert_eq!(node.verify_in_flight + node.verify_queue.len(), 1, "a tier within the cap is verified as before");
     }
 
     /// CON-60 (review): a pool verification of a state proof whose key is not built never waits
@@ -8307,7 +8460,7 @@ mod tests {
         let (mut node, seen) = bare_node(storage, gs, hs);
         node.dandelion = Dandelion::new(DandelionConfig { fluff_prob: q, embargo, seed: Some(7), ..DandelionConfig::default() });
         let succ = PeerId::random();
-        node.dandelion.router.add_peer(succ, true, &mut node.dandelion.rng);
+        node.dandelion.router.add_peer(succ, true, None, &mut node.dandelion.rng);
         (d, node, seen, succ)
     }
 
@@ -8376,7 +8529,9 @@ mod tests {
 
     /// The node's own RPC submission takes the stem: the caller hears `Ok`, the successor gets
     /// the transaction, nothing is published. The same bytes submitted again are answered alike
-    /// and neither verified nor stemmed a second time.
+    /// and not stemmed a second time — and, audit v12 PRIV-603, not answered before a
+    /// verification either: a held transaction waits on the verify queue as an unknown one does,
+    /// so the answer's timing does not say the node holds it.
     #[tokio::test]
     async fn an_rpc_submission_is_stemmed_once_and_a_resubmission_answered_alike() {
         let (_d, mut node, mut seen, succ) = stem_node(1.0, Duration::from_secs(60));
@@ -8392,12 +8547,17 @@ mod tests {
         assert_eq!(broadcast_txs(&out), vec![]);
         assert_eq!(tx_status(&mut node, h).await, rpc::PoolStatus::Unknown);
 
-        let (reply, answer) = oneshot::channel();
+        node.verify_limits = VerifyLimits { in_flight: 0, queue: 64 };
+        let (reply, mut answer) = oneshot::channel();
         node.submit_tx(tx.clone(), reply).await;
+        assert!(answer.try_recv().is_err(), "a held transaction is not answered before its verification");
+        assert_eq!(node.verify_queue.len(), 1, "queued for verification, as an unknown one is");
+        let (vtx, source, charge) = node.verify_queue.pop_front().unwrap();
+        node.on_verdict(Verdict { tx: vtx, result: Ok(()), source, proof_key: None, busy: false, charge }).await.unwrap();
         assert_eq!(answer.await.unwrap(), Ok(h), "a resubmission hears what the first submission heard");
-        assert!(node.verify_queue.is_empty() && node.verify_in_flight == 0, "not verified again");
         assert!(drain(&mut seen).await.is_empty(), "not stemmed again");
         assert_eq!(node.dandelion_stats.get(|s| &s.stem_sent), 1);
+        assert!(node.dandelion.stempool.contains(&h), "still held for its embargo");
     }
 
     /// With no stem-capable peer (a fleet of older nodes) or Dandelion off, a submission is
@@ -8410,7 +8570,7 @@ mod tests {
             node.dandelion = Dandelion::new(cfg.clone());
             if !cfg.enabled {
                 // A capable peer is ignored when Dandelion is off.
-                node.on_network_event(NetworkEvent::StemPeer { peer: PeerId::random(), outbound: true }).await.unwrap();
+                node.on_network_event(NetworkEvent::StemPeer { peer: PeerId::random(), host: None }).await.unwrap();
             }
             let tx = next_tx(node.hs.tip_ledger(), 3);
             let h = tx.hash();
@@ -8442,23 +8602,36 @@ mod tests {
         assert_eq!(node.dandelion_stats.get(|s| &s.fluff_coin), 1);
     }
 
-    /// A transaction held on the stem that comes back fluffed over gossip is pooled from the
-    /// stempool — accepted, so relayed, without a second verification — and its embargo is off.
+    /// A transaction held on the stem that comes back fluffed over gossip is judged as one this
+    /// node never saw (audit v12, PRIV-603): queued for verification and reported — so relayed —
+    /// only on its verdict, exactly as an unknown transaction delivered beside it. Answering the
+    /// held one at once let a peer read the stem path off the relay delay. On the verdict it is
+    /// pooled, accepted, and its embargo is off.
     #[tokio::test]
-    async fn a_held_transaction_seen_on_gossip_is_pooled_without_verifying_again() {
+    async fn a_held_transaction_seen_on_gossip_waits_for_a_verification_like_an_unknown_one() {
         let (_d, mut node, mut seen, _succ) = stem_node(0.0, Duration::from_secs(60));
-        let tx = next_tx(node.hs.tip_ledger(), 5);
-        let h = tx.hash();
-        node.on_verdict(Verdict { tx: tx.clone(), result: Ok(()), source: VerifySource::Stem(PeerId::random()), proof_key: None, busy: false, charge: AdmissionCharge::none() })
+        node.verify_limits = VerifyLimits { in_flight: 0, queue: 64 };
+        let ledger = node.hs.tip_ledger().clone();
+        let (held, unknown) = (next_tx(&ledger, 5), next_tx(&ledger, 8));
+        let h = held.hash();
+        node.on_verdict(Verdict { tx: held.clone(), result: Ok(()), source: VerifySource::Stem(PeerId::random()), proof_key: None, busy: false, charge: AdmissionCharge::none() })
             .await
             .unwrap();
         drain(&mut seen).await;
-        node.on_gossiped_tx(tx, gossip_id()).await.unwrap();
+        assert!(node.dandelion.stempool.contains(&h));
+        node.on_gossiped_tx(held, gossip_id()).await.unwrap();
+        node.on_gossiped_tx(unknown.clone(), gossip_id()).await.unwrap();
+        assert!(drain(&mut seen).await.is_empty(), "neither is reported before its verification");
+        assert_eq!(node.verify_queue.len(), 2, "both wait on the verify queue");
+        for _ in 0..2 {
+            let (tx, source, charge) = node.verify_queue.pop_front().unwrap();
+            node.on_verdict(Verdict { tx, result: Ok(()), source, proof_key: None, busy: false, charge }).await.unwrap();
+        }
         let out = drain(&mut seen).await;
-        assert!(out.iter().any(|s| matches!(s, Seen::Report(libp2p::gossipsub::MessageAcceptance::Accept))), "accepted: relayed on");
-        assert!(node.mempool.contains(&h));
+        let accepts = out.iter().filter(|s| matches!(s, Seen::Report(libp2p::gossipsub::MessageAcceptance::Accept))).count();
+        assert_eq!(accepts, 2, "both accepted on their verdicts");
+        assert!(node.mempool.contains(&h) && node.mempool.contains(&unknown.hash()));
         assert!(node.dandelion.stempool.is_empty() && node.dandelion.stempool.next_deadline().is_none(), "no embargo left");
-        assert!(node.verify_queue.is_empty() && node.verify_in_flight == 0, "not verified again");
     }
 
     /// Issue #157 × #145: a stemmed transaction waits on the verify queue with its bytes charged
@@ -8504,7 +8677,7 @@ mod tests {
     async fn a_looping_stem_goes_on_and_a_failed_send_moves_to_the_next_successor() {
         let (_d, mut node, mut seen, succ) = stem_node(0.0, Duration::from_secs(60));
         let second = PeerId::random();
-        node.on_network_event(NetworkEvent::StemPeer { peer: second, outbound: true }).await.unwrap();
+        node.on_network_event(NetworkEvent::StemPeer { peer: second, host: None }).await.unwrap();
         assert_eq!(node.dandelion.router.successors().len(), 2);
         let tx = next_tx(node.hs.tip_ledger(), 6);
         let h = tx.hash();
@@ -8531,6 +8704,39 @@ mod tests {
         node.on_network_event(NetworkEvent::PeerDisconnected(to)).await.unwrap();
         assert!(node.dandelion.router.successors().is_empty());
         assert_eq!(node.dandelion_stats.stem_peers.load(Ordering::Relaxed), 0);
+    }
+
+    /// Audit v12, PRIV-602: a stem peer is a preferred successor because a validator's binding
+    /// names it, never because of how it connected: with a validator's peer among a dozen others
+    /// (all on hosts of their own), the validator's is a successor in every epoch, and a binding
+    /// recorded later promotes a peer already known.
+    #[tokio::test]
+    async fn a_stem_successor_is_preferred_for_its_binding_not_its_connection() {
+        let (_d, mut node, _seen, _succ) = stem_node(0.0, Duration::from_secs(60));
+        node.dandelion = Dandelion::new(DandelionConfig { seed: Some(3), epoch: Duration::from_secs(1), ..DandelionConfig::default() });
+        let validator = PeerId::random();
+        node.peer_bindings.insert_for_test(Keypair::from_seed([77; 32]).unwrap().address(), validator);
+        let host = |n: u8| Some(network::edge::Source::V4(std::net::Ipv4Addr::new(203, 0, 113, n)));
+        for n in 1..=12u8 {
+            node.on_network_event(NetworkEvent::StemPeer { peer: PeerId::random(), host: host(n) }).await.unwrap();
+        }
+        node.on_network_event(NetworkEvent::StemPeer { peer: validator, host: host(50) }).await.unwrap();
+        let t0 = Instant::now();
+        for k in 0..20 {
+            node.dandelion.router.route(Edge::Local, t0 + Duration::from_secs(k), &mut node.dandelion.rng);
+            assert!(node.dandelion.router.successors().contains(&validator), "epoch {k}: the validator's peer is not a successor");
+        }
+        // A binding recorded after the peer was known promotes it too.
+        let late = PeerId::random();
+        node.on_network_event(NetworkEvent::StemPeer { peer: late, host: host(51) }).await.unwrap();
+        node.peer_bindings.insert_for_test(Keypair::from_seed([78; 32]).unwrap().address(), late);
+        node.apply_binding_change(crate::peer_bindings::BindingChange { reserve: Some(late), unreserve: vec![], persist: false }).await;
+        node.dandelion.router.route(Edge::Local, t0 + Duration::from_secs(100), &mut node.dandelion.rng);
+        let mut s = node.dandelion.router.successors().to_vec();
+        s.sort();
+        let mut want = vec![validator, late];
+        want.sort();
+        assert_eq!(s, want, "both validators' peers, none of the others");
     }
 
     /// A peer's stem is pre-screened like gossip — over its allowance it is dropped unverified —
@@ -9389,6 +9595,59 @@ mod tests {
         let (reply, _rx) = oneshot::channel();
         node.submit_tx(third.clone(), reply).await;
         assert_eq!(node.verify_queue.len(), usize::from(room));
+    }
+
+    /// Audit v12, OPS-602, the node's half: a burst of RPC submissions at once against a budget
+    /// that holds three. Every submission is answered exactly once; the ones past the budget hear
+    /// `AdmissionBusy` (`-32005`) before anything is queued, and every one answered `Ok` is in the
+    /// pool (or the stempool) when its caller hears it — the node never acknowledges a submission
+    /// it then drops. The budget's bytes in use never exceed its limit at any step.
+    #[tokio::test]
+    async fn a_submission_burst_is_either_pooled_or_told_busy_never_acknowledged_and_dropped() {
+        const BURST: u32 = 8;
+        const HELD: usize = 3;
+        let (_d, storage, gs, hs) = replica_past_a_boundary();
+        let (mut node, _seen) = bare_node(storage, gs, hs);
+        let ledger = node.hs.tip_ledger().clone();
+        let txs: Vec<Transaction> = (1..=BURST).map(|i| next_tx(&ledger, i)).collect();
+        let each = admission::charge_of(&txs[0]);
+        assert!(txs.iter().all(|t| admission::charge_of(t) == each), "equal sizes, as the 27 Oct burst");
+        node.admission = AdmissionBudget::new(HELD * each);
+        node.verify_limits = VerifyLimits { in_flight: 0, queue: 64 };
+
+        let mut replies = Vec::new();
+        for tx in &txs {
+            let (reply, rx) = oneshot::channel();
+            node.submit_tx(tx.clone(), reply).await;
+            assert!(node.admission.in_use() <= node.admission.limit());
+            replies.push((tx.hash(), rx));
+        }
+        assert_eq!(node.verify_queue.len(), HELD, "three queued, the rest refused at once");
+        // The verdicts, as the workers would hand them back.
+        while let Some((tx, source, charge)) = node.verify_queue.pop_front() {
+            node.on_verdict(Verdict { tx, result: Ok(()), source, proof_key: None, busy: false, charge }).await.unwrap();
+            assert!(node.admission.in_use() <= node.admission.limit());
+        }
+        let (mut acked, mut busy) = (0, 0);
+        for (hash, mut rx) in replies {
+            match rx.try_recv().expect("every submission is answered") {
+                Ok(h) => {
+                    assert_eq!(h, hash);
+                    assert!(
+                        node.mempool.contains(&hash) || node.dandelion.stempool.contains(&hash),
+                        "acknowledged {hash} is held by this node"
+                    );
+                    acked += 1;
+                }
+                Err(e) => {
+                    assert!(matches!(e, MempoolError::AdmissionBusy(_)) && e.is_retryable(), "{e}");
+                    assert!(!node.mempool.contains(&hash));
+                    busy += 1;
+                }
+            }
+        }
+        assert_eq!((acked, busy), (HELD, BURST as usize - HELD));
+        assert_eq!(node.admission.in_use(), 0, "every charge back once its verdict is handled");
     }
 
     /// A connected forwarder whose transaction allowance is spent, under a limiter that does not

@@ -202,3 +202,77 @@ fn an_amount_pin_is_met_exactly_or_refused() {
     let e = check_proposal_expecting(&prop, &pol, &[to.clone(), format!("{to}:1.x")]).unwrap_err().to_string();
     assert!(e.starts_with("expected recipient 1 has a malformed amount"), "{e}");
 }
+
+// ---- MSC-2: the signer's fee rule, the five apps' rule (clients signers.js `verdict`) ----
+
+use randprotocol_msig::{fee_refusal, sign_expecting_within_fee, Burns, OutputSummary, DEFAULT_MAX_FEE};
+
+fn summary_paying(fee: u64, outputs: &[(bool, u64, u32)]) -> ProposalSummary {
+    ProposalSummary {
+        chain_id: 7,
+        genesis: "00".repeat(32),
+        recipients_checked: true,
+        outputs: outputs
+            .iter()
+            .map(|&(to_account, amount, asset)| OutputSummary {
+                owner_fingerprint: "f".repeat(16),
+                to_account,
+                amount,
+                asset,
+                memo: String::new(),
+                matches: None,
+            })
+            .collect(),
+        fee,
+        burns: Burns { burn_a: 0, burn_asset: 0, burn_r: 0 },
+        expires_at: 100,
+        signing_message: [0; 45],
+        policy_fingerprint: String::new(),
+    }
+}
+
+const RAND: u64 = 1_000_000_000;
+
+#[test]
+fn the_default_fee_limit_is_the_apps_0_1_rand() {
+    assert_eq!(DEFAULT_MAX_FEE, RAND / 10);
+}
+
+#[test]
+fn a_fee_over_the_signers_limit_is_refused() {
+    let s = summary_paying(RAND / 10 + 1, &[(false, 10 * RAND, 0), (true, RAND, 0)]);
+    let e = fee_refusal(&s, DEFAULT_MAX_FEE).expect("over 0.1 RAND").to_string();
+    assert!(e.contains("more than this signer allows") && e.contains("0.1"), "{e}");
+    assert!(fee_refusal(&summary_paying(RAND / 10, &[(false, 10 * RAND, 0)]), DEFAULT_MAX_FEE).is_none(), "at the limit is fine");
+    assert!(fee_refusal(&s, RAND).is_none(), "a raised limit admits it");
+}
+
+#[test]
+fn a_fee_over_the_rand_paid_out_is_refused_change_and_tokens_not_counted() {
+    // Pays 0.01 RAND out, 5 RAND back to the account (change), fee 0.05: over what it pays.
+    let s = summary_paying(5 * RAND / 100, &[(false, RAND / 100, 0), (true, 5 * RAND, 0)]);
+    let e = fee_refusal(&s, DEFAULT_MAX_FEE).expect("fee over the payment").to_string();
+    assert!(e.contains("more than the") && e.contains("pays out"), "{e}");
+    // A token-only proposal is bounded by the limit alone.
+    let tok = summary_paying(5 * RAND / 100, &[(false, 1, 3), (true, RAND, 0)]);
+    assert!(fee_refusal(&tok, DEFAULT_MAX_FEE).is_none());
+    // A change-only proposal too.
+    let change = summary_paying(5 * RAND / 100, &[(true, RAND, 0)]);
+    assert!(fee_refusal(&change, DEFAULT_MAX_FEE).is_none());
+    // Zero-amount outputs pay nothing.
+    let zero = summary_paying(5 * RAND / 100, &[(false, 0, 0), (false, RAND / 100, 0)]);
+    assert!(fee_refusal(&zero, DEFAULT_MAX_FEE).is_some());
+}
+
+#[test]
+fn signing_within_the_fee_limit_applies_the_rule_and_none_overrides_it() {
+    let (members, _) = seeds();
+    let (p, pol) = (fixture("proposal-valid.json"), fixture("policy.json"));
+    let to = expected()["recipient"].as_str().unwrap().to_string();
+    let to = randprotocol_msig::parse_expected_recipients(&[to]).unwrap();
+    // The valid fixture pays 10 RAND with a 0.001 RAND fee: within the default.
+    assert_eq!(sign_expecting_within_fee(&p, &pol, &members[0], &to, Some(DEFAULT_MAX_FEE)).unwrap(), sign_expecting(&p, &pol, &members[0], &[expected()["recipient"].as_str().unwrap()]).unwrap());
+    let e = sign_expecting_within_fee(&p, &pol, &members[0], &to, Some(RAND / 10_000)).unwrap_err().to_string();
+    assert!(e.contains("more than this signer allows"), "{e}");
+    assert!(sign_expecting_within_fee(&p, &pol, &members[0], &to, None).is_ok(), "None is the explicit override");
+}

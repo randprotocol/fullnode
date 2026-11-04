@@ -8,14 +8,19 @@
 //! (`Storage::put_peer_bindings`) and reserved again at the next start, so a restart — and every
 //! node-by-node roll — finds its validators reserved before gossip has said anything. A freshly
 //! cut chain starts with none: that is what the bootstrap reservation and `--reserved-peer` are
-//! for.
+//! for. The hosts those peers were seen at — what lets a validator's handshake take a reserved
+//! pending slot before its identity is known — are persisted beside the record
+//! (`Storage::put_reserved_sources`, audit v12 NET-601) and restored at the next start with their
+//! ages, so a restart of the whole fleet at once does not leave the reserved slots to the
+//! bootstraps' hosts alone.
 //!
 //! The decision is a function of its inputs ([`PeerBindings::offer`]) so every path is tested
 //! without a swarm; the node loop does the I/O it asks for ([`BindingChange`]).
 
 use crate::admission::{Acceptance, PeerLimiter, TokenBucket};
 use crate::network::PeerBinding;
-use crate::storage::PeerBindingRow;
+use crate::network::edge::{LearnedSource, Source, SourceKind, MAX_SOURCES_PER_RESERVED_PEER, RESERVED_SOURCE_TTL};
+use crate::storage::{PeerBindingRow, ReservedSourceRow};
 use libp2p::PeerId;
 use randprotocol_core::{Address, Hash};
 use std::collections::{BTreeMap, HashSet};
@@ -38,6 +43,10 @@ pub const BINDING_ANNOUNCE_EVERY: Duration = Duration::from_secs(60);
 /// And when a peer connects, but not more often than this: a node reconnecting to many peers at
 /// once announces once.
 pub const BINDING_ANNOUNCE_MIN_GAP: Duration = Duration::from_secs(10);
+
+/// How often the node writes the sources it has learned for the validators' peers (audit v12,
+/// NET-601). A cache whose entries live for a day: a few minutes stale costs nothing.
+pub const SOURCES_PERSIST_EVERY: Duration = Duration::from_secs(300);
 
 /// How far past this node's clock a binding's `issued_ms` may be. The vote rule's drift bound
 /// (15 s): a binding from further ahead would, once recorded, make the validator's own honest
@@ -149,6 +158,62 @@ impl PeerBindings {
         let mut all: HashSet<&PeerId> = self.pinned.iter().collect();
         all.extend(self.by_validator.values().map(|b| &b.peer));
         all.len()
+    }
+
+    /// The rows to persist for the guard's learned sources (audit v12, NET-601): a validator's
+    /// peer's only — anything else the guard holds is a pinned peer's, which the operator's
+    /// flags give again — each source stamped with the wall-clock time it was last seen.
+    pub fn source_rows(&self, learned: &[(PeerId, Vec<LearnedSource>)], now_ms: u64) -> BTreeMap<String, Vec<ReservedSourceRow>> {
+        learned
+            .iter()
+            .filter(|(p, _)| self.is_validator_peer(p))
+            .take(MAX_PEER_BINDINGS)
+            .filter_map(|(p, list)| {
+                let rows: Vec<ReservedSourceRow> = list
+                    .iter()
+                    .take(MAX_SOURCES_PER_RESERVED_PEER)
+                    .filter_map(|l| {
+                        Some(ReservedSourceRow {
+                            source: l.source.to_text()?,
+                            kind: l.kind.as_text().to_string(),
+                            seen_ms: now_ms.saturating_sub(l.age.as_millis().min(u128::from(u64::MAX)) as u64),
+                        })
+                    })
+                    .collect();
+                (!rows.is_empty()).then(|| (p.to_base58(), rows))
+            })
+            .collect()
+    }
+
+    /// The persisted sources to restore at a start, `now_ms` being the clock then (NET-601):
+    /// only for a peer this record says is a validator's, only advertised or observed ones, and
+    /// only those seen within [`RESERVED_SOURCE_TTL`]. A row that does not parse is skipped — a
+    /// cache never stops a start.
+    pub fn restored_sources(&self, rows: BTreeMap<String, Vec<ReservedSourceRow>>, now_ms: u64) -> Vec<(PeerId, Vec<LearnedSource>)> {
+        let mut out = Vec::new();
+        for (peer, list) in rows {
+            let Ok(peer) = peer.parse::<PeerId>() else {
+                tracing::warn!(%peer, "skipping an unreadable persisted reserved source");
+                continue;
+            };
+            if !self.is_validator_peer(&peer) || out.len() >= MAX_PEER_BINDINGS {
+                continue;
+            }
+            let learned: Vec<LearnedSource> = list
+                .iter()
+                .filter_map(|r| {
+                    let source = Source::from_text(&r.source)?;
+                    let kind = SourceKind::from_text(&r.kind).filter(|k| *k != SourceKind::Configured)?;
+                    let age = Duration::from_millis(now_ms.saturating_sub(r.seen_ms));
+                    (age < RESERVED_SOURCE_TTL).then_some(LearnedSource { source, kind, age })
+                })
+                .take(MAX_SOURCES_PER_RESERVED_PEER)
+                .collect();
+            if !learned.is_empty() {
+                out.push((peer, learned));
+            }
+        }
+        out
     }
 
     /// Whether no binding but `except`'s names `peer` and it is not pinned: then it may stop
@@ -455,6 +520,59 @@ mod tests {
         let mut rows = storage.peer_bindings().unwrap();
         rows.insert("not an address".into(), PeerBindingRow { peer: "not a peer".into(), issued_ms: 0 });
         assert_eq!(PeerBindings::load(genesis(), HashSet::new(), rows).len(), 2);
+    }
+
+    /// Audit v12, NET-601: the sources learned for validators' peers go to the store with the
+    /// wall-clock time they were last seen and come back from a reopened store with that age, so
+    /// the next start reserves them at once (`network::EdgeConfig::bound_sources`). Only a
+    /// validator's peer's are written or read back; a row a TTL old, or one that does not
+    /// parse, is skipped.
+    #[test]
+    fn learned_sources_survive_a_storage_reopen_with_their_age() {
+        use crate::network::edge::{LearnedSource, Source, SourceKind, RESERVED_SOURCE_TTL};
+        let (v, _) = validators();
+        let (bound, stranger) = (PeerId::random(), PeerId::random());
+        let mut b = PeerBindings::new(genesis(), HashSet::new());
+        b.insert_for_test(v.address(), bound);
+        let v4 = LearnedSource { source: Source::V4(std::net::Ipv4Addr::new(198, 51, 100, 9)), kind: SourceKind::Observed, age: Duration::from_secs(600) };
+        let v6 = LearnedSource { source: Source::V6Prefix(0x2001_0db8_0001_0002), kind: SourceKind::Advertised, age: Duration::from_secs(60) };
+        let snapshot = vec![(bound, vec![v4, v6]), (stranger, vec![v4])];
+        let rows = b.source_rows(&snapshot, NOW);
+        assert_eq!(rows.len(), 1, "only a validator's peer is written: {rows:?}");
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let storage = crate::storage::Storage::open(dir.path()).unwrap();
+            assert!(storage.reserved_sources().unwrap().is_empty(), "a fresh store holds none");
+            storage.put_reserved_sources(&rows).unwrap();
+        }
+        let storage = crate::storage::Storage::open(dir.path()).unwrap();
+        let mut stored = storage.reserved_sources().unwrap();
+        // An hour after the stop, the next start reads them back.
+        let later = NOW + 3_600_000;
+        let back = b.restored_sources(stored.clone(), later);
+        assert_eq!(back.len(), 1);
+        assert_eq!(back[0].0, bound);
+        let got: Vec<(Source, SourceKind, Duration)> = back[0].1.iter().map(|l| (l.source, l.kind, l.age)).collect();
+        assert_eq!(
+            got,
+            vec![(v4.source, v4.kind, Duration::from_secs(600 + 3600)), (v6.source, v6.kind, Duration::from_secs(60 + 3600))],
+            "each source with the age it had at the stop plus the time stopped"
+        );
+        // A day later the first one is a TTL old: not restored. A stranger's row, a garbled one
+        // and a configured kind are skipped.
+        let next_day = NOW + RESERVED_SOURCE_TTL.as_millis() as u64 - 300_000;
+        let back = b.restored_sources(stored.clone(), next_day);
+        assert_eq!(back[0].1.len(), 1, "{back:?}");
+        assert_eq!(back[0].1[0].source, v6.source);
+        let one = stored[&bound.to_base58()][0].clone();
+        stored.insert(stranger.to_base58(), vec![one.clone()]);
+        stored.insert("not a peer".into(), vec![one.clone()]);
+        let garbled = crate::storage::ReservedSourceRow { source: "not a source".into(), ..one.clone() };
+        let configured = crate::storage::ReservedSourceRow { kind: "configured".into(), ..one };
+        stored.get_mut(&bound.to_base58()).unwrap().extend([garbled, configured]);
+        let back = b.restored_sources(stored, later);
+        assert_eq!(back.len(), 1);
+        assert_eq!(back[0].1.len(), 2, "{back:?}");
     }
 
     #[test]

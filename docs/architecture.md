@@ -396,7 +396,8 @@ libp2p 0.54 over TCP with Noise and Yamux. Behaviours: **gossipsub**, twice — 
 (`MessageAuthenticity::Signed`, topics `rand/<chain-id>/consensus`, `/status`, `/peers` and the
 legacy `/tx`) and anonymous (`MessageAuthenticity::Anonymous` under `ValidationMode::Anonymous`, on
 its own protocol `/rand/<chain-id>/txsub`, topic `rand/<chain-id>/tx/2`: a transaction names no
-author, issue #146) — **Kademlia** (protocol `/rand/<chain-id>/kad/1`)
+author, issue #146; a node publishes its own transactions on the anonymous lane only and merely
+relays the legacy `/tx`, unless `--legacy-tx-publish`, audit v12 PRIV-601) — **Kademlia** (protocol `/rand/<chain-id>/kad/1`)
 seeded from `--bootstrap`, **identify**, optional **mDNS** for LAN discovery, **request-response**
 (`/rand/sync/1`, CBOR) for block sync, and **ping** every 15 s. A node remembers every address it
 dialled or learnt through identify and redials disconnected known peers every 30 s, in addition to
@@ -406,7 +407,10 @@ the bootstrap list.
 request-response protocol, `/rand/<chain-id>/stem/1` (CBOR; the request is one transaction, the
 answer an acknowledgement sent on receipt), carries a transaction to one peer. Each node keeps two
 **stem successors** per 10-minute local epoch, drawn from the connected peers whose identify lists
-the stem protocol, preferring peers it dialled, and maps each incoming edge (each predecessor, and
+the stem protocol, preferring trusted peers (a validator's by its signed binding, a bootstrap, a
+`--reserved-peer`) and taking at most one peer per public host, however many identities the host
+runs (audit v12, PRIV-602; whether the node dialled a peer is no signal, since identify-advertised
+addresses are redialled every 30 s), and maps each incoming edge (each predecessor, and
 its own RPC) to one of them for the epoch, so its routes are consistent. A transaction from this
 node's RPC or from a peer's stem is verified on the ordinary verification queue and then, at a
 relay, **fluffed** with probability q (`--dandelion-fluff-prob`, 0.1): pooled and published on the
@@ -414,9 +418,12 @@ anonymous transaction lane. Otherwise it is held in the **stempool** and sent to
 successor; the submitter never fluffs its own transaction on the coin. A stem that comes back to a
 node holding it is decided as a fresh arrival (the coin, then the edge's route) without a second
 verification, at most 32 sends per transaction per node. Every holder runs an **embargo** timer —
-b + min(Exp(mean b/4), b) at a relay, 2b + Exp(mean b/4) at the submitter, b = `--dandelion-embargo-ms`
-(3 s) — and publishes the transaction itself if it has not come back over gossip by then. A
-holder that sees it on gossip pools it from the stempool without verifying again. The stempool
+b + min(Exp(mean b/4), b) at the submitter and at every relay alike (audit v12, PRIV-604), b = `--dandelion-embargo-ms`
+(3 s) — and publishes the transaction itself if it has not come back over gossip by then. A stem
+send not acknowledged within 1.5 s fails and the transaction goes to the edge's other successor.
+A holder that sees it on gossip judges that copy as it would an unknown transaction — the verify
+queue, then the report — and only then pools it and drops its embargo (PRIV-603); a resubmission
+of a held transaction over RPC likewise waits for a verification before its `Ok`. The stempool
 (1 024 transactions, 64 MiB) is invisible: `rand_getTransactionStatus` reads `unknown`,
 `rand_getMempoolInfo` does not count it, `SyncRequest::Transactions` does not serve it and no
 proposal includes it until it is fluffed. With no stem-capable peer a transaction is published at

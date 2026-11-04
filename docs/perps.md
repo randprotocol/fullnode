@@ -64,6 +64,7 @@ proved root and height, the digests not yet proved, and the withdrawals waiting 
 | `sparse_windows` | optional, default `false` (PERP-101): blocks without perp inputs record no digest, and a state proof spans up to `max_window_heights` heights over at most `max_window_blocks` recorded blocks ("Sparse windows" below). Off (chain 21), every block records a digest and a window is at most `max_window_blocks` consecutive heights |
 | `engine_program_log_height` | optional, default 0 = unpinned (CON-60): the program-table height of the engine image (`rand perp image-hc` prints it on stderr as `engine_program_log_height N`). Set, a state proof declaring another program height, or any keccak or sha256 table (the engine calls neither), is refused `ProofRefused("declared shape: …")` from its header before any verifier key is built; a header that does not decode is refused the same way. Left free: the tier (at most `max_tier`) and the input height. 1 to 24 |
 | `max_window_heights` | optional, default 0; required with `sparse_windows`, from `max_window_blocks` to `MAX_WINDOW_HEIGHTS` = 4096, and 0 without it: the most heights one sparse window spans, and the heartbeat interval |
+| `max_pending_digests` | optional, default 0 = off (PERP-5); only with `sparse_windows`, from `max_window_blocks` to `MAX_PENDING_DIGESTS` = 1 048 576. While the chain holds this many recorded digests no state proof has covered, a deposit, order, cancel or withdrawal request is refused `DigestLogFull` (not permanent, at validate and at apply) until a proof drains the log. With no prover the log then grows only by the heartbeat, one digest per `max_window_heights` heights, which keeps every window reachable. Off (chain 21), every closed block records a digest and only a state proof drops any, so a chain nobody proves on grows its log by one entry a block |
 
 The audit-v10 fields (and PERP-101's two) are bound into the genesis hash **only when set** (`PerpsConfig::commit_bytes`:
 the pre-v10 shape's bincode, then each later field tagged by name), so a file that omits them —
@@ -542,6 +543,31 @@ bridged one.
     a chain whose perps `max_tier` is at most 16**, or — a follow-up, not built yet — load a
     precomputed, hash-pinned state-proof key (13.7 KB, as the msauth key is loaded) instead of
     building it.
+  - **the node's tier cap (CON-601).** Chain 21's `max_tier` is 18 and it has no engine pin, so a
+    proof that passes every pre-key rule — no proving needed — makes a node build a tier-18 key
+    (94 s and 3.56 GB resident measured in a debug build), more than a 2 GB or 4 GB host holds.
+    Each node therefore has its own cap, `rand-node run --max-state-proof-tier <T>` (one of 10,
+    12, 14, 16, 18, 20). Its default is the highest tier whose key-build peak — 16 MiB · 4^((T −
+    10)/2): 1 GiB at 16, 4 GiB at 18, 16 GiB at 20 — fits in three quarters of the host's RAM:
+    **16 on 2 GB and 4 GB hosts, 18 on 8 GB, 20 from about 22 GB**; with the OS reporting no
+    size, no cap. A state proof above the cap whose shape the node has no key for is refused
+    first in the pool's pre-screen, from its header alone — before the ledger's segment, the
+    executor's pre-key rules, a cold-build token or the verify queue: `this node admits no state
+    proof above tier T to its pool …` (`StateProofAboveNodeTier`, not cached, no peer penalised).
+    So it is not verified, pooled, relayed or proposed by that node; a node with more memory
+    admits it. The startup warm skips shapes above the cap. A proof whose key the node holds
+    passes at any tier. **The residual: a block.** Node policy cannot refuse a valid block (that
+    would fork the node off the chain), so a block carrying a tier-18 state proof still makes
+    every validator build its key, and a host under ~8 GB can be killed applying it. Chain 22's
+    genesis `engine_program_log_height` pin, with a `max_tier` the fleet can build (or the
+    validators given the memory), is the consensus fix;
+  - **the FRI transcript's structure, before the key (CON-601).** `perp_pre_key` (the pool's
+    and the verify path's) also refuses a proof whose FRI transcript has commitments, commit-phase
+    openings and commit-phase proof-of-work words of unequal counts, no commit round, a folding
+    arity outside `1..=3`, a round opening another number of queries than the profile samples, or
+    a final polynomial of another length (`executor::fri_structure_violation`). Each is a check
+    `verify_fri` makes unconditionally after the key, so this moves no verdict, only when the
+    refusal happens.
 
   **The canonical state-proof shape** (`ledger::perps::canonical_input_log_height`,
   `canonical_witness_words`, `segment_public_log_height`; `rand perp prove` proves at it by default

@@ -652,6 +652,54 @@ pub fn sign_expecting_addresses(proposal_json: &str, policy_json: &str, signer_s
     Ok((index as u8, sig.as_bytes().to_vec()))
 }
 
+/// The signer's default fee limit (audit v12, MSC-2): 0.1 RAND, in base units — the five apps'
+/// `DEFAULT_MAX_FEE_UNITS` (clients `ui/engine/signers.js`), which a signer profile may change.
+pub const DEFAULT_MAX_FEE: u64 = 100_000_000;
+
+/// The fee rule every signer applies before signing (MSC-2), the five apps' rule exactly: refused
+/// when the fee is over `max_fee`, or over the RAND the proposal pays out — the sum of its
+/// non-change outputs of asset 0 (change is not a payment; a token is not RAND, so a token-only or
+/// change-only proposal is bounded by `max_fee` alone). `None` when the fee passes. The chain has
+/// no fee ceiling, so without this a coordinator could ask the signers to burn the account into
+/// the fee.
+pub fn fee_refusal(summary: &ProposalSummary, max_fee: u64) -> Option<MsigError> {
+    if summary.fee > max_fee {
+        return Some(refused(format!(
+            "the fee of {} RAND is more than this signer allows ({} RAND), so this proposal is not signed; raise the signer's fee limit or ask for a new proposal",
+            format_amount(summary.fee),
+            format_amount(max_fee)
+        )));
+    }
+    let rand_paid: u128 = summary.outputs.iter().filter(|o| !o.to_account && o.amount != 0 && o.asset == 0).map(|o| u128::from(o.amount)).sum();
+    if rand_paid > 0 && u128::from(summary.fee) > rand_paid {
+        return Some(refused(format!(
+            "the fee of {} RAND is more than the {} RAND this proposal pays out, so this proposal is not signed",
+            format_amount(summary.fee),
+            format_amount(u64::try_from(rand_paid).unwrap_or(u64::MAX))
+        )));
+    }
+    None
+}
+
+/// [`sign_expecting_addresses`] with the fee rule ([`fee_refusal`]) applied after the proposal's
+/// checks and before anything is signed. `max_fee: None` is the signer's explicit override (the
+/// CLI's `--allow-high-fee`): the rule is skipped, every other check still runs.
+pub fn sign_expecting_within_fee(
+    proposal_json: &str,
+    policy_json: &str,
+    signer_seed: &[u8; 32],
+    expected_recipients: &[ExpectedRecipient],
+    max_fee: Option<u64>,
+) -> Result<(u8, Vec<u8>), MsigError> {
+    if let Some(max_fee) = max_fee {
+        let summary = check_proposal_expecting_addresses(proposal_json, policy_json, expected_recipients)?;
+        if let Some(e) = fee_refusal(&summary, max_fee) {
+            return Err(e);
+        }
+    }
+    sign_expecting_addresses(proposal_json, policy_json, signer_seed, expected_recipients)
+}
+
 /// A share `"i:hex"` as `(i, signature bytes)`; the signature's length is checked.
 pub fn parse_share(share: &str) -> Result<(u8, Vec<u8>), MsigError> {
     let (i, sig) = share.split_once(':').ok_or_else(|| invalid("a share is index:hex"))?;

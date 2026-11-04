@@ -175,6 +175,7 @@ async fn start_configured(dir: &tempfile::TempDir, key: &Keypair, genesis: Genes
         min_free_disk_bytes: 0,
         verify_workers: None,
         apply_inline: false,
+        state_proof_tier_cap: None,
         prune_history: None,
         // Final review I2: the node runs the default gas policy (what `rand-node run` carries
         // unless told `--gas-price 0 --byte-price 0`), so every real call proof in these flows is
@@ -1327,7 +1328,7 @@ async fn a_private_multisig_receives_spends_rotates_and_refuses_one_signature_en
     let b = Wallet::from_spend_key(SpendKey([77; 8]));
     let fee = gas::BUNDLE_BASE;
     let prop = msig_private::prepare(&rpc, &policy, &mut store, &b.address, 10 * UNITS_PER_RAND, "rent", fee, CHAIN_ID).await.unwrap();
-    let shares: Vec<Share> = [0usize, 2].iter().map(|&i| msig_private::sign(&prop, &policy, &k[i], &[randprotocol_client::multisig_private::ExpectedRecipient::address(b.address.clone())]).unwrap().0).collect();
+    let shares: Vec<Share> = [0usize, 2].iter().map(|&i| msig_private::sign(&prop, &policy, &k[i], &[randprotocol_client::multisig_private::ExpectedRecipient::address(b.address.clone())], Some(randprotocol_client::multisig_private::DEFAULT_MAX_FEE)).unwrap().0).collect();
     phase("spend: prepared and signed by 0 and 2; proving (msauth tier 18 + bundle)");
     let slot = proving_slot().await;
     let tx = msig_private::prove(&prop, &policy, &shares, &cpu, FriProfile::Test, gas::MAX_PROOF_BYTES).await.unwrap();
@@ -1360,7 +1361,7 @@ async fn a_private_multisig_receives_spends_rotates_and_refuses_one_signature_en
 
     // ---- one signature: refused by the wallet, and by the node when forced ----
     let prop1 = msig_private::prepare(&rpc, &policy, &mut store, &b.address, UNITS_PER_RAND, "", fee, CHAIN_ID).await.unwrap();
-    let one = vec![msig_private::sign(&prop1, &policy, &k[0], &[randprotocol_client::multisig_private::ExpectedRecipient::address(b.address.clone())]).unwrap().0];
+    let one = vec![msig_private::sign(&prop1, &policy, &k[0], &[randprotocol_client::multisig_private::ExpectedRecipient::address(b.address.clone())], Some(randprotocol_client::multisig_private::DEFAULT_MAX_FEE)).unwrap().0];
     let e = msig_private::prove(&prop1, &policy, &one, &cpu, FriProfile::Test, gas::MAX_PROOF_BYTES).await.unwrap_err().to_string();
     assert!(e.contains("1 signature") && e.contains("needs 2"), "{e}");
     phase("one signature: the wallet refuses; forcing a sentinel proof (msauth tier 18 + bundle)");
@@ -1404,7 +1405,7 @@ async fn a_private_multisig_receives_spends_rotates_and_refuses_one_signature_en
     let k2: Vec<Keypair> = [111u8, 112].iter().map(|s| Keypair::from_seed([*s; 32]).unwrap()).collect();
     let next = Policy::new(k2.iter().map(|k| k.public_key().clone()).collect(), 2).unwrap();
     let sweep = msig_private::prepare_sweep(&rpc, &policy, &mut store, &next.wallet().address, fee, CHAIN_ID).await.unwrap();
-    let shares: Vec<Share> = [1usize, 2].iter().map(|&i| msig_private::sign(&sweep, &policy, &k[i], &[randprotocol_client::multisig_private::ExpectedRecipient::address(next.wallet().address.clone())]).unwrap().0).collect();
+    let shares: Vec<Share> = [1usize, 2].iter().map(|&i| msig_private::sign(&sweep, &policy, &k[i], &[randprotocol_client::multisig_private::ExpectedRecipient::address(next.wallet().address.clone())], Some(randprotocol_client::multisig_private::DEFAULT_MAX_FEE)).unwrap().0).collect();
     phase("rotate: sweep prepared and signed by 1 and 2; proving (msauth tier 18 + bundle)");
     let slot = proving_slot().await;
     let tx = msig_private::prove(&sweep, &policy, &shares, &cpu, FriProfile::Test, gas::MAX_PROOF_BYTES).await.unwrap();

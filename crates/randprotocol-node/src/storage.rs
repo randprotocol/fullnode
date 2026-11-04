@@ -397,6 +397,10 @@ const META_PRUNE_FLOOR: &str = "prune_floor";
 /// in consensus reads it, a lost or corrupt row costs only the wait for the next announcement,
 /// so it is written without an fsync and read back leniently.
 const META_PEER_BINDINGS: &str = "peer_bindings";
+/// The source addresses this node learned for the validators' peers (audit v12, NET-601): peer id
+/// (base58) → [`ReservedSourceRow`]s, as JSON. A cache like [`META_PEER_BINDINGS`], beside it and
+/// under its own key so a build that predates it neither reads nor clobbers it.
+const META_RESERVED_SOURCES: &str = "reserved_sources";
 /// The startup checkpoint (startup-checkpoint spec §3): the head this build last verified the
 /// store through, and the build. Local state, outside consensus; `commit` carries it forward,
 /// `truncate_to` clears it.
@@ -409,6 +413,16 @@ const META_VERIFIED_HEAD: &str = "verified_head";
 pub struct PeerBindingRow {
     pub peer: String,
     pub issued_ms: u64,
+}
+
+/// One persisted reserved source (audit v12, NET-601): the host in `network::edge::Source`'s text
+/// form, how it was learned (`observed` or `advertised`), and the wall-clock time, in unix ms, it
+/// was last seen — so the next start carries its age and the 24 h expiry runs on across the stop.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ReservedSourceRow {
+    pub source: String,
+    pub kind: String,
+    pub seen_ms: u64,
 }
 
 /// Blocks one `prune_history` pass deletes at most, so enabling the flag on a node holding days
@@ -3981,6 +3995,24 @@ impl Storage {
         Ok(())
     }
 
+    /// The persisted reserved sources (audit v12, NET-601), keyed by peer id (base58). Read like
+    /// [`Storage::peer_bindings`]: absent is empty, unreadable is an error the caller treats as
+    /// empty.
+    pub fn reserved_sources(&self) -> Result<BTreeMap<String, Vec<ReservedSourceRow>>> {
+        match self.get_meta_raw(META_RESERVED_SOURCES)? {
+            Some(bytes) => serde_json::from_slice(&bytes).map_err(|e| StorageError::Corrupt(format!("reserved sources: {e}"))),
+            None => Ok(BTreeMap::new()),
+        }
+    }
+
+    /// Replace the persisted reserved sources. Not synced, as for the bindings: a crash loses at
+    /// most the last few minutes of what was learned.
+    pub fn put_reserved_sources(&self, rows: &BTreeMap<String, Vec<ReservedSourceRow>>) -> Result<()> {
+        let bytes = serde_json::to_vec(rows).map_err(|e| StorageError::Corrupt(format!("reserved sources: {e}")))?;
+        self.db.put_cf(self.cf(CF_META), META_RESERVED_SOURCES, bytes)?;
+        Ok(())
+    }
+
     /// The operator's offline lock release (audit v6, CON-4, decision D23): lower the persisted
     /// lock to the committed head's certificate, fsynced. Returns the lock that was given up, or
     /// `None` when there was none above the head. Only ever called on a stopped node's store —
@@ -5750,6 +5782,7 @@ pub(crate) mod fixtures {
             sparse_windows: false,
             max_window_heights: 0,
             engine_program_log_height: 0,
+            max_pending_digests: 0,
             markets: vec![randprotocol_core::ledger::perps::MarketSpec {
                 id: 0,
                 symbol: "BTC-PERP".into(),

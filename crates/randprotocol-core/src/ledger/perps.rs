@@ -102,6 +102,9 @@ pub const MAX_ENGINE_PROGRAM_LOG_HEIGHT: u8 = 24;
 /// The most heights `max_window_heights` may let one sparse-window state proof span (PERP-101),
 /// which is also the longest a sparse chain goes without a recorded `Close`.
 pub const MAX_WINDOW_HEIGHTS: u64 = 4096;
+/// PERP-5: the largest `max_pending_digests` a genesis may set — a million digests, 40 MB of
+/// leaves, far past any prover lag worth waiting out.
+pub const MAX_PENDING_DIGESTS: u64 = 1 << 20;
 /// The widest a nonce window reaches below its highest nonce: the 64 bits of `used`.
 const NONCE_WINDOW: u64 = 64;
 /// The most `max_block_inputs` may let one block record: the genesis bound on the perp inputs
@@ -205,6 +208,16 @@ pub struct PerpsConfig {
     /// only ranged, as for any call.
     #[serde(default, skip_serializing_if = "is_zero_u8")]
     pub engine_program_log_height: u8,
+    /// PERP-5 (genesis-gated, default 0 = off): the most recorded digests no state proof has
+    /// covered before the exchange takes no more inputs. While the log holds this many, a
+    /// deposit, order, cancel or withdrawal request is refused `DigestLogFull` (not permanent:
+    /// it is accepted once a proof drains the log), so with no prover the log stops growing with
+    /// trading; only the `sparse_windows` heartbeat, one digest per `max_window_heights` heights,
+    /// still records, which keeps every window reachable. Requires `sparse_windows` (a dense
+    /// chain must record every block); `max_window_blocks..=MAX_PENDING_DIGESTS`. Off (chain
+    /// 21), the log grows one digest a block until a proof lands.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub max_pending_digests: u64,
 }
 
 // Audit v10's fields are left out of a written genesis file while at their defaults, so a file this
@@ -270,6 +283,10 @@ impl PerpsConfig {
             out.extend_from_slice(b"engine_program_log_height");
             out.push(self.engine_program_log_height);
         }
+        if self.max_pending_digests != 0 {
+            out.extend_from_slice(b"max_pending_digests");
+            out.extend_from_slice(&self.max_pending_digests.to_be_bytes());
+        }
         out
     }
 
@@ -301,6 +318,17 @@ impl PerpsConfig {
                 "perps.max_window_heights {} is set without sparse_windows",
                 self.max_window_heights
             ));
+        }
+        if self.max_pending_digests != 0 {
+            if !self.sparse_windows {
+                return Err(format!("perps.max_pending_digests {} is set without sparse_windows", self.max_pending_digests));
+            }
+            if !(self.max_window_blocks..=MAX_PENDING_DIGESTS).contains(&self.max_pending_digests) {
+                return Err(format!(
+                    "perps.max_pending_digests {} is outside max_window_blocks..={MAX_PENDING_DIGESTS} ({}..={MAX_PENDING_DIGESTS})",
+                    self.max_pending_digests, self.max_window_blocks
+                ));
+            }
         }
         if self.engine_program_log_height > MAX_ENGINE_PROGRAM_LOG_HEIGHT {
             return Err(format!(
@@ -688,6 +716,17 @@ struct PerpsExt {
     collateral_out: u64,
 }
 
+/// PERP-5: the trailer's second version, written instead of the first only when a field the
+/// first lacks is set ([`PerpsConfig::max_pending_digests`]): [`PerpsExt`]'s fields, then the
+/// new ones. A row whose later fields fit the first version keeps writing it, byte for byte.
+pub const PERSISTED_EXT_TAG_2: &[u8; 16] = b"rand-perps-ext-2";
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct PerpsExt2 {
+    v1: PerpsExt,
+    max_pending_digests: u64,
+}
+
 /// The owned twin of [`PerpsConfigV0`], for [`PerpsV0`].
 #[derive(Serialize, Deserialize)]
 struct PerpsConfigV0Owned {
@@ -780,7 +819,11 @@ impl Perps {
             collateral_in: self.collateral_in,
             collateral_out: self.collateral_out,
         };
-        if ext != PerpsExt::default() {
+        if c.max_pending_digests != 0 {
+            let ext2 = PerpsExt2 { v1: ext, max_pending_digests: c.max_pending_digests };
+            out.extend_from_slice(PERSISTED_EXT_TAG_2);
+            out.extend_from_slice(&bincode::serialize(&ext2).expect("serializes"));
+        } else if ext != PerpsExt::default() {
             out.extend_from_slice(PERSISTED_EXT_TAG);
             out.extend_from_slice(&bincode::serialize(&ext).expect("serializes"));
         }
@@ -795,14 +838,17 @@ impl Perps {
         let prefix = bincode::DefaultOptions::new().with_fixint_encoding().allow_trailing_bytes();
         let mut rest: &[u8] = bytes;
         let v0: PerpsV0 = prefix.deserialize_from(&mut rest)?;
+        let exact = || bincode::DefaultOptions::new().with_fixint_encoding().reject_trailing_bytes();
         let ext = if rest.is_empty() {
-            PerpsExt::default()
+            PerpsExt2::default()
+        } else if let Some(body) = rest.strip_prefix(PERSISTED_EXT_TAG.as_slice()) {
+            PerpsExt2 { v1: exact().deserialize::<PerpsExt>(body)?, max_pending_digests: 0 }
+        } else if let Some(body) = rest.strip_prefix(PERSISTED_EXT_TAG_2.as_slice()) {
+            exact().deserialize::<PerpsExt2>(body)?
         } else {
-            let body = rest
-                .strip_prefix(PERSISTED_EXT_TAG.as_slice())
-                .ok_or_else(|| Box::new(bincode::ErrorKind::Custom("perps row: an unknown trailer".into())))?;
-            bincode::DefaultOptions::new().with_fixint_encoding().reject_trailing_bytes().deserialize::<PerpsExt>(body)?
+            return Err(Box::new(bincode::ErrorKind::Custom("perps row: an unknown trailer".into())));
         };
+        let PerpsExt2 { v1: ext, max_pending_digests } = ext;
         let c = v0.config;
         Ok(Perps {
             config: PerpsConfig {
@@ -819,6 +865,7 @@ impl Perps {
                 sparse_windows: ext.sparse_windows,
                 max_window_heights: ext.max_window_heights,
                 engine_program_log_height: ext.engine_program_log_height,
+                max_pending_digests,
             },
             accounts: v0.accounts,
             oracle: v0.oracle,
@@ -1083,6 +1130,19 @@ fn check_block_room(p: &Perps, account: &AccountId) -> Result<(), PerpError> {
     let mine = p.block_inputs.iter().filter(|i| i.account() == Some(account)).count();
     if mine >= MAX_ACCOUNT_INPUTS_PER_BLOCK as usize {
         return Err(PerpError::AccountBlockFull);
+    }
+    Ok(())
+}
+
+/// PERP-5: whether the exchange may take one more input under genesis `max_pending_digests`:
+/// fewer than that many recorded digests wait on a state proof. Off (0), always. Read against the
+/// committed log, which only a block close grows and only a proof shrinks, so within a block it
+/// refuses every input or none.
+fn check_digest_room(p: &Perps) -> Result<(), PerpError> {
+    let max = p.config.max_pending_digests;
+    let pending = p.digests.len() as u64;
+    if max != 0 && pending >= max {
+        return Err(PerpError::DigestLogFull { pending, max });
     }
     Ok(())
 }
@@ -1600,6 +1660,7 @@ pub(super) fn validate(
     // The block's input caps, against the inputs this block has recorded so far (C1); after the
     // action's own rules, before the signature.
     if let Some(account) = a.input_account() {
+        check_digest_room(p)?;
         check_block_room(p, &account)?;
     }
     let (Some(key), Some(signature)) = (key, a.signature()) else {
@@ -1638,6 +1699,7 @@ pub(super) fn apply(
     let p = ledger.perps().ok_or(PerpError::Disabled)?;
     // The block's input caps before any write, as `validate` holds them.
     if let Some(account) = a.input_account() {
+        check_digest_room(p)?;
         check_block_room(p, &account)?;
     }
     match a {
@@ -1952,6 +2014,11 @@ pub enum PerpError {
     /// every deposit, less every payout). An engine fault — permanent.
     #[error("the proof pays {want} collateral units; the exchange holds {have} — an engine that pays more than it was given")]
     PayoutExceedsCollateral { want: u128, have: u128 },
+    /// PERP-5, under genesis `max_pending_digests`: the exchange already holds `max` recorded
+    /// digests no state proof has covered, so it takes no input until a proof drains them.
+    /// Clears with the next proof — never permanent.
+    #[error("the exchange holds {pending} unproved block digests, its limit of {max}; no perp input is taken until a state proof lands")]
+    DigestLogFull { pending: u64, max: u64 },
 }
 
 #[cfg(test)]
@@ -2128,6 +2195,7 @@ pub(crate) mod tests {
             sparse_windows: false,
             max_window_heights: 0,
             engine_program_log_height: 0,
+            max_pending_digests: 0,
             markets: vec![MarketSpec {
                 id: 0,
                 symbol: "X-PERP".into(),
@@ -3847,6 +3915,116 @@ pub(crate) mod tests {
         assert!(!o.contains_key("sparse_windows") && !o.contains_key("max_window_heights"), "written only when set");
         assert_eq!(serde_json::from_value::<PerpsConfig>(json).unwrap(), c, "absent means off");
         assert_eq!(serde_json::from_str::<PerpsConfig>(&serde_json::to_string(&on).unwrap()).unwrap(), on);
+    }
+
+    /// PERP-5: [`sparse_ledger`]'s ledger with `max_pending_digests` = `cap`.
+    fn capped_ledger(cap: u64) -> Ledger {
+        let mut l = sparse_ledger();
+        l.perps_mut().unwrap().config.max_pending_digests = cap;
+        l
+    }
+
+    /// PERP-5: the genesis rules for `max_pending_digests` and its commitment — absent, the
+    /// section's bytes, JSON and stored row are exactly today's (chain 21's file sets none of
+    /// it); set, it is tagged on after the other fields, needs `sparse_windows`, and rides a
+    /// second trailer version in the stored row, which still reads the first.
+    #[test]
+    fn perp5_max_pending_digests_is_checked_and_bound_only_when_set() {
+        let c = sample_config();
+        assert_eq!(c.max_pending_digests, 0, "off by default");
+        let mut sparse = c.clone();
+        sparse.sparse_windows = true;
+        sparse.max_window_heights = 16;
+        let base = sparse.commit_bytes();
+        let mut on = sparse.clone();
+        on.max_pending_digests = 64;
+        assert_eq!(on.check(), Ok(()));
+        assert_eq!(on.commit_bytes(), [base, b"max_pending_digests".to_vec(), 64u64.to_be_bytes().to_vec()].concat());
+        let refused = |f: &dyn Fn(&mut PerpsConfig)| {
+            let mut b = on.clone();
+            f(&mut b);
+            b.check().unwrap_err()
+        };
+        assert!(refused(&|b| b.max_pending_digests = b.max_window_blocks - 1).contains("max_pending_digests"), "below one window");
+        assert!(refused(&|b| b.max_pending_digests = MAX_PENDING_DIGESTS + 1).contains("max_pending_digests"));
+        assert!(refused(&|b| {
+            b.sparse_windows = false;
+            b.max_window_heights = 0;
+        })
+        .contains("without sparse_windows"));
+        // JSON: absent means off, written only when set.
+        let text = serde_json::to_string(&sparse).unwrap();
+        assert!(!text.contains("max_pending_digests"));
+        assert_eq!(serde_json::from_str::<PerpsConfig>(&text).unwrap(), sparse);
+        assert_eq!(serde_json::from_str::<PerpsConfig>(&serde_json::to_string(&on).unwrap()).unwrap(), on);
+        // The stored row: unset, the trailer is the first version, byte for byte as before …
+        let (l, _) = withdrawn(5);
+        let p = l.perps().unwrap().clone();
+        let row = p.encode_persisted();
+        let v1_at = row.windows(16).position(|w| w == PERSISTED_EXT_TAG).expect("the counters ride the v1 trailer");
+        assert_eq!(row.len(), v1_at + 16 + bincode::serialize(&PerpsExt::default()).unwrap().len(), "a v1 trailer, nothing after it");
+        // … and set, the second version carries it; both read back.
+        let mut capped = p.clone();
+        capped.config.sparse_windows = true;
+        capped.config.max_window_heights = 16;
+        capped.config.max_pending_digests = 64;
+        let row2 = capped.encode_persisted();
+        assert!(row2.windows(16).any(|w| w == PERSISTED_EXT_TAG_2));
+        assert_eq!(Perps::decode_persisted(&row2).unwrap().config, capped.config);
+        assert_eq!(Perps::decode_persisted(&row).unwrap().config, p.config);
+    }
+
+    /// PERP-5: under `max_pending_digests` a perp input is refused `DigestLogFull` while the log
+    /// holds that many digests nobody proved — so with no prover the input-bearing digests stop at
+    /// the cap and only the heartbeat (one per `max_window_heights` heights) still records, which
+    /// keeps every window reachable. A state proof drains the log and inputs flow again. Two
+    /// replays agree on the root at every step; without the field (chain 21's rule) nothing is
+    /// refused and the same run records a digest for every input block.
+    #[test]
+    fn perp5_the_capped_log_takes_no_input_past_the_cap_and_a_proof_drains_it() {
+        let k = kp(50);
+        let run = |mut l: Ledger| {
+            let mut roots = Vec::new();
+            let mut refused = 0;
+            for h in 1..=40u64 {
+                match dep(&mut l, &k, 10 * h as u32, RAND) {
+                    Ok(()) => {}
+                    Err(e) => {
+                        assert!(matches!(e, TxError::Perps(PerpError::DigestLogFull { max: 8, .. })), "height {h}: {e:?}");
+                        refused += 1;
+                    }
+                }
+                close(&mut l, h);
+                let p = l.perps().unwrap();
+                roots.push(p.root());
+                if p.config.max_pending_digests != 0 {
+                    assert!(p.pending_digests() <= 8 + (h as usize).div_ceil(16), "height {h}: past the cap and the heartbeats");
+                }
+            }
+            (l, roots, refused)
+        };
+        let (capped, roots, refused) = run(capped_ledger(8));
+        let p = capped.perps().unwrap();
+        // Heights 1..=8 took a deposit each; 9..=40 were refused; the heartbeats at 24 and 40
+        // still recorded, 16 heights apart.
+        assert_eq!(refused, 32);
+        assert_eq!(p.pending_heights(), vec![1, 2, 3, 4, 5, 6, 7, 8, 24, 40]);
+        let (again, roots_again, _) = run(capped_ledger(8));
+        assert_eq!(roots, roots_again, "deterministic, block by block");
+        assert!(again.perps().unwrap() == p);
+        // The refusal is the validator's too, by name, and a state proof drains the log.
+        let mut l = capped;
+        let probe = deposit(&l, &k, 999, RAND);
+        assert_eq!(refusal(&l, &probe), pe(PerpError::DigestLogFull { pending: 10, max: 8 }));
+        let proof = sparse_state_proof(&l, 0, 8, vec![]);
+        l.set_height(41);
+        apply(&mut l, &proof).unwrap();
+        assert_eq!(l.perps().unwrap().pending_heights(), vec![24, 40]);
+        assert_eq!(l.validate(&probe, &StubExecutor), Ok(()), "room again");
+        // Off: the same run refuses nothing and records every input block.
+        let (open, _, refused) = run(sparse_ledger());
+        assert_eq!(refused, 0);
+        assert_eq!(open.perps().unwrap().pending_digests(), 40);
     }
 
     /// CON-60: under the genesis `engine_program_log_height` pin a state proof declaring another

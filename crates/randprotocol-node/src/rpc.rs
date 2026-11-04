@@ -236,6 +236,14 @@ pub struct NodeStatus {
     /// Free space is under four times the startup minimum (`--min-free-disk-mb`): the node still
     /// runs, and `rand_getHealth` says `disk_low` ahead of everything else.
     pub disk_low: bool,
+    /// Free space is under `disk::DISK_WARN_FACTOR` times the startup minimum (audit v12,
+    /// OPS-601): the early warning, reported beside `rand_getHealth`'s status word.
+    pub disk_warn: bool,
+    /// Free space lost per day over the last hour-long window (OPS-601); `None` before one.
+    pub disk_bytes_per_day: Option<u64>,
+    /// Days until `disk_low` at that rate; `None` without a rate or while free space is not
+    /// shrinking.
+    pub disk_days_left: Option<f64>,
     /// The lowest height this node still serves besides genesis (history pruning spec §4); 0
     /// on an archive.
     pub prune_floor: u64,
@@ -565,13 +573,26 @@ pub fn health_json(s: &NodeStatus) -> Value {
         return json!({ "status": "disk_low", "free_bytes": s.disk_free_bytes.to_string() });
     }
     let behind = s.sync_target.saturating_sub(s.height);
-    if s.sync_inflight_age_ms.is_some() {
+    let mut v = if s.sync_inflight_age_ms.is_some() {
         json!({ "status": "syncing", "behind": behind })
     } else if behind > 2 {
         json!({ "status": "behind", "behind": behind })
     } else {
         json!({ "status": "ok" })
+    };
+    // OPS-601: the early disk warning rides beside the status word and never replaces it — a
+    // roll waits on `ok` — so a monitor reading `disk_warn` has days where `disk_low` gives hours.
+    if s.disk_warn {
+        v["disk_warn"] = json!(true);
+        v["free_bytes"] = json!(s.disk_free_bytes.to_string());
+        if let Some(r) = s.disk_bytes_per_day {
+            v["disk_bytes_per_day"] = json!(r.to_string());
+        }
+        if let Some(d) = s.disk_days_left {
+            v["disk_days_left"] = json!(d);
+        }
     }
+    v
 }
 
 /// One committed head, as `rand_getHead` reports it. What a `newHeads` notification carries.
@@ -662,6 +683,11 @@ pub struct RpcState {
     /// Issue #157: the node's admission byte budget, shared by both listeners and the verify
     /// queue. Every POST body is charged against it before it is read ([`charge_body`]).
     pub admission: crate::admission::AdmissionBudget,
+    /// Whether `rand_getScanLeaves` is served (audit v12, RPC-201). `rand` v0.8.3+ never calls
+    /// it; a wallet before v0.8.3 scanning with it tells the node which leaves it owns. On by
+    /// default so those wallets keep working; `--disable-scan-leaves` turns it off, and the plan
+    /// is to flip the default at the next minor (`docs/rpc.md`, `rand_getScanLeaves`).
+    pub scan_leaves: bool,
 }
 
 impl RpcState {
@@ -2931,6 +2957,16 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
         // `rand_getCommitments` only for the leaves one of its keys opens — about a third of the
         // bytes of a full page for the same answer.
         "rand_getScanLeaves" => {
+            if !st.scan_leaves {
+                return Err(RpcError {
+                    code: -32601,
+                    message: "rand_getScanLeaves is disabled on this node (--disable-scan-leaves, audit v12 RPC-201): \
+                              a scan that reads heads and then fetches its own leaves tells the node which leaves it owns. \
+                              Upgrade the wallet to rand v0.8.3 or later, which scans with rand_getCommitments"
+                        .into(),
+                    data: None,
+                });
+            }
             let from: u64 = param(p, 0, "from_index")?;
             let limit = parse_limit(p, 1)?;
             let rows = st.storage.notes_from(from, limit).map_err(RpcError::internal)?;
@@ -3269,6 +3305,8 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
                 // CON-60: the genesis engine program-height pin, 0 when unset (chain 21); a
                 // prover proves at the canonical shape by default only when it is set.
                 "engine_program_log_height": c.engine_program_log_height,
+                // PERP-5: the genesis cap on unproved digests, 0 when unset (chain 21).
+                "max_pending_digests": c.max_pending_digests,
                 "max_block_inputs": c.max_block_inputs,
                 "min_deposit": c.min_deposit.to_string(),
                 "engine_hc": word8_to_hex(&c.engine_hc),
@@ -4594,6 +4632,7 @@ pub(crate) mod tests {
             ws_conns: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             viewing: Arc::new(RwLock::new(crate::viewing::Registry::default())),
             admission: crate::admission::AdmissionBudget::new(crate::admission::AdmissionBudget::DEFAULT_MAX),
+            scan_leaves: true,
         }
     }
 
@@ -5282,6 +5321,23 @@ pub(crate) mod tests {
             for (k, v) in want.as_object().unwrap() {
                 assert_eq!(&j["action"][k], v, "{kind}.{k}: {j}");
             }
+        }
+    }
+
+    /// Audit v12, RPC-201: `--disable-scan-leaves` turns `rand_getScanLeaves` off on both
+    /// listeners — a wallet before v0.8.3 scanning with it tells the node which leaves it owns —
+    /// with an error naming the flag and the upgrade, while `rand_getCommitments` (what v0.8.3+
+    /// scans with) still answers. On by default until the next minor.
+    #[tokio::test]
+    async fn scan_leaves_can_be_disabled_and_commitments_still_serve() {
+        let (_d, st, _gs) = chain();
+        assert!(st.scan_leaves, "served by default for now (wallets before v0.8.3 use it)");
+        let off = RpcState { scan_leaves: false, ..st.clone() };
+        for state in [off.clone(), off.for_public_listener()] {
+            let e = call(&state, "rand_getScanLeaves", json!([0, 100])).await.unwrap_err();
+            assert_eq!(e.code, -32601, "{}", e.message);
+            assert!(e.message.contains("--disable-scan-leaves") && e.message.contains("v0.8.3"), "{}", e.message);
+            assert!(!call(&state, "rand_getCommitments", json!([0, 100])).await.unwrap().as_array().unwrap().is_empty());
         }
     }
 
@@ -8397,6 +8453,7 @@ pub(crate) mod tests {
                 "sparse_windows": false,
                 "max_window_heights": 0,
                 "engine_program_log_height": 0,
+                "max_pending_digests": 0,
                 "max_block_inputs": 8,
                 "min_deposit": "1000",
                 "engine_hc": word8_to_hex(&cfg.engine_hc),
@@ -9133,6 +9190,128 @@ pub(crate) mod tests {
         task.abort();
     }
 
+    /// Audit v12, OPS-602: the 27 Oct burst shape re-run against the v0.8.3 byte budget, in
+    /// process. Bursts of ~2.9 MB transactions (5.8 MB hex bodies) are sent at once to an RPC whose
+    /// budget is the default on a 1 967 MB validator (`default_for`: RAM/16, floored at one largest
+    /// submission). The stand-in node loop applies `Node::submit_tx`'s rule — the decoded
+    /// transaction charged against the same budget, `AdmissionBusy` when it does not fit — and
+    /// pools a held transaction before answering, as the node's verdict does.
+    ///
+    /// Asserted: the bytes in flight never exceed the budget (sampled throughout); every
+    /// submission is answered either with its hash or with `-32005`, never reset or lost; and every
+    /// hash acknowledged is one the node pooled — nothing is acknowledged and then dropped. The
+    /// 27 Oct burst of eight fits the 2 GB default outright (~8.7 MB counted each, ~70 MB of
+    /// ~117 MiB): the budget bounds counted bytes, not RSS, which is why MemoryHigh (PROC-601) and
+    /// the 4 GB validator minimum stand beside it. A burst twice that size is cut at the budget.
+    #[tokio::test]
+    async fn the_27_oct_burst_shape_stays_inside_the_2gb_default_budget() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let gs = genesis_with(7, vec![alloc_note(20, 1_000)]);
+        let (_dir, st) = state_for(&gs);
+        // ~2.9 MB encoded: 725 000 four-byte words.
+        let tx = |i: u32| Transaction {
+            chain_id: gs.chain_id,
+            bundle: None,
+            action: Action::Deploy { base_pc: i, words: vec![0x13; 725_000], public: vec![] },
+        };
+        let tx_len = tx(0).encoded_len();
+        assert!((2_850_000..2_950_000).contains(&tx_len), "a 27 Oct-sized transaction: {tx_len} B");
+        let body = |i: u32| serde_json::to_vec(&json!({ "jsonrpc": "2.0", "id": i, "method": "rand_sendTransaction", "params": [hex::encode(tx(i).encode())] })).unwrap();
+        assert!(body(0).len() <= st.max_body_bytes, "the body fits the RPC's cap");
+        const HOST_RAM: u64 = 1_967 * 1_000_000;
+        let limit = crate::admission::AdmissionBudget::default_for(
+            HOST_RAM,
+            crate::admission::AdmissionBudget::floor_for(st.max_body_bytes, st.limits.max_block_bytes),
+        );
+        let per_submission = body(0).len() + crate::admission::charge_of(&tx(0));
+
+        for burst in [8usize, 16] {
+            let budget = crate::admission::AdmissionBudget::new(limit);
+            let (node_tx, mut node_rx) = mpsc::channel(burst);
+            let st = RpcState { admission: budget.clone(), node: node_tx, ..st.clone() };
+            let (addr, task) = serve("127.0.0.1:0".parse().unwrap(), st).await.unwrap();
+
+            // A sampler that watches the budget for the whole burst.
+            let (peak, stop) = (std::sync::Arc::new(AtomicUsize::new(0)), std::sync::Arc::new(AtomicBool::new(false)));
+            let sampler = {
+                let (budget, peak, stop) = (budget.clone(), peak.clone(), stop.clone());
+                tokio::spawn(async move {
+                    while !stop.load(Ordering::Relaxed) {
+                        peak.fetch_max(budget.in_use(), Ordering::Relaxed);
+                        tokio::task::yield_now().await;
+                    }
+                })
+            };
+
+            let (done_tx, mut done) = mpsc::unbounded_channel();
+            for i in 0..burst as u32 {
+                let (raw, done_tx) = (body(i), done_tx.clone());
+                tokio::spawn(async move {
+                    let answer = async {
+                        let resp = reqwest::Client::new().post(format!("http://{addr}")).header("content-type", "application/json").body(raw).send().await?;
+                        let status = resp.status();
+                        Ok::<_, reqwest::Error>((status, resp.json::<Value>().await?))
+                    };
+                    let _ = done_tx.send(answer.await.map_err(|e| e.to_string()));
+                });
+            }
+
+            // Until every submission is either held by the node or answered.
+            let (mut held, mut answers) = (Vec::new(), Vec::new());
+            while held.len() + answers.len() < burst {
+                tokio::select! {
+                    Some(cmd) = node_rx.recv() => {
+                        let NodeCommand::SubmitTx { tx, reply } = cmd else { panic!("only submissions are sent") };
+                        match budget.try_charge(crate::admission::charge_of(&tx)) {
+                            Ok(charge) => held.push((tx, reply, charge)),
+                            Err(busy) => { let _ = reply.send(Err(MempoolError::AdmissionBusy(busy))); }
+                        }
+                        peak.fetch_max(budget.in_use(), Ordering::Relaxed);
+                    }
+                    Some(a) = done.recv() => answers.push(a.expect("every refusal is answered, not reset")),
+                }
+            }
+            assert!(budget.in_use() <= budget.limit());
+            // The verdicts: each held transaction is pooled, then its caller hears its hash.
+            let mut pooled = std::collections::HashSet::new();
+            for (tx, reply, charge) in held.drain(..) {
+                pooled.insert(tx.hash().to_hex());
+                drop(charge);
+                reply.send(Ok(tx.hash())).unwrap();
+            }
+            while answers.len() < burst {
+                answers.push(done.recv().await.unwrap().expect("answered"));
+            }
+            stop.store(true, Ordering::Relaxed);
+            sampler.await.unwrap();
+
+            let mut acked = std::collections::HashSet::new();
+            let mut busy = 0;
+            for (status, v) in &answers {
+                if let Some(h) = v["result"].as_str() {
+                    assert_eq!(*status, reqwest::StatusCode::OK);
+                    acked.insert(h.to_string());
+                } else {
+                    assert_eq!(v["error"]["code"], json!(BUSY_CODE), "anything not acknowledged is -32005: {v}");
+                    busy += 1;
+                }
+            }
+            assert_eq!(acked, pooled, "burst {burst}: every acknowledged transaction was pooled, none acknowledged and dropped");
+            assert_eq!(acked.len() + busy, burst);
+            let peak = peak.load(Ordering::Relaxed);
+            assert!(peak <= limit, "burst {burst}: {peak} bytes in flight over the {limit} budget");
+            assert_eq!(budget.in_use(), 0, "every charge is back");
+            let fits = limit / per_submission;
+            if burst <= fits {
+                assert_eq!(busy, 0, "the 27 Oct burst of {burst} fits a 2 GB host's default budget ({fits} would)");
+            } else {
+                assert!(busy >= burst - fits, "burst {burst}: at most {fits} admitted, {busy} told to retry");
+                assert!(acked.len() <= fits);
+            }
+            task.abort();
+        }
+    }
+
     /// A body within the limit still reaches the dispatcher, and a malformed one answers JSON too.
     #[tokio::test]
     async fn a_malformed_body_answers_json_rather_than_plain_text() {
@@ -9835,7 +10014,7 @@ pub(crate) mod tests {
         // passed happily through v0.2, v0.3 and v0.4 while the field reported 0.1.0 (audit v3,
         // PROC-3). The workspace version is bumped with each tag, and this is what notices when it
         // is not.
-        assert_eq!(v["version"], "0.8.4", "bump the workspace version in Cargo.toml with the tag");
+        assert_eq!(v["version"], "0.8.5", "bump the workspace version in Cargo.toml with the tag");
         // The full 40-hex commit, `-dirty` when tracked files differed at build time, or
         // "unknown" when neither git nor a `.git-rev` could say — never a short or stale form.
         let sha = v["git_sha"].as_str().unwrap();
@@ -9880,6 +10059,27 @@ pub(crate) mod tests {
         let v = health_json(&s);
         assert_eq!(v["status"], "disk_low");
         assert_eq!(v["free_bytes"], "123");
+    }
+
+    /// OPS-601: the early warning rides beside the status word, never replacing it (a roll waits
+    /// on `ok`), and carries the free bytes and the measured days left.
+    #[test]
+    fn health_carries_disk_warn_beside_the_status_word() {
+        let s = NodeStatus {
+            disk_warn: true,
+            disk_free_bytes: 10 << 30,
+            disk_bytes_per_day: Some(5 << 30),
+            disk_days_left: Some(1.2),
+            ..NodeStatus::default()
+        };
+        let v = health_json(&s);
+        assert_eq!(v["status"], "ok");
+        assert_eq!(v["disk_warn"], true);
+        assert_eq!(v["free_bytes"], (10u64 << 30).to_string());
+        assert_eq!(v["disk_bytes_per_day"], (5u64 << 30).to_string());
+        assert_eq!(v["disk_days_left"], 1.2);
+        let quiet = health_json(&NodeStatus::default());
+        assert_eq!(quiet, json!({ "status": "ok" }), "no warning, no extra keys");
     }
 
     /// Twelve timed blocks, pruned to a floor of 10, behind the RPC.

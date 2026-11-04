@@ -176,6 +176,22 @@ transaction before the first peer has it. The OOM kills of 2026-10-27 that lost 
 transactions were that window; the admission budget below is what closes them. Acceptance is
 still not commitment.
 
+**The 27 Oct burst, re-run in process (audit v12, OPS-602).** `rpc::tests::
+the_27_oct_burst_shape_stays_inside_the_2gb_default_budget` sends bursts of ~2.9 MB transactions
+(5.8 MB hex bodies) at once to an RPC on a 1 967 MB host's default budget, and
+`node::tests::a_submission_burst_is_either_pooled_or_told_busy_never_acknowledged_and_dropped`
+does the same to the node loop: bytes in flight never exceed the budget, each submission is
+answered once, with its hash or `-32005`, and every hash answered is pooled or stemmed. Note what
+the budget does not do: each such submission counts ~8.7 MB (body plus decoded transaction), so
+the 27 Oct burst of eight (~70 MB) fits a 2 GB host's ~117 MiB budget outright and is not
+refused; about fourteen fit before `-32005`. The budget bounds counted bytes, not RSS — the
+verifier's scratch is outside it — so a 2 GB validator's protection against that burst is the
+`MemoryHigh=85%` drop-in every roll writes (PROC-601) and the 4 GB validator minimum
+(`docs/node-hardware.md`). Two paths drop an acknowledged transaction by design and are not the
+budget's: the pool's byte cap evicting it for a better payer, and a stemmed transaction whose
+embargo fluff no longer pools (its nullifier spent meanwhile). A re-run of the burst on live 2 GB
+hosts has not been done.
+
 **Busy, retry: `-32005`** (issue #157). Every POST body is charged against the node's admission
 byte budget before it is read, and held until the answer; a transaction is charged again, by its
 decoded size, while it waits for verification — a peer's stem (issue #145) included. A request the budget cannot take now is answered at
@@ -264,6 +280,16 @@ a leaf against a head's 1 720, ~2.26× — the whole increase for a wallet whose
 256-leaf chunk, less for one whose did (1.07× with notes in four of eight chunks). The method
 stays on the node for other clients; what a client that uses it reveals by its follow-up reads is
 its own choice.
+
+**Turning it off (audit v12, RPC-201).** Wallets before v0.8.3 still scan with this method, so
+every node that serves it still learns those wallets' leaves. `rand-node run --disable-scan-leaves`
+refuses it on both listeners (`-32601`, the message names the flag and asks for rand v0.8.3+);
+`rand_getCommitments` is unaffected. **The plan:** served by default in v0.8.x so a wallet
+before v0.8.3 keeps scanning; at the next minor (v0.9.0) the default flips to off, with
+`--enable-scan-leaves` for an operator who wants it, once the wallet download page has carried
+v0.8.3+ for a release cycle. The public RPC deploy template (`deploy/enable-public-rpc.sh`) does
+not pass the flag yet: nothing in these docs says the public RPC should break old wallets before
+the flip, so that is the operator's call per host until v0.9.0.
 
 ### `rand_getNullifiers`
 Params: `[from_height]` or `[from_height, limit]`. Result: every nullifier published from that
@@ -474,6 +500,7 @@ without a `perps` section:
 { "enabled": true,
   "collateral_asset": 0, "max_tier": 18, "max_window_blocks": 64,
   "sparse_windows": false, "max_window_heights": 0, "engine_program_log_height": 0,
+  "max_pending_digests": 0,
   "max_block_inputs": 8, "min_deposit": "1000000",
   "engine_hc": "<64 hex>", "genesis_root": "<64 hex>",
   "markets": [{ "id": 0, "symbol": "BTC-PERP", "lot": 1000000, "tick": 1000000,
@@ -498,6 +525,11 @@ listed, and `initial_collateral + in − out`, decimal strings (`docs/perps.md`,
 number, `0` on a chain without it (chain 21; chain 22 on sets it). A node that predates the field
 omits it: read absent, `null` or `0` as unpinned. `rand perp prove` proves at the canonical
 state-proof shape by default only on a pinned chain (`docs/perps.md`).
+
+`max_pending_digests` (PERP-5) is the genesis cap on recorded digests no state proof has
+covered, a JSON number, `0` (off) on a chain without it (chain 21). While `pending_heights` holds
+that many, deposits, orders, cancels and withdrawal requests are refused `DigestLogFull` until a
+proof lands. A node that predates the field omits it: read absent as `0`.
 
 The three commitments are 64 lowercase hex characters (a `Word8`, its eight words little-endian).
 `pending_heights` are the closed heights no state proof has covered, ascending: the digests the
@@ -1544,6 +1576,14 @@ under four times the node's startup minimum (`--min-free-disk-mb`, default 1024 
 `ok` when `sync_target - height` is at most 2 and no sync batch request is outstanding. `syncing`
 while one is. `behind` when the node is not syncing and the lag is still above 2 — the chain-8
 stall shape. A load balancer reads `status` alone; an operator reads `behind` too.
+
+Beside any status but `disk_low`, while free space is under sixteen times the startup minimum
+(16 GB at the default), the result also carries the early warning (audit v12, OPS-601):
+`{"status":"ok","disk_warn":true,"free_bytes":"…","disk_bytes_per_day":"…","disk_days_left":2.7}`.
+`disk_bytes_per_day` is free space lost per day over the last hour-long window and
+`disk_days_left` the days until `disk_low` at that rate; each is absent until measured or while
+free space is not shrinking. The status word is unchanged, so a roll waiting on `ok` is not
+stopped by it; a monitor reads `disk_warn`.
 
 ### `rand_getTransactionStatus`
 Params: `[[hash, …]]`, 1 to 64 hashes. Result: one entry per hash, in order:
