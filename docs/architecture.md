@@ -407,7 +407,10 @@ the bootstrap list.
 request-response protocol, `/rand/<chain-id>/stem/1` (CBOR; the request is one transaction, the
 answer an acknowledgement sent on receipt), carries a transaction to one peer. Each node keeps two
 **stem successors** per 10-minute local epoch, drawn from the connected peers whose identify lists
-the stem protocol, preferring peers it dialled, and maps each incoming edge (each predecessor, and
+the stem protocol, preferring trusted peers (a validator's by its signed binding, a bootstrap, a
+`--reserved-peer`) and taking at most one peer per public host, however many identities the host
+runs (audit v12, PRIV-602; whether the node dialled a peer is no signal, since identify-advertised
+addresses are redialled every 30 s), and maps each incoming edge (each predecessor, and
 its own RPC) to one of them for the epoch, so its routes are consistent. A transaction from this
 node's RPC or from a peer's stem is verified on the ordinary verification queue and then, at a
 relay, **fluffed** with probability q (`--dandelion-fluff-prob`, 0.1): pooled and published on the

@@ -10,7 +10,10 @@
 //!   ONE peer over a direct request-response send (`/rand/{chain}/stem/1`, [`crate::network`]),
 //!   not gossip. Each node keeps [`STEM_SUCCESSORS`] successors per epoch ([`EPOCH`], a local
 //!   timer), drawn at random from the connected peers that advertise the stem protocol, preferring
-//!   peers this node dialled. Each incoming edge (a predecessor, or this node's own RPC) is
+//!   trusted peers — validators by their signed binding, the bootstraps and the operator's
+//!   reserved peers — and taking at most one peer per public host (audit v12, PRIV-602: whether
+//!   this node dialled a peer is no trust signal, since every identify-advertised address is
+//!   redialled). Each incoming edge (a predecessor, or this node's own RPC) is
 //!   mapped to one successor for the epoch ([`Router::route`]), so the routes a node uses are
 //!   consistent: an adversary sending many transactions through one node learns one edge, not a
 //!   fresh random walk per transaction.
@@ -39,6 +42,7 @@
 //! The type here is pure: no network, no clock and no randomness of its own (`now` and the RNG
 //! come in), so every rule above is unit-tested. The node loop drives it (`node.rs`).
 
+use crate::network::edge::Source;
 use libp2p::PeerId;
 use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
@@ -141,13 +145,26 @@ pub enum FluffReason {
     Embargo,
 }
 
+/// One stem-capable peer, as the router weighs it (audit v12, PRIV-602).
+#[derive(Clone, Copy, Debug)]
+struct Candidate {
+    /// A validator's peer by its signed binding, a bootstrap, or an operator-reserved peer:
+    /// identities a stranger cannot take on. Not "this node dialled it": identify-advertised
+    /// addresses are redialled every 30 s, so any peer that connects once becomes a dialled one.
+    trusted: bool,
+    /// The public host it is connected from. At most one successor per host, and a host is one
+    /// candidate however many identities it runs. `None` (loopback, a private network, no IP):
+    /// a candidate of its own.
+    host: Option<Source>,
+}
+
 /// The successors and the per-edge mapping of one epoch.
 pub struct Router {
     epoch_len: Duration,
     epoch_started: Option<Instant>,
     epoch: u64,
-    /// Connected peers that advertise the stem protocol, and whether this node dialled them.
-    capable: HashMap<PeerId, bool>,
+    /// Connected peers that advertise the stem protocol.
+    capable: HashMap<PeerId, Candidate>,
     successors: Vec<PeerId>,
     routes: HashMap<Edge, PeerId>,
 }
@@ -157,13 +174,21 @@ impl Router {
         Router { epoch_len, epoch_started: None, epoch: 0, capable: HashMap::new(), successors: Vec::new(), routes: HashMap::new() }
     }
 
-    /// A connected peer advertises the stem protocol. `outbound`: this node dialled it. A free
-    /// successor slot is filled at once, so a node that starts with no capable peer stems as soon
-    /// as one arrives.
-    pub fn add_peer(&mut self, peer: PeerId, outbound: bool, rng: &mut StdRng) {
-        let o = self.capable.entry(peer).or_insert(outbound);
-        *o |= outbound;
+    /// A connected peer advertises the stem protocol. `trusted`: see [`Candidate::trusted`];
+    /// `host`: the public host it is connected from ([`Candidate::host`]). A free successor slot
+    /// is filled at once, so a node that starts with no capable peer stems as soon as one
+    /// arrives. Repeated (identify runs again), it refreshes the peer's host and trust.
+    pub fn add_peer(&mut self, peer: PeerId, trusted: bool, host: Option<Source>, rng: &mut StdRng) {
+        self.capable.insert(peer, Candidate { trusted, host });
         self.fill(rng);
+    }
+
+    /// A peer's trust changed (its binding was recorded or superseded). Successors already drawn
+    /// keep their slot until the epoch ends or they leave.
+    pub fn set_trusted(&mut self, peer: &PeerId, trusted: bool) {
+        if let Some(c) = self.capable.get_mut(peer) {
+            c.trusted = trusted;
+        }
     }
 
     /// A peer left (or failed a stem send): never a successor again until it is re-added. A
@@ -178,22 +203,37 @@ impl Router {
     }
 
     /// Top the successors up to [`STEM_SUCCESSORS`] from the capable peers that are not one
-    /// already: dialled peers first (an adversary can open any number of connections to a node,
-    /// but cannot make the node dial it), then the rest.
+    /// already: trusted peers first, then the rest (audit v12, PRIV-602). Within each, the draw
+    /// is over hosts, not identities — a host is picked uniformly, then one of its peers — and a
+    /// host that already holds a successor slot is not drawn again, so identities an adversary
+    /// runs on one address count once.
     /// The candidates are sorted before the draw, so a seeded RNG gives the same successors
     /// whatever order the map iterates in.
     fn fill(&mut self, rng: &mut StdRng) {
-        for want_outbound in [true, false] {
-            let mut candidates: Vec<PeerId> = self
+        for want_trusted in [true, false] {
+            if self.successors.len() >= STEM_SUCCESSORS {
+                return;
+            }
+            let taken: Vec<Source> = self.successors.iter().filter_map(|p| self.capable.get(p).and_then(|c| c.host)).collect();
+            // Per host, its peers; a peer without a public host is a group of its own.
+            let mut groups: Vec<(Option<Source>, Vec<PeerId>)> = Vec::new();
+            let mut members: Vec<(PeerId, Option<Source>)> = self
                 .capable
                 .iter()
-                .filter(|(p, o)| **o == want_outbound && !self.successors.contains(p))
-                .map(|(p, _)| *p)
+                .filter(|(p, c)| c.trusted == want_trusted && !self.successors.contains(p))
+                .filter(|(_, c)| c.host.is_none_or(|h| !taken.contains(&h)))
+                .map(|(p, c)| (*p, c.host))
                 .collect();
-            candidates.sort();
-            while self.successors.len() < STEM_SUCCESSORS && !candidates.is_empty() {
-                let i = rng.gen_range(0..candidates.len());
-                self.successors.push(candidates.swap_remove(i));
+            members.sort_by_key(|(p, _)| *p);
+            for (p, h) in members {
+                match h.and_then(|h| groups.iter_mut().find(|(g, _)| *g == Some(h))) {
+                    Some((_, list)) => list.push(p),
+                    None => groups.push((h, vec![p])),
+                }
+            }
+            while self.successors.len() < STEM_SUCCESSORS && !groups.is_empty() {
+                let (_, list) = groups.swap_remove(rng.gen_range(0..groups.len()));
+                self.successors.push(list[rng.gen_range(0..list.len())]);
             }
         }
     }
@@ -484,12 +524,16 @@ mod tests {
         Transaction { chain_id: n, bundle: None, action: randprotocol_core::Action::None }
     }
 
-    fn router_with(ps: &[PeerId], outbound: bool, r: &mut StdRng) -> Router {
+    fn router_with(ps: &[PeerId], trusted: bool, r: &mut StdRng) -> Router {
         let mut router = Router::new(EPOCH);
         for p in ps {
-            router.add_peer(*p, outbound, r);
+            router.add_peer(*p, trusted, None, r);
         }
         router
+    }
+
+    fn host(n: u8) -> Option<Source> {
+        Some(Source::V4(std::net::Ipv4Addr::new(203, 0, 113, n)))
     }
 
     /// Within an epoch, every transaction on one edge goes to the same successor, the submitter's
@@ -530,7 +574,7 @@ mod tests {
         let ps = peers(12);
         let mut router = Router::new(Duration::from_secs(600));
         for p in &ps {
-            router.add_peer(*p, true, &mut r);
+            router.add_peer(*p, true, None, &mut r);
         }
         let t0 = Instant::now();
         let route0 = router.route(Edge::Local, t0, &mut r).unwrap();
@@ -576,29 +620,78 @@ mod tests {
         assert_eq!(router.capable(), 0);
     }
 
-    /// Peers this node dialled are preferred: with two of them among eight, they are the
-    /// successors in every epoch.
+    /// Audit v12, PRIV-602: trusted peers — validators by their signed binding, the bootstraps
+    /// and the operator's reserved peers — are preferred, and nothing else is: with two of them
+    /// among thirty-two (the rest connected, dialled or not, as identify-learned addresses are
+    /// redialled), they are the successors in every epoch.
     #[test]
-    fn dialled_peers_are_preferred_as_successors() {
+    fn trusted_peers_are_preferred_as_successors() {
         let mut r = rng(4);
-        let inbound = peers(6);
-        let dialled = peers(2);
+        let others = peers(30);
+        let trusted = peers(2);
         let mut router = Router::new(Duration::from_secs(1));
-        for p in &inbound {
-            router.add_peer(*p, false, &mut r);
+        for (i, p) in others.iter().enumerate() {
+            router.add_peer(*p, false, host(i as u8 + 1), &mut r);
         }
-        for p in &dialled {
-            router.add_peer(*p, true, &mut r);
+        for (i, p) in trusted.iter().enumerate() {
+            router.add_peer(*p, true, host(100 + i as u8), &mut r);
         }
         let t0 = Instant::now();
         for k in 0..20 {
             router.route(Edge::Local, t0 + Duration::from_secs(k), &mut r).unwrap();
             let mut s = router.successors().to_vec();
             s.sort();
-            let mut d = dialled.clone();
+            let mut d = trusted.clone();
             d.sort();
-            assert_eq!(s, d, "epoch {k}: an inbound peer took a successor slot");
+            assert_eq!(s, d, "epoch {k}: an untrusted peer took a successor slot");
         }
+        // A peer's trust follows its binding: lost, it competes with the rest from the next epoch.
+        router.set_trusted(&trusted[0], false);
+        router.route(Edge::Local, t0 + Duration::from_secs(100), &mut r).unwrap();
+        assert!(router.successors().contains(&trusted[1]));
+    }
+
+    /// Audit v12, PRIV-602: many identities on one host count as one candidate. Twenty-four
+    /// identities behind one public address against twelve honest peers on hosts of their own,
+    /// none trusted (the worst case: every one of them dialled by the 30 s redial): the crowd
+    /// holds at most one successor slot, never both, and takes the submitter's own route in about
+    /// 1/13 of epochs — one host among thirteen — not the 65% it took when every connected
+    /// identity was a candidate. Peers with no global address (loopback, a LAN) are not grouped.
+    #[test]
+    fn a_crowd_of_identities_on_one_host_takes_at_most_its_hosts_share() {
+        let mut r = rng(11);
+        let crowd = peers(24);
+        let honest = peers(12);
+        let mut router = Router::new(Duration::from_secs(1));
+        for p in &crowd {
+            router.add_peer(*p, false, host(66), &mut r);
+        }
+        for (i, p) in honest.iter().enumerate() {
+            router.add_peer(*p, false, host(i as u8 + 1), &mut r);
+        }
+        let t0 = Instant::now();
+        let epochs = 4000;
+        let mut taken = 0;
+        for k in 0..epochs {
+            let s = router.route(Edge::Local, t0 + Duration::from_secs(k), &mut r).unwrap();
+            assert_eq!(router.successors().len(), 2);
+            let in_crowd = router.successors().iter().filter(|p| crowd.contains(p)).count();
+            assert!(in_crowd <= 1, "epoch {k}: one host held both successor slots");
+            taken += usize::from(crowd.contains(&s));
+        }
+        let share = taken as f64 / epochs as f64;
+        eprintln!("PRIV-602: 24 identities on one host vs 12 honest hosts: the crowd took the submitter's route in {:.1}% of epochs", 100.0 * share);
+        assert!(share < 0.10, "the crowd took the submitter's route in {share} of epochs (one host in 13 is 0.077)");
+        // A crowd that filled every slot before is still held to one when it is all there is.
+        let mut alone = Router::new(Duration::from_secs(1));
+        for p in &crowd {
+            alone.add_peer(*p, false, host(66), &mut r);
+        }
+        alone.route(Edge::Local, t0, &mut r).unwrap();
+        assert_eq!(alone.successors().len(), 1, "one host, one successor");
+        // Peers without a global address are each their own candidate (a loopback test fleet, a LAN).
+        let local = router_with(&peers(3), false, &mut r);
+        assert_eq!(local.successors().len(), 2);
     }
 
     /// The fluff coin with a seeded RNG: q = 0 never, q = 1 always, q = 0.1 about one hop in ten,
@@ -609,7 +702,7 @@ mod tests {
         let make = |q: f64, seed: u64| {
             let mut d = Dandelion::new(DandelionConfig { fluff_prob: q, seed: Some(seed), ..Default::default() });
             for p in &ps {
-                d.router.add_peer(*p, true, &mut rng(9));
+                d.router.add_peer(*p, true, None, &mut rng(9));
             }
             d
         };
@@ -643,11 +736,11 @@ mod tests {
         // straight back; it fluffs. The submitter with that one peer stems to it.
         let only = PeerId::random();
         let mut pair = Dandelion::new(DandelionConfig { fluff_prob: 0.0, seed: Some(1), ..Default::default() });
-        pair.router.add_peer(only, true, &mut rng(1));
+        pair.router.add_peer(only, true, None, &mut rng(1));
         assert_eq!(pair.decide(Edge::Peer(only), t), Decision::Fluff(FluffReason::NoRoute));
         assert_eq!(pair.decide(Edge::Local, t), Decision::Stem(only));
         let mut off = Dandelion::new(DandelionConfig { seed: Some(1), ..DandelionConfig::off() });
-        off.router.add_peer(PeerId::random(), true, &mut rng(1));
+        off.router.add_peer(PeerId::random(), true, None, &mut rng(1));
         assert_eq!(off.decide(Edge::Local, t), Decision::Fluff(FluffReason::NoRoute));
     }
 
@@ -711,7 +804,7 @@ mod tests {
         small.take(&tx(1).hash());
         assert!(small.hold(tx(2).hash(), tx(2), Edge::Local, t), "bytes come back when one leaves");
         let mut d = Dandelion::new(DandelionConfig { seed: Some(1), ..Default::default() });
-        d.router.add_peer(PeerId::random(), true, &mut rng(1));
+        d.router.add_peer(PeerId::random(), true, None, &mut rng(1));
         d.stempool = Stempool::new(0, 0);
         assert_eq!(d.decide(Edge::Local, t), Decision::Fluff(FluffReason::Full));
     }
@@ -726,7 +819,7 @@ mod tests {
             let mut d = Dandelion::new(DandelionConfig { fluff_prob: 0.0, seed: Some(3), ..Default::default() });
             let ps = peers(3);
             for p in &ps {
-                d.router.add_peer(*p, true, &mut rng(1));
+                d.router.add_peer(*p, true, None, &mut rng(1));
             }
             let x = tx(9);
             let Decision::Stem(first) = d.decide(origin, t) else { panic!("stems") };
@@ -744,7 +837,7 @@ mod tests {
         }
         // At q = 1 a return is fluffed by the coin, as a fresh arrival at a relay would be.
         let mut d = Dandelion::new(DandelionConfig { fluff_prob: 1.0, seed: Some(3), ..Default::default() });
-        d.router.add_peer(PeerId::random(), true, &mut rng(1));
+        d.router.add_peer(PeerId::random(), true, None, &mut rng(1));
         let x = tx(10);
         assert!(d.hold(x.hash(), x.clone(), Edge::Local, t));
         assert_eq!(d.on_loop(&x.hash(), PeerId::random(), t), LoopAction::Fluff(FluffReason::Coin));
@@ -772,7 +865,7 @@ mod tests {
                 let mut r = rng(i as u64);
                 for (j, p) in ids.iter().enumerate() {
                     if j != i {
-                        d.router.add_peer(*p, j % 2 == i % 2, &mut r);
+                        d.router.add_peer(*p, j % 2 == i % 2, None, &mut r);
                     }
                 }
                 d

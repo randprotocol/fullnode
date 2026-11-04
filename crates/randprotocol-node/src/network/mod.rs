@@ -465,9 +465,12 @@ pub enum NetworkEvent {
     SyncResponse { peer: PeerId, request_id: OutboundRequestId, response: SyncResponse },
     SyncFailed { peer: PeerId, request_id: OutboundRequestId, error: String },
     /// A connected peer advertises the stem protocol (issue #145; only under
-    /// [`EdgeConfig::dandelion`]). `outbound`: this node dialled it. Repeated whenever identify
-    /// runs again; the receiver dedups.
-    StemPeer { peer: PeerId, outbound: bool },
+    /// [`EdgeConfig::dandelion`]). `host`: the public host its connection comes from, `None` when
+    /// it has no global address (loopback, a private network) — the router takes one successor
+    /// per host (audit v12, PRIV-602). Whether this node dialled it is deliberately not reported:
+    /// identify-advertised addresses are redialled, so it says nothing about who the peer is.
+    /// Repeated whenever identify runs again; the receiver dedups.
+    StemPeer { peer: PeerId, host: Option<edge::Source> },
     /// A transaction a peer stemmed to this node. Already acknowledged on the wire.
     StemTx { from: PeerId, tx: randprotocol_core::Transaction },
     /// A stem send that failed (the successor left, refused the stream or timed out).
@@ -632,9 +635,14 @@ impl Topics {
 struct ConnectedPeer {
     addrs: Vec<Multiaddr>,
     connected_at: Instant,
-    /// One of its connections is one this node dialled (Dandelion++ prefers such a peer as a stem
-    /// successor: an adversary can connect to a node at will, but cannot make it dial).
-    dialed: bool,
+}
+
+impl ConnectedPeer {
+    /// The public host this peer is connected from (audit v12, PRIV-602): the source of its
+    /// first connection address that is global. `None` when none is (loopback, a LAN).
+    fn public_host(&self) -> Option<edge::Source> {
+        self.addrs.iter().find(|a| addr_scope(a) == AddrScope::Global).map(edge::source_of).filter(|s| *s != edge::Source::Unknown)
+    }
 }
 
 /// Build the swarm, listen, and spawn the event loop. Returns immediately. No reserved peers
@@ -1225,8 +1233,7 @@ async fn handle_swarm_event(
                 remember_addr(known, peer_id, addr.clone());
             }
             let entry =
-                peers.entry(peer_id).or_insert_with(|| ConnectedPeer { addrs: Vec::new(), connected_at: Instant::now(), dialed: false });
-            entry.dialed |= endpoint.is_dialer();
+                peers.entry(peer_id).or_insert_with(|| ConnectedPeer { addrs: Vec::new(), connected_at: Instant::now() });
             if !entry.addrs.contains(&addr) {
                 entry.addrs.push(addr);
             }
@@ -1320,8 +1327,8 @@ async fn handle_swarm_event(
             // A peer that speaks the stem protocol may be a stem successor (issue #145).
             if let Some(proto) = gossip.stem_proto {
                 if info.protocols.contains(proto) {
-                    let outbound = peers.get(&peer_id).is_some_and(|p| p.dialed);
-                    let _ = evt_tx.send(NetworkEvent::StemPeer { peer: peer_id, outbound }).await;
+                    let host = peers.get(&peer_id).and_then(ConnectedPeer::public_host);
+                    let _ = evt_tx.send(NetworkEvent::StemPeer { peer: peer_id, host }).await;
                 }
             }
             for addr in info.listen_addrs {

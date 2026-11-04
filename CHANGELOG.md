@@ -28,6 +28,13 @@ Node (audit v12 network and privacy rows; node-only, no wire or consensus change
   brings the signed copy back for a chain that still needs it. **Transaction origin hiding remains
   design intent, not a measured property, until the first-spy test is re-run** against a fleet
   running these fixes.
+- **Stem successors are chosen by trust and host, not by who dialled whom** (PRIV-602): the
+  router preferred peers this node had dialled, but identify-advertised addresses are redialled
+  every 30 s, so any peer that connected once became one. Successors now come first from trusted
+  peers (validators by their signed binding, bootstraps, `--reserved-peer`), and a public host is
+  one candidate and holds at most one of the two successor slots however many identities it runs.
+  In the router simulation, 24 identities on one host against 12 honest hosts take the
+  submitter's route in about 1/13 of epochs instead of 65%.
 
 ## v0.8.4 — 2026-11-01 (chain 21, node-only; rolled to end the 2026-11-01 OOM kills and commit stalls)
 

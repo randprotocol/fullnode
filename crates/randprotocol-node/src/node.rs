@@ -3773,10 +3773,13 @@ impl Node {
     async fn apply_binding_change(&mut self, change: crate::peer_bindings::BindingChange) {
         for p in change.unreserve {
             self.net.unreserve_peer(p).await;
+            self.dandelion.router.set_trusted(&p, false);
         }
         if let Some(p) = change.reserve {
             tracing::info!(peer = %p, "validator peer binding recorded; peer reserved");
             self.net.reserve_peer(p).await;
+            // A stem successor candidate from now on (PRIV-602).
+            self.dandelion.router.set_trusted(&p, true);
         }
         if change.persist {
             if let Err(e) = self.storage.put_peer_bindings(&self.peer_bindings.rows()) {
@@ -4377,9 +4380,12 @@ impl Node {
                 self.on_sync_response(peer, request_id, response).await?;
             }
             // Dandelion++ (issue #145).
-            NetworkEvent::StemPeer { peer, outbound } => {
+            NetworkEvent::StemPeer { peer, host } => {
                 if self.dandelion.cfg.enabled {
-                    self.dandelion.router.add_peer(peer, outbound, &mut self.dandelion.rng);
+                    // Trusted by its binding (or the operator's flags), never by how it connected
+                    // (audit v12, PRIV-602).
+                    let trusted = self.peer_bindings.is_validator_peer(&peer);
+                    self.dandelion.router.add_peer(peer, trusted, host, &mut self.dandelion.rng);
                     self.dandelion_stats.stem_peers.store(self.dandelion.router.capable(), Ordering::Relaxed);
                 }
             }
@@ -8350,7 +8356,7 @@ mod tests {
         let (mut node, seen) = bare_node(storage, gs, hs);
         node.dandelion = Dandelion::new(DandelionConfig { fluff_prob: q, embargo, seed: Some(7), ..DandelionConfig::default() });
         let succ = PeerId::random();
-        node.dandelion.router.add_peer(succ, true, &mut node.dandelion.rng);
+        node.dandelion.router.add_peer(succ, true, None, &mut node.dandelion.rng);
         (d, node, seen, succ)
     }
 
@@ -8453,7 +8459,7 @@ mod tests {
             node.dandelion = Dandelion::new(cfg.clone());
             if !cfg.enabled {
                 // A capable peer is ignored when Dandelion is off.
-                node.on_network_event(NetworkEvent::StemPeer { peer: PeerId::random(), outbound: true }).await.unwrap();
+                node.on_network_event(NetworkEvent::StemPeer { peer: PeerId::random(), host: None }).await.unwrap();
             }
             let tx = next_tx(node.hs.tip_ledger(), 3);
             let h = tx.hash();
@@ -8547,7 +8553,7 @@ mod tests {
     async fn a_looping_stem_goes_on_and_a_failed_send_moves_to_the_next_successor() {
         let (_d, mut node, mut seen, succ) = stem_node(0.0, Duration::from_secs(60));
         let second = PeerId::random();
-        node.on_network_event(NetworkEvent::StemPeer { peer: second, outbound: true }).await.unwrap();
+        node.on_network_event(NetworkEvent::StemPeer { peer: second, host: None }).await.unwrap();
         assert_eq!(node.dandelion.router.successors().len(), 2);
         let tx = next_tx(node.hs.tip_ledger(), 6);
         let h = tx.hash();
@@ -8574,6 +8580,39 @@ mod tests {
         node.on_network_event(NetworkEvent::PeerDisconnected(to)).await.unwrap();
         assert!(node.dandelion.router.successors().is_empty());
         assert_eq!(node.dandelion_stats.stem_peers.load(Ordering::Relaxed), 0);
+    }
+
+    /// Audit v12, PRIV-602: a stem peer is a preferred successor because a validator's binding
+    /// names it, never because of how it connected: with a validator's peer among a dozen others
+    /// (all on hosts of their own), the validator's is a successor in every epoch, and a binding
+    /// recorded later promotes a peer already known.
+    #[tokio::test]
+    async fn a_stem_successor_is_preferred_for_its_binding_not_its_connection() {
+        let (_d, mut node, _seen, _succ) = stem_node(0.0, Duration::from_secs(60));
+        node.dandelion = Dandelion::new(DandelionConfig { seed: Some(3), epoch: Duration::from_secs(1), ..DandelionConfig::default() });
+        let validator = PeerId::random();
+        node.peer_bindings.insert_for_test(Keypair::from_seed([77; 32]).unwrap().address(), validator);
+        let host = |n: u8| Some(network::edge::Source::V4(std::net::Ipv4Addr::new(203, 0, 113, n)));
+        for n in 1..=12u8 {
+            node.on_network_event(NetworkEvent::StemPeer { peer: PeerId::random(), host: host(n) }).await.unwrap();
+        }
+        node.on_network_event(NetworkEvent::StemPeer { peer: validator, host: host(50) }).await.unwrap();
+        let t0 = Instant::now();
+        for k in 0..20 {
+            node.dandelion.router.route(Edge::Local, t0 + Duration::from_secs(k), &mut node.dandelion.rng);
+            assert!(node.dandelion.router.successors().contains(&validator), "epoch {k}: the validator's peer is not a successor");
+        }
+        // A binding recorded after the peer was known promotes it too.
+        let late = PeerId::random();
+        node.on_network_event(NetworkEvent::StemPeer { peer: late, host: host(51) }).await.unwrap();
+        node.peer_bindings.insert_for_test(Keypair::from_seed([78; 32]).unwrap().address(), late);
+        node.apply_binding_change(crate::peer_bindings::BindingChange { reserve: Some(late), unreserve: vec![], persist: false }).await;
+        node.dandelion.router.route(Edge::Local, t0 + Duration::from_secs(100), &mut node.dandelion.rng);
+        let mut s = node.dandelion.router.successors().to_vec();
+        s.sort();
+        let mut want = vec![validator, late];
+        want.sort();
+        assert_eq!(s, want, "both validators' peers, none of the others");
     }
 
     /// A peer's stem is pre-screened like gossip — over its allowance it is dropped unverified —
