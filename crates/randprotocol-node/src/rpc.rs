@@ -236,6 +236,14 @@ pub struct NodeStatus {
     /// Free space is under four times the startup minimum (`--min-free-disk-mb`): the node still
     /// runs, and `rand_getHealth` says `disk_low` ahead of everything else.
     pub disk_low: bool,
+    /// Free space is under `disk::DISK_WARN_FACTOR` times the startup minimum (audit v12,
+    /// OPS-601): the early warning, reported beside `rand_getHealth`'s status word.
+    pub disk_warn: bool,
+    /// Free space lost per day over the last hour-long window (OPS-601); `None` before one.
+    pub disk_bytes_per_day: Option<u64>,
+    /// Days until `disk_low` at that rate; `None` without a rate or while free space is not
+    /// shrinking.
+    pub disk_days_left: Option<f64>,
     /// The lowest height this node still serves besides genesis (history pruning spec §4); 0
     /// on an archive.
     pub prune_floor: u64,
@@ -565,13 +573,26 @@ pub fn health_json(s: &NodeStatus) -> Value {
         return json!({ "status": "disk_low", "free_bytes": s.disk_free_bytes.to_string() });
     }
     let behind = s.sync_target.saturating_sub(s.height);
-    if s.sync_inflight_age_ms.is_some() {
+    let mut v = if s.sync_inflight_age_ms.is_some() {
         json!({ "status": "syncing", "behind": behind })
     } else if behind > 2 {
         json!({ "status": "behind", "behind": behind })
     } else {
         json!({ "status": "ok" })
+    };
+    // OPS-601: the early disk warning rides beside the status word and never replaces it — a
+    // roll waits on `ok` — so a monitor reading `disk_warn` has days where `disk_low` gives hours.
+    if s.disk_warn {
+        v["disk_warn"] = json!(true);
+        v["free_bytes"] = json!(s.disk_free_bytes.to_string());
+        if let Some(r) = s.disk_bytes_per_day {
+            v["disk_bytes_per_day"] = json!(r.to_string());
+        }
+        if let Some(d) = s.disk_days_left {
+            v["disk_days_left"] = json!(d);
+        }
     }
+    v
 }
 
 /// One committed head, as `rand_getHead` reports it. What a `newHeads` notification carries.
@@ -9880,6 +9901,27 @@ pub(crate) mod tests {
         let v = health_json(&s);
         assert_eq!(v["status"], "disk_low");
         assert_eq!(v["free_bytes"], "123");
+    }
+
+    /// OPS-601: the early warning rides beside the status word, never replacing it (a roll waits
+    /// on `ok`), and carries the free bytes and the measured days left.
+    #[test]
+    fn health_carries_disk_warn_beside_the_status_word() {
+        let s = NodeStatus {
+            disk_warn: true,
+            disk_free_bytes: 10 << 30,
+            disk_bytes_per_day: Some(5 << 30),
+            disk_days_left: Some(1.2),
+            ..NodeStatus::default()
+        };
+        let v = health_json(&s);
+        assert_eq!(v["status"], "ok");
+        assert_eq!(v["disk_warn"], true);
+        assert_eq!(v["free_bytes"], (10u64 << 30).to_string());
+        assert_eq!(v["disk_bytes_per_day"], (5u64 << 30).to_string());
+        assert_eq!(v["disk_days_left"], 1.2);
+        let quiet = health_json(&NodeStatus::default());
+        assert_eq!(quiet, json!({ "status": "ok" }), "no warning, no extra keys");
     }
 
     /// Twelve timed blocks, pruned to a floor of 10, behind the RPC.

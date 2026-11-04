@@ -374,6 +374,10 @@ filesystem (`--min-free-disk-mb`, default 1024, names the directory and the flag
 tick with a warning in the log — the 2026-09-24 stall was seven full disks and a health check that
 said `ok` right up to the crash loop. A roll waits on `ok`, so a droplet near full now stops the
 roll at that node instead of at the next one that fills.
+Since audit v12 (OPS-601) the node also warns early: under 16 GB free (16 × the minimum) it logs
+`disk_warn` once an hour with its measured growth and days to `disk_low`, and `rand_getHealth`
+carries `disk_warn`, `disk_bytes_per_day` and `disk_days_left` beside an unchanged status word.
+An unpruned chain-21 archive grows 5–6 GB a day; size it by `docs/node-hardware.md`.
 
 ## The compact-blocks flag day
 

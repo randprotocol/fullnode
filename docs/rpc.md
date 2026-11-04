@@ -1545,6 +1545,14 @@ under four times the node's startup minimum (`--min-free-disk-mb`, default 1024 
 while one is. `behind` when the node is not syncing and the lag is still above 2 — the chain-8
 stall shape. A load balancer reads `status` alone; an operator reads `behind` too.
 
+Beside any status but `disk_low`, while free space is under sixteen times the startup minimum
+(16 GB at the default), the result also carries the early warning (audit v12, OPS-601):
+`{"status":"ok","disk_warn":true,"free_bytes":"…","disk_bytes_per_day":"…","disk_days_left":2.7}`.
+`disk_bytes_per_day` is free space lost per day over the last hour-long window and
+`disk_days_left` the days until `disk_low` at that rate; each is absent until measured or while
+free space is not shrinking. The status word is unchanged, so a roll waiting on `ok` is not
+stopped by it; a monitor reads `disk_warn`.
+
 ### `rand_getTransactionStatus`
 Params: `[[hash, …]]`, 1 to 64 hashes. Result: one entry per hash, in order:
 ```json
