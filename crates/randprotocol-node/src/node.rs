@@ -2535,6 +2535,9 @@ pub struct RpcOptions {
     /// ([`AdmissionBudget::default_for`]). Here rather than in [`NodeConfig`] so the many literal
     /// `NodeConfig`s stay untouched.
     pub admission_budget: Option<usize>,
+    /// `--disable-scan-leaves` (audit v12, RPC-201): `rand_getScanLeaves` refused on both
+    /// listeners. Off by default until the next minor, so wallets before v0.8.3 keep scanning.
+    pub disable_scan_leaves: bool,
 }
 
 /// What [`start_with`] adds to the network beyond [`NodeConfig`] (audit v6, NET-1): its own
@@ -2789,6 +2792,7 @@ pub async fn start_with(cfg: NodeConfig, rpc_options: RpcOptions, net_options: N
             refusals: refusals.clone(),
             ws_conns: ws_conns.clone(),
             viewing,
+            scan_leaves: !rpc_options.disable_scan_leaves,
     };
     let public_rpc = match rpc_options.public_addr {
         Some(addr) => Some(rpc::serve(addr, rpc_state.for_public_listener()).await.with_context(|| format!("binding --public-rpc {addr}"))?),

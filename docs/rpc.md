@@ -281,6 +281,16 @@ a leaf against a head's 1 720, ~2.26× — the whole increase for a wallet whose
 stays on the node for other clients; what a client that uses it reveals by its follow-up reads is
 its own choice.
 
+**Turning it off (audit v12, RPC-201).** Wallets before v0.8.3 still scan with this method, so
+every node that serves it still learns those wallets' leaves. `rand-node run --disable-scan-leaves`
+refuses it on both listeners (`-32601`, the message names the flag and asks for rand v0.8.3+);
+`rand_getCommitments` is unaffected. **The plan:** served by default in v0.8.x so a wallet
+before v0.8.3 keeps scanning; at the next minor (v0.9.0) the default flips to off, with
+`--enable-scan-leaves` for an operator who wants it, once the wallet download page has carried
+v0.8.3+ for a release cycle. The public RPC deploy template (`deploy/enable-public-rpc.sh`) does
+not pass the flag yet: nothing in these docs says the public RPC should break old wallets before
+the flip, so that is the operator's call per host until v0.9.0.
+
 ### `rand_getNullifiers`
 Params: `[from_height]` or `[from_height, limit]`. Result: every nullifier published from that
 block height onwards, same 1000-row cap.

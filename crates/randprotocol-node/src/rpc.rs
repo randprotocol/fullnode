@@ -683,6 +683,11 @@ pub struct RpcState {
     /// Issue #157: the node's admission byte budget, shared by both listeners and the verify
     /// queue. Every POST body is charged against it before it is read ([`charge_body`]).
     pub admission: crate::admission::AdmissionBudget,
+    /// Whether `rand_getScanLeaves` is served (audit v12, RPC-201). `rand` v0.8.3+ never calls
+    /// it; a wallet before v0.8.3 scanning with it tells the node which leaves it owns. On by
+    /// default so those wallets keep working; `--disable-scan-leaves` turns it off, and the plan
+    /// is to flip the default at the next minor (`docs/rpc.md`, `rand_getScanLeaves`).
+    pub scan_leaves: bool,
 }
 
 impl RpcState {
@@ -2952,6 +2957,16 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
         // `rand_getCommitments` only for the leaves one of its keys opens — about a third of the
         // bytes of a full page for the same answer.
         "rand_getScanLeaves" => {
+            if !st.scan_leaves {
+                return Err(RpcError {
+                    code: -32601,
+                    message: "rand_getScanLeaves is disabled on this node (--disable-scan-leaves, audit v12 RPC-201): \
+                              a scan that reads heads and then fetches its own leaves tells the node which leaves it owns. \
+                              Upgrade the wallet to rand v0.8.3 or later, which scans with rand_getCommitments"
+                        .into(),
+                    data: None,
+                });
+            }
             let from: u64 = param(p, 0, "from_index")?;
             let limit = parse_limit(p, 1)?;
             let rows = st.storage.notes_from(from, limit).map_err(RpcError::internal)?;
@@ -4615,6 +4630,7 @@ pub(crate) mod tests {
             ws_conns: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             viewing: Arc::new(RwLock::new(crate::viewing::Registry::default())),
             admission: crate::admission::AdmissionBudget::new(crate::admission::AdmissionBudget::DEFAULT_MAX),
+            scan_leaves: true,
         }
     }
 
@@ -5303,6 +5319,23 @@ pub(crate) mod tests {
             for (k, v) in want.as_object().unwrap() {
                 assert_eq!(&j["action"][k], v, "{kind}.{k}: {j}");
             }
+        }
+    }
+
+    /// Audit v12, RPC-201: `--disable-scan-leaves` turns `rand_getScanLeaves` off on both
+    /// listeners — a wallet before v0.8.3 scanning with it tells the node which leaves it owns —
+    /// with an error naming the flag and the upgrade, while `rand_getCommitments` (what v0.8.3+
+    /// scans with) still answers. On by default until the next minor.
+    #[tokio::test]
+    async fn scan_leaves_can_be_disabled_and_commitments_still_serve() {
+        let (_d, st, _gs) = chain();
+        assert!(st.scan_leaves, "served by default for now (wallets before v0.8.3 use it)");
+        let off = RpcState { scan_leaves: false, ..st.clone() };
+        for state in [off.clone(), off.for_public_listener()] {
+            let e = call(&state, "rand_getScanLeaves", json!([0, 100])).await.unwrap_err();
+            assert_eq!(e.code, -32601, "{}", e.message);
+            assert!(e.message.contains("--disable-scan-leaves") && e.message.contains("v0.8.3"), "{}", e.message);
+            assert!(!call(&state, "rand_getCommitments", json!([0, 100])).await.unwrap().as_array().unwrap().is_empty());
         }
     }
 

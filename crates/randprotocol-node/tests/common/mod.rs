@@ -240,6 +240,7 @@ async fn serve_genesis_seeded_with(
         ws_conns: Arc::new(AtomicUsize::new(0)),
         viewing: Arc::new(RwLock::new(randprotocol_node::viewing::Registry::default())),
         admission: randprotocol_node::admission::AdmissionBudget::new(randprotocol_node::admission::AdmissionBudget::DEFAULT_MAX),
+        scan_leaves: true,
     };
     let ws_conns = state.ws_conns.clone();
     let status = state.status.clone();
