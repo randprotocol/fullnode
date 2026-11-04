@@ -12,6 +12,12 @@ stopped at v0.4 until 2026-09-30, when the entries v0.5 to v0.6.7 were written f
 
 ## Unreleased
 
+Nothing yet.
+
+## v0.8.5 — 2026-11-04 (chain 21, node-only; audit v12 rows; no wire or consensus change)
+
+Node (audit v12 consensus-adjacent rows):
+
 - **CON-601 (node policy, every chain; consensus unchanged):** `rand-node run
   --max-state-proof-tier <T>` caps the perps state-proof tier a node verifies for its pool when it
   holds no verifier key for the proof's shape. A cold proof above it is refused at the pool's
@@ -69,6 +75,35 @@ Node (audit v12 network and privacy rows; node-only, no wire or consensus change
   from 10 s to 1.5 s, under the 3 s default embargo, so a successor that never answers is dropped
   and the transaction rerouted to the other successor before any embargo fires. (A successor
   that acknowledges and then drops is still covered only by the embargo.)
+
+Node and deploy (audit v12 operations rows):
+
+- **Every roll writes the service's limits** (PROC-601): `deploy/lib/unit-limits.sh` writes
+  `rand-node.service.d/50-limits.conf` (`MemoryHigh=85%`, `LimitNOFILE=524288:524288`)
+  idempotently. `update-droplet.sh`, `roll-all.sh` and `vps-setup.sh` all call it, so the
+  `MemoryHigh` of #157, which lived only in two unit templates and reached 0 of 26 hosts, is on
+  every host after this roll. `SELFTEST=1 bash deploy/lib/unit-limits.sh` runs in CI.
+- **Early low-disk warning** (OPS-601): under 16 × the startup minimum (16 GB by default) the
+  node logs `disk_warn` hourly with the measured growth rate and the days left to `disk_low`;
+  `rand_getHealth` carries `disk_warn`, `free_bytes`, `disk_bytes_per_day` and
+  `disk_days_left` beside an unchanged status word. Archive sizing is in
+  `docs/node-hardware.md` (about 5 GB a day unpruned).
+- **The 27 Oct burst, re-run in process** (OPS-602): tests only. The admission byte budget bounds
+  counted bytes, not RSS, so on 2 GB hosts `MemoryHigh` and the 4 GB validator minimum remain the
+  OOM protection (`docs/rpc.md`).
+- **`--disable-scan-leaves`** (RPC-201): refuses `rand_getScanLeaves` on both listeners with
+  `-32601` naming the flag. Off by default, since wallets before v0.8.3 still scan with it.
+
+Client and prover pool:
+
+- **`rand multisig-private sign` applies the apps' fee rule** (MSC-2): it refuses a fee over
+  `--max-fee` (default 0.1 RAND) or over the RAND the proposal pays out; `--allow-high-fee`
+  overrides. `randprotocol-msig` gains `DEFAULT_MAX_FEE`, `fee_refusal` and
+  `sign_expecting_within_fee`.
+- **The router's per-address submit rate follows the pool's capacity** (VK-10): one address's
+  refill is `SUBMIT_SHARE` (default 0.3) of the members' measured capacity, so one address gets
+  about a third of the pool's jobs instead of about 85%. A set `SUBMIT_PER_MIN` is a ceiling, not
+  an override.
 
 ## v0.8.4 — 2026-11-01 (chain 21, node-only; rolled to end the 2026-11-01 OOM kills and commit stalls)
 
