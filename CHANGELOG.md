@@ -12,7 +12,12 @@ stopped at v0.4 until 2026-09-30, when the entries v0.5 to v0.6.7 were written f
 
 ## Unreleased
 
-Nothing yet.
+- **Chain-22 cut (`deploy/cut-chain22-genesis.sh`):** the genesis sets
+  `perps.max_pending_digests = 65536`, the owner's decision of 2026-11-05 for chain 22's perps
+  digest cap (about 18 h of input-bearing blocks with no prover; ~2.6 MB of log). The script writes
+  it in the perps section, asserts it on the finished file, probes it in the genesis hash (eight
+  variants now), reads it back in `check-limits`, and refuses a `rand-node` (or
+  `EXPECT_NODE_VERSION`) below v0.8.5, the first release with the field. `docs/deploy.md` lists it.
 
 ## v0.8.5 — 2026-11-04 (chain 21, node-only; audit v12 rows; no wire or consensus change)
 

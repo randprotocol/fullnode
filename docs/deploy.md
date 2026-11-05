@@ -1851,6 +1851,7 @@ issues at the cut: randprotocol/monorepo#15 (PST-1), #13 (PERP-6) and #12 (PERP-
 | `perps.initial_collateral` | absent (0) | the collateral a seeded engine starts with; chain 22's engine starts from `perp-prover genesis-state`, which holds none | `docs/perps.md` field table |
 | `perps.sparse_windows` + `perps.max_window_heights` | `true` + **the owner's value** | input-less blocks record no digest; one window spans at most `max_window_heights` heights, `max_window_blocks` (64) ..= 4096; it is also the heartbeat interval, and back-pressure holds new orders at 4 × it past the proved height (PERP-101) | `docs/perps.md` "Sparse windows" |
 | `perps.engine_program_log_height` | `14` | pins the engine's program height so an invalid proof is not re-proved at another shape (CON-60); `rand perp image-hc` prints it on stderr for the pinned image `f286a611…` | `docs/perps.md` field table |
+| `perps.max_pending_digests` | `65536` (owner's decision, 2026-11-05) | caps the recorded digests no state proof has covered: at the cap, deposits, orders, cancels and withdrawal requests are refused `DigestLogFull` until a proof drains the log; about 18 h of input-bearing blocks with no prover, ~2.6 MB of log (PERP-5, v0.8.5+; the stored perps row then uses trailer `rand-perps-ext-2`) | `docs/perps.md` field table |
 | `multisig.max_accounts` | **the owner's value** (≥ 1) | the most accounts the register ever holds, the seeded treasury counted; a `CreateMultisig` past it is refused (MSA-4) | `docs/multisig.md` (`max_accounts`) |
 | `tokens.incremental_root` | `true` | "Recommended: on, for the next cut" (above, audit v6 TOK-1); chain 21 did not carry it | this page, "The next cut: `tokens.incremental_root`" |
 
@@ -1859,8 +1860,9 @@ zUSD, the pinned engine, tier 18, 24 inputs — and its `genesis_root`, re-deriv
 must equal chain 21's `da0e3a53…`), `multisig` create fee 1 RAND with one treasury 2 of 3,
 `hc_auth_multisig` 9705f8e2…, 6 MiB proofs and 19 MiB blocks, and chain 20's shape before them.
 
-**Open — the owner's, before the cut** (`deploy/cut-chain22-genesis.sh`'s header, OPEN 1–7). The
-real cut takes no default for any of them:
+**Open — the owner's, before the cut** (`deploy/cut-chain22-genesis.sh`'s header, OPEN 1–7; OPEN 8,
+`perps.max_pending_digests`, was decided 2026-11-05: 65536, in the table above). The real cut
+takes no default for any of them:
 
 1. `perps.max_window_heights` — no documented value (the documented default, 0, is refused beside
    `sparse_windows`). `PERPS_MAX_WINDOW_HEIGHTS`, 64..=4096.
@@ -1880,7 +1882,9 @@ real cut takes no default for any of them:
    note re-issues it.
 6. Not carried and not recommended by any page: `incremental_nullifier_root`, `staking.slashing`,
    and the aggregation-only fields — each refused, as chain 21 refused them.
-7. `EXPECT_NODE_VERSION` — v0.8.2 is the first release with every field; v0.8.3 is untagged.
+7. `EXPECT_NODE_VERSION` — v0.8.5 is the first release with every field (`max_pending_digests`;
+   the rest since v0.8.2). The cut refuses a `rand-node --version`, or an `EXPECT_NODE_VERSION`,
+   below 0.8.5, `DRY_RUN` and `NODE_VERSION_OK=1` included.
 
 RPL-2 program vaults are refused the same way (`rand_getSupply.program_rand_held`;
 `PROGRAM_VAULTS_DROPPED_OK=1`, the record's `drops:` naming them): chain 21's record dropped the
@@ -1891,15 +1895,16 @@ as the source (`snapshot` also reads `rand_getPerps`, `rand_getPerpAccounts` and
 `rand_getMultisig`). It writes `refuse_panics` and `incremental_root` through the build's flags,
 `max_accounts` in the `--multisig` file, and the perps fields in the section it splices; derives
 `engine_program_log_height` from `rand perp image-hc` and refuses anything but 14; asserts each on
-the finished file (`initial_collateral` absent; `max_window_heights` and `max_accounts` equal to the
-operator's inputs; each in its struct's field order); and proves each is part of the genesis hash
-— seven variants, each a valid genesis without one field (or, for `max_window_heights`, at another
-value in range), each of which must hash differently. The real cut refuses a build without
+the finished file (`initial_collateral` absent; `max_pending_digests` 65536; `max_window_heights`
+and `max_accounts` equal to the operator's inputs; each in its struct's field order); and proves
+each is part of the genesis hash — eight variants, each a valid genesis without one field (or, for
+`max_window_heights`, at another value in range; `sparse_windows` goes with the two fields that
+need it), each of which must hash differently. The real cut refuses a build without
 `--program-state-refuse-panics` or whose `rand perp image-hc` prints no
 `engine_program_log_height` (anything before v0.8.2); `DRY_RUN=1` skips them all on such a build,
 loudly (`AUDIT_V10 SKIPPED`), and puts in each operator input's lower bound (64; 1), loudly, as a
 placeholder. The cut record's `reason:` or `carries:` must name PST-1, PERP-6 and PERP-101 and the
-treasury. Every node — validators, archives, the RPC nodes the sites read — runs v0.8.2 or later
+treasury. Every node — validators, archives, the RPC nodes the sites read — runs v0.8.5 or later
 from chain 22's first block: an older one refuses the file (`deny_unknown_fields` on the perps,
 multisig and program-state sections). durian.market's perp-prover must build sparse jobs
 (durian 28cebfb, PERP-101) before the first perps window on chain 22, and the prover host must fit
@@ -1908,7 +1913,7 @@ a tier-18 proof (`rand perp prove` proves at the canonical shape once the pin is
 **After launch:** `NODE=… deploy/cut-chain22-genesis.sh check-limits <first node's RPC> <genesis
 file>` reads, beside every chain-21 value, `rand_getPerps` `bound_payouts` true,
 `initial_collateral` `"0"`, `sparse_windows` true, `max_window_heights`,
-`engine_program_log_height` 14, `accounts`/`pending_withdrawals` 0 and the collateral counters
+`engine_program_log_height` 14, `max_pending_digests` 65536, `accounts`/`pending_withdrawals` 0 and the collateral counters
 `"0"`; `rand_getLimits.multisig.max_accounts`; and `rand_getTokens.incremental_root` true. Run it
 before the first deposit and state proof. **No RPC serves `program_state.refuse_panics`**
 (`rand_getLimits.program_state` is the cell fee and three bounds): it is read back only through the
