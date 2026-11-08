@@ -56,7 +56,12 @@ Deploy (audit v13 rows; no host touched):
   run removes nothing. `update-droplet.sh`'s already-current branch restarts the node after such a
   removal too.
 
-## v0.8.5 — 2026-11-04 (chain 21, node-only; audit v12 rows; no wire or consensus change)
+## v0.8.5 — 2026-11-04 (chain 21, node-only; audit v12 rows; no wire or consensus change; rolled 2026-11-04 to all 25 inventory hosts)
+
+Rolled 2026-11-04 17:46–19:52 UTC to all 25 inventory hosts (archive2 offline, skipped) plus the
+durian site node: tag `d8efd472`, rand-node sha256 `2cdb3d18…` from the user-signed `SHA256SUMS`,
+with `rand-node.service.d/50-limits.conf` written on every host. Fleet probes of 2026-11-07 show
+25/25 on 0.8.5 (`deploy/roll-records/v0.8.5.record`).
 
 Node (audit v12 consensus-adjacent rows):
 

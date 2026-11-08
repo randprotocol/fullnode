@@ -29,8 +29,9 @@ Since this table was written: **chain 19** (v0.6.7, genesis `a3defc93…228a`, 2
 2026-10-01 06:17 UTC, `deploy/cut-chain20-genesis.sh`, `deploy/cut-records/chain20.record`; now on
 v0.7.1; retired at the chain-21 cut). **Chain 21** (v0.8.0, genesis `ca76c276…ca9a`, cut
 2026-10-12, all 26 validators switched at 10:31 UTC, `deploy/cut-records/` and
-`docs/chain21-cut-runbook.md`) is the chain that runs. The paragraph below is the cut's
-preparation record:
+`docs/chain21-cut-runbook.md`) is the chain that runs; since 2026-11-04 on **v0.8.5** (node-only
+rolls v0.8.2 → v0.8.3 → v0.8.4 → v0.8.5; `deploy/roll-records/v0.8.5.record`, `CHANGELOG.md`).
+The paragraph below is the cut's preparation record:
 `deploy/cut-chain21-genesis.sh` carries chain 20's shape and value plus three new sections —
 `fees` (`burn_base`, `burn_floor`), `perps` (RPL-3: BTC-PERP on zUSD) and `multisig` (the
 foundation treasury, 2 of 3) — and private multisig's `hc_auth_multisig` field with 6 MiB proofs
