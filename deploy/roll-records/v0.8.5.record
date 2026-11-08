@@ -1,0 +1,21 @@
+# Roll record — v0.8.5 onto chain 21 (a node-only, same-chain roll; no genesis, no cut).
+#
+# One line per field, like deploy/cut-records/*.record; lines starting with # are ignored. A roll
+# record says what was installed where and when, and what was left out. No host addresses or keys:
+# the fleet's list is the operator's (configuration/fleet in the private configuration repository).
+
+release: v0.8.5 (tag d8efd472, 2026-11-04; CHANGELOG.md, v0.8.5: audit v12 rows, node-only, no wire or consensus change)
+
+binary: rand-node sha256 2cdb3d18… as listed in the release's SHA256SUMS, signed by the user (deploy/release-signers)
+
+window: 2026-11-04 17:46–19:52 UTC
+
+hosts: all 25 inventory hosts plus the durian site node
+
+skipped: archive2 (offline at the roll)
+
+unit: rand-node.service.d/50-limits.conf (MemoryHigh=85%, LimitNOFILE=524288:524288; deploy/lib/unit-limits.sh, PROC-601) written on every host rolled
+
+left-over: every host still carries the hand-placed rand-node.service.d/nofile.conf of 2026-11-01, which sorts after 50-limits.conf and so sets LimitNOFILE (audit v13, PROC-702: the next roll's unit-limits.sh moves it aside)
+
+verified: fleet probes of 2026-11-07, 25/25 on 0.8.5

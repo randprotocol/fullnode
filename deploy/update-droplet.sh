@@ -92,8 +92,9 @@ if [ "$WANT" = "$HAVE" ] && [ "$WANT_WALLET" = "$HAVE_WALLET" ]; then
   LIMITS=$($SSH "set -e
   $(unit_limits_install_script "$SERVICE")")
   echo "$IP: $LIMITS"
+  # PROC-702: a legacy drop-in moved aside changes the effective LimitNOFILE too.
   case "$LIMITS" in
-    "limits: written"*) $SSH "systemctl restart $SERVICE; sleep 4; systemctl is-active $SERVICE" ;;
+    *"limits: written"*|*"limits: removed legacy"*) $SSH "systemctl restart $SERVICE; sleep 4; systemctl is-active $SERVICE" ;;
   esac
   echo "$IP: already on ${WANT:0:8}"; exit 0
 fi
@@ -103,7 +104,7 @@ $SSH "set -e
   systemctl stop $SERVICE
   install -m 755 /root/$BIN_NODE /root/$BIN_WALLET /usr/local/bin/
   if [ -n \"${PRUNE_ARGS:-}\" ] && ! grep -q -- '--prune-history' /etc/systemd/system/$SERVICE.service; then
-    sed -i \"s|^ExecStart=\(.*\)\$|ExecStart=\1 ${PRUNE_ARGS}|\" /etc/systemd/system/$SERVICE.service
+    sed -i \"s|^ExecStart=\(.*\)\$|ExecStart=\1 ${PRUNE_ARGS:-}|\" /etc/systemd/system/$SERVICE.service
     systemctl daemon-reload
   fi
   # A unit written by the chain-14 cutover still says \"RAND full node (d, chain 14)\" (#143): later

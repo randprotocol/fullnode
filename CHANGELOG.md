@@ -19,7 +19,55 @@ stopped at v0.4 until 2026-09-30, when the entries v0.5 to v0.6.7 were written f
   variants now), reads it back in `check-limits`, and refuses a `rand-node` (or
   `EXPECT_NODE_VERSION`) below v0.8.5, the first release with the field. `docs/deploy.md` lists it.
 
-## v0.8.5 — 2026-11-04 (chain 21, node-only; audit v12 rows; no wire or consensus change)
+Node (audit v13 rows; node-only, no wire, storage-format or consensus change):
+
+- **A failed gossip copy no longer ends a held stem transaction's embargo** (PRIV-701): a
+  marker-form copy (GOSSIP-2) of a transaction this node holds on the stem carries the held one's
+  id, is queued, and fails `PrunedFormOutsideSync`; that failed verdict took the honest
+  transaction out of the stempool and cancelled its embargo, so it was neither held, pooled nor
+  published although its submitter had heard `Ok`. Only an `Ok` verdict ends the embargo now.
+- **A full stempool no longer publishes the node's own submission first** (PRIV-605): at 1 024
+  held transactions or 64 MiB, `decide` answered `Fluff(Full)`, so a transaction submitted over
+  this node's RPC was pooled and published by the submitter itself. The submission now makes room
+  by fluffing the oldest transactions the node holds for peers (the `Full` fluff a relayed arrival
+  gets) and takes the stem as usual. A relayed arrival at a full stempool is still fluffed, and
+  when every held entry is the node's own the old answer stands.
+- **The default state-proof tier cap counts the memory left** (CON-701): v0.8.5 sized
+  `--max-state-proof-tier`'s default from the host's RAM alone, so host e (7.9 GB; `MemoryHigh=85%`
+  is 6.7 GB; the node ~5 GB resident) kept tier 18 and a free forged tier-18 header bought a
+  3.56 GB key build there. The default now fits the documented build peak in three quarters of
+  min(host RAM, the cgroup v2 `memory.high`/`memory.max` of the node's cgroup and its ancestors)
+  less the node's resident size, at startup and every minute on the status tick (logged when it
+  moves). Host e is 16; a 16 GB host with a small node stays 18. With no cgroup or `/proc`
+  reading (macOS) the old rule stands. `--max-state-proof-tier` still overrides it.
+
+Deploy (audit v13 rows; no host touched):
+
+- **The limits drop-in's wiring is tested by running the roll scripts** (PROC-701): the selftest
+  checked only that `update-droplet.sh`, `roll-all.sh` and `vps-setup.sh` mention
+  `unit_limits_install_script`, so deleting the already-current refresh in `update-droplet.sh` or
+  the install step's call in `roll-all.sh` stayed green. `SELFTEST=1 bash
+  deploy/lib/unit-limits.sh` now runs `update-droplet.sh` (already current, written and unchanged;
+  and a new binary) and `roll-all.sh` against stub `ssh`/`scp`/`launchctl` that only record, and
+  asserts each path sends the install script to each host before its restart or stop-all;
+  either deletion turns it red. `vps-setup.sh` (root on a fresh host) is checked for a live call
+  before the node's first start. Running it found that `update-droplet.sh`'s new-binary path died
+  under `set -u` with `PRUNE_ARGS` unset (`${PRUNE_ARGS}` in the `sed`); it is `${PRUNE_ARGS:-}`.
+- **The hosts' hand-placed `nofile.conf` is retired by the next roll** (PROC-702): every host still
+  had the `rand-node.service.d/nofile.conf` of 1 Nov beside the generated `50-limits.conf`; it
+  sorts after it, so it is what set `LimitNOFILE`. The install script `unit-limits.sh` writes now
+  also moves aside (`<name>.removed`, which systemd does not load) any other `*.conf` in that
+  directory that sets `LimitNOFILE` or `MemoryHigh`, on every run whether or not `50-limits.conf`
+  changed, with one `daemon-reload` and a `limits: removed legacy <path> …` line each; a second
+  run removes nothing. `update-droplet.sh`'s already-current branch restarts the node after such a
+  removal too.
+
+## v0.8.5 — 2026-11-04 (chain 21, node-only; audit v12 rows; no wire or consensus change; rolled 2026-11-04 to all 25 inventory hosts)
+
+Rolled 2026-11-04 17:46–19:52 UTC to all 25 inventory hosts (archive2 offline, skipped) plus the
+durian site node: tag `d8efd472`, rand-node sha256 `2cdb3d18…` from the user-signed `SHA256SUMS`,
+with `rand-node.service.d/50-limits.conf` written on every host. Fleet probes of 2026-11-07 show
+25/25 on 0.8.5 (`deploy/roll-records/v0.8.5.record`).
 
 Node (audit v12 consensus-adjacent rows):
 
@@ -30,7 +78,8 @@ Node (audit v12 consensus-adjacent rows):
   key build, so it is not verified, pooled, relayed or proposed there
   (`StateProofAboveNodeTier`: not cached, no peer penalised). The default is the highest tier
   whose documented key-build peak fits in three quarters of the host's RAM: 16 on 2 GB and 4 GB
-  hosts, 18 on 8 GB, 20 from about 22 GB. The startup warm skips shapes above the cap too. A
+  hosts, 18 from about 5.73 GB, 20 from about 22.9 GB (audit v13, CON-701, sizes it from the
+  memory left instead; see Unreleased). The startup warm skips shapes above the cap too. A
   block carrying such a proof still applies and builds its key: that residual waits for chain
   22's genesis engine pin. Also, the state-proof pre-key checks now refuse a FRI transcript of the
   wrong structure (commit rounds, proof-of-work words and openings of unequal counts, no round,

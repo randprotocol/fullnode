@@ -81,7 +81,9 @@ pub const STEM_PEER_BURST: u32 = 32;
 /// transaction's stem and, later, its gossip.
 pub const STEM_PEER_PER_SEC: f64 = 8.0;
 /// The most stem transactions held at once. Past it a new one is fluffed at once rather than
-/// held: the stempool is never a reason to drop a valid transaction.
+/// held: the stempool is never a reason to drop a valid transaction. The node's own submission is
+/// the exception: it makes room by fluffing the oldest entry held for a peer
+/// ([`Stempool::evict_relayed_for`], audit v13 PRIV-605).
 pub const STEMPOOL_MAX: usize = 1024;
 /// The most bytes of stem transactions held at once, by `Transaction::encoded_len`.
 pub const STEMPOOL_MAX_BYTES: usize = 64 << 20;
@@ -297,6 +299,8 @@ struct StemEntry {
     deadline: Instant,
     /// The successors it was sent to, in order.
     sent_to: Vec<PeerId>,
+    /// Its place in the order of holding ([`Stempool::evict_relayed_for`]'s "oldest").
+    seq: u64,
 }
 
 /// Verified stem transactions, invisible to everything but the node loop until fluffed.
@@ -305,11 +309,43 @@ pub struct Stempool {
     bytes: usize,
     max: usize,
     max_bytes: usize,
+    next_seq: u64,
 }
 
 impl Stempool {
     pub fn new(max: usize, max_bytes: usize) -> Stempool {
-        Stempool { entries: HashMap::new(), bytes: 0, max, max_bytes }
+        Stempool { entries: HashMap::new(), bytes: 0, max, max_bytes, next_seq: 0 }
+    }
+
+    /// Whether a `bytes`-long transaction fits under both caps now.
+    fn fits(&self, bytes: usize) -> bool {
+        self.entries.len() < self.max && self.bytes + bytes <= self.max_bytes
+    }
+
+    /// Audit v13, PRIV-605: room for a `bytes`-long transaction of this node's own — the oldest
+    /// entries held for peers, taken out (for the caller to fluff) until both caps fit it. Before,
+    /// a full stempool fluffed the node's own submission at once, so the submitter published it
+    /// first. Entries of the node's own (`Edge::Local`) are never taken, and nothing is taken when
+    /// taking every relayed entry would still not make room: the caller then fluffs as before.
+    pub fn evict_relayed_for(&mut self, bytes: usize) -> Vec<(Hash, Transaction)> {
+        let (own_len, own_bytes) = self
+            .entries
+            .values()
+            .filter(|e| e.origin == Edge::Local)
+            .fold((0usize, 0usize), |(n, b), e| (n + 1, b + e.bytes));
+        if own_len >= self.max || own_bytes + bytes > self.max_bytes {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        while !self.fits(bytes) {
+            let Some(h) = self.entries.iter().filter(|(_, e)| e.origin != Edge::Local).min_by_key(|(_, e)| e.seq).map(|(h, _)| *h) else {
+                break;
+            };
+            if let Some(tx) = self.take(&h) {
+                out.push((h, tx));
+            }
+        }
+        out
     }
 
     /// Hold `tx` until `deadline`; `false` (nothing held) when it would go over either cap.
@@ -318,11 +354,13 @@ impl Stempool {
             return true;
         }
         let bytes = tx.encoded_len();
-        if self.entries.len() >= self.max || self.bytes + bytes > self.max_bytes {
+        if !self.fits(bytes) {
             return false;
         }
         self.bytes += bytes;
-        self.entries.insert(hash, StemEntry { tx, bytes, origin, deadline, sent_to: Vec::new() });
+        let seq = self.next_seq;
+        self.next_seq += 1;
+        self.entries.insert(hash, StemEntry { tx, bytes, origin, deadline, sent_to: Vec::new(), seq });
         true
     }
 
@@ -825,7 +863,8 @@ mod tests {
         assert!(pool.is_empty() && pool.next_deadline().is_none());
     }
 
-    /// Both caps refuse rather than evict; the node then fluffs the newcomer.
+    /// Both caps refuse rather than evict; the node then fluffs a relayed newcomer (its own
+    /// submission makes room instead: PRIV-605, below).
     #[test]
     fn the_stempool_refuses_past_its_caps() {
         let t = Instant::now();
@@ -844,6 +883,36 @@ mod tests {
         d.router.add_peer(PeerId::random(), true, None, &mut rng(1));
         d.stempool = Stempool::new(0, 0);
         assert_eq!(d.decide(Edge::Local, t), Decision::Fluff(FluffReason::Full));
+    }
+
+    /// Audit v13, PRIV-605: room for the node's own transaction comes from the oldest entries held
+    /// for peers, never from its own, and only as many as the caps need; nothing is taken when
+    /// taking every relayed entry would still not make room.
+    #[test]
+    fn room_for_an_own_submission_comes_from_the_oldest_relayed_entries() {
+        let t = Instant::now();
+        let peer = Edge::Peer(PeerId::random());
+        let one = tx(1).encoded_len();
+        let mut pool = Stempool::new(3, 1 << 20);
+        assert!(pool.hold(tx(1).hash(), tx(1), Edge::Local, t));
+        assert!(pool.hold(tx(2).hash(), tx(2), peer, t + Duration::from_secs(9)));
+        assert!(pool.hold(tx(3).hash(), tx(3), peer, t));
+        assert!(pool.evict_relayed_for(one).iter().map(|(h, _)| *h).eq([tx(2).hash()]), "the oldest held, not the earliest deadline");
+        assert!(pool.hold(tx(4).hash(), tx(4), Edge::Local, t));
+        assert!(pool.evict_relayed_for(one).iter().map(|(h, _)| *h).eq([tx(3).hash()]));
+        assert!(pool.hold(tx(5).hash(), tx(5), Edge::Local, t));
+        assert!(pool.evict_relayed_for(one).is_empty(), "every entry the node's own: nothing to take");
+        assert_eq!(pool.len(), 3);
+        // The byte cap: as many relayed entries as it takes, oldest first.
+        let mut small = Stempool::new(8, 3 * one);
+        for i in 1..=3 {
+            assert!(small.hold(tx(i).hash(), tx(i), peer, t));
+        }
+        let big = 2 * one;
+        assert!(small.evict_relayed_for(big).iter().map(|(h, _)| *h).eq([tx(1).hash(), tx(2).hash()]));
+        assert!(small.evict_relayed_for(4 * one).is_empty(), "would never fit: nothing taken");
+        assert_eq!(small.len(), 1);
+        assert!(small.evict_relayed_for(one).is_empty(), "room already: nothing taken");
     }
 
     /// A stem that returns to a node holding it is decided like a fresh arrival on that edge —

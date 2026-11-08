@@ -480,16 +480,89 @@ pub const STATE_PROOF_KEY_BUILD_RAM_SHARE: (u64, u64) = (3, 4);
 
 /// CON-601: the default `--max-state-proof-tier`: the highest perps proof tier whose key build
 /// ([`state_proof_key_build_peak_bytes`]) fits in [`STATE_PROOF_KEY_BUILD_RAM_SHARE`] of
-/// `total_ram_bytes` — 16 on a 2 GB or 4 GB host, 18 on 8 GB, 20 from about 22 GB — and never
-/// below the lowest tier. `0` (the OS did not say) sets no cap (`u8::MAX`).
+/// `total_ram_bytes` — 16 on a 2 GB or 4 GB host, 18 from about 5.73 GB, 20 from about 22.9 GB —
+/// and never below the lowest tier. `0` (the OS did not say) sets no cap (`u8::MAX`). The node's
+/// default is [`state_proof_tier_cap_for`], which counts the cgroup ceiling and the node's own
+/// resident size as well (audit v13, CON-701); this is that rule with neither.
 pub fn default_state_proof_tier_cap(total_ram_bytes: u64) -> u8 {
     if total_ram_bytes == 0 {
         return u8::MAX;
     }
+    tier_cap_within(total_ram_bytes)
+}
+
+/// Audit v13, CON-701: the default `--max-state-proof-tier` sized from the memory this node can
+/// still take, not the host's total alone: the host's RAM, or its cgroup's ceiling
+/// (`memory.high`/`memory.max`, [`cgroup_memory_limit_bytes`]) when that is lower, less what the
+/// node already holds resident (`rss`). [`STATE_PROOF_KEY_BUILD_RAM_SHARE`] of that headroom must
+/// hold the build's documented peak ([`state_proof_key_build_peak_bytes`]). On host e — 7.9 GB,
+/// `MemoryHigh=85%` (6.7 GB), the node ~5 GB resident — that is 16, where the host total gave 18.
+/// With neither a cgroup ceiling nor a resident size (macOS) it is
+/// [`default_state_proof_tier_cap`] of the total. `total_ram_bytes == 0` sets no cap.
+pub fn state_proof_tier_cap_for(total_ram_bytes: u64, cgroup_limit: Option<u64>, rss: Option<u64>) -> u8 {
+    if total_ram_bytes == 0 {
+        return u8::MAX;
+    }
+    let ceiling = cgroup_limit.map_or(total_ram_bytes, |l| l.min(total_ram_bytes));
+    tier_cap_within(ceiling.saturating_sub(rss.unwrap_or(0)))
+}
+
+/// The highest tier whose key-build peak fits in [`STATE_PROOF_KEY_BUILD_RAM_SHARE`] of
+/// `headroom_bytes`, never below the lowest tier.
+fn tier_cap_within(headroom_bytes: u64) -> u8 {
     let (num, den) = STATE_PROOF_KEY_BUILD_RAM_SHARE;
-    let budget = (u128::from(total_ram_bytes) * u128::from(num) / u128::from(den)) as u64;
+    let budget = (u128::from(headroom_bytes) * u128::from(num) / u128::from(den)) as u64;
     let tiers = randprotocol_core::ledger::perps::TIERS;
     tiers.iter().copied().filter(|t| state_proof_key_build_peak_bytes(*t) <= budget).max().unwrap_or(tiers[0])
+}
+
+/// CON-701: [`state_proof_tier_cap_for`] on this host now — its RAM, this process's cgroup
+/// ceiling and its resident size. Read at startup and again on the node's status tick (the node
+/// grows to its working size after the start).
+pub fn host_state_proof_tier_cap() -> u8 {
+    state_proof_tier_cap_for(randprotocol_prover::memory::total_bytes(), cgroup_memory_limit_bytes(), process_rss_bytes())
+}
+
+/// CON-701: the cgroup v2 path in `/proc/self/cgroup` (the `0::` line); `None` without one
+/// (cgroup v1 only, or not Linux).
+fn cgroup_v2_path(proc_self_cgroup: &str) -> Option<&str> {
+    proc_self_cgroup.lines().find_map(|l| l.strip_prefix("0::")).map(str::trim).filter(|p| p.starts_with('/'))
+}
+
+/// CON-701: a `memory.high` or `memory.max` value; `max` (no limit) and junk are `None`.
+fn parse_cgroup_memory_limit(s: &str) -> Option<u64> {
+    s.trim().parse().ok()
+}
+
+/// CON-701: `VmRSS` from `/proc/self/status`, in bytes.
+fn parse_vm_rss(status: &str) -> Option<u64> {
+    let kb = status.lines().find_map(|l| l.strip_prefix("VmRSS:"))?.trim().strip_suffix("kB")?.trim();
+    kb.parse::<u64>().ok().map(|k| k.saturating_mul(1024))
+}
+
+/// CON-701: the least finite `memory.high` or `memory.max` over this process's cgroup v2 and its
+/// ancestors (a slice's limit binds the services under it too); `None` when there is none or it
+/// cannot be read (macOS, cgroup v1).
+pub fn cgroup_memory_limit_bytes() -> Option<u64> {
+    let root = std::path::Path::new("/sys/fs/cgroup");
+    let cg = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+    let mut dir = root.join(cgroup_v2_path(&cg)?.trim_start_matches('/'));
+    let mut least: Option<u64> = None;
+    loop {
+        for f in ["memory.high", "memory.max"] {
+            if let Some(v) = std::fs::read_to_string(dir.join(f)).ok().as_deref().and_then(parse_cgroup_memory_limit) {
+                least = Some(least.map_or(v, |l| l.min(v)));
+            }
+        }
+        if dir.as_path() == root || !dir.starts_with(root) || !dir.pop() {
+            return least;
+        }
+    }
+}
+
+/// CON-701: this process's resident size; `None` where `/proc` is not (macOS).
+pub fn process_rss_bytes() -> Option<u64> {
+    parse_vm_rss(&std::fs::read_to_string("/proc/self/status").ok()?)
 }
 
 /// CON-60 (b): what verifying a transaction costs in verifier-key builds.
@@ -4838,6 +4911,51 @@ mod tests {
         assert_eq!(default_state_proof_tier_cap(GIB), 14);
         assert_eq!(default_state_proof_tier_cap(64 << 20), 10, "never below the lowest tier");
         assert_eq!(default_state_proof_tier_cap(0), u8::MAX, "an unknown size sets no cap");
+    }
+
+    /// Audit v13, CON-701: the default is sized from the memory the node can still take — the
+    /// host's RAM or its cgroup's `memory.high`/`memory.max` if lower, less what the node already
+    /// holds — not from the host's RAM alone. Host e (7.9 GB, `MemoryHigh=85%` = 6.7 GB, the node
+    /// at ~5 GB resident) kept cap 18, so a free forged tier-18 header bought a 3.56 GB key build
+    /// on it; it is 16 now. A roomy host keeps 18, and with neither figure (macOS) the old rule
+    /// stands.
+    #[test]
+    fn con701_the_default_tier_cap_follows_the_memory_left_not_the_host_total() {
+        const GIB: u64 = 1 << 30;
+        let host_e = state_proof_tier_cap_for(7_900_000_000, Some(6_700_000_000), Some(5_000_000_000));
+        assert!(host_e <= 16, "host e: 1.7 GB left under MemoryHigh fits no tier-18 build ({host_e})");
+        assert_eq!(host_e, 16);
+        assert_eq!(state_proof_tier_cap_for(16_000_000_000, None, Some(300_000_000)), 18, "a 16 GB host with little resident");
+        assert_eq!(state_proof_tier_cap_for(16_000_000_000, Some(13_600_000_000), Some(300_000_000)), 18, "and under MemoryHigh=85%");
+        assert_eq!(state_proof_tier_cap_for(7_900_000_000, Some(6_700_000_000), Some(400_000_000)), 18, "host e just after its start");
+        // The cgroup ceiling counts only when it is the lower one.
+        assert_eq!(state_proof_tier_cap_for(48 * GIB, Some(u64::MAX / 2), None), 20);
+        assert_eq!(state_proof_tier_cap_for(48 * GIB, Some(6 * GIB), None), 18);
+        // Nothing left: the lowest tier, never no cap.
+        assert_eq!(state_proof_tier_cap_for(8 * GIB, Some(6 * GIB), Some(7 * GIB)), 10);
+        // With neither the cgroup nor the resident size the old rule stands, boundaries and all.
+        for total in [1_985_000_000, 4 * GIB - 100 * (1 << 20), 8 * GIB - 200 * (1 << 20), 48 * GIB, GIB, 64 << 20, 0] {
+            assert_eq!(state_proof_tier_cap_for(total, None, None), default_state_proof_tier_cap(total), "{total}");
+        }
+        assert_eq!(state_proof_tier_cap_for(0, Some(GIB), Some(GIB)), u8::MAX, "an unknown host size sets no cap");
+        // Tier 18 needs 4 GiB in ¾ of what is left (~5.73 GB); 20 needs 16 GiB in ¾ (~22.9 GB).
+        assert_eq!(state_proof_tier_cap_for(5_726_000_000, None, None), 16);
+        assert_eq!(state_proof_tier_cap_for(5_727_000_000, None, None), 18);
+        assert_eq!(state_proof_tier_cap_for(22_906_000_000, None, None), 18);
+        assert_eq!(state_proof_tier_cap_for(22_907_000_000, None, None), 20);
+    }
+
+    /// CON-701: the cgroup v2 and `/proc/self/status` readings the default is sized from.
+    #[test]
+    fn con701_the_cgroup_and_resident_readings_parse() {
+        assert_eq!(cgroup_v2_path("0::/system.slice/rand-node.service\n"), Some("/system.slice/rand-node.service"));
+        assert_eq!(cgroup_v2_path("12:memory:/x\n0::/\n"), Some("/"));
+        assert_eq!(cgroup_v2_path("12:memory:/system.slice\n"), None, "cgroup v1 only: no reading");
+        assert_eq!(parse_cgroup_memory_limit("max\n"), None);
+        assert_eq!(parse_cgroup_memory_limit("6700000256\n"), Some(6_700_000_256));
+        assert_eq!(parse_cgroup_memory_limit("junk"), None);
+        assert_eq!(parse_vm_rss("Name:\trand-node\nVmRSS:\t 5000000 kB\nThreads: 40\n"), Some(5_000_000 * 1024));
+        assert_eq!(parse_vm_rss("Name:\tx\n"), None);
     }
 
     /// CON-60 (b): junk state proofs — of fresh shapes and of the engine's own — never delay an

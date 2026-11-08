@@ -4,9 +4,29 @@ Guidance for agents working in this repository. The README is the user-facing
 overview; this file is the durable project memory: review state, load-bearing
 invariants, and known traps.
 
-## Project memory (state as of 2026-10-09)
+## Project memory (state as of 2026-11-08)
 
-### v0.8.2 (2026-10-27; branch `release/v0.8.2` off main `b9c38f29`, NOT pushed, NOT tagged; node-only on chain 21)
+### Releases on chain 21 since v0.8.2 (status as of 2026-11-08)
+
+Chain 21 runs **v0.8.5**. Every release below is node-only (no wire, storage-format or consensus
+change except v0.8.4's storage note); `CHANGELOG.md` has each one's rows.
+
+- **v0.8.5** (tag `d8efd472`, 2026-11-04; audit v12 rows): rolled 2026-11-04 17:46–19:52 UTC to all
+  25 inventory hosts (archive2 offline, skipped) plus the durian site node, rand-node binary sha256
+  `2cdb3d18…`, from the user-signed `SHA256SUMS`; `rand-node.service.d/50-limits.conf` (PROC-601)
+  written on every host. Fleet probes of 2026-11-07: 25/25 on 0.8.5. Roll record:
+  `deploy/roll-records/v0.8.5.record`. Follow-ups: the audit v13 rows (CHANGELOG, Unreleased) —
+  among them every host's hand-placed `nofile.conf`, which still overrides `50-limits.conf`'s
+  `LimitNOFILE` until the next roll removes it (PROC-702).
+- **v0.8.4** (tag `e1f75f11`, 2026-11-01): the perps-digest fix for the 2026-11-01 OOM kills and
+  commit stalls; rolled 2026-11-01. A node that committed on v0.8.4 cannot go back to an older
+  build on the same database.
+- **v0.8.3** (tag `b8a7bbf1`, 2026-11-01): Dandelion++, the anonymous transaction lane and the
+  RocksDB open-files cap; rolled 2026-11-01 to end the 2026-10-31 halt at 644660.
+
+### v0.8.2 (2026-10-27; tagged `6154732d` and released; node-only on chain 21)
+
+Superseded on the fleet by v0.8.3–v0.8.5 (above). The entry as written before the tag:
 
 Merges `fix/prover-ram`, `audit/v10-node` and `audit/v10-perps` and bumps the workspace to 0.8.2
 (`CHANGELOG.md`, v0.8.2, has every row). The consensus rules among them (PST-1

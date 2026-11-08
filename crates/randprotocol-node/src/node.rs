@@ -83,7 +83,8 @@ pub struct NodeConfig {
     pub verify_workers: Option<usize>,
     /// CON-601: the highest state-proof tier this node verifies for its pool without a built key
     /// (`--max-state-proof-tier`); `None` sizes it to the host
-    /// ([`crate::mempool::default_state_proof_tier_cap`]).
+    /// ([`crate::mempool::state_proof_tier_cap_for`]: the memory left for a key build, audit v13
+    /// CON-701).
     pub state_proof_tier_cap: Option<u8>,
     /// Apply incoming proposals on the consensus loop, as before (`--apply-proposals-inline`,
     /// spec 2026-10-11 off-loop apply §4.5); `false`, the default, applies them on a blocking
@@ -1352,6 +1353,9 @@ struct Node {
     /// last logged (once an hour while it holds).
     disk_trend: crate::disk::DiskTrend,
     disk_warned_at: Option<Instant>,
+    /// Audit v13, CON-701: when the host-sized state-proof tier cap was last re-measured
+    /// ([`Node::refresh_state_proof_tier_cap`]); only without `--max-state-proof-tier`.
+    tier_cap_checked_at: Option<Instant>,
     /// Transaction hashes this node has already refused for a reason about their bytes, so a
     /// re-gossiped copy costs a hash lookup instead of a proof verification.
     refused: admission::RefusedCache,
@@ -1443,6 +1447,9 @@ struct Node {
 /// Incoming proposals applied on blocking workers at once (spec 2026-10-11 off-loop apply §4.1).
 /// One more is delivered on the loop as before, so a burst costs no more than it used to.
 const OFFLOOP_APPLIES: usize = 4;
+
+/// Audit v13, CON-701: how often the host-sized state-proof tier cap is re-measured.
+const STATE_PROOF_TIER_CAP_REFRESH: Duration = Duration::from_secs(60);
 /// CON-60 (c): how many committed blocks back the startup warm looks for state proofs whose
 /// shapes it builds and pins (beside the shapes the node recorded).
 pub const PERP_WARM_SCAN_BLOCKS: u64 = 4096;
@@ -2846,10 +2853,10 @@ pub async fn start_with(cfg: NodeConfig, rpc_options: RpcOptions, net_options: N
 
     // CON-601: the highest state-proof tier this node builds a verifier key for outside a block
     // — its pool and its startup warm. Node policy: a block carrying a proof above it still
-    // applies and builds the key (chain 22's genesis engine pin is the consensus fix).
-    let state_proof_tier_cap = cfg
-        .state_proof_tier_cap
-        .unwrap_or_else(|| crate::mempool::default_state_proof_tier_cap(randprotocol_prover::memory::total_bytes()));
+    // applies and builds the key (chain 22's genesis engine pin is the consensus fix). Audit v13,
+    // CON-701: by default sized from the memory left — the host's RAM or its cgroup's ceiling,
+    // less the node's resident size — and re-measured on the status tick.
+    let state_proof_tier_cap = cfg.state_proof_tier_cap.unwrap_or_else(crate::mempool::host_state_proof_tier_cap);
     if let Some(p) = hs.committed_ledger().perps() {
         if p.config.max_tier > state_proof_tier_cap {
             tracing::warn!(
@@ -3030,6 +3037,7 @@ pub async fn start_with(cfg: NodeConfig, rpc_options: RpcOptions, net_options: N
         disk_free_bytes,
         disk_trend: crate::disk::DiskTrend::default(),
         disk_warned_at: None,
+        tier_cap_checked_at: Some(Instant::now()),
         refused: admission::RefusedCache::new(admission::REFUSED_CACHE_ENTRIES),
         proof_refused: admission::ProofRefusedCache::new(admission::PROOF_REFUSED_ENTRIES),
         limiter: admission::PeerLimiter::new(admission::PEER_TX_BURST, admission::PEER_TX_PER_SEC),
@@ -3159,6 +3167,7 @@ impl Node {
                 },
                 _ = status_tick.tick() => {
                     self.check_disk();
+                    self.refresh_state_proof_tier_cap();
                     self.broadcast_status().await;
                     self.announce_binding().await;
                     self.persist_reserved_sources().await;
@@ -3169,6 +3178,25 @@ impl Node {
                 // its embargo is fluffed here.
                 _ = sleep_until(self.dandelion.stempool.next_deadline()) => self.on_embargo().await,
             }
+        }
+    }
+
+    /// Audit v13, CON-701: re-measure the host-sized state-proof tier cap once a minute, since the
+    /// node grows to its working size after the start: a cap sized on a fresh process would hold
+    /// a tier-18 build on a host whose node later sits at 5 GB under `MemoryHigh`. Nothing to do
+    /// under `--max-state-proof-tier`.
+    fn refresh_state_proof_tier_cap(&mut self) {
+        if self.cfg.state_proof_tier_cap.is_some() || self.tier_cap_checked_at.is_some_and(|t| t.elapsed() < STATE_PROOF_TIER_CAP_REFRESH) {
+            return;
+        }
+        self.tier_cap_checked_at = Some(Instant::now());
+        let cap = crate::mempool::host_state_proof_tier_cap();
+        let was = self.mempool.state_proof_tier_cap();
+        if cap != was {
+            tracing::info!(
+                "state proofs: tier cap {was} -> {cap} for the pool (memory left for a key build; CON-701, --max-state-proof-tier overrides)"
+            );
+            self.mempool.set_state_proof_tier_cap(cap);
         }
     }
 
@@ -3416,12 +3444,15 @@ impl Node {
             // verified and then lost a pool conflict is still a valid message, and another node's
             // pool may have room for it.
             VerifySource::Gossip(id) => {
-                // One this node held on the stem was fluffed elsewhere: its embargo is off
-                // (PRIV-603: taken here, on the verdict, not when the copy arrived).
-                if !self.dandelion.stempool.is_empty() {
-                    self.dandelion.stempool.take(&hash);
-                }
                 if v.result.is_ok() {
+                    // One this node held on the stem was fluffed elsewhere: its embargo is off
+                    // (PRIV-603: taken here, on the verdict, not when the copy arrived). Only on an
+                    // `Ok` verdict (audit v13, PRIV-701): a copy that fails — a marker-form copy
+                    // (GOSSIP-2) has the held one's id and fails `PrunedFormOutsideSync` — says
+                    // nothing about the held transaction, which keeps its stem and its embargo.
+                    if !self.dandelion.stempool.is_empty() {
+                        self.dandelion.stempool.take(&hash);
+                    }
                     let _ = self.mempool.insert_verified(v.tx, self.hs.tip_ledger(), self.executor.as_ref());
                 }
                 self.net.report_validation(id, acceptance.into()).await
@@ -3458,13 +3489,19 @@ impl Node {
             self.on_stem_loop(hash, from).await;
             return Ok(hash);
         }
-        match self.dandelion.decide(from, now) {
+        let mut decision = self.dandelion.decide(from, now);
+        if from == Edge::Local && decision == Decision::Fluff(FluffReason::Full) && self.make_stem_room(&tx).await {
+            decision = self.dandelion.decide(from, now);
+        }
+        match decision {
             Decision::Fluff(why) => self.fluff(tx, why).await,
             Decision::Stem(peer) => {
                 // What `insert_verified` would re-check against the tip, so a stem never carries a
                 // transaction this node would not pool.
                 guard_precheck(|| self.mempool.precheck(&tx, self.hs.tip_ledger(), self.executor.as_ref()))?;
-                if !self.dandelion.hold(hash, tx.clone(), from, now) {
+                if !self.dandelion.hold(hash, tx.clone(), from, now)
+                    && !(from == Edge::Local && self.make_stem_room(&tx).await && self.dandelion.hold(hash, tx.clone(), from, now))
+                {
                     return self.fluff(tx, FluffReason::Full).await;
                 }
                 self.dandelion.stempool.sent(&hash, peer);
@@ -3474,6 +3511,22 @@ impl Node {
                 Ok(hash)
             }
         }
+    }
+
+    /// Audit v13, PRIV-605: room in a full stempool for this node's own submission `tx`, made by
+    /// fluffing the oldest transactions held for peers
+    /// ([`crate::dandelion::Stempool::evict_relayed_for`]) — the same `Full` fluff a relayed one
+    /// arriving at a full stempool gets. Before, the submission itself was fluffed, so its
+    /// submitter was the first to publish it. `false`: nothing was taken (every entry is the
+    /// node's own, or no room could be made).
+    async fn make_stem_room(&mut self, tx: &Transaction) -> bool {
+        let evicted = self.dandelion.stempool.evict_relayed_for(tx.encoded_len());
+        let made = !evicted.is_empty();
+        for (hash, old) in evicted {
+            tracing::debug!(%hash, "stempool full: fluffing the oldest relayed entry for this node's own submission");
+            let _ = self.fluff(old, FluffReason::Full).await;
+        }
+        made
     }
 
     /// Pool a verified transaction and publish it on gossip: the end of its stem, or no stem at
@@ -8018,6 +8071,7 @@ mod tests {
             disk_free_bytes: u64::MAX,
             disk_trend: crate::disk::DiskTrend::default(),
             disk_warned_at: None,
+            tier_cap_checked_at: None,
             refused: admission::RefusedCache::new(16),
             proof_refused: admission::ProofRefusedCache::new(16),
             limiter: admission::PeerLimiter::new(admission::PEER_TX_BURST, admission::PEER_TX_PER_SEC),
@@ -8451,6 +8505,24 @@ mod tests {
         bundle_tx(ledger, [[40 + i; 8], [50 + i; 8]], [[60 + i; 8], [70 + i; 8]], bundle_fee())
     }
 
+    /// Audit v13, CON-701: without `--max-state-proof-tier` the status tick re-sizes the cap from
+    /// the memory left now, at most once a minute; with the flag it never moves.
+    #[tokio::test]
+    async fn the_host_sized_tier_cap_is_re_measured_and_the_flag_pins_it() {
+        let (_d, storage, gs, hs) = replica_past_a_boundary();
+        let (mut node, _seen) = bare_node(storage, gs, hs);
+        node.mempool.set_state_proof_tier_cap(3);
+        node.refresh_state_proof_tier_cap();
+        assert_eq!(node.mempool.state_proof_tier_cap(), crate::mempool::host_state_proof_tier_cap());
+        node.mempool.set_state_proof_tier_cap(3);
+        node.refresh_state_proof_tier_cap();
+        assert_eq!(node.mempool.state_proof_tier_cap(), 3, "not again within the minute");
+        node.tier_cap_checked_at = None;
+        node.cfg.state_proof_tier_cap = Some(3);
+        node.refresh_state_proof_tier_cap();
+        assert_eq!(node.mempool.state_proof_tier_cap(), 3, "--max-state-proof-tier is the override");
+    }
+
     // ------------------------------------------- Dandelion++ (issue #145)
 
     /// A bare node on [`replica_past_a_boundary`] with one stem-capable peer, at fluff
@@ -8632,6 +8704,154 @@ mod tests {
         assert_eq!(accepts, 2, "both accepted on their verdicts");
         assert!(node.mempool.contains(&h) && node.mempool.contains(&unknown.hash()));
         assert!(node.dandelion.stempool.is_empty() && node.dandelion.stempool.next_deadline().is_none(), "no embargo left");
+    }
+
+    /// The marker form (GOSSIP-2) of `tx`: its proof replaced by `PRUNED_PROOF_MARKER` and the
+    /// proof's hash. The same id by design; refused `PrunedFormOutsideSync` outside a sync.
+    fn marker_form_of(tx: &Transaction) -> Transaction {
+        let mut marker = tx.clone();
+        let b = marker.bundle.as_mut().expect("a bundle");
+        let mut m = randprotocol_core::notes::PRUNED_PROOF_MARKER.to_vec();
+        m.extend_from_slice(Hash::digest(&b.proof).as_bytes());
+        b.proof = m;
+        assert_eq!(marker.hash(), tx.hash(), "the marker form carries the raw id");
+        assert!(compact::is_marker_form(&marker));
+        marker
+    }
+
+    /// Gossip `copy` into `node` and run its verification the way a worker does — against the
+    /// tip, so its verdict is the ledger's own — handling that verdict. Returns the verdict.
+    async fn gossip_and_verify(node: &mut Node, copy: Transaction) -> Result<(), randprotocol_core::TxError> {
+        node.verify_limits = VerifyLimits { in_flight: 0, queue: 64 };
+        node.on_gossiped_tx(copy, gossip_id()).await.unwrap();
+        assert_eq!(node.verify_queue.len(), 1, "the copy passes the pre-screen and the precheck and is queued");
+        let (tx, source, charge) = node.verify_queue.pop_front().unwrap();
+        let result = node.hs.tip_ledger().validate(&tx, &StubExecutor);
+        node.on_verdict(Verdict { tx, result: result.clone(), source, proof_key: None, busy: false, charge }).await.unwrap();
+        result
+    }
+
+    /// Audit v13, PRIV-701: a marker-form copy of a transaction this node holds on the stem has
+    /// the held one's id. Gossiped, it passes the pre-screen and the precheck, is queued, and
+    /// fails `PrunedFormOutsideSync` — and that failed verdict used to take the honest held
+    /// transaction out of the stempool and cancel its embargo, so it was then neither held,
+    /// pooled nor published although its submitter had heard `Ok`. Only an `Ok` verdict ends the
+    /// embargo now: at a relay and at the submitter the held transaction survives the copy and
+    /// its embargo still fluffs it.
+    #[tokio::test]
+    async fn a_failed_marker_form_copy_does_not_end_a_held_transactions_embargo() {
+        for local in [false, true] {
+            let (_d, mut node, mut seen, succ) = stem_node(0.0, Duration::from_millis(5));
+            let tx = next_tx(node.hs.tip_ledger(), 21);
+            let h = tx.hash();
+            let source = if local {
+                let (reply, answer) = oneshot::channel();
+                node.on_verdict(Verdict { tx: tx.clone(), result: Ok(()), source: VerifySource::Rpc(reply), proof_key: None, busy: false, charge: AdmissionCharge::none() })
+                    .await
+                    .unwrap();
+                assert_eq!(answer.await.unwrap(), Ok(h), "the submitter hears Ok");
+                "submitter"
+            } else {
+                node.on_verdict(Verdict { tx: tx.clone(), result: Ok(()), source: VerifySource::Stem(PeerId::random()), proof_key: None, busy: false, charge: AdmissionCharge::none() })
+                    .await
+                    .unwrap();
+                "relay"
+            };
+            assert_eq!(stems(&drain(&mut seen).await), vec![(succ, h)], "{source}: stemmed");
+            assert!(node.dandelion.stempool.contains(&h), "{source}: held");
+
+            let verdict = gossip_and_verify(&mut node, marker_form_of(&tx)).await;
+            assert_eq!(verdict, Err(randprotocol_core::TxError::PrunedFormOutsideSync), "{source}");
+            let out = drain(&mut seen).await;
+            assert!(broadcast_txs(&out).is_empty(), "{source}: the copy is not published");
+            assert!(node.dandelion.stempool.contains(&h), "{source}: still held after the copy's failed verdict");
+            assert!(node.dandelion.stempool.next_deadline().is_some(), "{source}: its embargo still set");
+            assert!(!node.mempool.contains(&h), "{source}: not pooled by the copy");
+
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            node.on_embargo().await;
+            let out = drain(&mut seen).await;
+            assert_eq!(broadcast_txs(&out), vec![h], "{source}: the embargo fluffs the honest transaction");
+            assert!(node.mempool.contains(&h) && !node.dandelion.stempool.contains(&h), "{source}");
+            assert_eq!(served(&mut node, h), vec![tx], "{source}: the raw bytes are what is pooled");
+        }
+    }
+
+    /// PRIV-701's control: to a node that holds nothing, the same marker-form copy is refused
+    /// and leaves no trace — not pooled, not held, not published — and the raw transaction
+    /// gossiped afterwards is verified and pooled as usual.
+    #[tokio::test]
+    async fn a_marker_form_copy_is_harmless_to_a_node_that_does_not_hold_it() {
+        let (_d, mut node, mut seen, _succ) = stem_node(0.0, Duration::from_millis(5));
+        let tx = next_tx(node.hs.tip_ledger(), 22);
+        let h = tx.hash();
+        let verdict = gossip_and_verify(&mut node, marker_form_of(&tx)).await;
+        assert_eq!(verdict, Err(randprotocol_core::TxError::PrunedFormOutsideSync));
+        let out = drain(&mut seen).await;
+        assert!(broadcast_txs(&out).is_empty() && stems(&out).is_empty());
+        assert!(!node.mempool.contains(&h) && node.dandelion.stempool.is_empty());
+        assert!(node.refused.get(&h).is_none(), "not cached against the id: the raw form must still get in");
+
+        assert_eq!(gossip_and_verify(&mut node, tx).await, Ok(()));
+        assert!(node.mempool.contains(&h), "the raw one is pooled");
+    }
+
+    /// Audit v13, PRIV-605: with the stempool full, the node's own RPC submission used to be
+    /// fluffed (`Full`) — pooled and published by the submitter itself, first. Now the oldest
+    /// transaction held for a peer is fluffed to make room, and the submission takes the stem as
+    /// usual. A relayed one arriving at a full stempool is still fluffed (`Full`), and with
+    /// nothing relayed left to evict — every entry the node's own — the old answer stands.
+    #[tokio::test]
+    async fn a_full_stempool_evicts_its_oldest_relayed_entry_for_the_nodes_own_submission() {
+        let (_d, mut node, mut seen, succ) = stem_node(0.0, Duration::from_secs(60));
+        node.dandelion.stempool = crate::dandelion::Stempool::new(2, crate::dandelion::STEMPOOL_MAX_BYTES);
+        let ledger = node.hs.tip_ledger().clone();
+        let (r1, r2, r3, own, own2) = (next_tx(&ledger, 31), next_tx(&ledger, 32), next_tx(&ledger, 33), next_tx(&ledger, 34), next_tx(&ledger, 35));
+        for r in [&r1, &r2] {
+            node.on_verdict(Verdict { tx: r.clone(), result: Ok(()), source: VerifySource::Stem(PeerId::random()), proof_key: None, busy: false, charge: AdmissionCharge::none() })
+                .await
+                .unwrap();
+            // Distinct hold times, so "oldest" is well defined whatever the clock's resolution.
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        assert_eq!(stems(&drain(&mut seen).await).len(), 2);
+        assert_eq!(node.dandelion.stempool.len(), 2, "full");
+
+        // A peer's stem at a full stempool: fluffed, as before.
+        node.on_verdict(Verdict { tx: r3.clone(), result: Ok(()), source: VerifySource::Stem(PeerId::random()), proof_key: None, busy: false, charge: AdmissionCharge::none() })
+            .await
+            .unwrap();
+        assert_eq!(broadcast_txs(&drain(&mut seen).await), vec![r3.hash()], "a relayed arrival still fluffs when full");
+
+        // The node's own submission: the oldest relayed entry is fluffed, the submission stemmed.
+        let (reply, answer) = oneshot::channel();
+        node.on_verdict(Verdict { tx: own.clone(), result: Ok(()), source: VerifySource::Rpc(reply), proof_key: None, busy: false, charge: AdmissionCharge::none() })
+            .await
+            .unwrap();
+        assert_eq!(answer.await.unwrap(), Ok(own.hash()));
+        let out = drain(&mut seen).await;
+        assert_eq!(broadcast_txs(&out), vec![r1.hash()], "the oldest relayed entry is fluffed, not the submission");
+        assert_eq!(stems(&out), vec![(succ, own.hash())], "the submission keeps the stem");
+        assert!(node.dandelion.stempool.contains(&own.hash()) && !node.mempool.contains(&own.hash()));
+        assert!(node.mempool.contains(&r1.hash()) && !node.dandelion.stempool.contains(&r1.hash()));
+        assert!(node.dandelion.stempool.contains(&r2.hash()), "the younger relayed entry is still held");
+
+        // Evict r2 the same way; then every entry is the node's own and a further submission
+        // fluffs as before.
+        let (reply, _a) = oneshot::channel();
+        node.on_verdict(Verdict { tx: own2.clone(), result: Ok(()), source: VerifySource::Rpc(reply), proof_key: None, busy: false, charge: AdmissionCharge::none() })
+            .await
+            .unwrap();
+        let out = drain(&mut seen).await;
+        assert_eq!((broadcast_txs(&out), stems(&out)), (vec![r2.hash()], vec![(succ, own2.hash())]));
+        let own3 = next_tx(&ledger, 36);
+        let (reply, answer) = oneshot::channel();
+        node.on_verdict(Verdict { tx: own3.clone(), result: Ok(()), source: VerifySource::Rpc(reply), proof_key: None, busy: false, charge: AdmissionCharge::none() })
+            .await
+            .unwrap();
+        assert_eq!(answer.await.unwrap(), Ok(own3.hash()));
+        assert_eq!(broadcast_txs(&drain(&mut seen).await), vec![own3.hash()], "nothing relayed to evict: fluffed (Full)");
+        assert!(node.dandelion.stempool.contains(&own.hash()) && node.dandelion.stempool.contains(&own2.hash()));
     }
 
     /// Issue #157 × #145: a stemmed transaction waits on the verify queue with its bytes charged

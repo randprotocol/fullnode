@@ -883,8 +883,9 @@ enum Cmd {
         /// and at 20 ~16 GB, so a cold proof above this is refused before any work — not
         /// verified, pooled, relayed or proposed here. Node policy only: a block carrying such a
         /// proof still applies (and builds its key). One of 10, 12, 14, 16, 18, 20. Default: the
-        /// highest tier whose build fits in three quarters of the host's RAM (16 on 2–4 GB, 18
-        /// on 8 GB, 20 from ~22 GB).
+        /// highest tier whose build fits in three quarters of the memory left — the host's RAM or
+        /// its cgroup's `memory.high`/`memory.max` if lower, less the node's resident size,
+        /// re-measured every minute (CON-701; 18 from ~5.73 GB left, 20 from ~22.9 GB).
         #[arg(long, value_name = "TIER", value_parser = parse_state_proof_tier)]
         max_state_proof_tier: Option<u8>,
         /// Admission memory budget in MiB (issue #157): one byte budget over RPC request bodies
