@@ -19,6 +19,14 @@ stopped at v0.4 until 2026-09-30, when the entries v0.5 to v0.6.7 were written f
   variants now), reads it back in `check-limits`, and refuses a `rand-node` (or
   `EXPECT_NODE_VERSION`) below v0.8.5, the first release with the field. `docs/deploy.md` lists it.
 
+Node (audit v13 rows; node-only, no wire, storage-format or consensus change):
+
+- **A failed gossip copy no longer ends a held stem transaction's embargo** (PRIV-701): a
+  marker-form copy (GOSSIP-2) of a transaction this node holds on the stem carries the held one's
+  id, is queued, and fails `PrunedFormOutsideSync`; that failed verdict took the honest
+  transaction out of the stempool and cancelled its embargo, so it was neither held, pooled nor
+  published although its submitter had heard `Ok`. Only an `Ok` verdict ends the embargo now.
+
 ## v0.8.5 — 2026-11-04 (chain 21, node-only; audit v12 rows; no wire or consensus change)
 
 Node (audit v12 consensus-adjacent rows):

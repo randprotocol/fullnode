@@ -3416,12 +3416,15 @@ impl Node {
             // verified and then lost a pool conflict is still a valid message, and another node's
             // pool may have room for it.
             VerifySource::Gossip(id) => {
-                // One this node held on the stem was fluffed elsewhere: its embargo is off
-                // (PRIV-603: taken here, on the verdict, not when the copy arrived).
-                if !self.dandelion.stempool.is_empty() {
-                    self.dandelion.stempool.take(&hash);
-                }
                 if v.result.is_ok() {
+                    // One this node held on the stem was fluffed elsewhere: its embargo is off
+                    // (PRIV-603: taken here, on the verdict, not when the copy arrived). Only on an
+                    // `Ok` verdict (audit v13, PRIV-701): a copy that fails — a marker-form copy
+                    // (GOSSIP-2) has the held one's id and fails `PrunedFormOutsideSync` — says
+                    // nothing about the held transaction, which keeps its stem and its embargo.
+                    if !self.dandelion.stempool.is_empty() {
+                        self.dandelion.stempool.take(&hash);
+                    }
                     let _ = self.mempool.insert_verified(v.tx, self.hs.tip_ledger(), self.executor.as_ref());
                 }
                 self.net.report_validation(id, acceptance.into()).await
@@ -8632,6 +8635,96 @@ mod tests {
         assert_eq!(accepts, 2, "both accepted on their verdicts");
         assert!(node.mempool.contains(&h) && node.mempool.contains(&unknown.hash()));
         assert!(node.dandelion.stempool.is_empty() && node.dandelion.stempool.next_deadline().is_none(), "no embargo left");
+    }
+
+    /// The marker form (GOSSIP-2) of `tx`: its proof replaced by `PRUNED_PROOF_MARKER` and the
+    /// proof's hash. The same id by design; refused `PrunedFormOutsideSync` outside a sync.
+    fn marker_form_of(tx: &Transaction) -> Transaction {
+        let mut marker = tx.clone();
+        let b = marker.bundle.as_mut().expect("a bundle");
+        let mut m = randprotocol_core::notes::PRUNED_PROOF_MARKER.to_vec();
+        m.extend_from_slice(Hash::digest(&b.proof).as_bytes());
+        b.proof = m;
+        assert_eq!(marker.hash(), tx.hash(), "the marker form carries the raw id");
+        assert!(compact::is_marker_form(&marker));
+        marker
+    }
+
+    /// Gossip `copy` into `node` and run its verification the way a worker does — against the
+    /// tip, so its verdict is the ledger's own — handling that verdict. Returns the verdict.
+    async fn gossip_and_verify(node: &mut Node, copy: Transaction) -> Result<(), randprotocol_core::TxError> {
+        node.verify_limits = VerifyLimits { in_flight: 0, queue: 64 };
+        node.on_gossiped_tx(copy, gossip_id()).await.unwrap();
+        assert_eq!(node.verify_queue.len(), 1, "the copy passes the pre-screen and the precheck and is queued");
+        let (tx, source, charge) = node.verify_queue.pop_front().unwrap();
+        let result = node.hs.tip_ledger().validate(&tx, &StubExecutor);
+        node.on_verdict(Verdict { tx, result: result.clone(), source, proof_key: None, busy: false, charge }).await.unwrap();
+        result
+    }
+
+    /// Audit v13, PRIV-701: a marker-form copy of a transaction this node holds on the stem has
+    /// the held one's id. Gossiped, it passes the pre-screen and the precheck, is queued, and
+    /// fails `PrunedFormOutsideSync` — and that failed verdict used to take the honest held
+    /// transaction out of the stempool and cancel its embargo, so it was then neither held,
+    /// pooled nor published although its submitter had heard `Ok`. Only an `Ok` verdict ends the
+    /// embargo now: at a relay and at the submitter the held transaction survives the copy and
+    /// its embargo still fluffs it.
+    #[tokio::test]
+    async fn a_failed_marker_form_copy_does_not_end_a_held_transactions_embargo() {
+        for local in [false, true] {
+            let (_d, mut node, mut seen, succ) = stem_node(0.0, Duration::from_millis(5));
+            let tx = next_tx(node.hs.tip_ledger(), 21);
+            let h = tx.hash();
+            let source = if local {
+                let (reply, answer) = oneshot::channel();
+                node.on_verdict(Verdict { tx: tx.clone(), result: Ok(()), source: VerifySource::Rpc(reply), proof_key: None, busy: false, charge: AdmissionCharge::none() })
+                    .await
+                    .unwrap();
+                assert_eq!(answer.await.unwrap(), Ok(h), "the submitter hears Ok");
+                "submitter"
+            } else {
+                node.on_verdict(Verdict { tx: tx.clone(), result: Ok(()), source: VerifySource::Stem(PeerId::random()), proof_key: None, busy: false, charge: AdmissionCharge::none() })
+                    .await
+                    .unwrap();
+                "relay"
+            };
+            assert_eq!(stems(&drain(&mut seen).await), vec![(succ, h)], "{source}: stemmed");
+            assert!(node.dandelion.stempool.contains(&h), "{source}: held");
+
+            let verdict = gossip_and_verify(&mut node, marker_form_of(&tx)).await;
+            assert_eq!(verdict, Err(randprotocol_core::TxError::PrunedFormOutsideSync), "{source}");
+            let out = drain(&mut seen).await;
+            assert!(broadcast_txs(&out).is_empty(), "{source}: the copy is not published");
+            assert!(node.dandelion.stempool.contains(&h), "{source}: still held after the copy's failed verdict");
+            assert!(node.dandelion.stempool.next_deadline().is_some(), "{source}: its embargo still set");
+            assert!(!node.mempool.contains(&h), "{source}: not pooled by the copy");
+
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            node.on_embargo().await;
+            let out = drain(&mut seen).await;
+            assert_eq!(broadcast_txs(&out), vec![h], "{source}: the embargo fluffs the honest transaction");
+            assert!(node.mempool.contains(&h) && !node.dandelion.stempool.contains(&h), "{source}");
+            assert_eq!(served(&mut node, h), vec![tx], "{source}: the raw bytes are what is pooled");
+        }
+    }
+
+    /// PRIV-701's control: to a node that holds nothing, the same marker-form copy is refused
+    /// and leaves no trace — not pooled, not held, not published — and the raw transaction
+    /// gossiped afterwards is verified and pooled as usual.
+    #[tokio::test]
+    async fn a_marker_form_copy_is_harmless_to_a_node_that_does_not_hold_it() {
+        let (_d, mut node, mut seen, _succ) = stem_node(0.0, Duration::from_millis(5));
+        let tx = next_tx(node.hs.tip_ledger(), 22);
+        let h = tx.hash();
+        let verdict = gossip_and_verify(&mut node, marker_form_of(&tx)).await;
+        assert_eq!(verdict, Err(randprotocol_core::TxError::PrunedFormOutsideSync));
+        let out = drain(&mut seen).await;
+        assert!(broadcast_txs(&out).is_empty() && stems(&out).is_empty());
+        assert!(!node.mempool.contains(&h) && node.dandelion.stempool.is_empty());
+        assert!(node.refused.get(&h).is_none(), "not cached against the id: the raw form must still get in");
+
+        assert_eq!(gossip_and_verify(&mut node, tx).await, Ok(()));
+        assert!(node.mempool.contains(&h), "the raw one is pooled");
     }
 
     /// Issue #157 × #145: a stemmed transaction waits on the verify queue with its bytes charged
