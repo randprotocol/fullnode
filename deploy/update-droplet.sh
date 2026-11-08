@@ -92,8 +92,9 @@ if [ "$WANT" = "$HAVE" ] && [ "$WANT_WALLET" = "$HAVE_WALLET" ]; then
   LIMITS=$($SSH "set -e
   $(unit_limits_install_script "$SERVICE")")
   echo "$IP: $LIMITS"
+  # PROC-702: a legacy drop-in moved aside changes the effective LimitNOFILE too.
   case "$LIMITS" in
-    "limits: written"*) $SSH "systemctl restart $SERVICE; sleep 4; systemctl is-active $SERVICE" ;;
+    *"limits: written"*|*"limits: removed legacy"*) $SSH "systemctl restart $SERVICE; sleep 4; systemctl is-active $SERVICE" ;;
   esac
   echo "$IP: already on ${WANT:0:8}"; exit 0
 fi

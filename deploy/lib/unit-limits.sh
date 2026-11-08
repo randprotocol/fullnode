@@ -15,7 +15,13 @@
 #                                           missing or differs, then `systemctl daemon-reload`, and
 #                                           prints `limits: written <path>`; when the file is
 #                                           already right it prints `limits: unchanged <path>` and
-#                                           reloads nothing. UNIT_DIR defaults to /etc/systemd/system.
+#                                           reloads nothing. Either way any OTHER *.conf in that
+#                                           directory that sets LimitNOFILE or MemoryHigh (the hosts'
+#                                           hand-placed nofile.conf of 1 Nov sorts after 50-limits.conf
+#                                           and so won: PROC-702) is moved aside to <name>.removed,
+#                                           which systemd does not load, with one daemon-reload and a
+#                                           `limits: removed legacy <path> …` line each.
+#                                           UNIT_DIR defaults to /etc/systemd/system.
 #
 # LimitNOFILE takes effect at the next start of the service; MemoryHigh at the daemon-reload.
 # The roll scripts restart the node after writing it, so both apply.
@@ -50,15 +56,26 @@ rand_limits_new=\$(cat <<'RAND_LIMITS_EOF'
 $(unit_limits_dropin)
 RAND_LIMITS_EOF
 )
+rand_limits_reload=
 if [ -f "\$rand_limits_f" ] && [ "\$(cat "\$rand_limits_f")" = "\$rand_limits_new" ]; then
-  echo "limits: unchanged \$rand_limits_f"
+  rand_limits_said="limits: unchanged \$rand_limits_f"
 else
   mkdir -p '$dir'
   printf '%s\n' "\$rand_limits_new" > "\$rand_limits_f.tmp"
   mv -f "\$rand_limits_f.tmp" "\$rand_limits_f"
-  systemctl daemon-reload
-  echo "limits: written \$rand_limits_f"
+  rand_limits_reload=1
+  rand_limits_said="limits: written \$rand_limits_f"
 fi
+echo "\$rand_limits_said"
+for rand_limits_old in '$dir'/*.conf; do
+  case "\$rand_limits_old" in "\$rand_limits_f"|*'*.conf') continue ;; esac
+  if [ -f "\$rand_limits_old" ] && grep -qE '^[[:space:]]*(LimitNOFILE|MemoryHigh)=' "\$rand_limits_old"; then
+    mv -f "\$rand_limits_old" "\$rand_limits_old.removed"
+    rand_limits_reload=1
+    echo "limits: removed legacy \$rand_limits_old (it set LimitNOFILE/MemoryHigh over $RAND_NODE_LIMITS_DROPIN; kept as \$rand_limits_old.removed)"
+  fi
+done
+if [ -n "\$rand_limits_reload" ]; then systemctl daemon-reload; fi
 SCRIPT
 }
 
@@ -93,6 +110,35 @@ if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${SELFTEST:-}" = 1 ]; then
   check "a drifted drop-in is rewritten" test "$(cat "$F")" = "$(unit_limits_dropin)"
   check "rewriting it reloads systemd" test "$(reloads)" = 2
   check "no temp file is left" test ! -e "$F.tmp"
+
+  # Audit v13, PROC-702: every host kept the hand-placed nofile.conf of 1 Nov beside 50-limits.conf;
+  # it sorts after it, so it set LimitNOFILE. Any other drop-in in the directory that sets
+  # LimitNOFILE or MemoryHigh is moved aside (<name>.removed, which systemd does not load), with a
+  # reload and a line saying so; one that sets neither is left alone.
+  D="$ST/units/rand-node.service.d"
+  printf '[Service]\nLimitNOFILE=524288\n' > "$D/nofile.conf"
+  printf '[Service]\n  MemoryHigh=90%%\n' > "$D/90-memory.conf"
+  printf '[Service]\nEnvironment=RUST_LOG=debug\n# LimitNOFILE=1 in a comment sets nothing\n' > "$D/env.conf"
+  : > "$ST/systemctl.log"
+  out=$(run_host)
+  check "a legacy nofile.conf is removed" test ! -e "$D/nofile.conf"
+  check "another drop-in that sets MemoryHigh is removed" test ! -e "$D/90-memory.conf"
+  check "  … kept aside where systemd does not load it" test -f "$D/nofile.conf.removed" -a -f "$D/90-memory.conf.removed"
+  check "a drop-in that sets neither is kept" test -f "$D/env.conf"
+  check "50-limits.conf is untouched" test "$(cat "$F")" = "$(unit_limits_dropin)"
+  check "removing them reloads systemd once" test "$(reloads)" = 1
+  check "it reports each removal" test "$(printf '%s\n' "$out" | grep -c '^limits: removed legacy ')" = 2
+  check "  … naming nofile.conf" grep -qF "limits: removed legacy $D/nofile.conf" <<<"$out"
+  check "only 50-limits.conf now sets LimitNOFILE/MemoryHigh" \
+    test "$(grep -lE '^[[:space:]]*(LimitNOFILE|MemoryHigh)=' "$D"/*.conf)" = "$F"
+  out=$(run_host)
+  check "a second run removes nothing (idempotent)" test "$out" = "limits: unchanged $F"
+  check "  … and reloads nothing" test "$(reloads)" = 1
+  printf '[Service]\nLimitNOFILE=524288\n' > "$D/nofile.conf"; rm -f "$F"
+  out=$(run_host)
+  check "written and removed in one run: one reload" test "$(reloads)" = 2
+  check "  … both reported" test "$(printf '%s\n' "$out" | grep -c '^limits: \(written\|removed legacy\) ')" = 2
+  rm -f "$D"/*.removed "$D/env.conf"
 
   # The roll paths, run (audit v13, PROC-701): a grep for the function's name stayed green with
   # the already-current refresh deleted from update-droplet.sh or the install step's call deleted
@@ -141,6 +187,7 @@ STUB
   rec() { local i=0 f; while read -r f; do i=$((i+1)); printf '%s\t%s\t%s\n' "$i" "$(head -1 "$f")" "$f"; done < "$ST/rec.idx"; }
   carrying_limits() { local n host f; while IFS=$'\t' read -r n host f; do
       [[ "$(tail -n +2 "$f")" == *"$LIMITS_SCRIPT"* ]] && echo "$n $host"; done < <(rec); }
+  # shellcheck disable=SC2053  # $pat is a glob on purpose
   first_matching() { local pat=$1 n host f; while IFS=$'\t' read -r n host f; do
       [[ "$(tail -n +2 "$f")" == $pat ]] && { echo "$n"; return; }; done < <(rec); echo 0; }
 
@@ -155,6 +202,11 @@ STUB
   stubbed STUB_HAVE_NODE="$NODE_SHA" STUB_HAVE_WALLET="$WALLET_SHA" STUB_LIMITS_ANSWER="limits: unchanged $F" \
     WANT_SHA="$NODE_SHA" WANT_SHA_WALLET="$WALLET_SHA" bash "$DEPLOY/update-droplet.sh" 198.18.0.1 198.18.0.9
   check "update-droplet.sh (already current) does not restart over an unchanged drop-in" test "$(first_matching '*systemctl restart*')" = 0
+  stubbed STUB_HAVE_NODE="$NODE_SHA" STUB_HAVE_WALLET="$WALLET_SHA" \
+    STUB_LIMITS_ANSWER="limits: unchanged $F"$'\n'"limits: removed legacy ${F%/*}/nofile.conf (…)" \
+    WANT_SHA="$NODE_SHA" WANT_SHA_WALLET="$WALLET_SHA" bash "$DEPLOY/update-droplet.sh" 198.18.0.1 198.18.0.9
+  check "update-droplet.sh (already current) restarts the node after a legacy drop-in is removed (PROC-702)" \
+    test "$(first_matching '*systemctl restart rand-node*')" -gt 0
   # update-droplet.sh, installing a new binary.
   stubbed STUB_HAVE_NODE=old STUB_HAVE_WALLET=old STUB_LIMITS_ANSWER= \
     WANT_SHA="$NODE_SHA" WANT_SHA_WALLET="$WALLET_SHA" bash "$DEPLOY/update-droplet.sh" 198.18.0.1 198.18.0.9

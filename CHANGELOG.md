@@ -47,6 +47,14 @@ Deploy (audit v13 rows; no host touched):
   either deletion turns it red. `vps-setup.sh` (root on a fresh host) is checked for a live call
   before the node's first start. Running it found that `update-droplet.sh`'s new-binary path died
   under `set -u` with `PRUNE_ARGS` unset (`${PRUNE_ARGS}` in the `sed`); it is `${PRUNE_ARGS:-}`.
+- **The hosts' hand-placed `nofile.conf` is retired by the next roll** (PROC-702): every host still
+  had the `rand-node.service.d/nofile.conf` of 1 Nov beside the generated `50-limits.conf`; it
+  sorts after it, so it is what set `LimitNOFILE`. The install script `unit-limits.sh` writes now
+  also moves aside (`<name>.removed`, which systemd does not load) any other `*.conf` in that
+  directory that sets `LimitNOFILE` or `MemoryHigh`, on every run whether or not `50-limits.conf`
+  changed, with one `daemon-reload` and a `limits: removed legacy <path> …` line each; a second
+  run removes nothing. `update-droplet.sh`'s already-current branch restarts the node after such a
+  removal too.
 
 ## v0.8.5 — 2026-11-04 (chain 21, node-only; audit v12 rows; no wire or consensus change)
 
