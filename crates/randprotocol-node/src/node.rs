@@ -3489,13 +3489,19 @@ impl Node {
             self.on_stem_loop(hash, from).await;
             return Ok(hash);
         }
-        match self.dandelion.decide(from, now) {
+        let mut decision = self.dandelion.decide(from, now);
+        if from == Edge::Local && decision == Decision::Fluff(FluffReason::Full) && self.make_stem_room(&tx).await {
+            decision = self.dandelion.decide(from, now);
+        }
+        match decision {
             Decision::Fluff(why) => self.fluff(tx, why).await,
             Decision::Stem(peer) => {
                 // What `insert_verified` would re-check against the tip, so a stem never carries a
                 // transaction this node would not pool.
                 guard_precheck(|| self.mempool.precheck(&tx, self.hs.tip_ledger(), self.executor.as_ref()))?;
-                if !self.dandelion.hold(hash, tx.clone(), from, now) {
+                if !self.dandelion.hold(hash, tx.clone(), from, now)
+                    && !(from == Edge::Local && self.make_stem_room(&tx).await && self.dandelion.hold(hash, tx.clone(), from, now))
+                {
                     return self.fluff(tx, FluffReason::Full).await;
                 }
                 self.dandelion.stempool.sent(&hash, peer);
@@ -3505,6 +3511,22 @@ impl Node {
                 Ok(hash)
             }
         }
+    }
+
+    /// Audit v13, PRIV-605: room in a full stempool for this node's own submission `tx`, made by
+    /// fluffing the oldest transactions held for peers
+    /// ([`crate::dandelion::Stempool::evict_relayed_for`]) — the same `Full` fluff a relayed one
+    /// arriving at a full stempool gets. Before, the submission itself was fluffed, so its
+    /// submitter was the first to publish it. `false`: nothing was taken (every entry is the
+    /// node's own, or no room could be made).
+    async fn make_stem_room(&mut self, tx: &Transaction) -> bool {
+        let evicted = self.dandelion.stempool.evict_relayed_for(tx.encoded_len());
+        let made = !evicted.is_empty();
+        for (hash, old) in evicted {
+            tracing::debug!(%hash, "stempool full: fluffing the oldest relayed entry for this node's own submission");
+            let _ = self.fluff(old, FluffReason::Full).await;
+        }
+        made
     }
 
     /// Pool a verified transaction and publish it on gossip: the end of its stem, or no stem at
@@ -8772,6 +8794,64 @@ mod tests {
 
         assert_eq!(gossip_and_verify(&mut node, tx).await, Ok(()));
         assert!(node.mempool.contains(&h), "the raw one is pooled");
+    }
+
+    /// Audit v13, PRIV-605: with the stempool full, the node's own RPC submission used to be
+    /// fluffed (`Full`) — pooled and published by the submitter itself, first. Now the oldest
+    /// transaction held for a peer is fluffed to make room, and the submission takes the stem as
+    /// usual. A relayed one arriving at a full stempool is still fluffed (`Full`), and with
+    /// nothing relayed left to evict — every entry the node's own — the old answer stands.
+    #[tokio::test]
+    async fn a_full_stempool_evicts_its_oldest_relayed_entry_for_the_nodes_own_submission() {
+        let (_d, mut node, mut seen, succ) = stem_node(0.0, Duration::from_secs(60));
+        node.dandelion.stempool = crate::dandelion::Stempool::new(2, crate::dandelion::STEMPOOL_MAX_BYTES);
+        let ledger = node.hs.tip_ledger().clone();
+        let (r1, r2, r3, own, own2) = (next_tx(&ledger, 31), next_tx(&ledger, 32), next_tx(&ledger, 33), next_tx(&ledger, 34), next_tx(&ledger, 35));
+        for r in [&r1, &r2] {
+            node.on_verdict(Verdict { tx: r.clone(), result: Ok(()), source: VerifySource::Stem(PeerId::random()), proof_key: None, busy: false, charge: AdmissionCharge::none() })
+                .await
+                .unwrap();
+            // Distinct hold times, so "oldest" is well defined whatever the clock's resolution.
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        assert_eq!(stems(&drain(&mut seen).await).len(), 2);
+        assert_eq!(node.dandelion.stempool.len(), 2, "full");
+
+        // A peer's stem at a full stempool: fluffed, as before.
+        node.on_verdict(Verdict { tx: r3.clone(), result: Ok(()), source: VerifySource::Stem(PeerId::random()), proof_key: None, busy: false, charge: AdmissionCharge::none() })
+            .await
+            .unwrap();
+        assert_eq!(broadcast_txs(&drain(&mut seen).await), vec![r3.hash()], "a relayed arrival still fluffs when full");
+
+        // The node's own submission: the oldest relayed entry is fluffed, the submission stemmed.
+        let (reply, answer) = oneshot::channel();
+        node.on_verdict(Verdict { tx: own.clone(), result: Ok(()), source: VerifySource::Rpc(reply), proof_key: None, busy: false, charge: AdmissionCharge::none() })
+            .await
+            .unwrap();
+        assert_eq!(answer.await.unwrap(), Ok(own.hash()));
+        let out = drain(&mut seen).await;
+        assert_eq!(broadcast_txs(&out), vec![r1.hash()], "the oldest relayed entry is fluffed, not the submission");
+        assert_eq!(stems(&out), vec![(succ, own.hash())], "the submission keeps the stem");
+        assert!(node.dandelion.stempool.contains(&own.hash()) && !node.mempool.contains(&own.hash()));
+        assert!(node.mempool.contains(&r1.hash()) && !node.dandelion.stempool.contains(&r1.hash()));
+        assert!(node.dandelion.stempool.contains(&r2.hash()), "the younger relayed entry is still held");
+
+        // Evict r2 the same way; then every entry is the node's own and a further submission
+        // fluffs as before.
+        let (reply, _a) = oneshot::channel();
+        node.on_verdict(Verdict { tx: own2.clone(), result: Ok(()), source: VerifySource::Rpc(reply), proof_key: None, busy: false, charge: AdmissionCharge::none() })
+            .await
+            .unwrap();
+        let out = drain(&mut seen).await;
+        assert_eq!((broadcast_txs(&out), stems(&out)), (vec![r2.hash()], vec![(succ, own2.hash())]));
+        let own3 = next_tx(&ledger, 36);
+        let (reply, answer) = oneshot::channel();
+        node.on_verdict(Verdict { tx: own3.clone(), result: Ok(()), source: VerifySource::Rpc(reply), proof_key: None, busy: false, charge: AdmissionCharge::none() })
+            .await
+            .unwrap();
+        assert_eq!(answer.await.unwrap(), Ok(own3.hash()));
+        assert_eq!(broadcast_txs(&drain(&mut seen).await), vec![own3.hash()], "nothing relayed to evict: fluffed (Full)");
+        assert!(node.dandelion.stempool.contains(&own.hash()) && node.dandelion.stempool.contains(&own2.hash()));
     }
 
     /// Issue #157 × #145: a stemmed transaction waits on the verify queue with its bytes charged

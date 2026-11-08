@@ -26,6 +26,12 @@ Node (audit v13 rows; node-only, no wire, storage-format or consensus change):
   id, is queued, and fails `PrunedFormOutsideSync`; that failed verdict took the honest
   transaction out of the stempool and cancelled its embargo, so it was neither held, pooled nor
   published although its submitter had heard `Ok`. Only an `Ok` verdict ends the embargo now.
+- **A full stempool no longer publishes the node's own submission first** (PRIV-605): at 1 024
+  held transactions or 64 MiB, `decide` answered `Fluff(Full)`, so a transaction submitted over
+  this node's RPC was pooled and published by the submitter itself. The submission now makes room
+  by fluffing the oldest transactions the node holds for peers (the `Full` fluff a relayed arrival
+  gets) and takes the stem as usual. A relayed arrival at a full stempool is still fluffed, and
+  when every held entry is the node's own the old answer stands.
 - **The default state-proof tier cap counts the memory left** (CON-701): v0.8.5 sized
   `--max-state-proof-tier`'s default from the host's RAM alone, so host e (7.9 GB; `MemoryHigh=85%`
   is 6.7 GB; the node ~5 GB resident) kept tier 18 and a free forged tier-18 header bought a
