@@ -20,7 +20,10 @@
 # LimitNOFILE takes effect at the next start of the service; MemoryHigh at the daemon-reload.
 # The roll scripts restart the node after writing it, so both apply.
 #
-#   SELFTEST=1 bash deploy/lib/unit-limits.sh   # temp dirs and a fake systemctl, no host touched
+#   SELFTEST=1 bash deploy/lib/unit-limits.sh   # temp dirs and a fake systemctl, no host touched;
+#                                               # runs update-droplet.sh (both branches) and roll-all.sh
+#                                               # against stub ssh/scp/launchctl that only record
+#                                               # (PROC-701)
 
 RAND_NODE_MEMORY_HIGH=85%
 RAND_NODE_LIMIT_NOFILE=524288:524288
@@ -91,10 +94,89 @@ if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${SELFTEST:-}" = 1 ]; then
   check "rewriting it reloads systemd" test "$(reloads)" = 2
   check "no temp file is left" test ! -e "$F.tmp"
 
-  # The roll path and the setup path use this file; no other deploy script spells the values.
-  check "update-droplet.sh writes the drop-in" grep -q 'unit_limits_install_script' "$DEPLOY/update-droplet.sh"
-  check "roll-all.sh writes the drop-in" grep -q 'unit_limits_install_script' "$DEPLOY/roll-all.sh"
-  check "vps-setup.sh writes the drop-in" grep -q 'unit_limits_install_script' "$DEPLOY/vps-setup.sh"
+  # The roll paths, run (audit v13, PROC-701): a grep for the function's name stayed green with
+  # the already-current refresh deleted from update-droplet.sh or the install step's call deleted
+  # from roll-all.sh. Each script is RUN here against stub ssh/scp/launchctl that record every
+  # remote command (none reaches a host), and each path must send this file's install script.
+  mkdir -p "$ST/rec" "$ST/build" "$ST/home"
+  : > "$ST/rec.idx"
+  cat > "$ST/bin/ssh" <<'STUB'
+#!/usr/bin/env bash
+# The remote command is the last argument; the host the root@ one. Record both, answer what the
+# scripts ask a host for, run nothing.
+cmd=${!#}; host=; for a in "$@"; do case "$a" in root@*) host=${a#root@} ;; esac; done
+f=$(mktemp "$STUB_ST/rec/c.XXXXXX"); printf '%s\n%s' "$host" "$cmd" > "$f"; echo "$f" >> "$STUB_ST/rec.idx"
+case "$cmd" in
+  "sha256sum /usr/local/bin/rand-node "*) echo "$STUB_HAVE_NODE" ;;
+  "sha256sum /usr/local/bin/rand "*) echo "$STUB_HAVE_WALLET" ;;
+  "sha256sum "*"/rand-node "*) echo "$STUB_NODE_SHA" ;;
+  "sha256sum "*"/rand "*) echo "$STUB_WALLET_SHA" ;;
+  *hc_auth_multisig*) echo plain ;;
+  *rand_limits_f=*) echo "$STUB_LIMITS_ANSWER" ;;
+esac
+exit 0
+STUB
+  cat > "$ST/bin/scp" <<'STUB'
+#!/usr/bin/env bash
+# A copy to a host is recorded only; a copy from the build host fetches the stub build.
+dest=${!#}
+case "$dest" in *:*) echo "scp-to ${dest%%:*}" >> "$STUB_ST/scp.log"; exit 0 ;; esac
+for a in "${@:1:$#-1}"; do case "$a" in -*) ;; *:*) cp "$STUB_ST/build/$(basename "${a#*:}")" "$dest/" ;; esac; done
+STUB
+  printf '#!/bin/sh\nexit 0\n' > "$ST/bin/launchctl"
+  chmod +x "$ST/bin/ssh" "$ST/bin/scp" "$ST/bin/launchctl"
+  echo node > "$ST/build/rand-node"; echo wallet > "$ST/build/rand"
+  sha() { shasum -a 256 "$1" | cut -d' ' -f1; }
+  NODE_SHA=$(sha "$ST/build/rand-node"); WALLET_SHA=$(sha "$ST/build/rand")
+  printf 'NODE_A=/ip4/198.18.0.1/tcp/30303/p2p/x\nNODE_B=/ip4/198.18.0.2/tcp/30303/p2p/y\n' > "$ST/nodes.env"
+  LIMITS_SCRIPT=$(unit_limits_install_script rand-node)
+  # Run one deploy script with the stubs first on PATH; the recorded commands start afresh.
+  stubbed() {
+    rm -f "$ST/rec"/c.* "$ST/scp.log"; : > "$ST/rec.idx"
+    env PATH="$ST/bin:$PATH" HOME="$ST/home" STUB_ST="$ST" STUB_NODE_SHA="$NODE_SHA" STUB_WALLET_SHA="$WALLET_SHA" \
+      NODES_ENV="$ST/nodes.env" ALLOW_UNSIGNED=1 SELFTEST= RELEASE_SUMS= RELEASE_SIG= "$@" > "$ST/run.out" 2>&1
+  }
+  # The recorded remote commands, in order: "<n> <host>" for those that carry the drop-in's install
+  # script, and the position of the first `systemctl restart`/`stop` after it.
+  rec() { local i=0 f; while read -r f; do i=$((i+1)); printf '%s\t%s\t%s\n' "$i" "$(head -1 "$f")" "$f"; done < "$ST/rec.idx"; }
+  carrying_limits() { local n host f; while IFS=$'\t' read -r n host f; do
+      [[ "$(tail -n +2 "$f")" == *"$LIMITS_SCRIPT"* ]] && echo "$n $host"; done < <(rec); }
+  first_matching() { local pat=$1 n host f; while IFS=$'\t' read -r n host f; do
+      [[ "$(tail -n +2 "$f")" == $pat ]] && { echo "$n"; return; }; done < <(rec); echo 0; }
+
+  # update-droplet.sh, already on the binary (PROC-601's refresh branch).
+  stubbed STUB_HAVE_NODE="$NODE_SHA" STUB_HAVE_WALLET="$WALLET_SHA" STUB_LIMITS_ANSWER="limits: written $F" \
+    WANT_SHA="$NODE_SHA" WANT_SHA_WALLET="$WALLET_SHA" bash "$DEPLOY/update-droplet.sh" 198.18.0.1 198.18.0.9
+  check "update-droplet.sh (already current) runs to its end" grep -q 'already on' "$ST/run.out"
+  check "update-droplet.sh (already current) sends the drop-in's install script to the host" \
+    test "$(carrying_limits | cut -d' ' -f2)" = 198.18.0.1
+  lim=$(carrying_limits | cut -d' ' -f1); rst=$(first_matching '*systemctl restart rand-node*')
+  check "update-droplet.sh (already current) restarts the node after a written drop-in" test "${lim:-0}" -gt 0 -a "$rst" -gt "${lim:-0}"
+  stubbed STUB_HAVE_NODE="$NODE_SHA" STUB_HAVE_WALLET="$WALLET_SHA" STUB_LIMITS_ANSWER="limits: unchanged $F" \
+    WANT_SHA="$NODE_SHA" WANT_SHA_WALLET="$WALLET_SHA" bash "$DEPLOY/update-droplet.sh" 198.18.0.1 198.18.0.9
+  check "update-droplet.sh (already current) does not restart over an unchanged drop-in" test "$(first_matching '*systemctl restart*')" = 0
+  # update-droplet.sh, installing a new binary.
+  stubbed STUB_HAVE_NODE=old STUB_HAVE_WALLET=old STUB_LIMITS_ANSWER= \
+    WANT_SHA="$NODE_SHA" WANT_SHA_WALLET="$WALLET_SHA" bash "$DEPLOY/update-droplet.sh" 198.18.0.1 198.18.0.9
+  check "update-droplet.sh (new binary) runs to its end" grep -q 'updated to' "$ST/run.out"
+  inst=$(first_matching '*install -m 755 /root/rand-node /root/rand /usr/local/bin/*')
+  check "update-droplet.sh (new binary) writes the drop-in in its install command" test "$(carrying_limits | cut -d' ' -f1)" = "$inst"
+  f=$(rec | awk -F'\t' -v n="$inst" '$1 == n { print $3 }')
+  check "  … before that command's restart" bash -c '[ -n "$1" ] && c=$(cat "$1") && l=${c%%rand_limits_f=*} && r=${c%%systemctl restart*} && [ ${#l} -lt ${#r} ]' _ "$f"
+
+  # roll-all.sh: every host's install step writes the drop-in, before the stop-all.
+  stubbed NO_MSAUTH_VK=1 bash "$DEPLOY/roll-all.sh" "$ST/build/rand-node" "$ST/build/rand" "$NODE_SHA" "$WALLET_SHA"
+  check "roll-all.sh runs to its end" grep -q 'ROLL-DONE' "$ST/run.out"
+  check "roll-all.sh sends the drop-in's install script to every host" \
+    test "$(carrying_limits | cut -d' ' -f2 | sort | tr '\n' ' ')" = "198.18.0.1 198.18.0.2 "
+  last=$(carrying_limits | tail -1 | cut -d' ' -f1); stop=$(first_matching '*systemctl stop rand-node*')
+  check "roll-all.sh writes them before it stops the fleet" test "${last:-0}" -gt 0 -a "$stop" -gt "${last:-0}"
+
+  # vps-setup.sh runs on a fresh host as root (cloud-init, cargo, /root), so it is not run here:
+  # its call must be a live line, ahead of the unit's first start.
+  vcall=$(grep -nE '^[^#]*bash -c "\$\(unit_limits_install_script rand-node\)"' "$DEPLOY/vps-setup.sh" | head -1 | cut -d: -f1)
+  vstart=$(grep -nE '^[^#]*systemctl (restart|start) rand-node' "$DEPLOY/vps-setup.sh" | head -1 | cut -d: -f1)
+  check "vps-setup.sh runs the drop-in's install script before it starts the node" test "${vcall:-0}" -gt 0 -a "${vstart:-0}" -gt "${vcall:-0}"
   stray=$(grep -lE '^[^#]*(MemoryHigh|LimitNOFILE)=' "$DEPLOY"/*.sh 2>/dev/null || true)
   check "no deploy script hard-codes MemoryHigh/LimitNOFILE (${stray:-none})" test -z "$stray"
 
@@ -103,7 +185,8 @@ if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${SELFTEST:-}" = 1 ]; then
   embedded="set -e
   $(unit_limits_install_script rand-node "$ST/units")
   echo done"
-  check "the script runs embedded in a larger set -e script" bash -c "PATH='$ST/bin':\$PATH; $embedded" >/dev/null
+  check "the script runs embedded in a larger set -e script" bash -c "PATH='$ST/bin':\$PATH; { $embedded
+  } >/dev/null"
   check "embedded, it still writes the drop-in" test "$(cat "$F")" = "$(unit_limits_dropin)"
 
   echo "unit-limits selftest: $PASS passed, $FAIL failed"; [ "$FAIL" -eq 0 ]; exit $?

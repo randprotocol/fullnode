@@ -35,6 +35,19 @@ Node (audit v13 rows; node-only, no wire, storage-format or consensus change):
   moves). Host e is 16; a 16 GB host with a small node stays 18. With no cgroup or `/proc`
   reading (macOS) the old rule stands. `--max-state-proof-tier` still overrides it.
 
+Deploy (audit v13 rows; no host touched):
+
+- **The limits drop-in's wiring is tested by running the roll scripts** (PROC-701): the selftest
+  checked only that `update-droplet.sh`, `roll-all.sh` and `vps-setup.sh` mention
+  `unit_limits_install_script`, so deleting the already-current refresh in `update-droplet.sh` or
+  the install step's call in `roll-all.sh` stayed green. `SELFTEST=1 bash
+  deploy/lib/unit-limits.sh` now runs `update-droplet.sh` (already current, written and unchanged;
+  and a new binary) and `roll-all.sh` against stub `ssh`/`scp`/`launchctl` that only record, and
+  asserts each path sends the install script to each host before its restart or stop-all;
+  either deletion turns it red. `vps-setup.sh` (root on a fresh host) is checked for a live call
+  before the node's first start. Running it found that `update-droplet.sh`'s new-binary path died
+  under `set -u` with `PRUNE_ARGS` unset (`${PRUNE_ARGS}` in the `sed`); it is `${PRUNE_ARGS:-}`.
+
 ## v0.8.5 — 2026-11-04 (chain 21, node-only; audit v12 rows; no wire or consensus change)
 
 Node (audit v12 consensus-adjacent rows):
