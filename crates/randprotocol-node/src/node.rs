@@ -83,7 +83,8 @@ pub struct NodeConfig {
     pub verify_workers: Option<usize>,
     /// CON-601: the highest state-proof tier this node verifies for its pool without a built key
     /// (`--max-state-proof-tier`); `None` sizes it to the host
-    /// ([`crate::mempool::default_state_proof_tier_cap`]).
+    /// ([`crate::mempool::state_proof_tier_cap_for`]: the memory left for a key build, audit v13
+    /// CON-701).
     pub state_proof_tier_cap: Option<u8>,
     /// Apply incoming proposals on the consensus loop, as before (`--apply-proposals-inline`,
     /// spec 2026-10-11 off-loop apply §4.5); `false`, the default, applies them on a blocking
@@ -1352,6 +1353,9 @@ struct Node {
     /// last logged (once an hour while it holds).
     disk_trend: crate::disk::DiskTrend,
     disk_warned_at: Option<Instant>,
+    /// Audit v13, CON-701: when the host-sized state-proof tier cap was last re-measured
+    /// ([`Node::refresh_state_proof_tier_cap`]); only without `--max-state-proof-tier`.
+    tier_cap_checked_at: Option<Instant>,
     /// Transaction hashes this node has already refused for a reason about their bytes, so a
     /// re-gossiped copy costs a hash lookup instead of a proof verification.
     refused: admission::RefusedCache,
@@ -1443,6 +1447,9 @@ struct Node {
 /// Incoming proposals applied on blocking workers at once (spec 2026-10-11 off-loop apply §4.1).
 /// One more is delivered on the loop as before, so a burst costs no more than it used to.
 const OFFLOOP_APPLIES: usize = 4;
+
+/// Audit v13, CON-701: how often the host-sized state-proof tier cap is re-measured.
+const STATE_PROOF_TIER_CAP_REFRESH: Duration = Duration::from_secs(60);
 /// CON-60 (c): how many committed blocks back the startup warm looks for state proofs whose
 /// shapes it builds and pins (beside the shapes the node recorded).
 pub const PERP_WARM_SCAN_BLOCKS: u64 = 4096;
@@ -2846,10 +2853,10 @@ pub async fn start_with(cfg: NodeConfig, rpc_options: RpcOptions, net_options: N
 
     // CON-601: the highest state-proof tier this node builds a verifier key for outside a block
     // — its pool and its startup warm. Node policy: a block carrying a proof above it still
-    // applies and builds the key (chain 22's genesis engine pin is the consensus fix).
-    let state_proof_tier_cap = cfg
-        .state_proof_tier_cap
-        .unwrap_or_else(|| crate::mempool::default_state_proof_tier_cap(randprotocol_prover::memory::total_bytes()));
+    // applies and builds the key (chain 22's genesis engine pin is the consensus fix). Audit v13,
+    // CON-701: by default sized from the memory left — the host's RAM or its cgroup's ceiling,
+    // less the node's resident size — and re-measured on the status tick.
+    let state_proof_tier_cap = cfg.state_proof_tier_cap.unwrap_or_else(crate::mempool::host_state_proof_tier_cap);
     if let Some(p) = hs.committed_ledger().perps() {
         if p.config.max_tier > state_proof_tier_cap {
             tracing::warn!(
@@ -3030,6 +3037,7 @@ pub async fn start_with(cfg: NodeConfig, rpc_options: RpcOptions, net_options: N
         disk_free_bytes,
         disk_trend: crate::disk::DiskTrend::default(),
         disk_warned_at: None,
+        tier_cap_checked_at: Some(Instant::now()),
         refused: admission::RefusedCache::new(admission::REFUSED_CACHE_ENTRIES),
         proof_refused: admission::ProofRefusedCache::new(admission::PROOF_REFUSED_ENTRIES),
         limiter: admission::PeerLimiter::new(admission::PEER_TX_BURST, admission::PEER_TX_PER_SEC),
@@ -3159,6 +3167,7 @@ impl Node {
                 },
                 _ = status_tick.tick() => {
                     self.check_disk();
+                    self.refresh_state_proof_tier_cap();
                     self.broadcast_status().await;
                     self.announce_binding().await;
                     self.persist_reserved_sources().await;
@@ -3169,6 +3178,25 @@ impl Node {
                 // its embargo is fluffed here.
                 _ = sleep_until(self.dandelion.stempool.next_deadline()) => self.on_embargo().await,
             }
+        }
+    }
+
+    /// Audit v13, CON-701: re-measure the host-sized state-proof tier cap once a minute, since the
+    /// node grows to its working size after the start: a cap sized on a fresh process would hold
+    /// a tier-18 build on a host whose node later sits at 5 GB under `MemoryHigh`. Nothing to do
+    /// under `--max-state-proof-tier`.
+    fn refresh_state_proof_tier_cap(&mut self) {
+        if self.cfg.state_proof_tier_cap.is_some() || self.tier_cap_checked_at.is_some_and(|t| t.elapsed() < STATE_PROOF_TIER_CAP_REFRESH) {
+            return;
+        }
+        self.tier_cap_checked_at = Some(Instant::now());
+        let cap = crate::mempool::host_state_proof_tier_cap();
+        let was = self.mempool.state_proof_tier_cap();
+        if cap != was {
+            tracing::info!(
+                "state proofs: tier cap {was} -> {cap} for the pool (memory left for a key build; CON-701, --max-state-proof-tier overrides)"
+            );
+            self.mempool.set_state_proof_tier_cap(cap);
         }
     }
 
@@ -8021,6 +8049,7 @@ mod tests {
             disk_free_bytes: u64::MAX,
             disk_trend: crate::disk::DiskTrend::default(),
             disk_warned_at: None,
+            tier_cap_checked_at: None,
             refused: admission::RefusedCache::new(16),
             proof_refused: admission::ProofRefusedCache::new(16),
             limiter: admission::PeerLimiter::new(admission::PEER_TX_BURST, admission::PEER_TX_PER_SEC),
@@ -8452,6 +8481,24 @@ mod tests {
     /// fixture chain's.
     fn next_tx(ledger: &Ledger, i: u32) -> Transaction {
         bundle_tx(ledger, [[40 + i; 8], [50 + i; 8]], [[60 + i; 8], [70 + i; 8]], bundle_fee())
+    }
+
+    /// Audit v13, CON-701: without `--max-state-proof-tier` the status tick re-sizes the cap from
+    /// the memory left now, at most once a minute; with the flag it never moves.
+    #[tokio::test]
+    async fn the_host_sized_tier_cap_is_re_measured_and_the_flag_pins_it() {
+        let (_d, storage, gs, hs) = replica_past_a_boundary();
+        let (mut node, _seen) = bare_node(storage, gs, hs);
+        node.mempool.set_state_proof_tier_cap(3);
+        node.refresh_state_proof_tier_cap();
+        assert_eq!(node.mempool.state_proof_tier_cap(), crate::mempool::host_state_proof_tier_cap());
+        node.mempool.set_state_proof_tier_cap(3);
+        node.refresh_state_proof_tier_cap();
+        assert_eq!(node.mempool.state_proof_tier_cap(), 3, "not again within the minute");
+        node.tier_cap_checked_at = None;
+        node.cfg.state_proof_tier_cap = Some(3);
+        node.refresh_state_proof_tier_cap();
+        assert_eq!(node.mempool.state_proof_tier_cap(), 3, "--max-state-proof-tier is the override");
     }
 
     // ------------------------------------------- Dandelion++ (issue #145)

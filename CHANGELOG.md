@@ -26,6 +26,14 @@ Node (audit v13 rows; node-only, no wire, storage-format or consensus change):
   id, is queued, and fails `PrunedFormOutsideSync`; that failed verdict took the honest
   transaction out of the stempool and cancelled its embargo, so it was neither held, pooled nor
   published although its submitter had heard `Ok`. Only an `Ok` verdict ends the embargo now.
+- **The default state-proof tier cap counts the memory left** (CON-701): v0.8.5 sized
+  `--max-state-proof-tier`'s default from the host's RAM alone, so host e (7.9 GB; `MemoryHigh=85%`
+  is 6.7 GB; the node ~5 GB resident) kept tier 18 and a free forged tier-18 header bought a
+  3.56 GB key build there. The default now fits the documented build peak in three quarters of
+  min(host RAM, the cgroup v2 `memory.high`/`memory.max` of the node's cgroup and its ancestors)
+  less the node's resident size, at startup and every minute on the status tick (logged when it
+  moves). Host e is 16; a 16 GB host with a small node stays 18. With no cgroup or `/proc`
+  reading (macOS) the old rule stands. `--max-state-proof-tier` still overrides it.
 
 ## v0.8.5 — 2026-11-04 (chain 21, node-only; audit v12 rows; no wire or consensus change)
 
@@ -38,7 +46,8 @@ Node (audit v12 consensus-adjacent rows):
   key build, so it is not verified, pooled, relayed or proposed there
   (`StateProofAboveNodeTier`: not cached, no peer penalised). The default is the highest tier
   whose documented key-build peak fits in three quarters of the host's RAM: 16 on 2 GB and 4 GB
-  hosts, 18 on 8 GB, 20 from about 22 GB. The startup warm skips shapes above the cap too. A
+  hosts, 18 from about 5.73 GB, 20 from about 22.9 GB (audit v13, CON-701, sizes it from the
+  memory left instead; see Unreleased). The startup warm skips shapes above the cap too. A
   block carrying such a proof still applies and builds its key: that residual waits for chain
   22's genesis engine pin. Also, the state-proof pre-key checks now refuse a FRI transcript of the
   wrong structure (commit rounds, proof-of-work words and openings of unequal counts, no round,

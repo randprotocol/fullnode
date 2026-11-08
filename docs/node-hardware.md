@@ -93,8 +93,11 @@ Rules that follow from these numbers:
 - **A perps state-proof key build is the largest single allocation a node makes** (CON-601):
   ~1 GiB at tier 16, ~4 GiB at tier 18 (3.56 GB resident measured), ~16 GiB at tier 20. Chain 21
   allows tier 18, which neither a 2 GB nor a 4 GB host can build. The node caps the tier it
-  builds keys for outside a block at the highest one fitting three quarters of its RAM (16 on
-  2–4 GB, 18 on 8 GB; `--max-state-proof-tier` overrides it), so such a proof is not pooled,
+  builds keys for outside a block at the highest one fitting three quarters of the memory left
+  (the host's RAM or its cgroup's `memory.high`/`memory.max` if lower, less the node's resident
+  size, re-measured every minute: CON-701; 16 on 2–4 GB; 18 needs ~5.73 GB left, so an 8 GB host
+  whose node sits at 5 GB under `MemoryHigh=85%` is 16; `--max-state-proof-tier` overrides it),
+  so such a proof is not pooled,
   relayed or proposed there. A block that carries one still makes every validator build the key;
   until chain 22 pins the engine shape, a validator that must survive that needs 8 GB
   (`docs/perps.md`, "the node's tier cap").

@@ -548,9 +548,13 @@ bridged one.
     (94 s and 3.56 GB resident measured in a debug build), more than a 2 GB or 4 GB host holds.
     Each node therefore has its own cap, `rand-node run --max-state-proof-tier <T>` (one of 10,
     12, 14, 16, 18, 20). Its default is the highest tier whose key-build peak — 16 MiB · 4^((T −
-    10)/2): 1 GiB at 16, 4 GiB at 18, 16 GiB at 20 — fits in three quarters of the host's RAM:
-    **16 on 2 GB and 4 GB hosts, 18 on 8 GB, 20 from about 22 GB**; with the OS reporting no
-    size, no cap. A state proof above the cap whose shape the node has no key for is refused
+    10)/2): 1 GiB at 16, 4 GiB at 18, 16 GiB at 20 — fits in three quarters of the memory left:
+    the host's RAM, or its cgroup v2 `memory.high`/`memory.max` (this cgroup's or an ancestor's)
+    when lower, less the node's resident size, measured at startup and every minute after (audit
+    v13, CON-701: v0.8.5 used the host's RAM alone, so host e — 7.9 GB, the node at ~5 GB under
+    `MemoryHigh=85%` — kept 18). **18 needs about 5.73 GB left and 20 about 22.9 GB**: 16 on 2 GB
+    and 4 GB hosts, and on an 8 GB host once its node has grown; with no cgroup or resident
+    reading (macOS) the host's RAM alone; with the OS reporting no size, no cap. A state proof above the cap whose shape the node has no key for is refused
     first in the pool's pre-screen, from its header alone — before the ledger's segment, the
     executor's pre-key rules, a cold-build token or the verify queue: `this node admits no state
     proof above tier T to its pool …` (`StateProofAboveNodeTier`, not cached, no peer penalised).
