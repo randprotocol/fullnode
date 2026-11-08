@@ -12,6 +12,10 @@ stopped at v0.4 until 2026-09-30, when the entries v0.5 to v0.6.7 were written f
 
 ## Unreleased
 
+Nothing yet.
+
+## v0.8.6 — 2026-11-09 (chain 21, node-only; audit v13 rows; no wire, storage-format or consensus change)
+
 - **Chain-22 cut (`deploy/cut-chain22-genesis.sh`):** the genesis sets
   `perps.max_pending_digests = 65536`, the owner's decision of 2026-11-05 for chain 22's perps
   digest cap (about 18 h of input-bearing blocks with no prover; ~2.6 MB of log). The script writes
