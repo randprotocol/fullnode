@@ -1,0 +1,21 @@
+# Roll record — v0.8.6 onto chain 21 (a node-only, same-chain roll; no genesis, no cut).
+#
+# One line per field, like deploy/cut-records/*.record; lines starting with # are ignored. A roll
+# record says what was installed where and when, and what was left out. No host addresses or keys:
+# the fleet's list is the operator's (configuration/fleet in the private configuration repository).
+
+release: v0.8.6 (tag 6591c884, 2026-11-09; CHANGELOG.md, v0.8.6: audit v13 rows, node-only, no wire, storage-format or consensus change)
+
+binary: rand-node sha256 61c2a8bb… and rand 4cd9beaf… as listed in the release's SHA256SUMS, signed by the user (deploy/release-signers), checked by update-droplet.sh on every host
+
+window: 2026-11-09 00:16–02:22 UTC, one host at a time, each back in step with the validators (height within 5 of a reference, at least 10 peers) before the next; validators first, archives obs1 and e last
+
+hosts: 24 of the 25 inventory hosts plus the durian site node
+
+skipped: archive2 (unreachable at the roll, as at v0.8.5)
+
+unit: 50-limits.conf unchanged on every host; the hand-placed nofile.conf of 2026-11-01 moved aside to nofile.conf.removed on all 24 hosts and on the durian node (PROC-702)
+
+durian site node: binaries in their own directory beside v0.8.5's, the unit's ExecStart edited (backup kept), msauth-vk-production.bin copied from the release (sha unchanged); back at the chain's height with 25 peers
+
+verified: 2026-11-09 02:30 UTC probe, 24/24 reachable hosts report rand-node 0.8.6 with sha 61c2a8bb, heights moving together; the public RPC answers rand_status
