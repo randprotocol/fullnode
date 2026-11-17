@@ -6,6 +6,37 @@ invariants, and known traps.
 
 ## Project memory (state as of 2026-11-08)
 
+### The constraint-set guard (issue #166, ZKVM-201; 2026-11-17, branch `fix/zkvm-201`)
+
+The guard half of #166; the re-vendor to constraint set 10 is not done and is the owner's call
+(a chain cut). `CIRCUITS_PIN` and every vendored file are unchanged.
+
+- **Why**: a genesis records no constraint set. A binary of another set that carries the chain's
+  guests passed `check_build_runs_genesis`; `startup_check` then truncated at the first proof —
+  in `run` itself, under the default `--verify-chain quick` (a new build's checkpoint row is
+  another build's, so it walks), not only in `verify --repair`. The msauth key check does not
+  stop it on a real roll: the roll installs the blob the new binary pins.
+- **`node::BUILD_CONSTRAINT_SET`** is a `u32` literal with a `const` assertion against
+  `randprotocol_zkvm::machine::CONSTRAINT_SET`. A literal on purpose: a re-export would let a
+  sync move the node's set with no edit and no review. **Moving it is a chain cut.**
+- **`constraint_set::CHAIN_CONSTRAINT_SETS`** (`crates/randprotocol-node/src/constraint_set.rs`):
+  chains 14-21 by genesis hash with their set. `check_build_runs_genesis` refuses a listed chain
+  of another set, so a bump refuses chain 21 with no row added to
+  `CHAINS_THIS_BUILD_CANNOT_RUN` (add one anyway, for its reason). **Every cut adds its row.**
+- **`<datadir>/constraint-set`** (the marker): written by `init`, and by `run` before
+  `Storage::open` when the datadir has no database or its genesis is listed under this build's
+  set. `constraint_set::bind` reads it in `run`, `verify` and `init` before the database opens;
+  a mismatch refuses and writes nothing. Never rewritten when present; a garbled one refuses.
+- **Unmarked + unlisted + has a database** (`Binding::Unknown`, a pre-guard devnet): starts, but
+  `startup_check_bound` runs under `Truncation::Refused` — a walk that finds a problem is an
+  error, nothing is truncated. A clean walk (or this build's own checkpoint) writes the marker;
+  `--verify-chain off` does not. `startup_check` / `check_and_repair_chain` without `_bound`
+  truncate as before and are for tests and already-bound stores.
+- **`deploy/check-constraint-set.sh`**: vendored vs node (and `--upstream` circuits' `machine.rs`
+  at the pin, in CI's `guest-provenance`); `deploy/sync-zkvm.sh` ends on it with `--before`.
+- **Trap**: a datadir copied without its marker (only `genesis.json` + `db/`) is `Unknown` on an
+  unlisted chain. The snapshot and cutover scripts were not changed here.
+
 ### Releases on chain 21 since v0.8.2 (status as of 2026-11-08)
 
 Chain 21 runs **v0.8.5**. Every release below is node-only (no wire, storage-format or consensus
