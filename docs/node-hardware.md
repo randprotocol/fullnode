@@ -95,10 +95,13 @@ Rules that follow from these numbers:
   allows tier 18, which neither a 2 GB nor a 4 GB host can build. The node caps the tier it
   builds keys for outside a block at the highest one fitting three quarters of the memory left
   (the host's RAM or its cgroup's `memory.high`/`memory.max` if lower, less the node's resident
-  size, re-measured every minute: CON-701; 16 on 2–4 GB; 18 needs ~5.73 GB left, so an 8 GB host
-  whose node sits at 5 GB under `MemoryHigh=85%` is 16; `--max-state-proof-tier` overrides it),
-  so such a proof is not pooled,
-  relayed or proposed there. A block that carries one still makes every validator build the key;
+  size, re-measured every minute and held at 16 or lower for the first minute after a start:
+  CON-701; 16 needs ~1.43 GB left and 18 ~5.73 GB, so an 8 GB host whose node sits at 5 GB
+  under `MemoryHigh=85%` is 16, a 4 GB host is 16 while its node stays under ~1.9 GB, and **a
+  2 GB host under `MemoryHigh=85%` is 14 or 12 at rest, not 16** — CON-751;
+  `--max-state-proof-tier` overrides it), so a proof above the cap is not pooled, relayed or
+  proposed there. On the default a 2 GB validator does not pool or relay a cold tier-16 proof
+  either; pass `--max-state-proof-tier 16` to have it do so, on swap. A block that carries one still makes every validator build the key;
   until chain 22 pins the engine shape, a validator that must survive that needs 8 GB
   (`docs/perps.md`, "the node's tier cap").
 - **Disk, not RAM, is the limit.** Keep at least 20 GB free for builds (`docs/block-space.md` §5)

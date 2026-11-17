@@ -516,11 +516,68 @@ fn tier_cap_within(headroom_bytes: u64) -> u8 {
     tiers.iter().copied().filter(|t| state_proof_key_build_peak_bytes(*t) <= budget).max().unwrap_or(tiers[0])
 }
 
+/// Audit v14, CON-701: the cap a node without `--max-state-proof-tier` holds from its start until
+/// its first re-reading (`node::STATE_PROOF_TIER_CAP_REFRESH` later): the v0.8.5 rule's value on
+/// every host that can build a tier-16 key at all. The memory-left rule read at startup sees a
+/// process that has not grown yet (under ~1 GB resident), so a 7.9 GB host read 18 for its first
+/// minute and a free forged tier-18 header still bought the 3.56 GB key build while the node grew.
+pub const STATE_PROOF_TIER_CAP_AT_START: u8 = 16;
+
+/// Audit v14, CON-701: the default cap at startup — the lower of the memory-left rule's reading
+/// (`measured`, [`host_state_proof_tier_cap`]) and [`STATE_PROOF_TIER_CAP_AT_START`]. The startup
+/// reading can lower the cap (a 1 GB host is 14) and never raises it past the held value; only a
+/// re-reading taken once the node has run for a while does.
+pub fn startup_state_proof_tier_cap(measured: u8) -> u8 {
+    measured.min(STATE_PROOF_TIER_CAP_AT_START)
+}
+
+/// CON-701: where the memory-left rule reads this process's cgroup v2 ceiling and resident size.
+/// [`HostMemorySources::linux`] is the real one; a test points it at a fixture tree (audit v14,
+/// CON-752: the readers run nowhere but Linux, so they are testable only this way elsewhere).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HostMemorySources {
+    /// The cgroup v2 mount.
+    pub cgroup_root: std::path::PathBuf,
+    /// This process's cgroup membership (its `0::` line is the v2 path).
+    pub proc_self_cgroup: std::path::PathBuf,
+    /// This process's status (`VmRSS`).
+    pub proc_self_status: std::path::PathBuf,
+}
+
+impl HostMemorySources {
+    /// The kernel's own files.
+    pub fn linux() -> Self {
+        HostMemorySources {
+            cgroup_root: "/sys/fs/cgroup".into(),
+            proc_self_cgroup: "/proc/self/cgroup".into(),
+            proc_self_status: "/proc/self/status".into(),
+        }
+    }
+
+    /// The least finite `memory.high` or `memory.max` over this process's cgroup v2 and its
+    /// ancestors; `None` when there is none or it cannot be read (macOS, cgroup v1).
+    pub fn cgroup_memory_limit_bytes(&self) -> Option<u64> {
+        let cg = std::fs::read_to_string(&self.proc_self_cgroup).ok()?;
+        cgroup_memory_limit_under(&self.cgroup_root, cgroup_v2_path(&cg)?)
+    }
+
+    /// This process's resident size; `None` where the status file is not (macOS).
+    pub fn process_rss_bytes(&self) -> Option<u64> {
+        parse_vm_rss(&std::fs::read_to_string(&self.proc_self_status).ok()?)
+    }
+
+    /// [`state_proof_tier_cap_for`] of `total_ram_bytes` and these sources' two readings.
+    pub fn state_proof_tier_cap(&self, total_ram_bytes: u64) -> u8 {
+        state_proof_tier_cap_for(total_ram_bytes, self.cgroup_memory_limit_bytes(), self.process_rss_bytes())
+    }
+}
+
 /// CON-701: [`state_proof_tier_cap_for`] on this host now — its RAM, this process's cgroup
-/// ceiling and its resident size. Read at startup and again on the node's status tick (the node
-/// grows to its working size after the start).
+/// ceiling and its resident size. Read at startup (where [`startup_state_proof_tier_cap`] holds
+/// it down) and again on the node's status tick (the node grows to its working size after the
+/// start).
 pub fn host_state_proof_tier_cap() -> u8 {
-    state_proof_tier_cap_for(randprotocol_prover::memory::total_bytes(), cgroup_memory_limit_bytes(), process_rss_bytes())
+    HostMemorySources::linux().state_proof_tier_cap(randprotocol_prover::memory::total_bytes())
 }
 
 /// CON-701: the cgroup v2 path in `/proc/self/cgroup` (the `0::` line); `None` without one
@@ -540,13 +597,12 @@ fn parse_vm_rss(status: &str) -> Option<u64> {
     kb.parse::<u64>().ok().map(|k| k.saturating_mul(1024))
 }
 
-/// CON-701: the least finite `memory.high` or `memory.max` over this process's cgroup v2 and its
-/// ancestors (a slice's limit binds the services under it too); `None` when there is none or it
-/// cannot be read (macOS, cgroup v1).
-pub fn cgroup_memory_limit_bytes() -> Option<u64> {
-    let root = std::path::Path::new("/sys/fs/cgroup");
-    let cg = std::fs::read_to_string("/proc/self/cgroup").ok()?;
-    let mut dir = root.join(cgroup_v2_path(&cg)?.trim_start_matches('/'));
+/// CON-701: the least finite `memory.high` or `memory.max` over the cgroup at `cgroup_path` (as
+/// `/proc/self/cgroup` names it, `/a/b`) under the cgroup v2 mount `root`, and over every
+/// ancestor up to the mount itself (a slice's limit binds the services under it too); `None`
+/// when no level sets one. The walk never leaves `root`.
+pub fn cgroup_memory_limit_under(root: &std::path::Path, cgroup_path: &str) -> Option<u64> {
+    let mut dir = root.join(cgroup_path.trim_start_matches('/'));
     let mut least: Option<u64> = None;
     loop {
         for f in ["memory.high", "memory.max"] {
@@ -560,9 +616,14 @@ pub fn cgroup_memory_limit_bytes() -> Option<u64> {
     }
 }
 
+/// CON-701: [`HostMemorySources::cgroup_memory_limit_bytes`] of the kernel's files.
+pub fn cgroup_memory_limit_bytes() -> Option<u64> {
+    HostMemorySources::linux().cgroup_memory_limit_bytes()
+}
+
 /// CON-701: this process's resident size; `None` where `/proc` is not (macOS).
 pub fn process_rss_bytes() -> Option<u64> {
-    parse_vm_rss(&std::fs::read_to_string("/proc/self/status").ok()?)
+    HostMemorySources::linux().process_rss_bytes()
 }
 
 /// CON-60 (b): what verifying a transaction costs in verifier-key builds.
@@ -4927,7 +4988,12 @@ mod tests {
         assert_eq!(host_e, 16);
         assert_eq!(state_proof_tier_cap_for(16_000_000_000, None, Some(300_000_000)), 18, "a 16 GB host with little resident");
         assert_eq!(state_proof_tier_cap_for(16_000_000_000, Some(13_600_000_000), Some(300_000_000)), 18, "and under MemoryHigh=85%");
-        assert_eq!(state_proof_tier_cap_for(7_900_000_000, Some(6_700_000_000), Some(400_000_000)), 18, "host e just after its start");
+        // Audit v14, CON-701: the rule alone still reads 18 for host e just after its start (the
+        // process has not grown), which is why the node does not use the rule alone then:
+        // `startup_state_proof_tier_cap` holds 16 until the first re-reading.
+        let host_e_at_start = state_proof_tier_cap_for(7_900_000_000, Some(6_700_000_000), Some(400_000_000));
+        assert_eq!(host_e_at_start, 18, "the bare rule on a fresh process");
+        assert_eq!(startup_state_proof_tier_cap(host_e_at_start), 16, "host e just after its start");
         // The cgroup ceiling counts only when it is the lower one.
         assert_eq!(state_proof_tier_cap_for(48 * GIB, Some(u64::MAX / 2), None), 20);
         assert_eq!(state_proof_tier_cap_for(48 * GIB, Some(6 * GIB), None), 18);
@@ -4943,6 +5009,151 @@ mod tests {
         assert_eq!(state_proof_tier_cap_for(5_727_000_000, None, None), 18);
         assert_eq!(state_proof_tier_cap_for(22_906_000_000, None, None), 18);
         assert_eq!(state_proof_tier_cap_for(22_907_000_000, None, None), 20);
+    }
+
+    /// Audit v14, CON-701: from its start until its first re-reading a node holds the lower of
+    /// the memory-left reading and 16, so a fresh process's small resident size cannot buy a
+    /// tier-18 (or tier-20) build for the first minute; a reading below 16 still lowers it.
+    #[test]
+    fn con701_the_startup_cap_is_held_at_16_until_the_first_re_reading() {
+        const GIB: u64 = 1 << 30;
+        assert_eq!(STATE_PROOF_TIER_CAP_AT_START, 16);
+        for measured in [18, 20, u8::MAX] {
+            assert_eq!(startup_state_proof_tier_cap(measured), 16, "{measured}");
+        }
+        for measured in [10, 12, 14, 16] {
+            assert_eq!(startup_state_proof_tier_cap(measured), measured, "a lower reading stands");
+        }
+        // The fleet's sizes just after a start (400 MB resident, MemoryHigh=85%).
+        for total in [1_985_000_000u64, 4 * GIB, 7_900_000_000, 16_000_000_000, 48 * GIB] {
+            let measured = state_proof_tier_cap_for(total, Some(total / 100 * 85), Some(400_000_000));
+            assert!(startup_state_proof_tier_cap(measured) <= 16, "{total}");
+        }
+    }
+
+    /// A cgroup v2 fixture tree and `/proc` files under a temp dir: `levels` are
+    /// `(path under the mount, file, contents)`.
+    fn memory_fixture(cgroup_line: &str, levels: &[(&str, &str, &str)], status: Option<&str>) -> (tempfile::TempDir, HostMemorySources) {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path().join("cgroup");
+        std::fs::create_dir_all(&root).unwrap();
+        for (dir, file, contents) in levels {
+            let at = root.join(dir);
+            std::fs::create_dir_all(&at).unwrap();
+            std::fs::write(at.join(file), contents).unwrap();
+        }
+        let proc_self_cgroup = d.path().join("proc-self-cgroup");
+        std::fs::write(&proc_self_cgroup, cgroup_line).unwrap();
+        let proc_self_status = d.path().join("proc-self-status");
+        if let Some(s) = status {
+            std::fs::write(&proc_self_status, s).unwrap();
+        }
+        (d, HostMemorySources { cgroup_root: root, proc_self_cgroup, proc_self_status })
+    }
+
+    /// Audit v14, CON-752: the cgroup walk takes the LEAST finite `memory.high`/`memory.max`
+    /// over the service's cgroup and every ancestor up to the mount — whichever level and
+    /// whichever file holds it, in whatever order the walk meets them — and never a level
+    /// outside the node's own path.
+    #[test]
+    fn con752_the_cgroup_walk_takes_the_least_limit_on_the_nodes_path() {
+        let svc = "system.slice/rand-node.service";
+        // The least is the service's own memory.high (MemoryHigh=85% of 7.9 GB).
+        let (d, src) = memory_fixture(
+            "0::/system.slice/rand-node.service\n",
+            &[
+                (svc, "memory.high", "6700000256\n"),
+                (svc, "memory.max", "max\n"),
+                ("system.slice", "memory.high", "max\n"),
+                ("system.slice", "memory.max", "7900000000\n"),
+                ("", "memory.max", "max\n"),
+                // A sibling's tighter limit is not on the node's path.
+                ("system.slice/other.service", "memory.max", "1000\n"),
+                ("user.slice", "memory.high", "2000\n"),
+            ],
+            None,
+        );
+        assert_eq!(src.cgroup_memory_limit_bytes(), Some(6_700_000_256));
+        assert_eq!(cgroup_memory_limit_under(&src.cgroup_root, "/system.slice/rand-node.service"), Some(6_700_000_256));
+        drop(d);
+        // The least is an ancestor's memory.max, met AFTER a larger value at the leaf.
+        let (_d, src) = memory_fixture(
+            "0::/system.slice/rand-node.service\n",
+            &[(svc, "memory.high", "6700000256\n"), (svc, "memory.max", "7000000000\n"), ("system.slice", "memory.max", "3000000000\n")],
+            None,
+        );
+        assert_eq!(src.cgroup_memory_limit_bytes(), Some(3_000_000_000), "a slice's lower ceiling binds the service under it");
+        // The least is the leaf's memory.max, below its own memory.high and met after it.
+        let (_d, src) = memory_fixture("0::/a/b\n", &[("a/b", "memory.high", "5000\n"), ("a/b", "memory.max", "4000\n"), ("a", "memory.high", "9000\n")], None);
+        assert_eq!(src.cgroup_memory_limit_bytes(), Some(4000));
+        // The least is the mount's own.
+        let (_d, src) = memory_fixture("0::/a/b\n", &[("a/b", "memory.high", "5000\n"), ("", "memory.high", "100\n")], None);
+        assert_eq!(src.cgroup_memory_limit_bytes(), Some(100));
+        // The root cgroup itself ("0::/").
+        assert_eq!(cgroup_memory_limit_under(&src.cgroup_root, "/"), Some(100));
+        // No finite limit anywhere, cgroup v1 only, and no file at all: no reading.
+        let (_d, src) = memory_fixture("0::/a\n", &[("a", "memory.high", "max\n"), ("a", "memory.max", "max\n")], None);
+        assert_eq!(src.cgroup_memory_limit_bytes(), None);
+        let (_d, src) = memory_fixture("12:memory:/a\n", &[("a", "memory.high", "5000\n")], None);
+        assert_eq!(src.cgroup_memory_limit_bytes(), None, "cgroup v1 only");
+        let missing = HostMemorySources { cgroup_root: "/nonexistent-cgroup".into(), proc_self_cgroup: "/nonexistent-a".into(), proc_self_status: "/nonexistent-b".into() };
+        assert_eq!((missing.cgroup_memory_limit_bytes(), missing.process_rss_bytes()), (None, None));
+    }
+
+    /// Audit v14, CON-752: the host reading is the rule over ALL THREE figures — the host's RAM,
+    /// the cgroup ceiling read from the tree and `VmRSS` read from the status file. Each
+    /// fixture's answer changes if any one reading is dropped.
+    #[test]
+    fn con752_the_host_reading_counts_the_cgroup_ceiling_and_the_resident_size() {
+        let levels = [("system.slice/rand-node.service", "memory.high", "6700000000\n")];
+        let line = "0::/system.slice/rand-node.service\n";
+        let status = |kb: u64| format!("Name:\trand-node\nVmPeak:\t 9999999 kB\nVmRSS:\t {kb} kB\nThreads:\t40\n");
+        // A 16 GB host, MemoryHigh 6.7 GB, the node at 5 GB: 1.7 GB left is tier 16.
+        let (_d, grown) = memory_fixture(line, &levels, Some(&status(5_000_000_000 / 1024)));
+        assert_eq!(grown.process_rss_bytes(), Some(5_000_000_000 / 1024 * 1024));
+        assert_eq!(grown.state_proof_tier_cap(16_000_000_000), 16);
+        // …without the cgroup ceiling it would be 18 (11 GB left)…
+        assert_eq!(state_proof_tier_cap_for(16_000_000_000, None, grown.process_rss_bytes()), 18);
+        // …and without the resident size 18 as well (6.7 GB left).
+        assert_eq!(state_proof_tier_cap_for(16_000_000_000, grown.cgroup_memory_limit_bytes(), None), 18);
+        // The host total counts too: the same files on a 48 GB host with no ceiling read 20.
+        let (_d, roomy) = memory_fixture("0::/x\n", &[], Some(&status(400_000)));
+        assert_eq!(roomy.state_proof_tier_cap(48 << 30), 20);
+        assert_eq!(roomy.state_proof_tier_cap(8 << 30), 18);
+        assert_eq!(roomy.state_proof_tier_cap(0), u8::MAX, "an unknown host size sets no cap");
+        // The node's reading is this, over the kernel's own files and the host's RAM.
+        let real = HostMemorySources::linux();
+        assert_eq!(
+            (real.cgroup_root.to_str(), real.proc_self_cgroup.to_str(), real.proc_self_status.to_str()),
+            (Some("/sys/fs/cgroup"), Some("/proc/self/cgroup"), Some("/proc/self/status"))
+        );
+        assert_eq!(cgroup_memory_limit_bytes(), real.cgroup_memory_limit_bytes());
+        // Not `process_rss_bytes() == real.process_rss_bytes()`: two readings a moment apart.
+        assert_eq!(process_rss_bytes().is_some(), real.process_rss_bytes().is_some());
+        let total = randprotocol_prover::memory::total_bytes();
+        assert!(total > 0, "the host reports its memory");
+        assert!(host_state_proof_tier_cap() <= state_proof_tier_cap_for(total, None, None), "the two readings only ever lower it");
+    }
+
+    /// Audit v14, CON-752, on Linux (where CI runs): the readers read the kernel's real files —
+    /// `VmRSS` is there and plausible, and the host reading is the rule over the real figures.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn con752_on_linux_the_real_readers_read() {
+        let rss = process_rss_bytes().expect("/proc/self/status has VmRSS");
+        let total = randprotocol_prover::memory::total_bytes();
+        assert!(rss > (1 << 20) && rss < total, "{rss} of {total}");
+        // A ballast the resident size must show: the reading is live, not a constant.
+        let ballast = vec![1u8; 256 << 20];
+        let after = process_rss_bytes().unwrap();
+        assert!(after >= rss + (128 << 20), "{rss} -> {after}");
+        // With a host total just above what is resident, nothing is left: the lowest tier — which
+        // only a reading that counts the real resident size gives.
+        assert_eq!(HostMemorySources::linux().state_proof_tier_cap(after + (8 << 20)), 10);
+        drop(ballast);
+        if let Some(limit) = cgroup_memory_limit_bytes() {
+            assert!(limit > 0);
+        }
     }
 
     /// CON-701: the cgroup v2 and `/proc/self/status` readings the default is sized from.
