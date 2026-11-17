@@ -11,6 +11,7 @@ use randprotocol_core::types::actions::{
 use randprotocol_zkvm::machine::FriProfile;
 use randprotocol_core::{format_amount, parse_amount};
 use randprotocol_core::{Keypair, PublicKey, UNITS_PER_RAND};
+use randprotocol_node::constraint_set;
 use randprotocol_node::keyfile::{load_keypair, KeyFile};
 use randprotocol_node::node::{self, NodeConfig};
 use randprotocol_node::storage::{Storage, VerifyMode};
@@ -3000,7 +3001,14 @@ async fn main() -> Result<()> {
             refuse_test_fri_profile(&g.fri_profile, test_profile_allowed)?;
             let executor = node::executor_for_profile(&g.fri_profile)?;
             let gs = g.build(executor.as_ref())?;
+            // Issue #166: a datadir marked for another constraint set, or a listed chain cut
+            // under one, is refused before the genesis file or the database is written; a new
+            // datadir gets its marker before its database.
+            let binding = constraint_set::bind(&datadir, &gs).map_err(|e| anyhow::anyhow!("{e:#}; refusing to init"))?;
             std::fs::write(datadir.join("genesis.json"), &text)?;
+            if binding == constraint_set::Binding::Unmarked {
+                constraint_set::write_marker(&datadir)?;
+            }
             let storage = Storage::open(&datadir)?;
             storage.init_genesis(&gs)?;
             println!("initialised {} at genesis {} (chain id {})", datadir.display(), gs.hash(), gs.chain_id);
@@ -3014,6 +3022,13 @@ async fn main() -> Result<()> {
             // genesis naming another build's guest is refused here, before any block is read, so
             // it is never reported CORRUPT and `--repair` never truncates on it.
             node::check_build_runs_genesis(&gs, &ZkExecutor::known_hc_bundles()).map_err(|e| anyhow::anyhow!("{e:#}; refusing to verify"))?;
+            // Issue #166: and the datadir's own constraint set (its marker), before the database
+            // is opened — a datadir of another set is neither reported CORRUPT nor repaired.
+            // `verify` never writes the marker: only `init` and `run` do.
+            let truncation = constraint_set::Truncation::for_binding(
+                constraint_set::bind(&datadir, &gs).map_err(|e| anyhow::anyhow!("{e:#}; refusing to verify"))?,
+                &datadir,
+            );
             // The pinned msauth key, loaded as `run` loads it: a replay must never build it.
             randprotocol_node::msauth_key::verify_startup(&gs, msauth_vk, executor.as_ref()).map_err(|e| anyhow::anyhow!("{e:#}; refusing to verify"))?;
             let storage = Storage::open(&datadir)?;
@@ -3039,7 +3054,9 @@ async fn main() -> Result<()> {
                     if repair {
                         // The repair ignores the checkpoint: under `quick` a same-build row
                         // would skip the walk and "repair" nothing (`node::repair_mode`).
-                        node::check_and_repair_chain(&storage, &gs, node::repair_mode(mode), executor.as_ref())?;
+                        // On a datadir nothing binds to this build's constraint set the
+                        // repair refuses instead of truncating (`constraint_set::Truncation`).
+                        node::check_and_repair_chain_bound(&storage, &gs, node::repair_mode(mode), executor.as_ref(), &truncation)?;
                         println!("repaired: head is now {}", storage.head()?.height);
                     } else {
                         std::process::exit(2);

@@ -4,6 +4,7 @@
 
 use crate::admission::{self, AdmissionBudget, AdmissionCharge, GossipOutcome, Verdict, VerifySource, VerifyLimits};
 use crate::compact;
+use crate::constraint_set::{Binding, Truncation};
 use crate::dandelion::{Dandelion, DandelionConfig, DandelionStats, Decision, Edge, FluffReason, LoopAction};
 use crate::mempool::{Mempool, MempoolError};
 use crate::network::{
@@ -603,7 +604,23 @@ pub struct StartupCheck {
 /// (startup-checkpoint spec §4). If the tail is damaged, truncate to the last good block
 /// (keeping safety state); the missing blocks are re-fetched from peers by the normal sync path.
 /// A successful walk writes the checkpoint for the head it verified.
+///
+/// This form truncates whenever the walk finds a problem: it is for a store already bound to
+/// this build's constraint set. `run` and `verify --repair` go through [`startup_check_bound`].
 pub fn startup_check(storage: &Storage, gs: &GenesisState, mode: VerifyMode, executor: &dyn ConfidentialExecutor) -> Result<StartupCheck> {
+    startup_check_bound(storage, gs, mode, executor, &Truncation::Allowed)
+}
+
+/// [`startup_check`] under a truncation policy (issue #166): with [`Truncation::Refused`] — a
+/// datadir nothing binds to this build's constraint set — a walk that finds a problem is an error
+/// naming it, and the store keeps every block it has.
+pub fn startup_check_bound(
+    storage: &Storage,
+    gs: &GenesisState,
+    mode: VerifyMode,
+    executor: &dyn ConfidentialExecutor,
+    truncation: &Truncation,
+) -> Result<StartupCheck> {
     if mode == VerifyMode::Off {
         return Ok(StartupCheck { resume: storage.head()?.height, stored: None, verify: StartupVerify::Off });
     }
@@ -689,6 +706,7 @@ pub fn startup_check(storage: &Storage, gs: &GenesisState, mode: VerifyMode, exe
             // Cleared before the truncate (which clears it too), so a failure between the two
             // steps still leaves no checkpoint for the damaged head (final review #2).
             storage.clear_verified_head()?;
+            truncation.check(check.last_good + 1, problem)?;
             let resume = if check.genesis_ok { check.last_good } else { 0 };
             tracing::warn!(
                 "CORRUPT CHAIN at height {}: {problem}; truncating {} -> {} and resyncing from peers",
@@ -717,6 +735,17 @@ pub fn startup_check(storage: &Storage, gs: &GenesisState, mode: VerifyMode, exe
 /// [`startup_check`]'s resume height.
 pub fn check_and_repair_chain(storage: &Storage, gs: &GenesisState, mode: VerifyMode, executor: &dyn ConfidentialExecutor) -> Result<u64> {
     Ok(startup_check(storage, gs, mode, executor)?.resume)
+}
+
+/// [`startup_check_bound`]'s resume height: `rand-node verify --repair`.
+pub fn check_and_repair_chain_bound(
+    storage: &Storage,
+    gs: &GenesisState,
+    mode: VerifyMode,
+    executor: &dyn ConfidentialExecutor,
+    truncation: &Truncation,
+) -> Result<u64> {
+    Ok(startup_check_bound(storage, gs, mode, executor, truncation)?.resume)
 }
 
 /// The tip block's own checks, as `apply_block_for_sync` makes them: the proposer's signature
@@ -2412,7 +2441,19 @@ pub const CHAINS_THIS_BUILD_CANNOT_RUN: [(u64, &str, &str); 7] = [
 
 /// The constraint set this build proves and verifies under: 9, the MODQ chip (private multisig
 /// phase 4; set 8, the gas meter, ran chains 18-20).
-pub const BUILD_CONSTRAINT_SET: u8 = 9;
+///
+/// A literal on purpose, held to the vendored zkVM's `CONSTRAINT_SET` by the assertion below
+/// (issue #166): a re-vendor that moves the zkVM's set stops the build here until this number is
+/// moved by hand. Moving it is a chain cut — every chain `constraint_set::CHAIN_CONSTRAINT_SETS`
+/// lists under the old set (the running one included) is refused from then on, so it goes in with
+/// the new chain's row there and never in a roll onto an existing chain.
+pub const BUILD_CONSTRAINT_SET: u32 = 9;
+
+const _: () = assert!(
+    BUILD_CONSTRAINT_SET == randprotocol_zkvm::machine::CONSTRAINT_SET,
+    "node::BUILD_CONSTRAINT_SET is not the vendored zkVM's machine::CONSTRAINT_SET: the re-vendor moved the \
+     constraint set, which is a chain cut — see BUILD_CONSTRAINT_SET's comment before changing either number"
+);
 
 const CONSTRAINT_SET_6_REASON: &str = "its proofs were made under constraint set 6; this build is constraint \
      set 9 (v0.8.0 and later) and verifies none of them, so its startup replay would refuse the chain's own \
@@ -2465,6 +2506,10 @@ pub fn refuse_chains_this_build_cannot_run(gs: &GenesisState) -> Result<()> {
 /// runnable; a genesis naming anything else is refused as before.
 pub fn check_build_runs_genesis(gs: &GenesisState, built_hc_bundles: &[randprotocol_core::notes::Word8]) -> Result<()> {
     refuse_chains_this_build_cannot_run(gs)?;
+    // Issue #166: the list above is written by hand, a row and a reason a chain; this is the
+    // same refusal derived from each listed chain's constraint set, so a build whose set moved
+    // refuses the chains before it — the running one first — without a row being added.
+    crate::constraint_set::refuse_a_listed_chain_of_another_set(gs)?;
     if !built_hc_bundles.contains(&gs.hc_bundle) {
         anyhow::bail!(
             "every bundle guest this build carries ({}) differs from the genesis hc_bundle ({}); \
@@ -2599,6 +2644,9 @@ pub async fn start_with(cfg: NodeConfig, rpc_options: RpcOptions, net_options: N
     let bare_executor = executor.clone();
     let executor: Arc<dyn ConfidentialExecutor> = Arc::new(crate::verify_cache::CachingExecutor::new(executor));
     check_build_runs_genesis(&gs, &ZkExecutor::known_hc_bundles())?;
+    // Issue #166: the datadir's constraint set against this build's, from the marker file alone —
+    // a refusal here has opened nothing and written nothing.
+    let binding = crate::constraint_set::bind(&cfg.datadir, &gs)?;
     // The precomputed msauth verifier key (plan Task 2b, spec §3.6), before any other key: on a
     // chain naming `hc_auth_multisig` a missing or unpinned blob refuses the start here, loudly;
     // the build happens only under `--build-msauth-key`, first in the warm thread below.
@@ -2649,13 +2697,25 @@ pub async fn start_with(cfg: NodeConfig, rpc_options: RpcOptions, net_options: N
     }
     prune_window_check(cfg.prune_history, gs.ledger.aggregation().map(|a| a.window), cfg.block_interval)
         .map_err(|e| anyhow::anyhow!(e))?;
+    // The marker goes down before the database does, so no datadir holds blocks of this build
+    // without it — when this build is entitled to write it (`Binding::Unmarked`).
+    if binding == Binding::Unmarked {
+        crate::constraint_set::write_marker(&cfg.datadir)?;
+    }
     let storage = Arc::new(Storage::open(&cfg.datadir)?);
     storage.init_genesis(&gs)?;
     refuse_a_halted_store(&storage)?;
     // The stored ledger a walk loaded goes to `resume_consensus_from` below: one load per startup.
     // The walk takes the bare executor: a replay would only fill the cache with history no later
     // lookup hits.
-    let StartupCheck { stored, verify: startup_verify, .. } = startup_check(&storage, &gs, cfg.verify, bare_executor.as_ref())?;
+    let StartupCheck { stored, verify: startup_verify, .. } =
+        startup_check_bound(&storage, &gs, cfg.verify, bare_executor.as_ref(), &Truncation::for_binding(binding, &cfg.datadir))?;
+    // A datadir nothing bound (a database, no marker, an unlisted genesis) that this build has
+    // now verified end to end — a clean walk, or this same build's checkpoint — is this build's:
+    // record it. `--verify-chain off` verified nothing and leaves it unbound.
+    if binding == Binding::Unknown && startup_verify != StartupVerify::Off {
+        crate::constraint_set::write_marker(&cfg.datadir)?;
+    }
 
     // "Is a validator" is "has a signer", not "is in the genesis set" (spec §8): a validator that
     // bonds in after genesis must already hold its key when its first epoch arrives, and a node
@@ -5824,6 +5884,9 @@ mod tests {
     #[test]
     fn this_build_refuses_chains_18_to_20() {
         assert_eq!(BUILD_CONSTRAINT_SET, 9);
+        // Issue #166: the build's number is the vendored zkVM's (also a compile-time assertion
+        // beside the constant, so a mismatch does not get as far as this test).
+        assert_eq!(BUILD_CONSTRAINT_SET, randprotocol_zkvm::machine::CONSTRAINT_SET);
         for (chain, hash) in [
             (18, "a7cb020cc99a33c83fc38cfa0ec1db357f67fbf8b6dab13ab1d9812280b4da76"),
             (19, "a3defc937d561d4beb1df9a08c9cb87a3dc32dadbfc2d1814ab6f627b0a2228a"),
@@ -6073,6 +6136,40 @@ mod tests {
         storage.plant_nullifier_for_testing(&[0xdead_beef; 8]).unwrap();
         let e = startup_check(&storage, &gs, VerifyMode::Quick, executor.as_ref()).err().expect("a tampered snapshot is refused");
         assert!(e.chain().any(|c| c.to_string().contains("ledger snapshot")), "{e:#}");
+    }
+
+    /// Issue #166: on a datadir nothing binds to this build's constraint set — a database, no
+    /// marker, an unlisted genesis — a walk that finds a problem is an error and the store keeps
+    /// every block: a block that does not verify there may be an intact block of another
+    /// constraint set. The same store under `Truncation::Allowed` is repaired as before.
+    #[test]
+    fn an_unbound_datadir_is_not_truncated_by_the_walk_or_the_repair() {
+        let (d, storage, gs, _) = chain_past_a_boundary();
+        let head = storage.head().unwrap();
+        assert_eq!(head.height, 2);
+        storage.overwrite_block_bytes_for_testing(1, b"garbage").unwrap();
+        let unbound = Truncation::for_binding(crate::constraint_set::bind(d.path(), &gs).unwrap(), d.path());
+        assert_eq!(unbound, Truncation::Refused { datadir: d.path().to_path_buf() }, "a database, no marker, an unlisted genesis");
+        // `run`'s walk, and `verify --repair`'s (which ignores the checkpoint).
+        for mode in [VerifyMode::Quick, repair_mode(VerifyMode::Quick), VerifyMode::Full] {
+            let e = match startup_check_bound(&storage, &gs, mode, &StubExecutor, &unbound) {
+                Ok(c) => panic!("{mode:?} truncated to {}", c.resume),
+                Err(e) => e.to_string(),
+            };
+            assert!(e.contains("Not truncating") && e.contains(&format!("constraint set {BUILD_CONSTRAINT_SET}")), "{mode:?}: {e}");
+            assert!(e.contains(&d.path().join(crate::constraint_set::MARKER_FILE).display().to_string()), "names the marker: {e}");
+            assert_eq!(storage.head().unwrap(), head, "{mode:?} kept the head");
+            assert!(storage.block_by_height(2).unwrap().is_some(), "{mode:?} kept block 2");
+            assert!(storage.verified_head().unwrap().is_none(), "a failed walk leaves no checkpoint");
+        }
+        assert!(check_and_repair_chain_bound(&storage, &gs, VerifyMode::Replay, &StubExecutor, &unbound).is_err());
+        // The operator records the set (the message says how): the same damage is now damage.
+        crate::constraint_set::write_marker(d.path()).unwrap();
+        let bound = Truncation::for_binding(crate::constraint_set::bind(d.path(), &gs).unwrap(), d.path());
+        assert_eq!(bound, Truncation::Allowed);
+        let resume = check_and_repair_chain_bound(&storage, &gs, VerifyMode::Replay, &StubExecutor, &bound).unwrap();
+        assert!(resume < 1, "truncated below the damaged block");
+        assert_eq!(storage.head().unwrap().height, resume);
     }
 
     #[test]
