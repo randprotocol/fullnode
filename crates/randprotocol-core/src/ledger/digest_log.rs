@@ -164,10 +164,23 @@ fn tail_top(mut level: Vec<Hash>) -> Hash {
 }
 
 impl FromIterator<(u64, Word8)> for DigestLog {
-    /// From entries in ascending height order.
+    /// From entries in any order; a height given twice keeps its last digest. Ascending entries
+    /// — every stored row, and every caller in the ledger — are appended as they come. The first
+    /// one out of order sends the rest through a map and the log is built once from it (audit
+    /// v14, LED-1001), where each such entry used to rebuild the whole log ([`DigestLog::insert`]).
     fn from_iter<I: IntoIterator<Item = (u64, Word8)>>(entries: I) -> DigestLog {
+        let mut entries = entries.into_iter();
         let mut log = DigestLog::new();
-        for (height, digest) in entries {
+        let mut last = None;
+        for (height, digest) in entries.by_ref() {
+            if last.is_some_and(|l| height <= l) {
+                let mut all: BTreeMap<u64, Word8> = log.iter().map(|(h, d)| (h, *d)).collect();
+                all.insert(height, digest);
+                all.extend(entries);
+                // Ascending now, so this pass never comes back here.
+                return all.into_iter().collect();
+            }
+            last = Some(height);
             log.insert(height, digest);
         }
         log
@@ -202,11 +215,22 @@ impl<'de> Deserialize<'de> for DigestLog {
                 f.write_str("a map of block heights to digests")
             }
             fn visit_map<A: MapAccess<'de>>(self, mut access: A) -> Result<DigestLog, A::Error> {
-                let mut log = DigestLog::new();
-                while let Some((height, digest)) = access.next_entry::<u64, Word8>()? {
-                    log.insert(height, digest);
+                // One pass whatever the document's order (audit v14, LED-1001): `collect`
+                // appends ascending entries and builds once from a map otherwise. The first
+                // error ends the read.
+                let mut failed = None;
+                let log = std::iter::from_fn(|| match access.next_entry::<u64, Word8>() {
+                    Ok(entry) => entry,
+                    Err(e) => {
+                        failed = Some(e);
+                        None
+                    }
+                })
+                .collect();
+                match failed {
+                    Some(e) => Err(e),
+                    None => Ok(log),
                 }
-                Ok(log)
             }
         }
         deserializer.deserialize_map(LogVisitor)
@@ -321,6 +345,60 @@ mod tests {
             assert_eq!(back.merkle_root(), full_root(&m));
             assert_eq!(serde_json::to_string(&log).unwrap(), serde_json::to_string(&m).unwrap());
             assert_eq!(serde_json::from_str::<DigestLog>(&serde_json::to_string(&m).unwrap()).unwrap(), log);
+        }
+    }
+
+    /// Audit v14, LED-1001: a stored document whose entries are not in ascending order (only
+    /// someone with write access to the data directory can make one) loaded entry by entry, each
+    /// out-of-order entry rebuilding the whole log: 4 096 descending entries took 6.4 s in a
+    /// debug build against 5.6 ms ascending. It loads in one pass now, to the very log the
+    /// entry-by-entry load gave — the map of its entries, a repeated height keeping its last
+    /// digest — in both wire forms.
+    #[test]
+    fn led1001_an_out_of_order_document_loads_in_one_pass_to_the_same_log() {
+        // bincode writes a map as a length and the pairs in order, exactly as it writes a list
+        // of pairs: a list is how a document in any order is made.
+        let load = |pairs: &[(u64, Word8)]| -> DigestLog { bincode::deserialize(&bincode::serialize(&pairs.to_vec()).unwrap()).unwrap() };
+        // What the old load did, entry by entry, for reference.
+        let one_by_one = |pairs: &[(u64, Word8)]| {
+            let mut log = DigestLog::new();
+            for (h, d) in pairs {
+                log.insert(*h, *d);
+            }
+            log
+        };
+        const N: u64 = 4_096;
+        let descending: Vec<(u64, Word8)> = (1..=N).rev().map(|h| (h, digest(h))).collect();
+        let at = std::time::Instant::now();
+        let log = load(&descending);
+        let took = at.elapsed();
+        let m = map(1..=N);
+        assert_eq!(log, log_of(&m));
+        assert_eq!(log.merkle_root(), full_root(&m));
+        assert_eq!((log.chunks.len(), log.tail.len()), (N as usize / CHUNK_LEN, 0), "chunked as an ascending load is");
+        assert_eq!(bincode::serialize(&log).unwrap(), bincode::serialize(&m).unwrap(), "and written back in order");
+        assert!(took < std::time::Duration::from_secs(2), "{N} descending entries took {took:?}: the load is quadratic");
+        // JSON, descending.
+        let json = format!("{{{}}}", descending.iter().map(|(h, d)| format!("\"{h}\":{}", serde_json::to_string(d).unwrap())).collect::<Vec<_>>().join(","));
+        assert_eq!(serde_json::from_str::<DigestLog>(&json).unwrap(), log);
+        // Any order, with repeats, against the old entry-by-entry result: a later entry for a
+        // height replaces an earlier one, wherever it comes.
+        let cases: [Vec<(u64, Word8)>; 6] = [
+            vec![],
+            vec![(7, digest(7))],
+            vec![(5, digest(5)), (3, digest(3)), (5, [9; 8]), (9, digest(9)), (3, [8; 8]), (1, digest(1))],
+            vec![(1, digest(1)), (2, digest(2)), (2, [7; 8]), (3, digest(3))],
+            (1..=1_500u64).map(|h| (h * 7919 % 1_501, digest(h))).collect(),
+            (1..=1_030u64).map(|h| (h, digest(h))).chain([(4, [6; 8])]).collect(),
+        ];
+        for pairs in &cases {
+            let (got, want) = (load(pairs), one_by_one(pairs));
+            assert_eq!(got, want, "{} entries", pairs.len());
+            assert_eq!(got.merkle_root(), want.merkle_root());
+            assert_eq!(got.last_height(), want.last_height());
+            assert_eq!(bincode::serialize(&got).unwrap(), bincode::serialize(&want).unwrap());
+            let collected: DigestLog = pairs.iter().copied().collect();
+            assert_eq!(collected, want, "`collect` takes any order too");
         }
     }
 
