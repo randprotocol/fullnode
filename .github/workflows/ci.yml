@@ -222,6 +222,13 @@ jobs:
           for crate in evm-core sbpf-core dilithium-core; do
             diff -r --exclude Cargo.lock --exclude target "$crate" "$GITHUB_WORKSPACE/circuits/guests-compiled/$crate"
           done
+      # Issue #166 (ZKVM-201): one constraint set in three places — circuits at the pin, the vendored
+      # zkVM, the node's BUILD_CONSTRAINT_SET. The build already fails when the last two differ (a
+      # const assertion in node.rs); this is the half no build sees, a CIRCUITS_PIN that names a
+      # commit of another constraint set than the tree that was vendored.
+      - name: The constraint set is circuits' at the pin, the vendored zkVM's and the node's
+        working-directory: fullnode
+        run: deploy/check-constraint-set.sh --upstream "$GITHUB_WORKSPACE/circuits/research/src/machine.rs"
       # The CUDA backend is a git dependency at its own revision (`crates/randprotocol-zkvm/Cargo.toml`),
       # which may trail CIRCUITS_PIN; what must not differ between the two is the backend itself and
       # the constants table it `#[path]`-includes from research, or a cuda build would prove with a
