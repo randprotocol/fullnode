@@ -575,6 +575,21 @@ mod tests {
             let env = randprotocol_zkvm::address::envelope_from_core(env);
             assert!(env.open_as_sender_with(b.commitments[slot], &w.scan_key).is_some(), "slot {slot} opens as sender");
         }
+        // Audit v14, VK-751: each output's creator field is the account's own `pk` — the bundle
+        // is the account's spend, built over the account's `nk` — so under the account's viewing
+        // key the payment is `Sent` (never dropped as another key's, never unverified), the
+        // change is the account's own, and the dummies are skipped as dummies.
+        let found: Vec<crate::wallet::Found> = b.commitments.iter().zip(&b.envelopes).map(|(cm, e)| crate::wallet::classify(&w, *cm, e)).collect();
+        for (slot, (cm, e)) in b.commitments.iter().zip(&b.envelopes).enumerate() {
+            let (_, note) = randprotocol_zkvm::address::envelope_from_core(e).open_as_sender_with(*cm, &w.scan_key).unwrap();
+            assert_eq!(note.from, w.vk.pk(), "slot {slot}: created by the account");
+        }
+        assert_eq!(found.iter().filter(|f| matches!(f, crate::wallet::Found::Sent(n, _) if n.pk != w.vk.pk() && n.amount > 0)).count(), 1, "{found:?}");
+        assert_eq!(found.iter().filter(|f| matches!(f, crate::wallet::Found::Received(n, _) if n.pk == w.vk.pk())).count(), 1, "{found:?}");
+        assert!(!found.iter().any(|f| matches!(f, crate::wallet::Found::SentUnverified(..))), "{found:?}");
+        let roles: Vec<_> = crate::wallet::output_keys(&w, &tx).iter().map(|r| r.role).collect();
+        assert_eq!(roles.iter().filter(|r| **r == crate::wallet::KeyRole::Sent).count(), 1, "{roles:?}");
+        assert_eq!(roles.iter().filter(|r| **r == crate::wallet::KeyRole::Change).count(), 1, "{roles:?}");
         // A proposal whose witness spends more than the outputs + fee account for is refused.
         let mut skim = prop.clone();
         skim.bundle_words = tests_support::with_input_amount_raised(&prop.bundle_words, 1);

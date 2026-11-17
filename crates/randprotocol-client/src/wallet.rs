@@ -29,7 +29,7 @@ use randprotocol_core::bridge::{AssetId, Attestation, Payload};
 use randprotocol_core::confidential::ConfidentialExecutor;
 use randprotocol_core::ledger::tokens::{MintAuthority, MINT_FROM};
 use randprotocol_core::ledger::{bridge_notes, MAX_PROOF_WINDOW_BLOCKS, MIN_PROOF_WINDOW_BLOCKS, TIME_WINDOW};
-use randprotocol_core::notes::{word8_from_hex, word8_to_hex, Bundle, Envelope, EnvelopeFormat, ShieldedAddress, Word8, DEPTH};
+use randprotocol_core::notes::{creator_of, word8_from_hex, word8_to_hex, Bundle, Creator, Envelope, EnvelopeFormat, ShieldedAddress, Word8, DEPTH};
 use randprotocol_core::types::TX_BINDING_WORDS;
 use randprotocol_core::{format_amount, gas, Action, BindingDomain, Hash, InitialMint, Keypair, PublicKey, Transaction};
 use randprotocol_zkvm::address::{address_of, envelope_from_core, seal_note_as};
@@ -405,6 +405,13 @@ pub struct SentRow {
     /// loads, at `None`.
     #[serde(default)]
     pub memo: Option<String>,
+    /// Audit v14, VK-751: the note's creator field is a word the chain fixes (a deposit this
+    /// wallet relayed, a token it minted, a payout it called for), so nothing in the note says
+    /// this wallet sealed it rather than another holder of its viewing key
+    /// ([`Found::SentUnverified`]). Absent — and never written — for an ordinary payment, so a
+    /// store without such rows keeps its bytes and an older one loads unchanged.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub sender_unverified: bool,
 }
 
 /// Everything scanning has learned, as JSON at `<key path>.notes.json`.
@@ -629,8 +636,13 @@ impl Wallet {
 /// How one output of a transaction relates to the wallet looking at it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KeyRole {
-    /// This wallet sealed it for someone else: a payment.
+    /// This wallet sealed it for someone else: a payment. The note names this wallet as its
+    /// creator (audit v14, VK-751).
     Sent,
+    /// The sender part opens under this wallet's key, but the note's creator field is a word
+    /// the chain fixes (a deposit, a mint, a payout): this wallet may have submitted it, or
+    /// another holder of its viewing key ([`Found::SentUnverified`]).
+    SentUnverified,
     /// Someone else sealed it to this wallet, and the note names this wallet's `pk`.
     Received,
     /// This wallet sealed it to itself: change, or a merge.
@@ -641,6 +653,7 @@ impl KeyRole {
     pub fn as_str(self) -> &'static str {
         match self {
             KeyRole::Sent => "sent",
+            KeyRole::SentUnverified => "sent_unverified",
             KeyRole::Received => "received",
             KeyRole::Change => "change",
         }
@@ -693,12 +706,16 @@ pub fn output_keys(w: &Wallet, tx: &Transaction) -> Vec<OutputKey> {
         // Opening under the KEM is not ownership (see [`Found`]): only a note naming this
         // wallet's `pk` is received.
         let received = env.open_as_receiver_with(cm, &w.scan_key).filter(|(_, n)| n.pk == w.vk.pk());
-        let sent = env.open_as_sender_with(cm, &w.scan_key);
+        // The sender part opening is not authorship (audit v14, VK-751, see [`Found`]): the
+        // note's creator field decides what the opening means.
+        let sent = env.open_as_sender_with(cm, &w.scan_key).map(|s| (creator_of(&s.1.from, &w.vk.pk()), s));
         let (role, (key, note)) = match (received, sent) {
-            (Some(r), Some(_)) => (KeyRole::Change, r),
-            (Some(r), None) => (KeyRole::Received, r),
-            (None, Some(s)) => (KeyRole::Sent, s),
-            (None, None) => continue,
+            (Some(r), Some((Creator::Own, _))) => (KeyRole::Change, r),
+            (Some(r), _) => (KeyRole::Received, r),
+            (None, Some((Creator::Own, s))) => (KeyRole::Sent, s),
+            (None, Some((Creator::Chain, s))) => (KeyRole::SentUnverified, s),
+            // Another key's note that some holder of this wallet's viewing key sealed.
+            (None, Some((Creator::Other, _))) | (None, None) => continue,
         };
         // A zero-value output is a dummy slot: nothing to disclose, and no payment to prove.
         if is_dummy(&note) {
@@ -744,13 +761,28 @@ pub enum Found {
     /// A note this wallet owns and can spend, with its memo if the sender sealed one.
     Received(Note, Option<String>),
     /// A note this wallet created for someone else — history only — with the memo it carried.
+    /// The envelope's sender part opens under this wallet's `ovk` **and** the note's creator
+    /// field is this wallet's `pk`, which the bundle proof binds to the spender (audit v14,
+    /// VK-751: the opening alone shows only that the sealer held the viewing key, which a
+    /// delegated prover, an auditor and a node it was imported into all do).
     Sent(Note, Option<String>),
+    /// The sender part opens under this wallet's `ovk` but the note's creator field is a word
+    /// the chain fixes ([`randprotocol_core::notes::CHAIN_CREATORS`]): a bridge deposit, a mint
+    /// or a payout, whose submitter seals the envelope under its own key and whose note names no
+    /// creator. This wallet may have submitted it — it relayed the deposit, minted the token —
+    /// or another holder of its viewing key did; the chain cannot say which. Kept as history
+    /// under its own mark, never as a payment sent.
+    SentUnverified(Note, Option<String>),
     /// Not this wallet's, with the reason for the log.
     Skipped(&'static str),
 }
 
 /// Why [`classify`] skips a leaf no key of this wallet opens — the ordinary case, never logged.
 const NOT_OURS: &str = "no key of this wallet opens it";
+/// Why [`classify`] skips a note whose sender part opens under this wallet's key but whose
+/// creator is another key (audit v14, VK-751): logged, since only a holder of this wallet's
+/// viewing key can seal one.
+const PLANTED: &str = "sealed under this wallet's viewing key but created by another key";
 /// Why [`classify`] skips a zero-value note — a dummy slot's, never logged either.
 const DUMMY: &str = "a zero-value dummy";
 
@@ -778,7 +810,16 @@ pub fn classify(w: &Wallet, cm: Word8, envelope: &Envelope) -> Found {
     // Still worth the sender path: an envelope this wallet sealed for someone else is opened
     // through `ovk`, not through the KEM, so the two openings are independent.
     if let Some((key, note)) = env.open_as_sender_with(cm, &w.scan_key) {
-        return if is_dummy(&note) { Found::Skipped(DUMMY) } else { Found::Sent(note, env.memo(cm, &key)) };
+        if is_dummy(&note) {
+            return Found::Skipped(DUMMY);
+        }
+        // Audit v14, VK-751: the opening shows that the sealer held this wallet's viewing key,
+        // not that this wallet created the note; the creator field says which.
+        return match creator_of(&note.from, &w.vk.pk()) {
+            Creator::Own => Found::Sent(note, env.memo(cm, &key)),
+            Creator::Chain => Found::SentUnverified(note, env.memo(cm, &key)),
+            Creator::Other => Found::Skipped(PLANTED),
+        };
     }
     Found::Skipped(why)
 }
@@ -1115,7 +1156,13 @@ fn place_leaf(w: &Wallet, store: &mut NoteStore, row: &CommitmentRow, rebuilt: &
         }
         Found::Sent(note, memo) => {
             if !store.sent.iter().any(|s| s.index == row.index) {
-                store.sent.push(SentRow { index: row.index, to_pk: note.pk, amount: note.amount, height: row.height, memo });
+                store.sent.push(SentRow { index: row.index, to_pk: note.pk, amount: note.amount, height: row.height, memo, sender_unverified: false });
+            }
+            Placement::NotMine
+        }
+        Found::SentUnverified(note, memo) => {
+            if !store.sent.iter().any(|s| s.index == row.index) {
+                store.sent.push(SentRow { index: row.index, to_pk: note.pk, amount: note.amount, height: row.height, memo, sender_unverified: true });
             }
             Placement::NotMine
         }
@@ -6902,7 +6949,7 @@ pub(crate) mod tests {
             scanned_height: 240_000,
             scanned_attest_height: 240_000,
             notes: vec![owned(0, 5, false)],
-            sent: vec![SentRow { index: 7, to_pk: [4; 8], amount: 11, height: 2, memo: None }],
+            sent: vec![SentRow { index: 7, to_pk: [4; 8], amount: 11, height: 2, memo: None, sender_unverified: false }],
             ..NoteStore::default()
         };
         assert_eq!(store.bind(this), Bound::Reset { previous: Some(other) });
@@ -6936,7 +6983,7 @@ pub(crate) mod tests {
             scanned_height: 240_000,
             scanned_attest_height: 240_000,
             notes: vec![owned(0, 5, true), pending],
-            sent: vec![SentRow { index: 7, to_pk: [4; 8], amount: 11, height: 2, memo: None }],
+            sent: vec![SentRow { index: 7, to_pk: [4; 8], amount: 11, height: 2, memo: None, sender_unverified: false }],
             ..NoteStore::default()
         };
         store.reset();
@@ -9207,7 +9254,7 @@ pub(crate) mod tests {
             scanned_height: 4,
             scanned_attest_height: 5,
             notes: vec![owned(0, 5, false), owned(1, 3, true)],
-            sent: vec![SentRow { index: 7, to_pk: [4; 8], amount: 11, height: 2, memo: None }],
+            sent: vec![SentRow { index: 7, to_pk: [4; 8], amount: 11, height: 2, memo: None, sender_unverified: false }],
             ..NoteStore::default()
         };
         store.save(&path).unwrap();
@@ -9309,6 +9356,123 @@ pub(crate) mod tests {
         let rows = output_keys(&me, &tx);
         assert_eq!(rows.len(), 1);
         assert_eq!((rows[0].output, rows[0].slot, rows[0].role, rows[0].key), ("mint", 0, KeyRole::Received, k));
+    }
+
+    /// Audit v14, VK-751: the sender part opening under this wallet's `ovk` shows only that the
+    /// sealer held the viewing key. Mallory holds it (the prover this wallet delegated to, an
+    /// auditor, a node it was imported into) and seals an output of her own bundle — its creator
+    /// field is her `pk`, as the bundle proof binds it — with the sender part under this
+    /// wallet's key. It is not a payment this wallet sent: not in `classify`, not in the store a
+    /// scan fills, not in `output_keys`.
+    #[test]
+    fn vk751_a_holder_of_the_viewing_key_cannot_plant_a_sent_payment() {
+        let me = Wallet::from_spend_key(SpendKey([11; 8]));
+        let (mallory, payee) = (Wallet::from_spend_key(SpendKey([66; 8])), Wallet::from_spend_key(SpendKey([12; 8])));
+        // All Mallory has of mine is the viewing key.
+        let my_vk = Wallet::from_viewing_key(randprotocol_zkvm::notes::ViewingKey { nk: me.vk.nk }).vk;
+        let planted = Note::new(payee.vk.pk(), mallory.vk.pk(), 1_000_000, 0, 1);
+        let cm = planted.commitment();
+        for format in [EnvelopeFormat::Legacy, EnvelopeFormat::Memo] {
+            let memo = if format == EnvelopeFormat::Memo { "rent" } else { "" };
+            let envelope = seal_note_as(format, &my_vk, &payee.address, &planted, &TxKey::random(), memo).unwrap();
+            assert!(envelope_from_core(&envelope).open_as_sender_with(cm, &me.scan_key).is_some(), "it does open under my ovk");
+            let Found::Skipped(why) = classify(&me, cm, &envelope) else {
+                panic!("a note another key created is not one this wallet sent");
+            };
+            assert!(why.contains("created by another key"), "{why}");
+            assert!(matches!(classify(&payee, cm, &envelope), Found::Received(n, _) if n == planted), "the payee's receipt is untouched");
+            // The scan's own step: nothing lands in the history.
+            let mut store = NoteStore::default();
+            let row = CommitmentRow { index: 9, cm, height: 4, envelope: envelope.clone() };
+            place_leaf(&me, &mut store, &row, &mut BTreeMap::new());
+            assert!(store.sent.is_empty() && store.notes.is_empty(), "{:?}", store.sent);
+            // Nor does `tx-key` hand out a key for a payment this wallet never made.
+            let mut bundle = payment(&me, &payee).0.bundle.unwrap();
+            bundle.commitments = [cm, [5; 8], [6; 8], [7; 8]];
+            bundle.envelopes = [envelope, env(), env(), env()];
+            assert!(output_keys(&me, &Transaction::shielded(7, bundle, Action::None)).is_empty());
+        }
+        // Planted on me: sealed to me, owned by me, the sender part under my own key. I do own
+        // it, so it is received — and it is not my own change.
+        let to_me = Note::new(me.vk.pk(), mallory.vk.pk(), 5, 0, 1);
+        let envelope = seal_note(&my_vk, &me.address, &to_me, &TxKey::random()).unwrap();
+        assert_eq!(classify(&me, to_me.commitment(), &envelope), Found::Received(to_me, None));
+        let mut bundle = payment(&me, &payee).0.bundle.unwrap();
+        bundle.commitments = [to_me.commitment(), [5; 8], [6; 8], [7; 8]];
+        bundle.envelopes = [envelope, env(), env(), env()];
+        let rows = output_keys(&me, &Transaction::shielded(7, bundle, Action::None));
+        assert_eq!(rows.iter().map(|r| r.role).collect::<Vec<_>>(), vec![KeyRole::Received]);
+    }
+
+    /// Audit v14, VK-751, the reviewer's caution: a creator comparison alone would drop the rows
+    /// of the deposits this wallet relays and the tokens it mints, whose notes carry a `from` the
+    /// chain fixes rather than this wallet's `pk`. The wallet's own builders make them here —
+    /// `deposit_note_for`, `mint_note_for`, `payout_note_for` — and each is kept, marked
+    /// `sender_unverified` (anyone holding the viewing key could seal the same), not dropped and
+    /// not counted as a payment sent. To the wallet itself each is simply received.
+    #[test]
+    fn vk751_a_relayed_deposit_a_mint_and_a_payout_stay_in_the_history_as_sender_unverified() {
+        use randprotocol_core::ledger::perps::PERP_FROM;
+        let me = Wallet::from_spend_key(SpendKey([11; 8]));
+        let payee = Wallet::from_spend_key(SpendKey([12; 8]));
+        for format in [EnvelopeFormat::Legacy, EnvelopeFormat::Memo] {
+            let deposit = |to: &Wallet| deposit_note_for(&me, &to.address, &transfer_attestation(250, to.address.recipient_hash()), 250, 3, 9, format).unwrap();
+            let mint = |to: &Wallet| mint_note_for(&me, &to.address, 250, 4, 9, format).unwrap();
+            let payout = |to: &Wallet| payout_note_for(&me, &to.address, 250, 0, 9, format).unwrap();
+            let perp = |to: &Wallet| {
+                let note = Note::new(to.vk.pk(), PERP_FROM, 250, 0, 9);
+                let envelope = seal_note_as(format, &me.vk, &to.address, &note, &TxKey::random(), "").unwrap();
+                (note, envelope)
+            };
+            type Make<'a> = &'a dyn Fn(&Wallet) -> (Note, Envelope);
+            let kinds: [(&str, Make); 4] =
+                [("a relayed deposit", &deposit), ("a token mint", &mint), ("a program payout", &payout), ("a perps withdrawal", &perp)];
+            for (i, (what, make)) in kinds.into_iter().enumerate() {
+                let (note, envelope) = make(&payee);
+                assert_ne!(note.from, me.vk.pk(), "{what}: the chain fixes the creator word");
+                assert_eq!(classify(&me, note.commitment(), &envelope), Found::SentUnverified(note, None), "{what}");
+                assert!(matches!(classify(&payee, note.commitment(), &envelope), Found::Received(n, _) if n == note), "{what}: the recipient's");
+                let mut store = NoteStore::default();
+                let row = CommitmentRow { index: i as u64, cm: note.commitment(), height: 4, envelope };
+                place_leaf(&me, &mut store, &row, &mut BTreeMap::new());
+                assert_eq!(store.sent.len(), 1, "{what} is kept");
+                assert!(store.sent[0].sender_unverified && store.sent[0].amount == 250 && store.sent[0].to_pk == payee.vk.pk(), "{what}: {:?}", store.sent);
+                // To this wallet itself: received, and nothing in the sent history.
+                let (own, envelope) = make(&me);
+                assert_eq!(classify(&me, own.commitment(), &envelope), Found::Received(own, None), "{what} to oneself");
+            }
+        }
+        // An ordinary payment is sent, and its row carries no mark — nor a new field on disk.
+        let paid = Note::new(payee.vk.pk(), me.vk.pk(), 3, 0, 1);
+        let mut store = NoteStore::default();
+        let row = CommitmentRow { index: 0, cm: paid.commitment(), height: 1, envelope: sealed(&me, &payee, &paid) };
+        place_leaf(&me, &mut store, &row, &mut BTreeMap::new());
+        assert!(!store.sent[0].sender_unverified);
+        let json = serde_json::to_string(&store.sent[0]).unwrap();
+        assert!(!json.contains("sender_unverified"), "{json}");
+        let old: SentRow = serde_json::from_str(&json).unwrap();
+        assert!(!old.sender_unverified, "a row written before the field loads as an ordinary payment");
+        let marked = SentRow { sender_unverified: true, ..old };
+        let back: SentRow = serde_json::from_str(&serde_json::to_string(&marked).unwrap()).unwrap();
+        assert!(back.sender_unverified, "the mark survives a save");
+    }
+
+    /// Audit v14, VK-751 in `output_keys` (`rand tx-key`): the faucet mint this wallet sealed for
+    /// someone else is an output it can key, as `sent_unverified` — its note's creator is the
+    /// chain's zero word — and its own payment and change keep their roles.
+    #[test]
+    fn vk751_output_keys_marks_a_mint_this_wallet_sealed_as_sender_unverified() {
+        let (minter, you) = (Wallet::from_spend_key(SpendKey([14; 8])), Wallet::from_spend_key(SpendKey([11; 8])));
+        let note = Note::new(you.vk.pk(), [0; 8], 100, 0, 1);
+        let k = TxKey::random();
+        let envelope = seal_note(&minter.vk, &you.address, &note, &k).unwrap();
+        let ex = randprotocol_zkvm::executor::ZkExecutor::new(FriProfile::Test);
+        let tx = Transaction::mint(7, note.pk, note.time, note.r, envelope, 100, &randprotocol_core::Keypair::generate(), &ex);
+        let rows = output_keys(&minter, &tx);
+        assert_eq!(rows.len(), 1);
+        assert_eq!((rows[0].output, rows[0].role, rows[0].role.as_str(), rows[0].key), ("mint", KeyRole::SentUnverified, "sent_unverified", k));
+        let (tx, ..) = payment(&minter, &you);
+        assert_eq!(output_keys(&minter, &tx).iter().map(|r| r.role).collect::<Vec<_>>(), vec![KeyRole::Sent, KeyRole::Change]);
     }
 
     /// Task 8 (T7 review round 1): [`output_keys`] carries the memo through for whichever output
