@@ -5144,7 +5144,13 @@ mod tests {
         let total = randprotocol_prover::memory::total_bytes();
         assert!(rss > (1 << 20) && rss < total, "{rss} of {total}");
         // A ballast the resident size must show: the reading is live, not a constant.
-        let ballast = vec![1u8; 256 << 20];
+        // Written page by page and passed through `black_box`: a release build otherwise drops an
+        // allocation nothing reads, and the resident size never moves.
+        let mut ballast = vec![0u8; 256 << 20];
+        for page in ballast.chunks_mut(4096) {
+            page[0] = 1;
+        }
+        std::hint::black_box(&mut ballast);
         let after = process_rss_bytes().unwrap();
         assert!(after >= rss + (128 << 20), "{rss} -> {after}");
         // With a host total just above what is resident, nothing is left: the lowest tier — which
