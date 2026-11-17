@@ -598,11 +598,12 @@ does no LDE and no Merkle commit, which is the build's 4 GB.
 **To measure on an `s-2vcpu-4gb` droplet (Task 8 / cut rehearsal): RSS after load, and after the
 first tier-18 verify.** glibc may return freed memory where macOS did not.
 
-**The proof itself: not yet measured.** One Test-profile measurement exists (M = 2 shares, tier 18, 52 GB M-series Mac, `/usr/bin/time -l`): max RSS 22.5 GB but a peak memory footprint of 76.4 GB (compressed pages included; RSS understates it), killed by macOS after 273 s. Plan for a machine with at least 96 GB; the Production profile is larger and unmeasured. The guest runs 85 830 / 169 068 / 251 946 cycles at
+**The proof itself: one Production measurement (audit v14, MSC-751).** On 6 November 2026 one Production-profile proof completed: M = 3 signatures, tier 18, a proof of 3.7 MB, 69 minutes, peak RSS 92.9 GiB (≈ 99.7 GB). Plan for a machine with **at least 128 GB**; the earlier "at least 96 GB" was a guess made before any proof had finished and is too small. The logs are held privately in the operator's configuration records, not in this repository; the machine it ran on is not recorded here. It has not been submitted on chain 21 by a wallet flow. Before it, one Test-profile attempt existed (M = 2 shares, tier 18, 52 GB M-series Mac, `/usr/bin/time -l`): max RSS 22.5 GB but a peak memory footprint of 76.4 GB (compressed pages included; RSS understates it), killed by macOS after 273 s. The guest runs 85 830 / 169 068 / 251 946 cycles at
 M = 1 / 2 / 3 signatures, inside tier 18's 262 143 (a Dilithium2 verify is 80 572 cycles with the
-MODQ chip, 880 102 in software). The Production msauth prove (time and peak RSS on the wallet's
-machine, at least 96 GB), the proof's size and a warm tier-18 verify on a validator are the plan's
-Task 2 `MSAUTH-PROD:`/`MSAUTH-TEST:` lines, which have not been taken (a user-terminal run). Until
-they are: the auth proof is estimated at ≥ 3.4 MB (≈ 4.8 MB with the bundle proof), the node's floor
+MODQ chip, 880 102 in software). The plan's Task 2 `MSAUTH-PROD:`/`MSAUTH-TEST:` lines (the
+Production prove's time and peak RSS, the proof's size, and a warm tier-18 verify on a validator)
+are not recorded in this repository: the 6 November figures above come from the operator's private
+logs, and no warm tier-18 verify on a validator is on record here. The auth proof was estimated at
+≥ 3.4 MB (≈ 4.8 MB with the bundle proof) and measured at 3.7 MB; the node's floor
 beside `hc_auth_multisig` is a 4 MiB `max_proof_bytes`, and chain 21 is cut at 6 MiB (6 291 456) with
 19 MiB blocks (19 922 944) — the decided chain-21 values; asserted by the cut script on `feat/chain21-msauth` (`a7379a6c`), which merges after this branch.

@@ -300,8 +300,9 @@ lets the multisig auth guest verify up to three signatures inside tier 18 (85 83
   ceiling and the preprocessed-matrix count both see the table (`executor.rs`, `NO_MODQ`).
 - **Proof size.** A chip-free proof grows by ≈ 1–4 KB over constraint set 8 (the wider cpu table);
   one modq block adds ≈ 35 KB at the Test profile and ≈ 153 KB at Production (measured at tier 10).
-  The Production msauth proof's own size is not yet measured (estimate ≥ 3.4 MB, dominated by the
-  keccak table's width, §8).
+  The Production msauth proof's own size was estimated at ≥ 3.4 MB (dominated by the keccak
+  table's width, §8); the one Production proof on record (6 November 2026, M = 3; the operator's
+  private logs) is 3.7 MB.
 
 ## 9. Soundness notes worth knowing
 
