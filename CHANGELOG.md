@@ -12,6 +12,37 @@ stopped at v0.4 until 2026-09-30, when the entries v0.5 to v0.6.7 were written f
 
 ## Unreleased
 
+Node, wallet and viewing (audit v14 addendum rows; node-local policy and client-side reading only: no wire, storage-format or consensus change):
+
+- **CON-701, the first minute** (Medium, was Partial): without `--max-state-proof-tier` a node
+  holds its state-proof tier cap at 16 or lower from its start until the first re-reading of the
+  memory left, a minute later; a fresh process's small resident size no longer reads 18 on an
+  8 GB host. The startup warm follows the held cap and builds the shapes above it once a
+  re-reading admits their tier. The flag still wins and is never re-read. Not closed: nothing
+  measures that the node has reached its working size at that first re-reading.
+- **CON-752**: the cap's wiring is pinned by tests: the host reading, the startup default, the
+  status tick's call, the refresh's recurrence and the least-of rule of the cgroup walk (a fixture
+  tree, so it runs on macOS; the real Linux readers have a Linux-only test).
+- **CON-751** (docs): `docs/perps.md`, `docs/node-hardware.md` and `docs/cli.md` give the default
+  cap per host size. A 2 GB validator under `MemoryHigh=85%` reads 14 or 12 at rest and does not
+  pool or relay a cold tier-16 state proof unless `--max-state-proof-tier 16` is set; the v0.8.5
+  entry's "16 on 2 GB and 4 GB hosts" is true of that release's host-total rule only.
+- **VK-751**: a note is `sent` only when its creator field is the key's own address, in the
+  wallet and in the node's viewing scan. A leaf whose sender part opens but whose creator is a
+  chain-fixed word (a relayed deposit, a mint, a payout, a perps withdrawal) is `sent_unverified`
+  (a new `role` value in `rand_getViewingNotes`; "(sender unverified)" in `rand history`); one
+  created by another key is no row. A holder of a wallet's viewing key can no longer plant sent
+  payments in its history. Rows an existing wallet store already holds are reclassified by a
+  rescan. The explorer and the wallet apps carry the same rule in their own repositories.
+- **VK-1003, VK-1004**: `program_code` and `assets()` refuse out-of-range or wrong-typed reply
+  values instead of truncating them or reading zero.
+- **LED-1001**: the perps digest log loads an out-of-order stored document in one pass (it was
+  quadratic: 4,096 descending entries took seconds); the stored bytes are unchanged.
+- **PROV-1001** (`deploy/prover/router.py`): a job the router has forgotten is remembered only
+  against a member that answers for it (HTTP 200 with a JSON-RPC `result`). An HTTP error, a body
+  that is not JSON-RPC or another JSON-RPC error used to pin the job to that member for an hour;
+  the first two are now an outage (503) and a member's own refusal is relayed, neither remembered.
+
 Deploy and records (audit v14 addendum rows; no node code, no host touched):
 
 - **The one-at-a-time roll is a committed script: `deploy/roll-fleet.sh`** (PROC-751). The v0.8.5

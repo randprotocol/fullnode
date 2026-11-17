@@ -43,4 +43,4 @@ verified: 2026-11-09 02:30 UTC probe, 24/24 reachable hosts report rand-node 0.8
 
 amendment: 2026-11-17 — the verification line's 02:30 UTC probe postdates this file's merge (02:25:37 UTC) and no probe output was committed; the procedure that ran was an uncommitted driver loop round update-droplet.sh, committed since as deploy/roll-fleet.sh
 
-HOST-COUNT: to be settled by the 2026-11-17 fleet probe (see monorepo configuration/)
+HOST-COUNT: settled by the fleet probe of 2026-11-17 07:14 UTC (monorepo configuration/fleet/probe-2026-11-17.md): the inventory has 26 rows; 25 answered and all 25 report rand-node 0.8.6 with sha256 61c2a8bb6a9da8667be9d539d9e45a49465c2230f3cc5028ac392833c66f3ad4, each holding a staged binary dated 2026-11-09 between 00:16 and 01:47 UTC; archive2 did not answer. This record's "24 of the 25" is therefore one short on both numbers: 25 of 26, archive2 skipped. The probe reads file dates and the running version, not restart times: it does not show the order of the roll or the state at 02:30 UTC on 9 November.

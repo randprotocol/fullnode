@@ -583,7 +583,7 @@ What a release is from the next tag on, and who is trusted for what:
    `deploy/roll-all.sh` take `RELEASE_SUMS` and `RELEASE_SIG`, verify first, and read the expected
    sha256s from the signed file. Without them they print that the install is unsigned and refuse,
    unless `ALLOW_UNSIGNED=1` says so on purpose. `SELFTEST=1 bash deploy/lib/verify-release.sh`
-   runs the cases on throwaway keys (20 checks).
+   runs the cases on throwaway keys (22 checks).
 
    ```bash
    gh release download <tag> -R randprotocol/fullnode -D rel     # rand-node, rand, rand-prover, SHA256SUMS, SHA256SUMS.sig (and SHA256SUMS.sig2 ... when the threshold is above 1)

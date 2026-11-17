@@ -26,6 +26,7 @@ class FakeProver:
         self.jobs = {}
         self.submits = 0
         self.allowed_origin = allowed_origin
+        self.status_fault = None  # PROV-1001: "http500", "garbage" or "other-error" on a status call
         fake = self
 
         class H(BaseHTTPRequestHandler):
@@ -62,6 +63,21 @@ class FakeProver:
                 if cors == "refused":
                     return self.reply({"jsonrpc": "2.0", "id": req.get("id"), "error": {"code": -32007, "message": "origin not allowed"}}, cors)
                 m, p = req.get("method"), req.get("params")
+                if m in ("prover_status", "prover_cancel") and fake.status_fault == "http500":
+                    self.send_response(500)
+                    self.send_header("content-length", "0")
+                    self.end_headers()
+                    return
+                if m in ("prover_status", "prover_cancel") and fake.status_fault == "garbage":
+                    raw = b"<html>bad gateway</html>"
+                    self.send_response(200)
+                    self.send_header("content-type", "text/html")
+                    self.send_header("content-length", str(len(raw)))
+                    self.end_headers()
+                    self.wfile.write(raw)
+                    return
+                if m in ("prover_status", "prover_cancel") and fake.status_fault == "other-error":
+                    return self.reply({"jsonrpc": "2.0", "id": req.get("id"), "error": {"code": -32603, "message": "internal error"}}, cors)
                 if m == "prover_info":
                     out = {"result": {"kem_fingerprint": "POOL-KEY", "served_by": fake.name,
                                       "queue": {"depth": fake.depth, "max": fake.max_queue, "proving": fake.proving}}}
@@ -204,6 +220,39 @@ class RouterTest(unittest.TestCase):
         status, _, r = self.call("prover_status", ["held-by-the-silent-one"])
         self.assertEqual(status, 503)
         self.assertIsNone(r)
+
+    def test_a_forgotten_job_is_pinned_only_to_a_member_that_answers_for_it(self):
+        # PROV-1001: an HTTP error, a non-JSON body or another JSON-RPC error is not "I hold it".
+        # The job was recorded against the first such member for an hour; the real holder was
+        # never asked again.
+        for fault in ("http500", "garbage", "other-error"):
+            with self.subTest(fault=fault):
+                job = f"lost-{fault}"
+                for f in (self.a, self.b, self.c):
+                    f.status_fault = None
+                self.a.status_fault = self.b.status_fault = fault
+                self.c.jobs[job] = "proving"
+                _, _, r = self.call("prover_status", [job])
+                self.assertEqual(r["result"]["held_by"], "c", r)
+                self.assertIs(self.pool.holder(job).url, self.pool.backends[2].url)
+
+    def test_a_forgotten_job_nobody_answers_for_is_never_pinned_to_a_member_that_misanswered(self):
+        # No member holds it. One that answered with an HTTP error or a body that is not JSON-RPC
+        # makes it an outage, not `unknown job` (a wallet reads that as final); one that answered
+        # with its own JSON-RPC error has that error relayed. In no case is the job remembered.
+        for fault in ("http500", "garbage", "other-error"):
+            with self.subTest(fault=fault):
+                for f in (self.a, self.b, self.c):
+                    f.status_fault = None
+                self.b.status_fault = fault
+                job = f"nobody-{fault}"
+                status, _, r = self.call("prover_status", [job])
+                if fault == "other-error":
+                    self.assertEqual(r["error"]["code"], -32603, r)
+                else:
+                    self.assertEqual(status, 503)
+                    self.assertIsNone(r)
+                self.assertIsNone(self.pool.holder(job))
 
     def test_info_reports_the_pools_queue(self):
         self.a.depth, self.b.depth, self.b.proving, self.c.proving = 1, 2, 1, 1
