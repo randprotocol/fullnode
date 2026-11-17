@@ -22,8 +22,20 @@
 #   it). Without RELEASE_SUMS/RELEASE_SIG the install is unsigned — the sha is only as good as
 #   whoever typed it — and the script refuses unless ALLOW_UNSIGNED=1 says so on purpose.
 #
-# Run one droplet at a time and let it rejoin (16 peers, height moving) before the next, so the
-# validator quorum is never short by more than one node.
+# PRUNE_ARGS (optional; e.g. PRUNE_ARGS="--prune-history 24h") is appended to the unit's ExecStart
+#   when the unit has no --prune-history yet. It is optional NOW. From 2026-09-24 (65f75553) to
+#   2026-11-08 (7e640561, v0.8.6) the install step expanded ${PRUNE_ARGS} under `set -u`: with a
+#   new binary to install, the script aborted ("PRUNE_ARGS: unbound variable") unless the variable
+#   happened to be set — before the service was stopped or anything installed (since the relay
+#   of 2026-09-26, after the binaries were copied to the host's /root) — and only the
+#   already-current path ran without it (audit v14, PROC-751). A run that needs no pruning change sets nothing; the
+#   selftest (deploy/lib/unit-limits.sh) runs the new-binary path with PRUNE_ARGS unset and set.
+#
+# This script rolls ONE host and waits for nothing. The fleet, one host at a time with each back
+# in step before the next (height within 5 of a reference node, at least 10 peers), is
+# deploy/roll-fleet.sh, which calls this script per host, stops at a host that does not rejoin
+# and writes the roll record. Do not loop over this script by hand: the v0.8.5 and v0.8.6 rolls
+# did, and the gate their records describe was in no committed file.
 set -euo pipefail
 . "$(dirname "$0")/lib/fleet-env.sh"
 IP=$1; BUILD_HOST=${2:-$(fleet_ip E)}

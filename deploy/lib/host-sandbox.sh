@@ -10,7 +10,8 @@
 #   $SANDBOX/hosts/<name>/            the host's root: etc/systemd/system, usr/local/bin, root
 #   $SANDBOX/bin/{ssh,scp,launchctl}  put first on PATH of the script under test
 #   $SANDBOX/hostbin/…                what a host's own commands resolve to: systemctl, curl, sleep,
-#                                     hostname, cargo, sed (and sha256sum where the OS has none)
+#                                     hostname, cargo, sed, install (and sha256sum where the OS
+#                                     has none)
 #
 # The ssh stub takes the remote command (its last argument), rewrites the three absolute roots the
 # deploy scripts use (/etc/systemd/system, /usr/local/bin, /root) to the host's directory, and runs
@@ -161,6 +162,10 @@ printf '{"jsonrpc":"2.0","id":1,"result":{"chain_id":21,"height":%s,"view":%s,"p
 STUB
 
   printf '#!/bin/sh\nexit 0\n' > "$SANDBOX/hostbin/sleep"
+  # A host with a file INSTALL-NOOP in its root "installs" nothing and says it did: the install
+  # that did not take, which only a read-back of the installed binary's sha256 catches.
+  real_install=$(command -v install)
+  printf '#!/bin/sh\n[ -e "$SANDBOX_ROOT/INSTALL-NOOP" ] && exit 0\nexec %s "$@"\n' "$real_install" > "$SANDBOX/hostbin/install"
   printf '#!/bin/sh\nexit 0\n' > "$SANDBOX/hostbin/cargo"
   printf '#!/bin/sh\necho "rand-node-$SANDBOX_HOST"\n' > "$SANDBOX/hostbin/hostname"
   # GNU `sed -i SCRIPT FILE` (what the hosts run) on a BSD sed, which wants `-i ''`.
