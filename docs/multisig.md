@@ -3,7 +3,7 @@
 > **Status: live on chain 21 (v0.8.0, cut 2026-10-12), which carries the foundation treasury
 > (2 of 3) in its `multisig` section.** The section is genesis-gated: a chain without it refuses
 > all four actions (`UnsupportedAction("multisig")`). Private multisig (`hc_auth_multisig`, below)
-> is enabled on chain 21 too, but has no completed auth proof yet ("Status: not yet proved"). Design: `docs/superpowers/specs/2026-10-08-multisig-design.md`.
+> is enabled on chain 21 too, and one Production auth proof has completed (6 November 2026), though none has been spent on chain 21 ("Status: proved once, not yet spent on chain 21"). Design: `docs/superpowers/specs/2026-10-08-multisig-design.md`.
 
 This page explains how RandProtocol holds RAND (and RPL tokens) under the control of **`threshold`
 of `n` keys**, what the foundation does at the genesis cut to seed its treasury this way, and what
@@ -260,15 +260,17 @@ of M signatures and learns nothing about the policy. It needs a chain whose gene
 - `msk` and the policy are a **viewing** key: every signer can scan the account and read its whole
   history. Neither can spend without `T` signatures.
 
-> **Status: not yet proved.** The module is enabled on chain 21, but no tier-18 auth proof has
-> ever been completed, and no node has ever verified one. The only Test-profile attempt was
-> stopped at about 76 GB of memory before it finished, so 76 GB is a lower bound on the
-> footprint, not a measurement, and "≥ 96 GB" below is a guess, not a tested requirement. The
+> **Status: proved once, not yet spent on chain 21** (corrected 2026-11-17; audit v14, MSC-751).
+> The module is enabled on chain 21. On 6 November 2026 one Production-profile proof completed: M = 3 signatures, tier 18, a proof of 3.7 MB, 69 minutes, peak RSS 92.9 GiB (≈ 99.7 GB).
+> A machine that proves one therefore needs **at least 128 GB**; the "≥ 96 GB" this page carried
+> until v0.8.6 was a guess made before any proof had finished. At 3.7 MB the proof is under chain
+> 21's 6 MiB proof cap. The logs are held privately in the operator's configuration records, not in this repository.
+> What is still open: that proof has **not been submitted on chain 21 by a wallet flow**, and
+> whether it was checked against the pinned verifier key is not recorded in this repository; the
 > end-to-end test (`a_private_multisig_receives_spends_rotates_and_refuses_one_signature_end_to_end`)
-> is `#[ignore]`d and has never run to completion. The Production proof size is estimated from table
-> widths; if a real proof exceeds the chain's proof cap, no private-multisig spend can be admitted
-> until a new cut. **Until a proof has been made and verified, treat funds sent to a private
-> multisig address as possibly unspendable**, and use a public account for anything that matters.
+> is `#[ignore]`d and no completed run of it is on record. **Until a private-multisig spend has
+> been admitted on chain 21, treat funds sent to a private multisig address as possibly
+> unspendable**, and use a public account for anything that matters.
 
 ### Public register or private policy: what each shows
 
@@ -281,7 +283,7 @@ of M signatures and learns nothing about the policy. It needs a chain whose gene
 | a payment's amounts and recipients | the payouts' amounts (recipients shielded) | hidden |
 | what the chain does see | everything above | that the auth proof has the multisig shape, the bundle's public fields, the transaction size |
 | what a signer signs | a 32-byte blake3 digest, checked natively by the node | `b"rand-msauth-1" ‖ binding`, checked inside the proof |
-| cost | a few KB of keys and signatures | an auth proof of ≥ 3.4 MB (estimated; no Production proof has been made), on a machine of unknown size: a Test-profile attempt was stopped at ≈ 76 GB before it finished, so more than that (see the status note above) |
+| cost | a few KB of keys and signatures | an auth proof of 3.7 MB (the one Production proof, M = 3, 6 November 2026), made on a machine with at least 128 GB: 69 minutes, peak RSS 92.9 GiB ≈ 99.7 GB (see the status note above) |
 
 A treasury that must be auditable stays public; M-of-N control with the pool's privacy is the
 private account.
