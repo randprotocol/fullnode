@@ -24,3 +24,6 @@ bin-*/
 # The prover feasibility spike's build output: several GB per target directory.
 /spikes/*/target*/
 /spikes/*/pkg*/
+# Python bytecode: deploy/prover/__pycache__/*.pyc were tracked by mistake.
+__pycache__/
+*.pyc
