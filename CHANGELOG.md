@@ -12,6 +12,13 @@ stopped at v0.4 until 2026-09-30, when the entries v0.5 to v0.6.7 were written f
 
 ## Unreleased
 
+- **Chain-22 cut: the record must say how validators hold the tier-18 key build** (CON-601,
+  CON-60; deploy script only): `deploy/cut-chain22-genesis.sh` refuses a cut record whose
+  `reason:`, `carries:` and `clients:` lines name neither `CON-601`, `validator memory` nor `key
+  build`. The engine pin bounds the shapes a state proof may declare, not what a key costs to
+  build: a block carrying a `max_tier`-18 proof makes every validator build a ~3.6 GB key, which
+  node policy cannot refuse. Listed as OPEN 9 in the script and in `docs/deploy.md`.
+
 Core and node (issue #168, ZKVM-203; **genesis-gated, on no chain** — chain 21's genesis hash,
 wire, storage and behaviour are unchanged):
 
