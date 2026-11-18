@@ -583,7 +583,7 @@ What a release is from the next tag on, and who is trusted for what:
    `deploy/roll-all.sh` take `RELEASE_SUMS` and `RELEASE_SIG`, verify first, and read the expected
    sha256s from the signed file. Without them they print that the install is unsigned and refuse,
    unless `ALLOW_UNSIGNED=1` says so on purpose. `SELFTEST=1 bash deploy/lib/verify-release.sh`
-   runs the cases on throwaway keys (22 checks).
+   runs the cases on throwaway keys (32 checks, k-of-n with three holders among them).
 
    ```bash
    gh release download <tag> -R randprotocol/fullnode -D rel     # rand-node, rand, rand-prover, SHA256SUMS, SHA256SUMS.sig (and SHA256SUMS.sig2 ... when the threshold is above 1)
@@ -602,20 +602,51 @@ and find its siblings. An unlisted, tampered or duplicate signature counts for n
 signing twice counts once, and a *T* above the number of listed keys refuses every release.
 
 `deploy/sign-release.sh SHA256SUMS [key …]` signs with every key it is given (or `$RELEASE_KEYS`,
-or the private keys in `~/.rand-release/`) and then runs the same check. To go to 2-of-N:
+or the private keys in `~/.rand-release/`) and then runs the same check.
+
+**Two holders, one release (monorepo#14).** Until 2026-11-18 `sign-release.sh` deleted every
+`SHA256SUMS.sig*` before it signed, so a second holder who ran it erased the first holder's
+signature. It now has three modes:
+
+| run | what it does |
+|---|---|
+| `sign-release.sh SHA256SUMS` | the first signer. Refuses, changing nothing, if any `SHA256SUMS.sig*` is already there. |
+| `sign-release.sh --append SHA256SUMS` | every later signer. Keeps what is there and writes the new signature to the first free slot (`.sig`, `.sig2` … `.sig9`). Refuses, changing nothing, when a signature already there is not a good signature over this `SHA256SUMS` (the file changed, or the `.sig` is another release's), or when the key has already signed. |
+| `sign-release.sh --replace SHA256SUMS` | discards every signature and signs afresh. |
+
+The flow:
+
+1. Holder 1, on their machine: `gh release download <tag> -R randprotocol/fullnode -D rel`, check
+   the attestation, `deploy/sign-release.sh rel/SHA256SUMS`, then
+   `gh release upload <tag> rel/SHA256SUMS.sig -R randprotocol/fullnode`.
+2. Holder 2, on *their* machine, with their own key: download the same release (it now carries
+   `SHA256SUMS.sig`), check the attestation themselves, `deploy/sign-release.sh --append
+   rel/SHA256SUMS`, then `gh release upload <tag> rel/SHA256SUMS.sig2 -R randprotocol/fullnode`.
+   Neither holder ever has the other's key, and neither signs a file the other could have changed
+   unnoticed: `--append` re-checks holder 1's signature over the bytes holder 2 is about to sign.
+3. Anyone: `gh release download`, then `RELEASE_THRESHOLD=2 bash -c 'source
+   deploy/lib/verify-release.sh; verify_release_sums rel/SHA256SUMS rel/SHA256SUMS.sig'` prints
+   who signed and `(2 of the required 2)`.
+
+`SELFTEST=1 bash deploy/sign-release.sh` runs that flow with throwaway keys (15 checks: the
+forgotten `--append`, the duplicate signer, a third holder, a gap in the slots, a stale set,
+`--replace`); CI runs it and the verifier's self-test.
+
+To go to 2-of-N — **the owner's steps, none of them done in the repository**:
 
 1. **Owner:** a second holder generates their own key on their own machine, off any build host,
    preferably hardware-backed: `ssh-keygen -t ed25519-sk -f ~/.rand-release/release_sk` (or
    `-t ed25519` with a passphrase). Only the `.pub` leaves that machine.
 2. **Owner:** add it as one more line of `deploy/release-signers`
-   (`<who> namespaces="rand-release" <type> <base64>`), reviewed like any change there.
-3. Each holder signs the same `SHA256SUMS` on their own machine
-   (`ssh-keygen -Y sign -n rand-release -f <key> SHA256SUMS`); upload the first as
-   `SHA256SUMS.sig` and the other as `SHA256SUMS.sig2`
-   (`gh release upload <tag> SHA256SUMS.sig SHA256SUMS.sig2 -R randprotocol/fullnode`).
+   (`<who> namespaces="rand-release" <type> <base64>`), reviewed like any change there. Until
+   then holder 2 can still sign and test: `RELEASE_SIGNERS=<a file with both public keys>
+   deploy/sign-release.sh --append …` checks against that file instead (the roll scripts never
+   read `RELEASE_SIGNERS`).
+3. Sign one release with both, as above, and verify it at `RELEASE_THRESHOLD=2`.
 4. Only then set `deploy/release-threshold` to `2` (a reviewed change), and check that
    `SELFTEST=1 bash deploy/lib/verify-release.sh` and a dry `verify_release_sums` on the last
-   release's files behave. Do this before the next release, not during a roll.
+   release's files behave. Do this before the next release, not during a roll. As committed
+   today: **one key listed, threshold 1**.
 
 
 **What is not in place yet (2026-09-30), stated so nobody reads the above as done:**

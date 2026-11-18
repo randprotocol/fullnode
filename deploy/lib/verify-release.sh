@@ -228,6 +228,32 @@ if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${SELFTEST:-}" = 1 ]; then
   refuses "a threshold above the number of listed keys refuses" env SELFTEST=0 RELEASE_THRESHOLD=3 bash -c 'source "$0"; verify_release_sums "$1" "$2" "$3"' "$ST/lib/verify-release.sh" "$ST/t/SHA256SUMS" "$ST/t/SHA256SUMS.sig" "$ST/signers2"
   refuses "a junk threshold refuses" env SELFTEST=0 RELEASE_THRESHOLD=x bash -c 'source "$0"; verify_release_sums "$1" "$2" "$3"' "$ST/lib/verify-release.sh" "$ST/t/SHA256SUMS" "$ST/t/SHA256SUMS.sig" "$ST/signers2"
 
+  # --- k of n with three holders (monorepo#14): throwaway keys, never the committed list ------
+  ssh-keygen -q -t ed25519 -N '' -C selftest-third -f "$ST/third" || { echo "ssh-keygen cannot make a key"; exit 1; }
+  { cat "$ST/signers2"; printf 'selftest-third namespaces="%s" %s\n' "$RELEASE_NAMESPACE" "$(cut -d' ' -f1,2 "$ST/third.pub")"; } > "$ST/signers3"
+  kofn() { local t=$1; shift; env SELFTEST=0 RELEASE_THRESHOLD="$t" bash -c 'source "$0"; verify_release_sums "$1" "$2" "$3"' "$ST/lib/verify-release.sh" "$@"; }
+  sig_by() { cp "$ST/rel/SHA256SUMS" "$ST/k/tmp"; rm -f "$ST/k/tmp.sig"; ssh-keygen -q -Y sign -n "$RELEASE_NAMESPACE" -f "$ST/$1" "$ST/k/tmp" 2>/dev/null; mv "$ST/k/tmp.sig" "$2"; }
+  mkdir "$ST/k"; cp "$ST/rel/SHA256SUMS" "$ST/k/SHA256SUMS"
+  sig_by release "$ST/k/SHA256SUMS.sig"; sig_by third "$ST/k/SHA256SUMS.sig3"
+  accepts "2-of-3: the first and third holders signed, with slot 2 empty" kofn 2 "$ST/k/SHA256SUMS" "$ST/k/SHA256SUMS.sig" "$ST/signers3"
+  refuses "3-of-3: two signatures are not three" kofn 3 "$ST/k/SHA256SUMS" "$ST/k/SHA256SUMS.sig" "$ST/signers3"
+  sig_by second "$ST/k/SHA256SUMS.sig2"
+  accepts "3-of-3: all three holders signed" kofn 3 "$ST/k/SHA256SUMS" "$ST/k/SHA256SUMS.sig" "$ST/signers3"
+  sig_by stranger "$ST/k/SHA256SUMS.sig"
+  accepts "2-of-3: the primary .sig is an unlisted key's, the other two are listed" kofn 2 "$ST/k/SHA256SUMS" "$ST/k/SHA256SUMS.sig" "$ST/signers3"
+  refuses "3-of-3: an unlisted key in the primary slot is not a third holder" kofn 3 "$ST/k/SHA256SUMS" "$ST/k/SHA256SUMS.sig" "$ST/signers3"
+  sig_by second "$ST/k/SHA256SUMS.sig"; sig_by second "$ST/k/SHA256SUMS.sig3"
+  refuses "2-of-3: one holder in three slots is one signer" kofn 2 "$ST/k/SHA256SUMS" "$ST/k/SHA256SUMS.sig" "$ST/signers3"
+  # One key listed under two names is still one key: the same holder cannot be two signers.
+  { cat "$ST/signers2"; printf 'selftest-second-again namespaces="%s" %s\n' "$RELEASE_NAMESPACE" "$(cut -d' ' -f1,2 "$ST/second.pub")"; } > "$ST/signers-twice"
+  rm -f "$ST/k/SHA256SUMS.sig3"; sig_by second "$ST/k/SHA256SUMS.sig2"   # .sig and .sig2: the same key, twice
+  refuses "2-of-3: a key listed twice under two names signs once" kofn 2 "$ST/k/SHA256SUMS" "$ST/k/SHA256SUMS.sig" "$ST/signers-twice"
+  sig_by release "$ST/k/SHA256SUMS.sig2"; cp "$ST/k/SHA256SUMS" "$ST/k/changed"; printf 'dddd  extra\n' >> "$ST/k/changed"
+  cp "$ST/k/SHA256SUMS.sig" "$ST/k/changed.sig"; cp "$ST/k/SHA256SUMS.sig2" "$ST/k/changed.sig2"
+  accepts "2-of-3: two listed holders over the same bytes" kofn 2 "$ST/k/SHA256SUMS" "$ST/k/SHA256SUMS.sig" "$ST/signers3"
+  refuses "2-of-3: the same two signatures over changed sums count for nothing" kofn 2 "$ST/k/changed" "$ST/k/changed.sig" "$ST/signers3"
+  if grep -q 'selftest-' "$HERE/../release-signers" 2>/dev/null; then bad "a self-test key is in deploy/release-signers"; else ok "no self-test key is in deploy/release-signers"; fi
+
   printf 'not in the sums\n' > "$ST/rand-prover"
   refuses "a binary the sums do not list is refused" verify_binary "$ST/rand-prover" "$ST/rel/SHA256SUMS"
   if [ "$(release_sha "$ST/rel/SHA256SUMS" rand 2>/dev/null)" = "$(_vr_sha256 "$ST/rel/rand")" ]; then ok "release_sha reads the listed sha256"; else bad "release_sha reads the listed sha256"; fi
