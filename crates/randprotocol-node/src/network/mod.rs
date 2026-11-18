@@ -1028,6 +1028,29 @@ fn dial_bootstrap(swarm: &mut Swarm<RandBehaviour>, cfg: &NetworkConfig, peers: 
     }
 }
 
+/// Whether a node gossips transactions on the anonymous lane only
+/// ([`EdgeConfig::anonymous_tx_only`]), from its flags and the release it is (`version`, the
+/// crate's `major.minor.patch[-pre]`). `--anonymous-tx-only` leaves the legacy signed topic on any
+/// release; `--legacy-tx-relay` or `--legacy-tx-publish` keeps it on any release. With none of
+/// them a release before v0.9.0 still subscribes and relays there (the v0.8.3 rolling upgrade,
+/// issue #146) and v0.9.0 or later does not: the last phase of that roll, taken by the version so
+/// it needs no flag on any unit and no edit at the bump (monorepo#27, PRIV-601). Every node since
+/// v0.8.3 speaks the anonymous lane, so the two defaults interoperate. A version that does not
+/// parse takes the private default.
+pub fn anonymous_tx_only(anonymous_only: bool, keep_legacy: bool, version: &str) -> bool {
+    if anonymous_only {
+        return true;
+    }
+    if keep_legacy {
+        return false;
+    }
+    let mut parts = version.split(['.', '-']).map(|p| p.parse::<u64>().ok());
+    match (parts.next().flatten(), parts.next().flatten()) {
+        (Some(major), Some(minor)) => (major, minor) >= (0, 9),
+        _ => true,
+    }
+}
+
 /// How transactions leave this node besides the anonymous lane (issues #145, #146).
 struct TxPaths {
     /// Subscribe and relay on the legacy signed topic too ([`EdgeConfig::anonymous_tx_only`] off).
@@ -2633,6 +2656,29 @@ mod tests {
         let mut none = FrameMeter::new(0);
         assert!(!none.admit(p, 1, t), "a zero frame admits nothing");
         assert!(none.admit(p, 0, t), "but an empty frame costs nothing");
+    }
+
+    /// monorepo#27 (PRIV-601): which lanes a node gossips transactions on follows its release. A
+    /// v0.8.x node keeps the legacy signed topic unless `--anonymous-tx-only`; from v0.9.0 a node
+    /// leaves it unless `--legacy-tx-relay` or `--legacy-tx-publish` keeps it. The explicit
+    /// anonymous-only flag wins on every release, and an unreadable version is anonymous-only.
+    #[test]
+    fn the_legacy_transaction_topic_is_left_by_default_from_v0_9_0() {
+        for v in ["0.8.6", "0.8.99", "0.8.7-rc1", "0.1.0"] {
+            assert!(!anonymous_tx_only(false, false, v), "{v}: both lanes by default");
+            assert!(anonymous_tx_only(true, false, v), "{v}: --anonymous-tx-only");
+            assert!(anonymous_tx_only(true, true, v), "{v}: --anonymous-tx-only wins");
+        }
+        for v in ["0.9.0", "0.9.0-rc1", "0.10.2", "1.0.0"] {
+            assert!(anonymous_tx_only(false, false, v), "{v}: the anonymous lane only by default");
+            assert!(!anonymous_tx_only(false, true, v), "{v}: kept on request");
+            assert!(anonymous_tx_only(true, true, v), "{v}: --anonymous-tx-only wins");
+        }
+        assert!(anonymous_tx_only(false, false, "not a version"));
+        assert!(anonymous_tx_only(false, false, "1"));
+        // This build.
+        let v = env!("CARGO_PKG_VERSION");
+        assert_eq!(anonymous_tx_only(false, false, v), !v.starts_with("0.8."));
     }
 
     /// `EdgeConfig::default()` is what `start` passes: no reserved or bound peers, permissive

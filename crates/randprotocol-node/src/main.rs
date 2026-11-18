@@ -771,8 +771,16 @@ enum Cmd {
         /// subscribing to and relaying on the legacy signed topic `rand/{chain}/tx` as well.
         /// Since audit v12 (PRIV-601) a node never publishes its own transactions there unless
         /// `--legacy-tx-publish`; this flag also stops it hearing and relaying older nodes' copies.
+        /// The default from v0.9.0 on (`--legacy-tx-relay` keeps the topic there).
         #[arg(long)]
         anonymous_tx_only: bool,
+        /// Keep subscribing to and relaying on the legacy signed topic `rand/{chain}/tx` on a
+        /// release that leaves it by default (v0.9.0 on), for a chain that still runs nodes from
+        /// before v0.8.3. No effect before v0.9.0, where the topic is kept anyway, nor under
+        /// `--anonymous-tx-only`. This node's own transactions still go on the anonymous lane only
+        /// unless `--legacy-tx-publish`.
+        #[arg(long)]
+        legacy_tx_relay: bool,
         /// Also publish this node's transactions, signed, on the legacy topic `rand/{chain}/tx`
         /// (audit v12, PRIV-601). Each copy there names this node as its publisher, which is what
         /// the anonymous lane and the stem exist to hide, so it is off by default. Only for a
@@ -3089,6 +3097,7 @@ async fn main() -> Result<()> {
             reserved_peer,
             strict_gossip,
             anonymous_tx_only,
+            legacy_tx_relay,
             legacy_tx_publish,
             dandelion,
             dandelion_fluff_prob,
@@ -3195,7 +3204,7 @@ async fn main() -> Result<()> {
             }, rpc_options, node::NetOptions {
                 reserved_peers: reserved_peer,
                 strict_gossip,
-                anonymous_tx_only,
+                anonymous_tx_only: randprotocol_node::network::anonymous_tx_only(anonymous_tx_only, legacy_tx_relay || legacy_tx_publish, env!("CARGO_PKG_VERSION")),
                 legacy_tx_publish,
                 dandelion: randprotocol_node::dandelion::DandelionConfig {
                     enabled: dandelion == "on",
@@ -4658,13 +4667,15 @@ mod tests {
         let run = |extra: &[&str]| {
             let args = ["rand-node", "run", "--datadir", "d", "--key", "k.json"].into_iter().chain(extra.iter().copied());
             match Cli::try_parse_from(args).map(|c| c.cmd) {
-                Ok(Cmd::Run { legacy_tx_publish, anonymous_tx_only, .. }) => (legacy_tx_publish, anonymous_tx_only),
+                Ok(Cmd::Run { legacy_tx_publish, anonymous_tx_only, legacy_tx_relay, .. }) => (legacy_tx_publish, anonymous_tx_only, legacy_tx_relay),
                 _ => unreachable!("a run"),
             }
         };
-        assert_eq!(run(&[]), (false, false), "no signed legacy copy by default");
-        assert_eq!(run(&["--legacy-tx-publish"]), (true, false));
-        assert_eq!(run(&["--anonymous-tx-only"]), (false, true));
+        assert_eq!(run(&[]), (false, false, false), "no signed legacy copy by default");
+        assert_eq!(run(&["--legacy-tx-publish"]), (true, false, false));
+        assert_eq!(run(&["--anonymous-tx-only"]), (false, true, false));
+        // monorepo#27: the flag that keeps the legacy topic on a release that leaves it by default.
+        assert_eq!(run(&["--legacy-tx-relay"]), (false, false, true));
     }
 
     /// Issue #145: Dandelion++ is on by default at q = 0.1 and a 3 s embargo; each flag parses,

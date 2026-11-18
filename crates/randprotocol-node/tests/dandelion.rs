@@ -35,6 +35,12 @@ struct Net {
 }
 
 async fn start(gen: &Genesis, seed: u8, bootstrap: Vec<libp2p::Multiaddr>, dandelion: DandelionConfig) -> TestNode {
+    start_on_lanes(gen, seed, bootstrap, dandelion, false).await
+}
+
+/// [`start`], choosing the node's transaction lanes: `anonymous_tx_only` is what a node of v0.9.0
+/// or later runs by default, off is a v0.8.x node's default (both lanes subscribed and relayed).
+async fn start_on_lanes(gen: &Genesis, seed: u8, bootstrap: Vec<libp2p::Multiaddr>, dandelion: DandelionConfig, anonymous_tx_only: bool) -> TestNode {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("genesis.json"), gen.to_json()).unwrap();
     let key = Keypair::from_seed([seed; 32]).unwrap();
@@ -62,7 +68,7 @@ async fn start(gen: &Genesis, seed: u8, bootstrap: Vec<libp2p::Multiaddr>, dande
             msauth: Default::default(),
         },
         RpcOptions::default(),
-        NetOptions { dandelion, ..NetOptions::default() },
+        NetOptions { dandelion, anonymous_tx_only, ..NetOptions::default() },
     )
     .await
     .expect("node starts");
@@ -75,13 +81,24 @@ impl Net {
     /// is connected to all the others — and, where its config speaks the stem, until it knows
     /// every other stem-capable node as a stem peer — plus two gossip heartbeats for the mesh.
     async fn start(configs: Vec<DandelionConfig>) -> Net {
+        Net::start_on_lanes(configs, &[]).await
+    }
+
+    /// [`Net::start`] with the nodes whose index is in `anonymous_only` on the anonymous
+    /// transaction lane only, the rest on both lanes.
+    async fn start_on_lanes(configs: Vec<DandelionConfig>, anonymous_only: &[usize]) -> Net {
         common::cluster::init_tracing();
         let gen = common::genesis(&minter());
         let executor = node::executor_for_profile(&gen.fri_profile).unwrap();
         let mut nodes: Vec<TestNode> = Vec::new();
         for (i, cfg) in configs.iter().enumerate() {
             let boot = nodes.iter().map(common::cluster::bootstrap_addr).collect();
-            nodes.push(start(&gen, 1 + i as u8, boot, cfg.clone()).await);
+            let node = if anonymous_only.contains(&i) {
+                start_on_lanes(&gen, 1 + i as u8, boot, cfg.clone(), true).await
+            } else {
+                start(&gen, 1 + i as u8, boot, cfg.clone()).await
+            };
+            nodes.push(node);
         }
         let n = nodes.len();
         let capable = configs.iter().filter(|c| c.enabled).count();
@@ -370,4 +387,132 @@ async fn dandelion_latency_against_publishing_at_once() {
         net.stop().await;
     }
     eprintln!("dandelion added {:.1} ms to the mean time to every mempool on loopback", report[1] - report[0]);
+}
+
+/// A first spy: a bare network node connected to every node of `net`, on both transaction lanes,
+/// speaking no stem (so no node ever stems to it), that relays nothing and records, for each
+/// transaction, the peer that first forwarded it — the first-spy estimator's guess at its origin —
+/// and the lane each copy arrived on.
+struct Spy {
+    handle: network::NetworkHandle,
+    seen: Arc<std::sync::Mutex<Vec<(Hash, libp2p::PeerId, network::GossipLane)>>>,
+}
+
+impl Spy {
+    async fn join(net: &Net) -> Spy {
+        let (handle, mut rx) = network::start_with(
+            NetworkConfig {
+                chain_id: net.gen.chain_id,
+                listen: vec!["/ip4/127.0.0.1/tcp/0".parse().unwrap()],
+                bootstrap: net.nodes.iter().map(common::cluster::bootstrap_addr).collect(),
+                enable_mdns: false,
+                limits: WireLimits::default(),
+            },
+            [98; 32],
+            EdgeConfig::default(),
+        )
+        .await
+        .unwrap();
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let connected = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (record, count, reporter) = (seen.clone(), connected.clone(), handle.clone());
+        tokio::spawn(async move {
+            while let Some(ev) = rx.recv().await {
+                match ev {
+                    NetworkEvent::PeerConnected(_) => {
+                        count.fetch_add(1, Ordering::Relaxed);
+                    }
+                    NetworkEvent::Gossip { from, msg, id } => {
+                        if let network::GossipMessage::Transaction(tx) = &msg {
+                            record.lock().unwrap().push((tx.hash(), from, id.lane));
+                        }
+                        // Every delivery is answered; `Ignore`: the spy relays nothing.
+                        reporter.report_validation(id, libp2p::gossipsub::MessageAcceptance::Ignore).await;
+                    }
+                    _ => {}
+                }
+            }
+        });
+        let n = net.nodes.len();
+        common::cluster::wait_for("the spy is connected to every node", Duration::from_secs(30), || connected.load(Ordering::Relaxed) >= n).await;
+        // Three gossip heartbeats, so every node has grafted the spy into its transaction mesh.
+        tokio::time::sleep(Duration::from_millis(3000)).await;
+        Spy { handle, seen }
+    }
+
+    /// The node (by index in `net`) that first forwarded `tx` to the spy.
+    fn first_forwarder(&self, net: &Net, tx: &Hash) -> Option<usize> {
+        let from = self.seen.lock().unwrap().iter().find(|(h, ..)| h == tx).map(|(_, from, _)| *from)?;
+        net.nodes.iter().position(|n| n.handle.network.local_peer_id == from)
+    }
+
+    /// How many transaction copies reached the spy on the legacy signed topic.
+    fn signed_copies(&self) -> usize {
+        self.seen.lock().unwrap().iter().filter(|(.., lane)| *lane == network::GossipLane::Signed).count()
+    }
+}
+
+/// The first-spy test (monorepo#27, PRIV-601), in process: the measurement that found the
+/// submitter first in 27 of 27 traces on chain 21, re-run against this build's defaults with an
+/// observer that is connected to every node and guesses each transaction's origin as the peer
+/// that first forwarded it.
+///
+/// * Control, Dandelion off (how a node published before v0.8.3): the spy's guess is the
+///   submitter for at least 8 of 10 transactions — the estimator works, so the next result means
+///   something.
+/// * Dandelion on at the defaults (q = 0.1, 3 s embargo), 20 transactions from rotating
+///   submitters over a mixed fleet — two nodes on the anonymous lane only (a v0.9.0 node's
+///   default), three on both lanes (a v0.8.x node's): the spy's guess is the submitter for at most
+///   half of them, every mempool still gets every transaction, and both counts are printed.
+/// * In both runs no copy reaches the spy on the legacy signed topic: nothing names a publisher.
+///
+/// Five nodes on loopback bound what this shows: with five nodes a stem ends back at the
+/// submitter about one time in five. The fleet measurement is `docs/deploy.md`'s to record.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_first_spy_names_the_submitter_without_dandelion_and_rarely_with_it() {
+    // (label, configs, nodes on the anonymous lane only, transactions)
+    let runs: [(&str, Vec<DandelionConfig>, &[usize], usize); 2] = [
+        ("off", (0..5).map(|_| DandelionConfig::off()).collect(), &[], 10),
+        ("on (q = 0.1, b = 3 s)", (0..5).map(|i| DandelionConfig { seed: Some(60 + i), ..DandelionConfig::default() }).collect(), &[1, 3], 20),
+    ];
+    let mut named = Vec::new();
+    for (label, configs, anonymous_only, txs) in runs {
+        let mut net = Net::start_on_lanes(configs, anonymous_only).await;
+        let spy = Spy::join(&net).await;
+        let (mut spy_named_submitter, mut submitter_published, mut unheard) = (0, 0, 0);
+        for k in 1..=txs {
+            let tx = net.mint();
+            let at_node = (k - 1) % 5;
+            let before = net.all_fluffs();
+            net.submit_and_watch(at_node, &tx, k, Duration::from_secs(30)).await;
+            submitter_published += usize::from(published_by(&before, &net.all_fluffs()).contains(&at_node));
+            let hash = tx.hash();
+            let heard = tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    if let Some(first) = spy.first_forwarder(&net, &hash) {
+                        return first;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await;
+            match heard {
+                Ok(first) => spy_named_submitter += usize::from(first == at_node),
+                Err(_) => unheard += 1,
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        eprintln!(
+            "first spy, dandelion {label}: the spy named the submitter for {spy_named_submitter}/{txs}; the submitter itself published {submitter_published}/{txs}; unheard by the spy {unheard}; copies on the signed legacy topic {}",
+            spy.signed_copies()
+        );
+        assert_eq!(unheard, 0, "dandelion {label}: the spy missed a transaction, so its count means nothing");
+        assert_eq!(spy.signed_copies(), 0, "dandelion {label}: a transaction reached the spy on the signed legacy topic");
+        named.push((spy_named_submitter, txs));
+        spy.handle.shutdown().await;
+        net.stop().await;
+    }
+    let ((off, off_txs), (on, on_txs)) = (named[0], named[1]);
+    assert!(off * 10 >= off_txs * 8, "without Dandelion the first spy should name the submitter nearly always: {off}/{off_txs}");
+    assert!(on * 2 <= on_txs, "with Dandelion the first spy named the submitter for more than half: {on}/{on_txs}");
 }
