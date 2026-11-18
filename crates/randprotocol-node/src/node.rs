@@ -5,7 +5,7 @@
 use crate::admission::{self, AdmissionBudget, AdmissionCharge, GossipOutcome, Verdict, VerifySource, VerifyLimits};
 use crate::compact;
 use crate::constraint_set::{Binding, Truncation};
-use crate::dandelion::{Dandelion, DandelionConfig, DandelionStats, Decision, Edge, FluffReason, LoopAction};
+use crate::dandelion::{Dandelion, DandelionConfig, DandelionStats, Decision, Edge, EmbargoAction, FluffReason, LoopAction};
 use crate::mempool::{Mempool, MempoolError};
 use crate::network::{
     self, CompactBlock, GossipId, GossipMessage, NetworkConfig, NetworkEvent, NetworkHandle, Status, SyncRequest, SyncResponse,
@@ -3716,12 +3716,24 @@ impl Node {
         }
     }
 
-    /// The embargo fail-safe (issue #145): every stem transaction whose timer ran out without it
-    /// coming back over gossip is fluffed by this node.
+    /// The embargo fail-safe (issue #145): a stem transaction whose timer ran out without it
+    /// coming back over gossip. The first time, it is stemmed to a successor that has not had it,
+    /// around whichever node downstream went silent; when that timer runs out as well, or there
+    /// is no such successor, this node fluffs it ([`Dandelion::on_embargo`]; audit v12, PRIV-604).
     async fn on_embargo(&mut self) {
-        for (hash, tx) in self.dandelion.stempool.expired(Instant::now()) {
-            tracing::debug!(%hash, "embargo expired; fluffing");
-            let _ = self.fluff(tx, FluffReason::Embargo).await;
+        for action in self.dandelion.on_embargo(Instant::now()) {
+            match action {
+                EmbargoAction::Restem { hash, peer, tx } => {
+                    tracing::debug!(%hash, %peer, "embargo expired; stemming around the silent successor");
+                    DandelionStats::bump(&self.dandelion_stats.embargo_restem);
+                    DandelionStats::bump(&self.dandelion_stats.stem_sent);
+                    self.net.stem(peer, tx).await;
+                }
+                EmbargoAction::Fluff { hash, tx } => {
+                    tracing::debug!(%hash, "embargo expired; fluffing");
+                    let _ = self.fluff(tx, FluffReason::Embargo).await;
+                }
+            }
         }
     }
 
@@ -8898,6 +8910,45 @@ mod tests {
         assert!(node.mempool.contains(&h) && !node.dandelion.stempool.contains(&h));
         assert_eq!(tx_status(&mut node, h).await, rpc::PoolStatus::Pending);
         assert_eq!(served(&mut node, h), vec![tx]);
+        assert_eq!(node.dandelion_stats.get(|s| &s.fluff_embargo), 1);
+    }
+
+    /// Audit v12, PRIV-604 (monorepo#30), in the node loop: the submitter's stem successor
+    /// acknowledged the stem and nothing came back. At its first embargo the submitter publishes
+    /// nothing — it stems the transaction to its other successor and keeps it out of every
+    /// answer; only its second embargo fluffs it. Through v0.8.6 the first embargo published it,
+    /// from the one node that held it.
+    #[tokio::test]
+    async fn a_submitter_whose_successor_went_silent_stems_to_the_other_before_it_publishes() {
+        let (_d, mut node, mut seen, first) = stem_node(0.0, Duration::from_millis(5));
+        let tx = next_tx(node.hs.tip_ledger(), 31);
+        let h = tx.hash();
+        let (reply, answer) = oneshot::channel();
+        node.on_verdict(Verdict { tx: tx.clone(), result: Ok(()), source: VerifySource::Rpc(reply), proof_key: None, busy: false, charge: AdmissionCharge::none() })
+            .await
+            .unwrap();
+        assert_eq!(answer.await.unwrap(), Ok(h));
+        assert_eq!(stems(&drain(&mut seen).await), vec![(first, h)], "stemmed to its only successor");
+        // A second stem-capable peer: the free successor slot is filled; the edge keeps `first`.
+        let other = PeerId::random();
+        node.dandelion.router.add_peer(other, true, None, &mut node.dandelion.rng);
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        node.on_embargo().await;
+        let out = drain(&mut seen).await;
+        assert_eq!(stems(&out), vec![(other, h)], "the first embargo stems it around the silent successor");
+        assert_eq!(broadcast_txs(&out), vec![], "and publishes nothing");
+        assert!(node.dandelion.stempool.contains(&h) && !node.mempool.contains(&h), "still held, still invisible");
+        assert_eq!(tx_status(&mut node, h).await, rpc::PoolStatus::Unknown);
+        assert_eq!(node.dandelion_stats.get(|s| &s.embargo_restem), 1);
+        assert_eq!(node.dandelion_stats.get(|s| &s.fluff_embargo), 0);
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        node.on_embargo().await;
+        let out = drain(&mut seen).await;
+        assert_eq!(stems(&out), vec![], "no third send");
+        assert_eq!(broadcast_txs(&out), vec![h], "the second embargo is the fail-safe");
+        assert!(node.mempool.contains(&h) && !node.dandelion.stempool.contains(&h));
         assert_eq!(node.dandelion_stats.get(|s| &s.fluff_embargo), 1);
     }
 

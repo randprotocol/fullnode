@@ -292,8 +292,23 @@ transaction for the first time, its verification. With q = 0.1 a stem runs ten h
 (22 at the 90th percentile in a 25-node simulation), so on the fleet's links expect about one to
 two seconds more before a transaction is first published, against a block time of about a second
 and an eight-second finality. A stem whose successor drops it waits for the embargo: 3–6 s (about
-3.75 s on average) when a relay's fires, 6 s or more when only the submitter's does. `wait_for_transaction` and the
+3.75 s on average), the same at the submitter and at a relay. The holder whose timer runs out
+first does not publish yet: it stems the transaction once more, to a successor that has not had
+it, and that stem ends at a fluff like any other (monorepo#30, PRIV-604). A holder with no such
+successor, or whose second timer also runs out, publishes it itself: 12 s at the latest after it
+was held, at the defaults. `wait_for_transaction` and the
 wallets see `unknown`, then `pending`, then `committed`, as before, only later.
+
+**A successor that acknowledges and drops** (a black hole, or an honest node past its admission
+budget). Through v0.8.6 the embargo alone covered it: the holders before the hole published, and
+when the hole was the submitter's own successor the submitter was the only holder, so the node
+that published was the origin. Now every holder — submitter or relay, it cannot be told which —
+first stems around the silence. This is a rule about what a node does with its own held
+transactions; the stem protocol is unchanged, so nodes with and without it mix freely during a
+roll. What is left: a submitter *all* of whose successors drop the stem still publishes it itself
+(as does a node with one stem-capable peer); the time to the fluff still shortens with the number
+of holders before the hole; and the successor a stem is sent to always sees it, with or without
+this (below).
 
 **What it does not hide.** Dandelion++ protects against an observer of the gossip; it does not
 protect against an adversary that runs many of a node's stem successors (it sees the stem
