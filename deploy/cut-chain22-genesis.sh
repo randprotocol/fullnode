@@ -24,6 +24,24 @@
 #     `tokens.incremental_root`": "Recommended: on, for the next cut"; chain 21 did not carry it and
 #     no record says why — the user's standing rule takes the recommended value; striking it is one
 #     constant, TOKENS_INCREMENTAL_ROOT, here and in docs/deploy.md together).
+#   - `program_state.reference_block_window` (issue #168, PR #184; docs/evm-block-context.md §7):
+#     how many closed blocks an `InvokeAt` may name as its reference block — EVM block context
+#     (TIMESTAMP, NUMBER, CHAINID, BASEFEE) for programs. The OWNER DECIDED 2026-11-18 that chain
+#     22 carries it; the VALUE is an owner value to CONFIRM (OPEN 9): REFERENCE_BLOCK_WINDOW,
+#     default 256 (the proof window's lower bound and default), 256..=4096. Needs bounded block
+#     time — chain 22 has `bridge` and `perps`.
+#   - `beacon { commit_delay_blocks, commitments }` (the randomness beacon, PR #189;
+#     docs/evm-block-context.md §11): one hash-chain commitment per genesis validator, every block
+#     opening with its proposer's reveal — PREVRANDAO. The OWNER DECIDED 2026-11-18 that chain 22
+#     carries it; refused by the node without the window above. BEACON_TSV ("<name> <64 hex>",
+#     one line per validator, joined by name with VALIDATORS_TSV / the registrations) and
+#     BEACON_COMMIT_DELAY_BLOCKS (default 256, an owner value to CONFIRM, OPEN 10; 1..=2^20).
+#     EACH VALIDATOR OPERATOR runs `rand-node beacon init` on its own host and sends ONLY the
+#     commitment; nobody else ever holds a seed; each keeps an offline encrypted backup of
+#     `beacon.seed.json` (total seed loss halts the chain — accepted by the owner 2026-11-18 as an
+#     operational risk covered by those backups). deploy/check-beacon-seed.sh, run ON EACH
+#     VALIDATOR HOST before its node starts, proves the host's seed file opens its genesis
+#     commitment.
 #
 #   deploy/cut-chain22-genesis.sh snapshot <dir>     # chain 21 still up, bridge daemons stopped
 #   WALLET=<chain 21's rand, v0.8.2> deploy/cut-chain22-genesis.sh balances <dir>
@@ -31,6 +49,8 @@
 #   CUT_RECORD=<record> CHAIN21_SNAPSHOT=<dir> NODE=<the cut build's rand-node> WALLET=<its rand> \
 #     EXPECT_NODE_VERSION=<that release> PERP_PROVER=<durian's perp-prover> \
 #     PERPS_MAX_WINDOW_HEIGHTS=<64..4096> MULTISIG_MAX_ACCOUNTS=<n ≥ 1> \
+#     [BEACON_TSV=<name ↔ commitment>] [REFERENCE_BLOCK_WINDOW=<256..4096, 256>] \
+#     [BEACON_COMMIT_DELAY_BLOCKS=<1..1048576, 256>] \
 #     [PERP_IMAGE=<perp-engine.image.bin>] [TREASURY=<treasury.txt>] \
 #     [MULTISIG_NOT_CARRIED_OK=1] [PERPS_STATE_NOT_CARRIED_OK=1] [PROGRAM_VAULTS_DROPPED_OK=1] \
 #     deploy/cut-chain22-genesis.sh                  # the cut
@@ -117,6 +137,16 @@
 #      (PERPS_MAX_PENDING_DIGESTS, not an input). With sparse_windows on, chain 22's log grows only
 #      with input blocks and heartbeats; the cap bounds the input part when no prover runs (inputs
 #      are refused `DigestLogFull` until a proof drains it). Range max_window_blocks..=1048576.
+#   9. program_state.reference_block_window (issue #168) — CARRIED (owner, 2026-11-18); the value
+#      is the owner's to CONFIRM: REFERENCE_BLOCK_WINDOW, default 256 (the proof window's default
+#      and the lower bound), 256..=4096. It is how stale a reference block may be, and therefore
+#      how many re-rolls a caller of a naive PREVRANDAO contract gets (docs/evm-block-context.md
+#      §11.4): larger is friendlier to slow provers, worse for naive randomness.
+#  10. beacon.commit_delay_blocks (PR #189) — CARRIED (owner, 2026-11-18); the value is the owner's
+#      to CONFIRM: BEACON_COMMIT_DELAY_BLOCKS, default 256 (the node's default), 1..=1048576. How
+#      long a `BeaconCommit` waits before it can be opened: what keeps two colluding leaders from
+#      registering a seed chosen against the current value. The commitments themselves are the
+#      validator operators' (BEACON_TSV), never chosen here.
 #
 #   9. Validator memory for the state-proof key build (CON-601, monorepo#23; CON-60, #6). The cut
 #      keeps max_tier 18 (the production sizing) and pins the engine's program height, which
@@ -210,6 +240,27 @@
 #         release BINARY carries the row (no command prints the table); it checks the tree the
 #         next release is built from, and the node's own tests fail a tree whose committed
 #         deploy/genesis-chain22.json has no row.
+#   * BLOCK CONTEXT AND THE BEACON (issue #168 / PR #184, PR #189; OPEN 9, 10). Both are SPLICED
+#     by this script, like perps: `rand-node genesis --program-state-reference-block-window` (and
+#     `--beacon-commitment`, which needs it) is refused on the base file, which has no `bridge` or
+#     `perps` yet — the window needs bounded block time (Genesis::validate). The build must still
+#     know them: the real cut refuses a NODE whose `genesis --help` lacks either flag (DRY_RUN skips
+#     both, LOUDLY: BLOCK_CONTEXT_SKIPPED). The beacon's addresses are each validator's address AS
+#     ITS PUBLIC KEY DERIVES IT (`rand-node admit sign --candidate <public key>` under a throwaway
+#     key prints it; nothing is submitted), and the cut refuses a VALIDATORS_TSV / registration
+#     address that differs. Refused: a BEACON_TSV line that is not "<name> <64 lowercase hex>", a
+#     name twice, a name that is no chain-22 validator, a validator with no line, one commitment for
+#     two validators. Asserted on the finished file (program_state's field order, the beacon section
+#     last, every commitment in validator order), field-probed (the hash moves without the window
+#     and the beacon, with the window at another value, without the beacon alone, with the delay
+#     changed, and with EACH ONE commitment changed), read back by `check-limits`
+#     (rand_getLimits.program_state.{reference_block_window, beacon_commit_delay_blocks},
+#     rand_getBlockContext, rand_getBeacon: every validator, its commitment, nonce 0, nothing
+#     pending), and written to the cut record (`reference-block-window:`,
+#     `beacon-commit-delay-blocks:`, one `beacon-commitment: <name> <address> <hex>` per validator,
+#     and the operator procedure). The per-host seed check is deploy/check-beacon-seed.sh, which the
+#     chain-22 cutover's `start` must run on every validator host before its node starts (the only
+#     place that sees a host's seed file; `check-limits` reads one RPC from the operator's machine).
 #
 # The inputs outside the repository (chain 21's, re-pointed at ~/.rand-chain22 where the cut writes):
 #   PERP_IMAGE / EXPECT_ENGINE_HC / PERP_PROVER   as chain 21's (f286a611…; durian.market's perp-prover,
@@ -218,6 +269,10 @@
 #                     hex>` × 3 in order, `threshold 2`, `balance <RAND>` (OPEN 3). Public keys only.
 #   FEE_RECIPIENT_FILE  default ~/.rand-chain20/fee-recipient-address.txt — chain 20's and chain
 #                     21's recipient, fingerprint 89DS-4Q4X-HXSX-MBYW (it never moved).
+#   BEACON_TSV        default ~/.rand-chain22/beacon-commitments.tsv: "<validator name> <64 hex>",
+#                     one line per chain-22 validator (the 26 names of GENESIS_NAMES and BONDED), each
+#                     commitment what that validator's own `rand-node beacon init --chain-id 22`
+#                     printed on its own host. Public: commitments only, never a seed.
 #
 # Operations (not checked here; the cut record's `clients:` and the launch checklist): as chain
 # 21's (NTP, msauth-vk-production.bin beside every rand-node, a perp-view service and a prover
@@ -443,6 +498,17 @@ PROGRAM_STATE_REFUSE_PANICS=true
 # ── the NEW tokens switch: incremental_root (audit v6 TOK-1; docs/deploy.md "Recommended: on, for the
 # next cut"), written by `rand-node genesis --tokens-incremental-root`. Not overridable.
 TOKENS_INCREMENTAL_ROOT=true
+# ── the NEW block context and beacon (issue #168 / PR #184, PR #189), CARRIED by the owner's decision
+# of 2026-11-18 — the values are the owner's to CONFIRM (OPEN 9, OPEN 10); spliced (see the header).
+#   - program_state.reference_block_window = REFERENCE_BLOCK_WINDOW, default 256, 256..=4096
+#     (MIN/MAX_PROOF_WINDOW_BLOCKS, ProgramStateConfig::check). Explicitly empty is refused: the
+#     beacon needs the window.
+#   - beacon.commit_delay_blocks = BEACON_COMMIT_DELAY_BLOCKS, default 256 (DEFAULT_COMMIT_DELAY_BLOCKS),
+#     1..=1048576 (MIN/MAX_COMMIT_DELAY_BLOCKS).
+#   - beacon.commitments from BEACON_TSV, one per validator (the operators', never this script's).
+REFERENCE_BLOCK_WINDOW=${REFERENCE_BLOCK_WINDOW-256}
+BEACON_COMMIT_DELAY_BLOCKS=${BEACON_COMMIT_DELAY_BLOCKS-256}
+BEACON_TSV=${BEACON_TSV:-$HOME/.rand-chain22/beacon-commitments.tsv}
 # PERPS_SKIPPED (DRY_RUN without PERP_PROVER) and AUDIT_V10_SKIPPED (DRY_RUN on a build without the
 # audit-v10 fields): the script's own words, never the operator's — whatever the environment says
 # is captured and cleared here; the real cut refuses it, DRY_RUN ignores it, loudly. check-limits
@@ -453,6 +519,11 @@ PERPS_SKIPPED=
 # shellcheck disable=SC2034  # likewise
 AUDIT_V10_SKIPPED_FROM_ENV=${AUDIT_V10_SKIPPED:-}
 AUDIT_V10_SKIPPED=
+# BLOCK_CONTEXT_SKIPPED (DRY_RUN on a build without --program-state-reference-block-window /
+# --beacon-commitment): the window and the beacon together — the beacon needs the window.
+# shellcheck disable=SC2034  # likewise
+BLOCK_CONTEXT_SKIPPED_FROM_ENV=${BLOCK_CONTEXT_SKIPPED:-}
+BLOCK_CONTEXT_SKIPPED=
 [ "$EXPECT_HC_AUTH_MULTISIG" = "$HC_AUTH_MULTISIG_DECIDED" ] || {
   echo "cut-chain22: EXPECT_HC_AUTH_MULTISIG=$EXPECT_HC_AUTH_MULTISIG is not chain 21's multisig auth guest ($HC_AUTH_MULTISIG_DECIDED, MSAUTH_HC) — another guest edits this script and docs/deploy.md together" >&2; exit 1; }
 [ "$EXPECT_ENGINE_HC" = "$ENGINE_HC_DECIDED" ] || {
@@ -468,6 +539,11 @@ if [ -n "$MULTISIG_MAX_ACCOUNTS" ]; then
   [[ $MULTISIG_MAX_ACCOUNTS =~ ^[0-9]+$ ]] && [ "$MULTISIG_MAX_ACCOUNTS" -ge 1 ] && [ "${#MULTISIG_MAX_ACCOUNTS}" -le 18 ] || {
     echo "cut-chain22: MULTISIG_MAX_ACCOUNTS=$MULTISIG_MAX_ACCOUNTS is not a count ≥ 1 (the seeded treasury counts)" >&2; exit 1; }
 fi
+# OPEN 9 / OPEN 10: defaulted, the owner's to confirm, always in range (checked again on the file).
+[[ $REFERENCE_BLOCK_WINDOW =~ ^[0-9]{1,5}$ ]] && [ "$REFERENCE_BLOCK_WINDOW" -ge 256 ] && [ "$REFERENCE_BLOCK_WINDOW" -le 4096 ] || {
+  echo "cut-chain22: REFERENCE_BLOCK_WINDOW='$REFERENCE_BLOCK_WINDOW' is outside 256..=4096 (the proof window's bounds; program_state.reference_block_window, OPEN 9) — chain 22 carries the window (owner, 2026-11-18) and the beacon needs it" >&2; exit 1; }
+[[ $BEACON_COMMIT_DELAY_BLOCKS =~ ^[0-9]{1,7}$ ]] && [ "$BEACON_COMMIT_DELAY_BLOCKS" -ge 1 ] && [ "$BEACON_COMMIT_DELAY_BLOCKS" -le 1048576 ] || {
+  echo "cut-chain22: BEACON_COMMIT_DELAY_BLOCKS='$BEACON_COMMIT_DELAY_BLOCKS' is outside 1..=1048576 (MIN/MAX_COMMIT_DELAY_BLOCKS; beacon.commit_delay_blocks, OPEN 10)" >&2; exit 1; }
 
 # shellcheck disable=SC2090
 export CHAIN_ID CHAIN21_GENESIS CHAIN21_HASH CHAIN21_GENESIS_SHA256 CHAIN21_TREASURY_ID CHAIN21_RPC VALIDATORS_TSV REGISTRATIONS BONDED GENESIS_NAMES \
@@ -481,7 +557,8 @@ export CHAIN_ID CHAIN21_GENESIS CHAIN21_HASH CHAIN21_GENESIS_SHA256 CHAIN21_TREA
   FEE_RECIPIENT_FINGERPRINT FEES_JSON PERPS_JSON ENGINE_HC_DECIDED EXPECT_ENGINE_HC PERP_GENESIS_ROOT \
   PERPS_SKIPPED PERPS_V10_JSON PERPS_MAX_WINDOW_HEIGHTS EXPECT_ENGINE_PROGRAM_LOG_HEIGHT ENGINE_PROGRAM_LOG_HEIGHT PERPS_MAX_PENDING_DIGESTS \
   MULTISIG_CREATE_FEE TREASURY_THRESHOLD TREASURY_SIGNERS TREASURY MULTISIG_MAX_ACCOUNTS \
-  PROGRAM_STATE_REFUSE_PANICS TOKENS_INCREMENTAL_ROOT AUDIT_V10_SKIPPED EXPECT_HC_AUTH_MULTISIG
+  PROGRAM_STATE_REFUSE_PANICS TOKENS_INCREMENTAL_ROOT AUDIT_V10_SKIPPED EXPECT_HC_AUTH_MULTISIG \
+  REFERENCE_BLOCK_WINDOW BEACON_COMMIT_DELAY_BLOCKS BEACON_TSV BLOCK_CONTEXT_SKIPPED
 
 # Decimal RAND/zUSD text → base units, the exact rule of `parse_amount` (no float anywhere).
 # shellcheck disable=SC2089,SC2090  # python source in a string, exported whole, never word-split
@@ -967,6 +1044,71 @@ json.dump(section, open(os.path.join(E["TMP"], "perps.json"), "w"), indent=1)
 PY
 }
 
+# ══ the cut, step 1d: the beacon — BEACON_TSV joined by name with the validators → $TMP/beacon.json ═
+# BEACON_TSV: "<name> <commitment>" per line (blank lines and # comments skipped), the commitment
+# 64 LOWERCASE hex as `rand-node beacon init` prints it. Joined by validator name against
+# $TMP/validators.json (py_validators: VALIDATORS_TSV's genesis names, then BONDED's
+# registrations), as the script joins every other validator datum. Refused: a malformed line, a
+# name twice, a name that is no chain-22 validator, a validator with no line, a commitment listed
+# for two validators. The address written is the one the validator's PUBLIC KEY derives
+# ($TMP/derived-addresses.tsv, from the node; the cut refuses a TSV / registration address that
+# differs — FIXTURE_ADDRESSES_OK=1, the dry run's synthetic register, warns instead). Commitments
+# in validator order; the delay BEACON_COMMIT_DELAY_BLOCKS (1..=2^20). Also writes
+# $TMP/beacon-record.txt, the cut record's `beacon-commitment:` lines.
+py_beacon() {
+  python3 - <<'PY'
+import json, os, re, sys
+E = os.environ
+def need(cond, msg):
+    if not cond:
+        sys.exit(f"cut-chain22: {msg}")
+tsv = E["BEACON_TSV"]
+rows = json.load(open(os.path.join(E["TMP"], "validators.json")))
+names = [r["name"] for r in rows]
+got = {}
+for n, line in enumerate(open(tsv), 1):
+    f = line.split()
+    if not f or f[0].startswith("#"):
+        continue
+    need(len(f) == 2, f"{tsv}: line {n}: {line.rstrip()!r} is not \"<validator name> <commitment>\"")
+    name, c = f
+    need(re.fullmatch(r"[0-9a-f]{64}", c), f"{tsv}: line {n}: {name}'s commitment {c!r} is not 64 lowercase hex characters (what `rand-node beacon init` prints)")
+    need(name not in got, f"{tsv}: line {n}: {name} is listed twice — one commitment per validator")
+    need(name in names, f"{tsv}: line {n}: {name} is not a chain-22 validator (GENESIS_NAMES / BONDED) — no extras")
+    got[name] = c
+missing = [x for x in names if x not in got]
+need(not missing, f"{tsv}: no commitment for {', '.join(missing)} — every chain-22 validator has exactly one (a validator without one could never propose)")
+seen = {}
+for x in names:
+    need(got[x] not in seen, f"{tsv}: {x} and {seen.get(got[x])} have the same commitment — each validator runs its own `rand-node beacon init`")
+    seen[got[x]] = x
+need(all(int(c, 16) != 0 for c in got.values()), f"{tsv}: an all-zero commitment — not what `rand-node beacon init` prints")
+delay = E.get("BEACON_COMMIT_DELAY_BLOCKS", "")
+need(delay.isdigit() and 1 <= int(delay) <= 1 << 20, f"BEACON_COMMIT_DELAY_BLOCKS {delay!r} is not in 1..=1048576 (OPEN 10)")
+derived = {}
+dpath = os.path.join(E["TMP"], "derived-addresses.tsv")
+need(os.path.isfile(dpath), "no $TMP/derived-addresses.tsv — the validators' addresses were not derived from their public keys")
+for line in open(dpath):
+    f = line.split()
+    if f:
+        derived[f[0]] = f[1]
+need(set(derived) == set(names), f"the derived addresses name {sorted(derived)}, not the 26 validators")
+mismatch = [x for x in rows if x["address"] != derived[x["name"]]]
+if mismatch:
+    need(E.get("FIXTURE_ADDRESSES_OK") == "1",
+         "the address listed for " + ", ".join(f"{x['name']} ({x['address']} ≠ {derived[x['name']]})" for x in mismatch)
+         + " is not the address of its public key — VALIDATORS_TSV / the registration is wrong")
+    print(f"cut-chain22: ⚠ FIXTURE_ADDRESSES_OK: {len(mismatch)} fixture address(es) differ from the key-derived ones; the beacon lists the derived ones")
+need(len(set(derived.values())) == len(names), "two validators derive one address")
+section = {"commit_delay_blocks": int(delay), "commitments": [{"validator": derived[x], "commitment": got[x]} for x in names]}
+json.dump(section, open(os.path.join(E["TMP"], "beacon.json"), "w"), indent=1)
+with open(os.path.join(E["TMP"], "beacon-record.txt"), "w") as f:
+    for x in names:
+        f.write(f"beacon-commitment: {x} {derived[x]} {got[x]}\n")
+print(f"cut-chain22: beacon: {len(names)} commitments from {tsv} (one per validator, all distinct), commit_delay_blocks {delay} (OPEN 10)")
+PY
+}
+
 # ══ the cut, step 2: splice bridge, tokens, staking; assert every carried sum and every new field ═
 py_splice() {
   python3 - <<'PY'
@@ -988,7 +1130,8 @@ need(snap["genesis_hash"] == E["CHAIN21_HASH"], "the snapshot is not of chain 21
 need(not g21.get("vesting"), "chain 21's genesis has a vesting section — this script carries none")
 need(g21.get("chain_id") == 21 and "fees" in g21 and "perps" in g21 and "multisig" in g21 and "hc_auth_multisig" in g21
      and not {"bound_payouts", "initial_collateral", "sparse_windows", "max_window_heights", "engine_program_log_height", "max_pending_digests"} & set(g21["perps"])
-     and "max_accounts" not in g21["multisig"] and "refuse_panics" not in g21["program_state"] and "incremental_root" not in g21["tokens"],
+     and "max_accounts" not in g21["multisig"] and "refuse_panics" not in g21["program_state"] and "incremental_root" not in g21["tokens"]
+     and "reference_block_window" not in g21["program_state"] and "beacon" not in g21,
      "CHAIN21_GENESIS is not chain 21's (chain id 21 with fees, perps, multisig and hc_auth_multisig; none of the fields chain 22 adds)")
 b21 = g21["bridge"]
 need({c: E[f"C21_EMITTER_{c}"] for c in "2345"} == b21["emitters"], "C21_EMITTER_* are not deploy/genesis-chain21.json's emitters")
@@ -1235,12 +1378,32 @@ if not E.get("PERPS_SKIPPED"):
 else:
     need(not os.path.isfile(perps_file), "PERPS_SKIPPED yet a perps section is present ($TMP/perps.json) — the genesis-root step ran")
 
+# ── the new block context and beacon (#168 / #184, #189), spliced: `rand-node genesis` refuses the
+# window on the base file (no bridge, no perps yet: unbounded block time), and the beacon needs it ─
+beacon_file = os.path.join(E["TMP"], "beacon.json")
+ctx_skipped = bool(E.get("BLOCK_CONTEXT_SKIPPED"))
+need("reference_block_window" not in g.get("program_state", {}) and "beacon" not in g,
+     "the base file already has program_state.reference_block_window or a beacon section — this script splices both")
+if ctx_skipped:
+    need(not os.path.isfile(beacon_file), "BLOCK_CONTEXT_SKIPPED yet a beacon section is present ($TMP/beacon.json) — the beacon step ran")
+    warnings.append("BLOCK CONTEXT SKIPPED — no program_state.reference_block_window and no beacon (a build without #184 / #189); "
+                    "the real cut refuses such a build; this file is NOT what chain 22 will be")
+else:
+    rbw = E.get("REFERENCE_BLOCK_WINDOW", "")
+    need(rbw, "the beacon needs program_state.reference_block_window — REFERENCE_BLOCK_WINDOW is empty (OPEN 9)")
+    need(os.path.isfile(beacon_file), "no beacon section to splice ($TMP/beacon.json) — the beacon step did not run")
+    need(rbw.isdigit() and 256 <= int(rbw) <= 4096, f"REFERENCE_BLOCK_WINDOW {rbw!r} is not in 256..=4096 (OPEN 9)")
+    need("program_state" in g, "no program_state section to carry reference_block_window — --program-state-cell-fee did not take")
+    g["program_state"]["reference_block_window"] = int(rbw)
+    g["beacon"] = json.load(open(beacon_file))
+
 order = ["chain_id", "timestamp_ms", "validators", "alloc", "faucet", "confidential", "fri_profile",
          "hc_bundle", "bridge", "tokens", "aggregation", "consensus_domain", "staking", "epoch_blocks",
          "max_program_words", "max_proof_bytes", "max_block_bytes", "max_call_envelope_bytes",
          "max_program_public_words", "envelope_bytes", "vesting", "hardening_v6", "hc_auth", "gas",
          "testnet", "binding_domain", "proof_window_blocks", "program_state", "fees", "perps", "multisig",
-         "hc_auth_multisig"]   # Genesis's last field (712c6336): a file that has it lists it last
+         "hc_auth_multisig",   # 712c6336
+         "beacon"]             # Genesis's last field (PR #189): a file that has it lists it last
 unknown = [k for k in g if k not in order]
 need(not unknown, f"the genesis command wrote fields this script does not know: {unknown}")
 g = {k: g[k] for k in order if k in g}
@@ -1387,6 +1550,8 @@ need(g.get("proof_window_blocks") == int(E["PROOF_WINDOW_BLOCKS"]) == 1024, f"pr
 # program_state: chain 21's cell fee, plus the new refuse_panics (PST-1) unless AUDIT_V10_SKIPPED
 need(E["PROGRAM_STATE_REFUSE_PANICS"] == "true", f"PROGRAM_STATE_REFUSE_PANICS is {E['PROGRAM_STATE_REFUSE_PANICS']!r}, not the decided true (PST-1)")
 want_ps = {"cell_fee": int(E["PROGRAM_STATE_CELL_FEE"])} if v10_skipped else {"cell_fee": int(E["PROGRAM_STATE_CELL_FEE"]), "refuse_panics": True}
+if not ctx_skipped:
+    want_ps["reference_block_window"] = int(E["REFERENCE_BLOCK_WINDOW"])   # spliced above (#168)
 need(same_json(g.get("program_state"), want_ps),
      f"program_state is {g.get('program_state')!r}, not {want_ps!r} — --program-state-cell-fee"
      f"{'' if v10_skipped else ' / --program-state-refuse-panics'} did not take")
@@ -1397,6 +1562,34 @@ need(int(E["PROGRAM_STATE_CELL_FEE"]) == 10000000 == g21["program_state"]["cell_
 need(E["TOKENS_INCREMENTAL_ROOT"] == "true", f"TOKENS_INCREMENTAL_ROOT is {E['TOKENS_INCREMENTAL_ROOT']!r}, not the recommended true")
 need(g["tokens"].get("incremental_root") is True,
      f"tokens.incremental_root is {g['tokens'].get('incremental_root')!r}, not true — --tokens-incremental-root did not take")
+# the block context (#168) and the beacon (#189), on the finished file
+ps_now = g.get("program_state") or {}
+bc = g.get("beacon")
+if ctx_skipped:
+    need("reference_block_window" not in ps_now and bc is None, "BLOCK_CONTEXT_SKIPPED yet the window or the beacon is present")
+else:
+    w = ps_now.get("reference_block_window")
+    need(type(w) is int and str(w) == E["REFERENCE_BLOCK_WINDOW"] and 256 <= w <= 4096,
+         f"program_state.reference_block_window is {w!r}, not REFERENCE_BLOCK_WINDOW {E['REFERENCE_BLOCK_WINDOW']!r} in 256..=4096 (OPEN 9)")
+    need(list(ps_now)[-1] == "reference_block_window" and list(ps_now)[0] == "cell_fee",
+         f"program_state lists {list(ps_now)}, not ProgramStateConfig's order (cell_fee, refuse_panics, reference_block_window)")
+    need(g.get("bridge") is not None or g.get("perps") is not None,
+         "program_state.reference_block_window needs bounded block time: a bridge or a perps section (Genesis::validate)")
+    need(bc is not None, "no beacon section in the finished file — the splice did not take")
+    need(list(g)[-1] == "beacon", f"the beacon section is not the file's last field: {list(g)[-3:]}")
+    need(list(bc) == ["commit_delay_blocks", "commitments"], f"the beacon section lists {list(bc)}, not BeaconConfig's (commit_delay_blocks, commitments)")
+    bd = bc["commit_delay_blocks"]
+    need(type(bd) is int and str(bd) == E["BEACON_COMMIT_DELAY_BLOCKS"] and 1 <= bd <= 1 << 20,
+         f"beacon.commit_delay_blocks is {bd!r}, not BEACON_COMMIT_DELAY_BLOCKS {E['BEACON_COMMIT_DELAY_BLOCKS']!r} in 1..=1048576 (OPEN 10)")
+    cm = bc["commitments"]
+    need(isinstance(cm, list) and len(cm) == len(g["validators"]) == 26, f"the beacon lists {len(cm) if isinstance(cm, list) else cm!r} commitments for {len(g['validators'])} validators — exactly one each")
+    need(all(list(c) == ["validator", "commitment"] and re.fullmatch(r"[0-9a-f]{64}", str(c["commitment"])) for c in cm),
+         "a beacon commitment is not {validator, commitment: 64 lowercase hex}")
+    need(len({c["validator"] for c in cm}) == len(cm) and len({c["commitment"] for c in cm}) == len(cm), "a beacon validator or commitment twice")
+    want_bc = json.load(open(beacon_file))
+    need(same_json(bc, want_bc), "the beacon section is not the file this cut wrote ($TMP/beacon.json: BEACON_TSV joined with the validators, in validator order)")
+    need([c["validator"] for c in cm] == [v["address"] for v in json.load(open(os.path.join(E["TMP"], "validators.json")))]
+         or E.get("FIXTURE_ADDRESSES_OK") == "1", "the beacon's validators are not the chain-22 validators in order")
 # the gas section: chain 21's, its ceilings and paying byte load included
 need(g.get("gas") is not None, "the gas section is missing — --gas-price did not take")
 gas = g["gas"]
@@ -1465,7 +1658,7 @@ need(g["max_block_bytes"] >= 3 * g["max_proof_bytes"] + 1048576,
 # backings' `locked`, the faucet lists, the treasury (salt, balance) and the new fields (asserted at
 # their values above), every byte is chain 21's: gas, staking, bridge, tokens, perps, multisig and
 # program_state are compared on their own lines below, the new fields taken out.
-excused = {"chain_id", "timestamp_ms", "alloc", "bridge", "tokens", "staking", "gas", "perps", "multisig", "program_state"}
+excused = {"chain_id", "timestamp_ms", "alloc", "bridge", "tokens", "staking", "gas", "perps", "multisig", "program_state", "beacon"}
 if E.get("LIMITS_CHANGED"):
     excused |= {"max_program_words", "max_proof_bytes", "max_block_bytes", "max_call_envelope_bytes", "max_program_public_words"}
 moved = sorted(k for k in set(g) | set(g21) if k not in excused and g.get(k) != g21.get(k))
@@ -1489,8 +1682,8 @@ if perps is not None:
     skip = V10_FIELDS + ("genesis_root",)
     need(same_json({k: v for k, v in perps.items() if k not in skip}, {k: v for k, v in p21.items() if k not in skip}),
          f"perps differs from chain 21's in more than the new fields: {sorted(k for k in set(perps) | set(p21) if k not in skip and not same_json(perps.get(k), p21.get(k)))}")
-need(same_json({k: v for k, v in g["program_state"].items() if k != "refuse_panics"}, g21["program_state"]),
-     "program_state differs from chain 21's in more than refuse_panics")
+need(same_json({k: v for k, v in g["program_state"].items() if k not in ("refuse_panics", "reference_block_window")}, g21["program_state"]),
+     "program_state differs from chain 21's in more than refuse_panics and reference_block_window")
 need(ms["create_fee"] == g21["multisig"]["create_fee"] and set(ms) - {"max_accounts"} == set(g21["multisig"])
      and set(a) == set(a21) and a["threshold"] == a21["threshold"],
      "multisig differs from chain 21's in more than max_accounts and the treasury's salt, balance (and, knowingly, signers)")
@@ -1520,7 +1713,10 @@ if ms:
     print(f"cut-chain22: multisig: create fee {fmt(int(ms['create_fee']))} RAND, max_accounts {ms.get('max_accounts', 'SKIPPED')}; the treasury 2 of 3 "
           f"(chain 21's signers{'' if a['signers'] == a21['signers'] else ' — CHANGED'}), {fmt(treasury_units)} RAND NEW ISSUANCE "
           f"(not carried: Σ RAND notes {fmt(alloc_total)} == Σ scanned is the carry); issued at genesis: notes + stakes + treasury = {fmt(issued_total)} RAND")
-print("cut-chain22: zUSD locked per backing: " + (", ".join(f"{b['chain']}:{b['token'][-8:]}={b['locked']}" for b in backings if b.get("locked")) or "none"))
+if bc:
+    print(f"cut-chain22: block context: program_state.reference_block_window {ps_now['reference_block_window']} (#168, OPEN 9); "
+          f"beacon: commit_delay_blocks {bc['commit_delay_blocks']} (OPEN 10), {len(bc['commitments'])} commitments, one per validator, the section last (#189)")
+print("cut-chain22: zUSD locked per backing: " +(", ".join(f"{b['chain']}:{b['token'][-8:]}={b['locked']}" for b in backings if b.get("locked")) or "none"))
 for w in warnings:
     print(f"cut-chain22: ⚠ {w}")
 PY
@@ -1533,7 +1729,10 @@ PY
 # `perps.max_window_heights` and `perps.max_pending_digests` together (the last two are refused
 # without the first), with `perps.max_window_heights` at another value in range (it cannot be
 # dropped alone), without `perps.engine_program_log_height`, without `perps.max_pending_digests`,
-# and without `tokens.incremental_root`. Each must hash
+# and without `tokens.incremental_root`; and (#168 / #189) without `program_state.reference_block_window`
+# and the beacon together (the beacon is refused without the window), with the window at another
+# value in range, without the beacon alone, with `beacon.commit_delay_blocks` at another value, and
+# with each one commitment changed (26 variants). Each must hash
 # differently. A build that parses a field but leaves it out of the hash would launch a chain
 # without that rule. Chain 21's fields are compared equal to deploy/genesis-chain21.json, whose hash
 # this same rand-node re-derives (ca76c276…) — chain 21's own cut probed its sections. A field the
@@ -1577,6 +1776,28 @@ if "max_pending_digests" in p:
     variant("perps.max_pending_digests", ["perps", "max_pending_digests"])
 if "incremental_root" in g["tokens"]:
     variant("tokens.incremental_root", ["tokens", "incremental_root"])
+# #168 / #189: without the window (and so without the beacon, which the node refuses without it),
+# the window at another value, without the beacon alone, the delay at another value, and EACH ONE
+# commitment changed (to a value no other validator holds): every one must move the hash.
+ps = g.get("program_state") or {}
+if "reference_block_window" in ps:
+    variant("program_state.reference_block_window" + ("+beacon" if "beacon" in g else ""),
+            ["program_state", "reference_block_window"], *([["beacon"]] if "beacon" in g else []))
+    w = ps["reference_block_window"]
+    variant("program_state.reference_block_window=" + str(w + 1 if w < 4096 else w - 1), ["program_state", "reference_block_window"],
+            set_to=w + 1 if w < 4096 else w - 1)
+if "beacon" in g:
+    b = g["beacon"]
+    variant("beacon", ["beacon"])
+    bd = b["commit_delay_blocks"]
+    variant("beacon.commit_delay_blocks=" + str(bd + 1 if bd < 1 << 20 else bd - 1), ["beacon", "commit_delay_blocks"],
+            set_to=bd + 1 if bd < 1 << 20 else bd - 1)
+    held = {c["commitment"] for c in b["commitments"]}
+    for i, c in enumerate(b["commitments"]):
+        other = c["commitment"]
+        while other in held:   # flip the last nibble until no validator holds it
+            other = other[:-1] + "0123456789abcdef"[(int(other[-1], 16) + 1) % 16]
+        variant(f"beacon.commitments.{i:02d}", ["beacon", "commitments", i, "commitment"], set_to=other)
 open(os.path.join(d, "count"), "w").write(str(n))
 PY
 }
@@ -1585,6 +1806,7 @@ probe_fields() {   # <finished genesis> <its hash>
   local f name h ok=0 want
   [ -z "${PERPS_SKIPPED:-}" ] || echo "cut-chain22: ⚠ field probe of the perps fields SKIPPED — PERPS SKIPPED, the file has no perps section (DRY_RUN)" >&2
   [ -z "${AUDIT_V10_SKIPPED:-}" ] || echo "cut-chain22: ⚠ field probe of refuse_panics, max_accounts and the perps fields SKIPPED — AUDIT_V10 SKIPPED (DRY_RUN)" >&2
+  [ -z "${BLOCK_CONTEXT_SKIPPED:-}" ] || echo "cut-chain22: ⚠ field probe of reference_block_window and the beacon SKIPPED — BLOCK CONTEXT SKIPPED (DRY_RUN)" >&2
   py_variants
   want=$(cat "$TMP/variants/count")
   for f in "$TMP"/variants/*.json; do
@@ -1600,25 +1822,31 @@ probe_fields() {   # <finished genesis> <its hash>
     ok=$((ok + 1))
   done
   [ "$ok" -eq "$want" ] || { echo "cut-chain22: the field probe ran $ok variant(s), expected $want" >&2; exit 1; }
-  [ -n "${PERPS_SKIPPED:-}${AUDIT_V10_SKIPPED:-}" ] || [ "$ok" -eq 8 ] \
-    || { echo "cut-chain22: the field probe ran $ok variant(s), expected 8 (program_state.refuse_panics, multisig.max_accounts, perps.bound_payouts, perps.sparse_windows+max_window_heights+max_pending_digests, perps.max_window_heights at another value, perps.engine_program_log_height, perps.max_pending_digests, tokens.incremental_root)" >&2; exit 1; }
+  # The full set: the audit-v10 eight, plus (#168 / #189) the window with the beacon, the window at
+  # another value, the beacon, its delay at another value, and one per commitment (26).
+  local full=$((8 + 4 + 26))
+  [ -n "${PERPS_SKIPPED:-}${AUDIT_V10_SKIPPED:-}${BLOCK_CONTEXT_SKIPPED:-}" ] || [ "$ok" -eq "$full" ] \
+    || { echo "cut-chain22: the field probe ran $ok variant(s), expected $full (program_state.refuse_panics, multisig.max_accounts, perps.bound_payouts, perps.sparse_windows+max_window_heights+max_pending_digests, perps.max_window_heights at another value, perps.engine_program_log_height, perps.max_pending_digests, tokens.incremental_root; program_state.reference_block_window+beacon, the window at another value, beacon, beacon.commit_delay_blocks at another value, and each of the 26 commitments changed)" >&2; exit 1; }
   echo "cut-chain22: the new fields ($ok variants probed) are part of this rand-node's genesis hash"
 }
 
 # ══ check-limits: what a chain-22 node serves (after launch; DRY_RUN runs it on a loopback node) ═
 py_check_limits() {
   python3 - <<'PY'
-import json, os, sys, urllib.request
+import json, os, re, sys, urllib.request
 E = os.environ
 url, gen = E["CHECK_RPC"], json.load(open(E["CHECK_GENESIS"]))
-def rpc(method, params=None):
+def rpc_maybe(method, params=None):   # (result, None) or (None, the error object)
     req = urllib.request.Request(url, json.dumps({"jsonrpc": "2.0", "id": 1, "method": method, "params": params or []}).encode(),
                                  {"content-type": "application/json", "user-agent": "rand-cut-chain22/1"})
     with urllib.request.urlopen(req, timeout=20) as r:
         out = json.load(r)
-    if "error" in out:
-        sys.exit(f"check-limits: {method}: {out['error']}")
-    return out["result"]
+    return (None, out["error"]) if "error" in out else (out["result"], None)
+def rpc(method, params=None):
+    res, err = rpc_maybe(method, params)
+    if err is not None:
+        sys.exit(f"check-limits: {method}: {err}")
+    return res
 bad = []
 def want(what, got, exp):
     # JSON-typed comparison: Python's == would take 1 for true and 1.0 for 1
@@ -1719,6 +1947,56 @@ if gen["program_state"].get("refuse_panics") is True:
     print("check-limits:   program_state.refuse_panics (PST-1)    not served — held by the genesis hash above (field-probed at the cut)")
 else:
     print("check-limits:   ⚠ program_state.refuse_panics ABSENT from the genesis file (AUDIT_V10 SKIPPED) — a real chain-22 genesis has it")
+# #168 / #189: the window and the beacon, read back where the node serves them. Skipped-ness is the
+# genesis file's (a DRY_RUN that skipped BLOCK CONTEXT), never the environment's.
+gw = gen["program_state"].get("reference_block_window", 0)
+gb = gen.get("beacon")
+if not gw:
+    print("check-limits:   ⚠ program_state.reference_block_window and the beacon ABSENT from the genesis file (BLOCK CONTEXT SKIPPED) — a real chain-22 genesis has both")
+want("program_state.reference_block_window (#168)", ps.get("reference_block_window"), gw or None)
+want("program_state.beacon_commit_delay_blocks (#189)", ps.get("beacon_commit_delay_blocks"), gb["commit_delay_blocks"] if gb else None)
+C, cerr = rpc_maybe("rand_getBlockContext")
+if not gw:
+    want("rand_getBlockContext (SKIPPED: absent)", C, {"enabled": False})
+elif cerr is not None:
+    if cerr.get("code") == -32001:
+        print("check-limits:   rand_getBlockContext                 no block has closed yet (-32001) — the window is read from rand_getLimits alone; re-run after block 1")
+    else:
+        want("rand_getBlockContext", cerr, "a result")
+else:
+    want("block context enabled", C.get("enabled"), True)
+    want("block context window (#168)", C.get("window"), gw)
+    want("block context chain_id", C.get("chain_id"), int(gen["chain_id"]))
+    want("block context context_version", C.get("context_version"), 2)
+    want("block context has_randomness (the beacon)", C.get("has_randomness"), gb is not None)
+Bk = rpc("rand_getBeacon")
+if gb is None:
+    want("rand_getBeacon (SKIPPED: absent)", Bk, {"enabled": False})
+else:
+    want("beacon enabled (#189)", Bk.get("enabled"), True)
+    want("beacon commit_delay_blocks", Bk.get("commit_delay_blocks"), gb["commit_delay_blocks"])
+    want("beacon value (64 hex)", bool(re.fullmatch(r"[0-9a-f]{64}", str(Bk.get("value")))), True)
+    bh = Bk.get("height") if isinstance(Bk.get("height"), int) else -1
+    rows = {r.get("validator"): r for r in (Bk.get("validators") or [])}
+    gc = {c["validator"]: c["commitment"] for c in gb["commitments"]}
+    want("beacon validators (the genesis list)", sorted(rows), sorted(gc))
+    # At height 0 every commitment is the genesis one, exactly. A validator that has proposed since
+    # holds its last reveal instead (the node checked L(reveal) = the old commitment; BLAKE3 is not
+    # in this script's Python): accepted only above height 0, for at most `height` validators.
+    moved = []
+    for v, c in gc.items():
+        r = rows.get(v) or {}
+        cur = r.get("commitment")
+        proposed = bh > 0 and isinstance(cur, str) and cur != c and re.fullmatch(r"[0-9a-f]{64}", cur) is not None
+        if proposed:
+            moved.append(v)
+        want(f"beacon {v[:12]}…" + (" (proposed since)" if proposed else ""),
+             {"commitment": c if proposed else cur, "nonce": r.get("nonce"), "pending": r.get("pending"), "due = commitment": cur is not None and r.get("due") == cur},
+             {"commitment": c, "nonce": 0, "pending": None, "due = commitment": True})
+    want(f"beacon commitments moved since genesis (≤ height {bh})", len(moved) <= max(bh, 0), True)
+    want("beacon commitments distinct", len({r.get("commitment") for r in rows.values()}) == len(rows), True)
+    print(f"check-limits:   beacon at height {bh}: {len(gc) - len(moved)} of {len(gc)} commitments read back exactly as the genesis lists them"
+          + (f", {len(moved)} moved to their last reveal (proposed since)" if moved else ""))
 T = rpc("rand_getTokens", [0, 1])
 want("tokens incremental_root (TOK-1)", T.get("incremental_root"), gen["tokens"].get("incremental_root", False))
 want("tokens bound_note_value", T.get("bound_note_value"), gen["tokens"].get("bound_note_value", False))
@@ -1770,6 +2048,50 @@ constraint-set-row: $2
 EOF
 }
 
+# Each validator's address as its public key derives it (the address the node checks the beacon
+# section against): `rand-node admit sign --candidate <public key hex>` prints "… votes to admit
+# <address> …" on stderr. It signs a vote under a THROWAWAY key over an all-zero genesis hash and
+# submits nothing (the vote is good on no chain). $TMP/validators.json → $TMP/derived-addresses.tsv.
+derive_validator_addresses() {
+  local name pk a zero
+  zero=$(printf '0%.0s' $(seq 64))
+  "$NODE" keygen --out "$TMP/address-probe.key.json" >/dev/null
+  : > "$TMP/derived-addresses.tsv"
+  while read -r name pk; do
+    a=$("$NODE" admit sign --candidate "$pk" --key "$TMP/address-probe.key.json" --genesis-hash "$zero" 2>&1 >/dev/null \
+          | sed -n 's/.* votes to admit \([1-9A-HJ-NP-Za-km-z]\{32,64\}\) on the chain.*/\1/p' | head -1 || true)
+    [ -n "$a" ] || { echo "cut-chain22: $NODE admit sign printed no address for $name's public key — cannot derive the beacon's addresses" >&2; exit 1; }
+    printf '%s\t%s\n' "$name" "$a" >> "$TMP/derived-addresses.tsv"
+  done < <(python3 -c 'import json,sys; [print(v["name"], v["public_key"]) for v in json.load(open(sys.argv[1]))]' "$TMP/validators.json")
+  rm -f "$TMP/address-probe.key.json"
+}
+
+# Append the block context, the beacon and the operator procedure to the cut record: the owner
+# values to confirm (OPEN 9, 10) and one `beacon-commitment: <name> <address> <hex>` per validator
+# (<beacon-record.txt>, py_beacon's). Once: a record that already holds these exact lines is left.
+record_beacon() {   # <cut record> <window> <delay> <beacon-record.txt>
+  if grep -qxF "reference-block-window: $2" "$1" && grep -qxF "beacon-commit-delay-blocks: $3" "$1" \
+     && ! grep -vxFf "$1" "$4" | grep -q .; then return 0; fi
+  [ -z "$(tail -c1 "$1")" ] || echo >> "$1"
+  {
+    cat <<EOF
+# OWNER VALUES TO CONFIRM (written by the cut; OPEN 9, OPEN 10): EVM block context (#168) and the
+# randomness beacon (#189) — carried by the owner's decision of 2026-11-18, the values defaulted.
+reference-block-window: $2
+beacon-commit-delay-blocks: $3
+# The beacon commitments, one per validator, as each validator's operator sent it. PROCEDURE: each
+# validator operator runs \`rand-node beacon init --datadir <its datadir> --key <its node key>
+# --chain-id $CHAIN_ID\` ON ITS OWN HOST and sends ONLY the printed commitment; nobody else ever
+# holds a seed (never copy beacon.seed.json between hosts); each keeps an OFFLINE, ENCRYPTED
+# backup of beacon.seed.json, for restoring onto the same validator only (the owner accepted
+# total seed loss — which halts the chain — as an operational risk covered by these backups,
+# 2026-11-18). Before its node starts, each host runs deploy/check-beacon-seed.sh --genesis
+# <this genesis> --datadir <datadir> --key <node key>, and after the start the same with --rpc.
+EOF
+    cat "$4"
+  } >> "$1"
+}
+
 check_limits() {   # <rpc url> <genesis file>
   local h d tid bset rc=0
   [ -f "$2" ] || { echo "check-limits: $2 is not a file" >&2; exit 1; }
@@ -1785,6 +2107,10 @@ check_limits() {   # <rpc url> <genesis file>
   echo "check-limits: the constraint-set row (issue #166), chain $CHAIN_ID, genesis $h:"
   [ -n "$bset" ] || echo "check-limits:   ⚠ $NODE's init wrote no constraint-set marker (a build before the guard): the binary's own set is NOT checked against the row"
   deploy/check-constraint-set.sh --chain "$CHAIN_ID" --genesis-hash "$h" ${bset:+--binary-set "$bset"} || rc=1
+  # The beacon seeds are on the validator hosts, not here: this reads one RPC. Each host's own
+  # check is deploy/check-beacon-seed.sh (the cutover's start gate).
+  ! python3 -c 'import json,sys; sys.exit(0 if json.load(open(sys.argv[1])).get("beacon") else 1)' "$2" \
+    || echo "check-limits: the beacon seeds are NOT checked here — each validator host runs deploy/check-beacon-seed.sh --genesis $2 --datadir <datadir> --key <node key> [--rpc 127.0.0.1:8545]"
   [ "$rc" = 0 ] || echo "check-limits: REFUSED — see above" >&2
   return "$rc"
 }
@@ -1872,7 +2198,8 @@ holder = payouts[len(rand_notes)] if dry else "rand1SELFTESTz"
 open(f"{st}/zusd-carry.txt", "w").write("".join(f"holder {holder} {fmt(n['amount'], 8)}\n" for n in zusd_notes))
 # A filled cut record (the fixture's — the real one is the operator's, published before the cut).
 open(f"{st}/cut-record.txt", "w").write(
-    "chain-id: 22\nreason: audit v11 gated fields — PST-1 refuse_panics, PERP-6 bound_payouts, PERP-101 sparse windows, CON-60, CON-601 validator memory for the tier-18 key build (fixture), MSA-4 max_accounts\n"
+    "chain-id: 22\nreason: audit v11 gated fields — PST-1 refuse_panics, PERP-6 bound_payouts, PERP-101 sparse windows, CON-60, CON-601 validator memory for the tier-18 key build (fixture), MSA-4 max_accounts; "
+    "#168 block context (reference_block_window) and #189 the randomness beacon\n"
     "carries: fixture register, bridge state, balances and the treasury signers (new issuance)\n"
     "drops: fixture: chain 21's multisig register (the treasury vault)\nclients: fixture: none\n"
     "second-operator: fixture\nrollback: fixture: keep chain 21 dirs and *.pre-c22 binaries a day\n")
@@ -1880,8 +2207,17 @@ open(f"{st}/cut-record.txt", "w").write(
 open(f"{st}/treasury.txt", "w").write(f"# {'dry run' if dry else 'selftest'} treasury: chain 21's signers, PLACEHOLDER balance (OPEN 3)\n"
                                       + "".join(f"signer s{i} {pk}\n" for i, pk in enumerate(a21["signers"], 1))
                                       + "threshold 2\nbalance 100000\n")
+# The beacon commitments (#189), one per validator name: PLACEHOLDERS — the real ones come from each
+# validator's own `rand-node beacon init` (fixed in the selftest, fresh random in the dry run).
+import hashlib, secrets
+open(f"{st}/beacon.tsv", "w").write(f"# {'dry run' if dry else 'selftest'}: PLACEHOLDER commitments, opened by no seed\n" + "".join(
+    f"{n}\t{secrets.token_hex(32) if dry else hashlib.sha256(('beacon-' + n).encode()).hexdigest()}\n" for n in names))
 if dry:
     raise SystemExit(0)
+# The validators' key-derived addresses (the cut asks the node; the fixture's are the listed ones).
+with open(f"{st}/tmp/derived-addresses.tsv", "w") as f:
+    for n in names:
+        f.write(f"{n}\t{addr[n]}\n")
 # The perps section the cut writes after the genesis-root step (a fixture root).
 d = json.loads(E["PERPS_JSON"])
 v10 = json.loads(E["PERPS_V10_JSON"])
@@ -1926,7 +2262,10 @@ answers, portfile = sys.argv[1], sys.argv[2]
 class H(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         req = json.loads(self.rfile.read(int(self.headers["content-length"])))
-        body = json.dumps({"jsonrpc": "2.0", "id": 1, "result": json.load(open(answers)).get(req["method"])}).encode()
+        ans = json.load(open(answers)).get(req["method"])
+        # {"__error__": {...}} answers as a JSON-RPC error (rand_getBlockContext before block 1)
+        out = {"error": ans["__error__"]} if isinstance(ans, dict) and "__error__" in ans else {"result": ans}
+        body = json.dumps({"jsonrpc": "2.0", "id": 1, **out}).encode()
         self.send_response(200); self.send_header("content-type", "application/json"); self.end_headers(); self.wfile.write(body)
     def log_message(self, *a): pass
 with socketserver.TCPServer(("127.0.0.1", 0), H) as s:
@@ -1967,6 +2306,20 @@ if [ "${SELFTEST:-}" = 1 ]; then
     ok "the fixture treasury (chain 21's signers) parses: $(grep -o 'treasury: .*' "$ST/log" | head -1 | cut -c1-110)"
   else bad "the fixture treasury: $(tail -2 "$ST/log")"; fi
   python3 -c 'import json,sys; b=json.load(open(sys.argv[1])); b["multisig"]=json.load(open(sys.argv[2])); json.dump(b, open(sys.argv[1],"w"))' "$ST/base.json" "$ST/tmp/multisig.json"
+  # The beacon (#189): py_beacon joins the fixture BEACON_TSV with the validators → $TMP/beacon.json.
+  export BEACON_TSV=$ST/beacon.tsv
+  if py_validators >/dev/null && py_beacon >"$ST/log" 2>&1 && grep -q '26 commitments' "$ST/log" \
+     && python3 - "$ST/tmp/beacon.json" "$ST/tmp/validators.json" "$ST/beacon.tsv" "$ST/tmp/beacon-record.txt" <<'PY'
+import json, sys
+b, v = json.load(open(sys.argv[1])), json.load(open(sys.argv[2]))
+t = dict(l.split() for l in open(sys.argv[3]) if l.strip() and not l.startswith("#"))
+assert list(b) == ["commit_delay_blocks", "commitments"] and b["commit_delay_blocks"] == 256
+assert [c["validator"] for c in b["commitments"]] == [x["address"] for x in v]
+assert [c["commitment"] for c in b["commitments"]] == [t[x["name"]] for x in v]
+assert open(sys.argv[4]).read().splitlines() == [f"beacon-commitment: {x['name']} {x['address']} {t[x['name']]}" for x in v]
+PY
+  then ok "the fixture BEACON_TSV joins by name with the 26 validators: one commitment each, in validator order, delay 256, the record lines written"
+  else bad "the fixture beacon: $(tail -2 "$ST/log")"; fi
 
   fresh
   if py_validators && py_splice; then
@@ -1976,7 +2329,8 @@ E = os.environ
 g = json.load(open(E["OUT"]))
 g21 = json.load(open(E["CHAIN21_GENESIS"]))
 assert g["chain_id"] == 22 and g["hc_auth"] == g21["hc_auth"] and g["hc_bundle"] == g21["hc_bundle"]
-assert list(g) == list(g21), "every key chain 21 has, in chain 21's order — and no other"
+assert list(g) == list(g21) + ["beacon"], "every key chain 21 has, in chain 21's order — and the beacon, last"
+assert g["beacon"] == json.load(open(E["TMP"] + "/beacon.json")) and len(g["beacon"]["commitments"]) == 26 and g["beacon"]["commit_delay_blocks"] == 256
 assert g["fees"] == g21["fees"] == {"burn_base": True, "burn_floor": True}
 assert g["hc_auth_multisig"] == g21["hc_auth_multisig"] == "9705f8e2f1bc8561848b29cb8efd57c37e3e39788fa58a5f03304d8019668247" != g["hc_auth"]
 p = g["perps"]
@@ -1992,7 +2346,8 @@ m = g["multisig"]
 assert list(m) == ["create_fee", "accounts", "max_accounts"] and m["create_fee"] == g21["multisig"]["create_fee"] == "1000000000" and m["max_accounts"] == 1
 a, a21 = m["accounts"][0], g21["multisig"]["accounts"][0]
 assert a["threshold"] == 2 and a["signers"] == a21["signers"] and a["balance"] == str(100000 * 10**9) and a["salt"] == "5a" * 32 != a21["salt"]
-assert g["program_state"] == {"cell_fee": 10000000, "refuse_panics": True}
+assert g["program_state"] == {"cell_fee": 10000000, "refuse_panics": True, "reference_block_window": 256}
+assert list(g["program_state"]) == ["cell_fee", "refuse_panics", "reference_block_window"]
 assert g["tokens"] == {**g21["tokens"], "incremental_root": True}
 assert g["testnet"] is True and g["binding_domain"] == 1 and g["proof_window_blocks"] == 1024
 assert (g["max_proof_bytes"], g["max_block_bytes"]) == (g21["max_proof_bytes"], g21["max_block_bytes"]) == (6291456, 19922944)
@@ -2010,21 +2365,37 @@ assert sum(n["amount"] for n in g["alloc"] if n["opening"].get("asset", 0) == 0)
 assert sum(n["amount"] for n in g["alloc"] if n["opening"].get("asset", 0) == 1) == 10000199900
 assert all(sum(len(v) // 2 for v in n["envelope"].values()) == 1860 for n in g["alloc"])
 PY
-    then ok "the chain-21 fixture assembles into a chain-22 genesis: chain 21's keys in chain 21's order and every section chain 21's, plus program_state.refuse_panics true (PST-1), perps bound_payouts true (PERP-6), sparse_windows true + max_window_heights 256 (PERP-101), engine_program_log_height 14 (CON-60), max_pending_digests 65536 (PERP-5), no initial_collateral, multisig.max_accounts 1 (MSA-4), tokens.incremental_root true; the treasury chain 21's signers, fresh salt, 100000 RAND new issuance; floors 3/5/3/7, burn sequence 14, 100.001999 zUSD locked on four backings"; else bad "assembled genesis content"; fi
+    then ok "the chain-21 fixture assembles into a chain-22 genesis: chain 21's keys in chain 21's order and every section chain 21's, plus program_state.refuse_panics true (PST-1), perps bound_payouts true (PERP-6), sparse_windows true + max_window_heights 256 (PERP-101), engine_program_log_height 14 (CON-60), max_pending_digests 65536 (PERP-5), no initial_collateral, multisig.max_accounts 1 (MSA-4), tokens.incremental_root true, program_state.reference_block_window 256 (#168), the beacon last with 26 commitments and delay 256 (#189); the treasury chain 21's signers, fresh salt, 100000 RAND new issuance; floors 3/5/3/7, burn sequence 14, 100.001999 zUSD locked on four backings"; else bad "assembled genesis content"; fi
   else bad "the happy path refused"; fi
   cp "$ST/out.json" "$ST/good.json"
 
-  export -f py_validators py_splice py_treasury py_variants
-  # The field probe's variants (the probe itself needs a rand-node: DRY_RUN runs it): eight on the
-  # finished file, each a different file, each still with chain 21's other fields.
+  export -f py_validators py_splice py_treasury py_variants py_beacon
+  # The field probe's variants (the probe itself needs a rand-node: DRY_RUN runs it): 38 on the
+  # finished file — the audit-v10 eight, the window (+ beacon) and the window at 257, the beacon and
+  # its delay at 257, each of the 26 commitments changed — each a different file, each still with
+  # chain 21's other fields.
   rm -rf "$ST/vtmp"; mkdir -p "$ST/vtmp"
-  if OUT=$ST/good.json TMP=$ST/vtmp bash -c py_variants && [ "$(cat "$ST/vtmp/variants/count")" = 8 ] \
+  if OUT=$ST/good.json TMP=$ST/vtmp bash -c py_variants && [ "$(cat "$ST/vtmp/variants/count")" = 38 ] \
      && python3 - "$ST/vtmp/variants" "$ST/good.json" <<'PY'
 import glob, json, os, sys
 d, g = sys.argv[1], json.load(open(sys.argv[2]))
 names = sorted(os.path.basename(f)[:-5] for f in glob.glob(d + "/*.json"))
 assert names == sorted(["program_state.refuse_panics", "multisig.max_accounts", "perps.bound_payouts", "perps.sparse_windows+max_window_heights+max_pending_digests",
-                        "perps.max_window_heights=257", "perps.engine_program_log_height", "perps.max_pending_digests", "tokens.incremental_root"]), names
+                        "perps.max_window_heights=257", "perps.engine_program_log_height", "perps.max_pending_digests", "tokens.incremental_root",
+                        "program_state.reference_block_window+beacon", "program_state.reference_block_window=257", "beacon", "beacon.commit_delay_blocks=257"]
+                       + [f"beacon.commitments.{i:02d}" for i in range(26)]), names
+v = json.load(open(d + "/program_state.reference_block_window+beacon.json"))
+assert "reference_block_window" not in v["program_state"] and "beacon" not in v and v["program_state"]["refuse_panics"] is True
+v = json.load(open(d + "/beacon.json"))
+assert "beacon" not in v and v["program_state"]["reference_block_window"] == 256
+assert json.load(open(d + "/program_state.reference_block_window=257.json"))["program_state"]["reference_block_window"] == 257
+assert json.load(open(d + "/beacon.commit_delay_blocks=257.json"))["beacon"]["commit_delay_blocks"] == 257
+held = [c["commitment"] for c in g["beacon"]["commitments"]]
+for i in range(26):
+    c = json.load(open(d + f"/beacon.commitments.{i:02d}.json"))["beacon"]["commitments"]
+    now = [x["commitment"] for x in c]
+    assert [j for j in range(26) if now[j] != held[j]] == [i] and now[i] not in held and len(set(now)) == 26, i
+    assert [x["validator"] for x in c] == [x["validator"] for x in g["beacon"]["commitments"]]
 v = json.load(open(d + "/perps.sparse_windows+max_window_heights+max_pending_digests.json"))
 assert not {"sparse_windows", "max_window_heights", "max_pending_digests"} & set(v["perps"]) and v["perps"]["bound_payouts"] is True
 v = json.load(open(d + "/perps.max_pending_digests.json"))
@@ -2032,9 +2403,9 @@ assert "max_pending_digests" not in v["perps"] and v["perps"]["sparse_windows"] 
 assert json.load(open(d + "/perps.max_window_heights=257.json"))["perps"]["max_window_heights"] == 257
 for f in glob.glob(d + "/*.json"):
     x = json.load(open(f))
-    assert x != g and set(x) == set(g), f
+    assert x != g and set(x) - {"beacon"} == set(g) - {"beacon"}, f   # only the beacon's own variants drop a top-level key
 PY
-  then ok "the field probe writes its 8 variants (refuse_panics, max_accounts, bound_payouts, sparse_windows+max_window_heights+max_pending_digests, max_window_heights 257, engine_program_log_height, max_pending_digests, incremental_root)"
+  then ok "the field probe writes its 38 variants (refuse_panics, max_accounts, bound_payouts, sparse_windows+max_window_heights+max_pending_digests, max_window_heights 257, engine_program_log_height, max_pending_digests, incremental_root; reference_block_window+beacon, reference_block_window 257, beacon, commit_delay_blocks 257, and each of the 26 commitments changed alone to a value no validator holds)"
   else bad "field probe variants: $(find "$ST/vtmp/variants" -name '*.json' 2>&1 | sed 's|.*/||' | tr '\n' ' ')"; fi
 
   # AUDIT_V10_SKIPPED (DRY_RUN's path on a build before v0.8.2): the base and the section files as
@@ -2051,11 +2422,15 @@ for k in ("bound_payouts", "sparse_windows", "max_window_heights", "engine_progr
 json.dump(b, open(sys.argv[1], "w")); json.dump(p, open(sys.argv[2], "w"))
 PY
   fresh
-  if AUDIT_V10_SKIPPED=1 bash -c 'py_validators >/dev/null && py_splice' >"$ST/log" 2>&1 && grep -q 'AUDIT_V10 SKIPPED' "$ST/log" \
-     && python3 -c 'import json,os; g=json.load(open(os.environ["OUT"])); assert "refuse_panics" not in g["program_state"] and "max_accounts" not in g["multisig"] and "bound_payouts" not in g["perps"] and g["tokens"]["incremental_root"] is True'; then
-    ok "AUDIT_V10_SKIPPED=1 (DRY_RUN on a build before v0.8.2) cuts without refuse_panics / max_accounts / the perps fields, and says so"
+  # (a build before v0.8.2 has no block context or beacon either: BLOCK_CONTEXT_SKIPPED with it)
+  mv "$ST/tmp/beacon.json" "$ST/tmp/beacon.json.away"
+  if AUDIT_V10_SKIPPED=1 BLOCK_CONTEXT_SKIPPED=1 bash -c 'py_validators >/dev/null && py_splice' >"$ST/log" 2>&1 && grep -q 'AUDIT_V10 SKIPPED' "$ST/log" \
+     && grep -q 'BLOCK CONTEXT SKIPPED' "$ST/log" \
+     && python3 -c 'import json,os; g=json.load(open(os.environ["OUT"])); assert "refuse_panics" not in g["program_state"] and "max_accounts" not in g["multisig"] and "bound_payouts" not in g["perps"] and g["tokens"]["incremental_root"] is True and "reference_block_window" not in g["program_state"] and "beacon" not in g'; then
+    ok "AUDIT_V10_SKIPPED=1 BLOCK_CONTEXT_SKIPPED=1 (DRY_RUN on a build before v0.8.2) cuts without refuse_panics / max_accounts / the perps fields / the window / the beacon, and says so"
     cp "$ST/out.json" "$ST/good-v10skipped.json"
   else bad "AUDIT_V10_SKIPPED path: $(tail -2 "$ST/log")"; fi
+  mv "$ST/tmp/beacon.json.away" "$ST/tmp/beacon.json"
   fresh
   if bash -c 'py_validators >/dev/null && py_splice' >"$ST/log" 2>&1; then bad "a file without the audit-v10 fields accepted when not skipped"
   elif grep -q 'perps carries the fields' "$ST/log"; then ok "the same inputs without AUDIT_V10_SKIPPED are refused ($(grep -o 'cut-chain22: .*' "$ST/log" | tail -1 | cut -c1-80))"
@@ -2148,6 +2523,73 @@ PY
   refuse "chain 21's genesis without multisig"     "$G" 'del d["multisig"]' "CHAIN21_GENESIS is not chain 21's"
   refuse "chain 21's genesis without hc_auth_multisig" "$G" 'del d["hc_auth_multisig"]' "CHAIN21_GENESIS is not chain 21's"
   refuse "chain 20's id on the chain-21 file"      "$G" 'd["chain_id"] = 20' "CHAIN21_GENESIS is not chain 21's"
+  refuse "reference_block_window in chain 21's genesis" "$G" 'd["program_state"]["reference_block_window"] = 256' "CHAIN21_GENESIS is not chain 21's"
+  refuse "a beacon in chain 21's genesis"          "$G" 'd["beacon"] = {"commit_delay_blocks": 256, "commitments": []}' "CHAIN21_GENESIS is not chain 21's"
+  # ── #168 / #189: the window and the beacon (spliced; $BJ is the beacon section py_beacon wrote) ──
+  BJ=$ST/tmp/beacon.json
+  refuse "the beacon without a window (REFERENCE_BLOCK_WINDOW empty)" "$S" 'pass' "the beacon needs program_state.reference_block_window" REFERENCE_BLOCK_WINDOW=
+  refuse "reference_block_window 255 (below the proof window)" "$S" 'pass' "is not in 256..=4096 (OPEN 9)" REFERENCE_BLOCK_WINDOW=255
+  refuse "reference_block_window 4097"             "$S" 'pass' "is not in 256..=4096 (OPEN 9)" REFERENCE_BLOCK_WINDOW=4097
+  refuse "reference_block_window not a number"     "$S" 'pass' "is not in 256..=4096 (OPEN 9)" REFERENCE_BLOCK_WINDOW=abc
+  refuse "a window already in the base file"       "$B" 'd["program_state"]["reference_block_window"] = 256' "the base file already has program_state.reference_block_window"
+  refuse "a beacon already in the base file"       "$B" 'd["beacon"] = json.load(open(sys.argv[1].replace("base.json", "tmp/beacon.json")))' "the base file already has program_state.reference_block_window or a beacon"
+  refuse "a beacon delay not BEACON_COMMIT_DELAY_BLOCKS" "$BJ" 'd["commit_delay_blocks"] = 300' "not BEACON_COMMIT_DELAY_BLOCKS '256'"
+  refuse "a beacon delay of 0"                     "$BJ" 'd["commit_delay_blocks"] = 0' "in 1..=1048576 (OPEN 10)" BEACON_COMMIT_DELAY_BLOCKS=0
+  refuse "a beacon delay as a string"              "$BJ" 'd["commit_delay_blocks"] = "256"' "not BEACON_COMMIT_DELAY_BLOCKS"
+  refuse "a beacon with 25 commitments"            "$BJ" 'd["commitments"].pop()' "exactly one each"
+  refuse "a beacon with 27 commitments"            "$BJ" 'd["commitments"].append({"validator": "x", "commitment": "ee" * 32})' "exactly one each"
+  refuse "a beacon commitment in upper case"       "$BJ" 'd["commitments"][3]["commitment"] = d["commitments"][3]["commitment"].upper()' "64 lowercase hex"
+  refuse "a beacon commitment of 63 hex"           "$BJ" 'd["commitments"][3]["commitment"] = d["commitments"][3]["commitment"][:63]' "64 lowercase hex"
+  refuse "a beacon commitment twice"               "$BJ" 'd["commitments"][3]["commitment"] = d["commitments"][4]["commitment"]' "a beacon validator or commitment twice"
+  refuse "a beacon validator twice"                "$BJ" 'd["commitments"][3]["validator"] = d["commitments"][4]["validator"]' "a beacon validator or commitment twice"
+  refuse "the beacon's validators out of order"    "$BJ" 'c = d["commitments"]; c[0], c[1] = c[1], c[0]' "not the chain-22 validators in order"
+  refuse "an extra field in a beacon commitment"   "$BJ" 'd["commitments"][0]["note"] = 1' "is not {validator, commitment"
+  refuse "an extra field in the beacon section"    "$BJ" 'd["extra"] = 1' "not BeaconConfig's"
+  refuse "BLOCK_CONTEXT_SKIPPED with a beacon section present" "$S" 'pass' "BLOCK_CONTEXT_SKIPPED yet a beacon section is present" BLOCK_CONTEXT_SKIPPED=1
+  mv "$BJ" "$BJ.away"; fresh
+  if bash -c 'py_validators >/dev/null && py_splice' >"$ST/log" 2>&1; then bad "no beacon section to splice — accepted"
+  elif grep -qF "no beacon section to splice" "$ST/log"; then ok "no beacon section to splice — $(grep -o 'cut-chain22: .*' "$ST/log" | tail -1 | cut -c1-110)"
+  else bad "no beacon section — wrong refusal: $(tail -1 "$ST/log")"; fi
+  mv "$BJ.away" "$BJ"
+  # BEACON_TSV itself (py_beacon), each refusal before a section is written: <description> <phrase> <file content> [env…]
+  TSV_OK=$(grep -v '^#' "$ST/beacon.tsv")
+  read -r N0 C0 < <(sed -n 2p "$ST/beacon.tsv"); read -r N1 _ < <(sed -n 3p "$ST/beacon.tsv")
+  tsv_with() {  # <name> [replacement line]: TSV_OK with that validator's line replaced (or dropped)
+    awk -v n="$1" -v r="${2:-}" '$1 == n { if (r != "") print r; next } { print }' <<<"$TSV_OK"
+  }
+  beacon_refuses() {
+    local what=$1 phrase=$2; printf '%s\n' "$3" > "$ST/beacon-case.tsv"; shift 3
+    cp "$BJ" "$BJ.keep"
+    if env BEACON_TSV="$ST/beacon-case.tsv" "$@" bash -c 'py_validators >/dev/null && py_beacon' >"$ST/log" 2>&1; then bad "BEACON_TSV: $what — accepted"
+    elif grep -qF -- "$phrase" "$ST/log"; then ok "BEACON_TSV: $what — $(grep -o 'cut-chain22: .*' "$ST/log" | tail -1 | cut -c1-110)"
+    else bad "BEACON_TSV: $what — wrong refusal (wanted \"$phrase\"): $(tail -1 "$ST/log")"; fi
+    mv "$BJ.keep" "$BJ"
+  }
+  beacon_refuses "a validator missing"           "no commitment for $N0"          "$(tsv_with "$N0")"
+  beacon_refuses "an extra name"                 "is not a chain-22 validator"    "$TSV_OK"$'\n'"stranger $(printf 'e1%.0s' $(seq 32))"
+  beacon_refuses "a name twice"                  "$N0 is listed twice"            "$TSV_OK"$'\n'"$N0 $(printf 'e1%.0s' $(seq 32))"
+  beacon_refuses "one commitment for two validators" "have the same commitment"   "$(tsv_with "$N1" "$N1 $C0")"
+  beacon_refuses "a commitment in upper case"    "not 64 lowercase hex"           "$(tsv_with "$N0" "$N0 $(tr 'a-f' 'A-F' <<<"$C0")")"
+  beacon_refuses "a commitment of 63 hex"        "not 64 lowercase hex"           "$(tsv_with "$N0" "$N0 ${C0:0:63}")"
+  beacon_refuses "a commitment of 65 hex"        "not 64 lowercase hex"           "$(tsv_with "$N0" "$N0 ${C0}0")"
+  beacon_refuses "a 0x-prefixed commitment"      "not 64 lowercase hex"           "$(tsv_with "$N0" "$N0 0x${C0:0:62}")"
+  beacon_refuses "a line of three fields"        "is not \"<validator name> <commitment>\"" "$(tsv_with "$N0" "$N0 $C0 extra")"
+  beacon_refuses "a name alone"                  "is not \"<validator name> <commitment>\"" "$(tsv_with "$N0" "$N0")"
+  beacon_refuses "an all-zero commitment"        "an all-zero commitment"         "$(tsv_with "$N0" "$N0 $(printf '0%.0s' $(seq 64))")"
+  beacon_refuses "an empty file"                 "no commitment for"              "# nothing"
+  beacon_refuses "a delay of 0"                  "BEACON_COMMIT_DELAY_BLOCKS '0' is not in 1..=1048576" "$TSV_OK" BEACON_COMMIT_DELAY_BLOCKS=0
+  beacon_refuses "a delay of 2^20 + 1"           "is not in 1..=1048576"          "$TSV_OK" BEACON_COMMIT_DELAY_BLOCKS=1048577
+  # the addresses: the beacon lists what each public key derives; a listed address that differs is refused
+  DA=$ST/tmp/derived-addresses.tsv; cp "$DA" "$DA.keep"
+  sed "s/^\($N1\)[[:space:]].*/\1\tDERIVEDotheraddress/" "$DA.keep" > "$DA"
+  beacon_refuses "a VALIDATORS_TSV address that is not its key's" "is not the address of its public key" "$TSV_OK"
+  printf '%s\n' "$TSV_OK" > "$ST/beacon-case.tsv"; cp "$BJ" "$BJ.keep"
+  if BEACON_TSV="$ST/beacon-case.tsv" FIXTURE_ADDRESSES_OK=1 bash -c 'py_validators >/dev/null && py_beacon' >"$ST/log" 2>&1 && grep -q 'FIXTURE_ADDRESSES_OK: 1 fixture address' "$ST/log" \
+     && python3 -c 'import json,sys; assert [c["validator"] for c in json.load(open(sys.argv[1]))["commitments"]].count("DERIVEDotheraddress") == 1' "$BJ"; then
+    ok "FIXTURE_ADDRESSES_OK=1 (the dry run's synthetic register) lists the key-derived address, with a warning"
+  else bad "FIXTURE_ADDRESSES_OK: $(tail -1 "$ST/log")"; fi
+  mv "$BJ.keep" "$BJ"
+  mv "$DA" "$DA.case"; beacon_refuses "no derived addresses" "were not derived from their public keys" "$TSV_OK"; mv "$DA.keep" "$DA"; rm -f "$DA.case"
   # ── chain 21's state its cut never carried (OPEN 3–5) ──
   refuse "chain 21's treasury vault, no MULTISIG_NOT_CARRIED_OK" "$S" 'pass' "no document says how a multisig account crosses a cut" MULTISIG_NOT_CARRIED_OK=
   refuse "a zUSD balance in the treasury vault"    "$S" 'd["treasury"]["vault"].append({"asset": 1, "amount": "5"})' "and token(s)" MULTISIG_NOT_CARRIED_OK=
@@ -2361,14 +2803,28 @@ g = json.load(open(sys.argv[1])); d = g["gas"]["dynamic"]; p = g.get("perps") or
 ml = {"create_fee": "1000000000", "max_signers": 10, "max_payouts": 4}
 if "max_accounts" in m:
     ml["max_accounts"] = m["max_accounts"]
+# #168 / #189 as the node serves them (rpc.rs): absent fields on a chain without them
+pl = {"cell_fee": str(g["program_state"]["cell_fee"]), "max_reads": 8, "max_writes": 8, "max_payouts": 4}
+w, b = g["program_state"].get("reference_block_window", 0), g.get("beacon")
+if w:
+    pl["reference_block_window"] = w
+if b:
+    pl["beacon_commit_delay_blocks"] = b["commit_delay_blocks"]
+ctx = ({"enabled": True, "height": 3, "timestamp": 1794960123, "timestamp_ms": 1794960123456, "chain_id": 22, "basefee": "100",
+        "has_randomness": b is not None, "randomness": "5e" * 32, "window": w, "oldest": 1, "newest": 3, "context_version": 2, "offset": 11,
+        "words": [3] + [0] * 16} if w else {"enabled": False})
+bk = ({"enabled": True, "height": 0, "value": "5e" * 32, "commit_delay_blocks": b["commit_delay_blocks"],
+       "validators": [{"validator": c["validator"], "commitment": c["commitment"], "nonce": 0, "pending": None, "due": c["commitment"]}
+                      for c in sorted(b["commitments"], key=lambda c: c["validator"])]} if b else {"enabled": False})
 json.dump({"rand_getGenesisHash": "ab" * 32,
+           "rand_getBlockContext": ctx, "rand_getBeacon": bk,
            "rand_status": {"chain_id": 22, "hc_bundle": g["hc_bundle"], "hc_auth": g["hc_auth"], "hc_auth_multisig": g["hc_auth_multisig"], "fri_profile": "production"},
            "rand_getLimits": {"proof_window_blocks": 1024, "binding_domain": 1, "testnet": True, "admission_by_vote": True, "slashing": None,
                               "max_gas_price": d["max_gas_price"], "max_byte_price": d["max_byte_price"], "byte_load": "paying",
                               "gas_metering": "circuit", "bundle_gas_limit": 20479, "adjust_bps": 1250, "envelope_bytes": 1860,
                               "hardening_v6": True, "hc_auth": g["hc_auth"], "max_proof_bytes": g["max_proof_bytes"], "max_block_bytes": g["max_block_bytes"],
                               "hc_auth_multisig": g["hc_auth_multisig"],
-                              "program_state": {"cell_fee": str(g["program_state"]["cell_fee"]), "max_reads": 8, "max_writes": 8, "max_payouts": 4},
+                              "program_state": pl,
                               "fee_rules": {"burn_base": True, "subsidy_net_of_fees": False, "burn_floor": True,
                                             "proposer_share_bps": None, "prove_base": None, "usd_subsidy": None},
                               "perps": {"collateral_asset": 1, "max_tier": 18, "max_window_blocks": 64, "max_payouts": 8, "max_block_inputs": 24, "min_deposit": "100000000"},
@@ -2409,6 +2865,28 @@ PY
     ok "check-limits with BASE_FEES_BURNED_ANY=1 accepts a node that has burned since launch (base_fees_burned \"4063900\")"
   else bad "BASE_FEES_BURNED_ANY=1: $(tail -2 "$ST/log")"; fi
   mv "$ST/answers.keep" "$ST/answers.json"
+  # #168 / #189 read-backs: every commitment exactly at height 0; before block 1 the block context
+  # is -32001 (the window then read from rand_getLimits alone); above height 0 a validator that
+  # proposed holds its reveal — at most `height` of them
+  if check "$ST/good.json" && grep -q 'beacon at height 0: 26 of 26 commitments read back exactly' "$ST/log" \
+     && grep -q 'block context window (#168)' "$ST/log" && grep -q 'beacon_commit_delay_blocks (#189)' "$ST/log"; then
+    ok "check-limits reads back the window (rand_getLimits, rand_getBlockContext), the delay and all 26 commitments at height 0 (rand_getBeacon)"
+  else bad "check-limits, the beacon read-back: $(grep -E 'beacon|block context|✗' "$ST/log" | tail -3)"; fi
+  cp "$ST/answers.json" "$ST/answers.keep"
+  python3 -c "import json,sys; p=sys.argv[1]; a=json.load(open(p)); a['rand_getBlockContext'] = {'__error__': {'code': -32001, 'message': 'no block has closed yet'}}; json.dump(a, open(p,'w'))" "$ST/answers.json"
+  if check "$ST/good.json" && grep -q 'no block has closed yet (-32001)' "$ST/log"; then ok "check-limits before block 1 (rand_getBlockContext -32001) reads the window from rand_getLimits and says so"
+  else bad "check-limits, -32001: $(tail -2 "$ST/log")"; fi
+  python3 -c "import json,sys; p=sys.argv[1]; a=json.load(open(p)); K=a['rand_getBeacon']; K['height'] = 5
+for i, r in enumerate(K['validators'][:3]): r['commitment'] = r['due'] = ('%02x' % (0xa0 + i)) * 32
+json.dump(a, open(p,'w'))" "$ST/answers.json"
+  if check "$ST/good.json" && grep -q 'beacon at height 5: 23 of 26 commitments read back exactly as the genesis lists them, 3 moved' "$ST/log"; then
+    ok "check-limits at height 5 accepts 3 validators whose commitment moved to their reveal (≤ height), the other 23 read back exactly"
+  else bad "check-limits, height 5 with 3 moved: $(grep -E 'beacon|✗' "$ST/log" | tail -2)"; fi
+  python3 -c "import json,sys; p=sys.argv[1]; a=json.load(open(p)); a['rand_getBeacon']['height'] = 2; json.dump(a, open(p,'w'))" "$ST/answers.json"
+  if check "$ST/good.json"; then bad "check-limits accepted 3 moved commitments at height 2"
+  elif grep -q 'does NOT serve chain 22 as cut: beacon commitments moved since genesis' "$ST/log"; then ok "check-limits refuses more moved commitments than blocks (3 at height 2)"
+  else bad "check-limits, 3 moved at height 2: $(tail -1 "$ST/log")"; fi
+  mv "$ST/answers.keep" "$ST/answers.json"
   for m in 'L["proof_window_blocks"] = 256' 'L["binding_domain"] = 0' 'L["testnet"] = False' 'L["admission_by_vote"] = False' \
            'L["byte_load"] = None' 'L["max_gas_price"] = None' 'L["max_proof_bytes"] = 4194304' 'L["program_state"] = None' 'B["rotation_rules"] = None' 'B["fees"]["burn_bps"] = 20' \
            'L["fee_rules"] = None' 'L["fee_rules"]["burn_floor"] = False' 'L["fee_rules"]["subsidy_net_of_fees"] = True' 'L["proof_window_blocks"] = 1024.0' \
@@ -2421,9 +2899,18 @@ PY
            'L["multisig"] = None' 'L["multisig"]["create_fee"] = "0"' 'del L["multisig"]["max_accounts"]' 'L["multisig"]["max_accounts"] = 2' \
            'S["multisig_issued"] = "0"' 'M["threshold"] = 3' 'M["signers"].reverse()' 'a["rand_getMultisig"] = None' \
            'T["incremental_root"] = False' 'del T["incremental_root"]' 'T["bound_note_value"] = False' \
-           'L["hc_auth_multisig"] = None' 'a["rand_status"]["hc_auth_multisig"] = None'; do
+           'L["hc_auth_multisig"] = None' 'a["rand_status"]["hc_auth_multisig"] = None' \
+           'del L["program_state"]["reference_block_window"]' 'L["program_state"]["reference_block_window"] = 512' \
+           'del L["program_state"]["beacon_commit_delay_blocks"]' 'L["program_state"]["beacon_commit_delay_blocks"] = 300' \
+           'C.clear(); C["enabled"] = False' 'C["window"] = 4096' 'C["has_randomness"] = False' 'C["chain_id"] = 21' 'C["context_version"] = 1' \
+           'a["rand_getBlockContext"] = {"__error__": {"code": -32602, "message": "too old"}}' \
+           'K.clear(); K["enabled"] = False' 'K["commit_delay_blocks"] = 300' 'K["value"] = None' \
+           'K["validators"].pop()' 'K["validators"].append(dict(K["validators"][0], validator="stranger"))' \
+           'K["validators"][2]["commitment"] = "77" * 32; K["validators"][2]["due"] = "77" * 32' \
+           'K["validators"][2]["nonce"] = 1' 'K["validators"][2]["pending"] = {"activates_at": 300, "commitment": "77" * 32}' \
+           'K["validators"][2]["due"] = None' 'K["validators"][2]["commitment"] = None'; do
     cp "$ST/answers.json" "$ST/answers.keep"
-    python3 -c "import json,sys; p=sys.argv[1]; a=json.load(open(p)); L=a['rand_getLimits']; B=a['rand_getBridgeState']; S=a['rand_getSupply']; P=a['rand_getPerps']; M=a['rand_getMultisig']; T=a['rand_getTokens']; $m; json.dump(a, open(p,'w'))" "$ST/answers.json"
+    python3 -c "import json,sys; p=sys.argv[1]; a=json.load(open(p)); L=a['rand_getLimits']; B=a['rand_getBridgeState']; S=a['rand_getSupply']; P=a['rand_getPerps']; M=a['rand_getMultisig']; T=a['rand_getTokens']; C=a['rand_getBlockContext']; K=a['rand_getBeacon']; $m; json.dump(a, open(p,'w'))" "$ST/answers.json"
     if check "$ST/good.json"; then bad "check-limits accepted a node with $m"
     elif grep -q 'does NOT serve chain 22 as cut' "$ST/log"; then ok "check-limits refuses a node with $m"
     else bad "check-limits, $m: $(tail -1 "$ST/log")"; fi
@@ -2440,8 +2927,9 @@ PY
   if [ -f "$ST/good-v10skipped.json" ]; then
     cp "$ST/answers.json" "$ST/answers.keep"
     write_answers "$ST/good-v10skipped.json" "$ST/answers.json"
-    if check "$ST/good-v10skipped.json" && grep -q 'AUDIT_V10 SKIPPED' "$ST/log" && grep -q 'refuse_panics ABSENT' "$ST/log"; then
-      ok "check-limits on an AUDIT_V10-skipped genesis wants bound_payouts false, max_window_heights 0, engine_program_log_height 0, max_pending_digests 0 and no max_accounts, and says SKIPPED"
+    if check "$ST/good-v10skipped.json" && grep -q 'AUDIT_V10 SKIPPED' "$ST/log" && grep -q 'refuse_panics ABSENT' "$ST/log" \
+       && grep -q 'BLOCK CONTEXT SKIPPED' "$ST/log"; then
+      ok "check-limits on an AUDIT_V10 / BLOCK_CONTEXT-skipped genesis wants bound_payouts false, max_window_heights 0, engine_program_log_height 0, max_pending_digests 0, no max_accounts, no window and no beacon ({\"enabled\": false}), and says SKIPPED"
     else bad "check-limits, AUDIT_V10-skipped genesis: $(tail -1 "$ST/log")"; fi
     if check "$ST/good.json"; then bad "check-limits accepted a node without the audit-v10 fields for a genesis that has them"
     elif grep -q 'does NOT serve chain 22 as cut: perps bound_payouts (PERP-6)' "$ST/log"; then ok "check-limits refuses a node without the audit-v10 fields (a build before v0.8.2) for a genesis that has them"
@@ -2548,6 +3036,14 @@ PY
   bash_refuses "PERPS_MAX_WINDOW_HEIGHTS=4097" "outside max_window_blocks..=MAX_WINDOW_HEIGHTS" PERPS_MAX_WINDOW_HEIGHTS=4097 --
   bash_refuses "PERPS_MAX_WINDOW_HEIGHTS=abc" "outside max_window_blocks..=MAX_WINDOW_HEIGHTS" PERPS_MAX_WINDOW_HEIGHTS=abc --
   bash_refuses "MULTISIG_MAX_ACCOUNTS=0" "is not a count ≥ 1" MULTISIG_MAX_ACCOUNTS=0 --
+  bash_refuses "REFERENCE_BLOCK_WINDOW=255 (below the proof window)" "REFERENCE_BLOCK_WINDOW='255' is outside 256..=4096" REFERENCE_BLOCK_WINDOW=255 --
+  bash_refuses "REFERENCE_BLOCK_WINDOW=4097" "REFERENCE_BLOCK_WINDOW='4097' is outside 256..=4096" REFERENCE_BLOCK_WINDOW=4097 --
+  bash_refuses "REFERENCE_BLOCK_WINDOW empty (the beacon needs it)" "the beacon needs it" REFERENCE_BLOCK_WINDOW= --
+  bash_refuses "REFERENCE_BLOCK_WINDOW=0 (off)" "is outside 256..=4096" REFERENCE_BLOCK_WINDOW=0 --
+  bash_refuses "REFERENCE_BLOCK_WINDOW=abc" "is outside 256..=4096" REFERENCE_BLOCK_WINDOW=abc --
+  bash_refuses "BEACON_COMMIT_DELAY_BLOCKS=0" "BEACON_COMMIT_DELAY_BLOCKS='0' is outside 1..=1048576" BEACON_COMMIT_DELAY_BLOCKS=0 --
+  bash_refuses "BEACON_COMMIT_DELAY_BLOCKS=1048577" "is outside 1..=1048576" BEACON_COMMIT_DELAY_BLOCKS=1048577 --
+  bash_refuses "BEACON_COMMIT_DELAY_BLOCKS empty" "is outside 1..=1048576" BEACON_COMMIT_DELAY_BLOCKS= --
   bash_refuses "an EXPECT_ENGINE_PROGRAM_LOG_HEIGHT off the pin" "is not the pinned engine's program height" EXPECT_ENGINE_PROGRAM_LOG_HEIGHT=15 --
   bash_refuses "an EXPECT_HC_AUTH_MULTISIG off chain 21's guest" "is not chain 21's multisig auth guest" EXPECT_HC_AUTH_MULTISIG="$(printf 'cd%.0s' $(seq 32))" --
   bash_refuses "an EXPECT_ENGINE_HC off the decided engine" "is not the decided engine" EXPECT_ENGINE_HC="$(printf 'cd%.0s' $(seq 32))" --
@@ -2587,7 +3083,7 @@ PY
   # out) and --program-state-refuse-panics only unless FAKE_V10_FLAG is set empty; `--version` says
   # FAKE_VERSION (default 0.8.5); nothing else answers (init prints no hash). A fake perp-prover and engine image.
   # shellcheck disable=SC2016  # the fake's own source
-  printf '#!/usr/bin/env bash\ncase "$1" in\n  --version) echo "rand-node ${FAKE_VERSION:-0.8.5}";;\n  genesis) echo "--hardening-v6 --bundle-guest --auth-guest --gas-price --gas-dynamic --envelope-bytes --max-gas-price --max-byte-price --gas-byte-load --testnet --binding-domain --proof-window-blocks --program-state-cell-fee --fees --multisig --auth-multisig-guest --tokens-incremental-root ${FAKE_V10_FLAG---program-state-refuse-panics} ${FAKE_EXTRA:-}" | tr " " "\\n" | grep -vxF -- "${FAKE_DROP:-@none@}" | tr "\\n" " ";;\nesac\n' > "$ST/fake-node"; chmod +x "$ST/fake-node"
+  printf '#!/usr/bin/env bash\ncase "$1" in\n  --version) echo "rand-node ${FAKE_VERSION:-0.8.5}";;\n  genesis) echo "--hardening-v6 --bundle-guest --auth-guest --gas-price --gas-dynamic --envelope-bytes --max-gas-price --max-byte-price --gas-byte-load --testnet --binding-domain --proof-window-blocks --program-state-cell-fee --fees --multisig --auth-multisig-guest --tokens-incremental-root ${FAKE_V10_FLAG---program-state-refuse-panics} ${FAKE_CTX_FLAGS---program-state-reference-block-window --beacon-commitment} ${FAKE_EXTRA:-}" | tr " " "\\n" | grep -vxF -- "${FAKE_DROP:-@none@}" | tr "\\n" " ";;\nesac\n' > "$ST/fake-node"; chmod +x "$ST/fake-node"
   printf '#!/usr/bin/env bash\nexit 1\n' > "$ST/fake-prover"; chmod +x "$ST/fake-prover"; echo image > "$ST/fake-image"
   for x in "treasury:the genesis fees section is a genesis-gated validity rule (PST-1, PERP-6, PERP-101)" \
            "pst1:audit v11 — PERP-6 bound_payouts, PERP-101 sparse windows; the treasury re-seeded" \
@@ -2597,6 +3093,8 @@ PY
     sed "s/^reason:.*/reason: ${x#*:}/; s/^carries:.*/carries: fixture register, bridge state and balances/" "$ST/cut-record.txt" > "$ST/cut-record-no-${x%%:*}.txt"
   done
   sed 's/^drops:.*/drops: nothing/' "$ST/cut-record.txt" > "$ST/cut-record-drops-nothing.txt"
+  sed 's/; #168 block context (reference_block_window) and #189/; #189/' "$ST/cut-record.txt" > "$ST/cut-record-no-ctx.txt"
+  sed 's/ and #189 the randomness beacon//' "$ST/cut-record.txt" > "$ST/cut-record-no-beacon.txt"
   printf '%s\n' "$FEE_RECIPIENT" > "$ST/fee-c21.txt"
   real_cut=(CUT_POLICY_GENESIS_DIR="$ST/gendir-21" CUT_RECORD="$ST/cut-record.txt" CHAIN21_SNAPSHOT="$ST/snap" CHAIN21_GENESIS=deploy/genesis-chain21.json
             OUT="$ST/not-yet.json" NODE="$ST/fake-node" WALLET="$ST/fake-rand" FEE_RECIPIENT_FILE="$ST/fee-c21.txt"
@@ -2610,6 +3108,12 @@ PY
   bash_refuses "the real cut on a rand-node without --program-state-refuse-panics (before v0.8.2)" "a build before v0.8.2" "${real_cut[@]}" FAKE_V10_FLAG= --
   bash_refuses "the real cut with a rand whose image-hc prints no engine_program_log_height" "a build before v0.8.2" "${real_cut[@]}" FAKE_EPLH= --
   bash_refuses "an engine image whose program height is not 14" "not EXPECT_ENGINE_PROGRAM_LOG_HEIGHT 14" "${real_cut[@]}" FAKE_EPLH=15 --
+  bash_refuses "the real cut on a rand-node without --program-state-reference-block-window (#184)" "genesis has no --program-state-reference-block-window — a build before the EVM block context" "${real_cut[@]}" FAKE_DROP=--program-state-reference-block-window --
+  bash_refuses "the real cut on a rand-node without --beacon-commitment (#189)" "genesis has no --beacon-commitment — a build before" "${real_cut[@]}" FAKE_DROP=--beacon-commitment --
+  bash_refuses "BLOCK_CONTEXT_SKIPPED=1 from the environment on the real cut" "BLOCK_CONTEXT_SKIPPED=1 is set in the environment — refusing" "${real_cut[@]}" BLOCK_CONTEXT_SKIPPED=1 --
+  bash_refuses "the real cut without a BEACON_TSV" "missing $ST/no-beacon.tsv" "${real_cut[@]}" BEACON_TSV="$ST/no-beacon.tsv" --
+  bash_refuses "a cut record that does not name the block context" "names no the EVM block context (#168" "${real_cut[@]}" CUT_RECORD="$ST/cut-record-no-ctx.txt" --
+  bash_refuses "a cut record that does not name the beacon" "names no the randomness beacon (#189" "${real_cut[@]}" CUT_RECORD="$ST/cut-record-no-beacon.txt" --
   bash_refuses "the real cut without PERPS_MAX_WINDOW_HEIGHTS (OPEN 1)" "PERPS_MAX_WINDOW_HEIGHTS is unset — the owner's decision (OPEN 1" "${real_cut[@]}" PERPS_MAX_WINDOW_HEIGHTS= --
   bash_refuses "the real cut without MULTISIG_MAX_ACCOUNTS (OPEN 2)" "MULTISIG_MAX_ACCOUNTS is unset — the owner's decision (OPEN 2" "${real_cut[@]}" MULTISIG_MAX_ACCOUNTS= --
   bash_refuses "PERPS_SKIPPED=1 from the environment on the real cut" "PERPS_SKIPPED=1 is set in the environment — refusing" "${real_cut[@]}" PERPS_SKIPPED=1 --
@@ -2653,6 +3157,76 @@ PY
        && grep -q 'engine image .*(= EXPECT_ENGINE_HC' "$ST/log"; then
     ok "DRY_RUN ignores PERPS/AUDIT_V10_SKIPPED=1 from the environment (loudly), reads the engine height 14, and puts in loud PLACEHOLDERS (64, 1) for the unset operator inputs"
   else bad "DRY_RUN with env *_SKIPPED: $(tail -2 "$ST/log")"; fi
+  # DRY_RUN on a build without the block-context / beacon flags: one loud banner, then on
+  if "${dry[@]}" FAKE_CTX_FLAGS= BLOCK_CONTEXT_SKIPPED=1 PERP_PROVER="$ST/fake-prover" PERP_IMAGE="$ST/fake-image" bash "$0" >"$ST/log" 2>&1; then bad "DRY_RUN on a fake rand-node finished"
+  elif [ "$(grep -c 'BLOCK CONTEXT SKIPPED ⚠⚠⚠' "$ST/log")" = 1 ] && grep -q 'BLOCK_CONTEXT_SKIPPED=1 in the environment is IGNORED' "$ST/log" \
+       && grep -q "cutting with rand-node 0.8.5" "$ST/log"; then
+    ok "DRY_RUN on a build without --program-state-reference-block-window / --beacon-commitment says BLOCK CONTEXT SKIPPED once, loudly, ignores the env's word, and goes on past the gates"
+  else bad "DRY_RUN without the block-context flags: $(tail -2 "$ST/log")"; fi
+
+  # ── #189: the cut record's beacon block, and the per-host seed check (deploy/check-beacon-seed.sh) ──
+  printf 'reason: fixture\nrollback: fixture' > "$ST/record-beacon.txt"   # no trailing newline
+  record_beacon "$ST/record-beacon.txt" 256 256 "$ST/tmp/beacon-record.txt"; record_beacon "$ST/record-beacon.txt" 256 256 "$ST/tmp/beacon-record.txt"
+  if [ "$(_cut_record_value "$ST/record-beacon.txt" reference-block-window)" = 256 ] && [ "$(_cut_record_value "$ST/record-beacon.txt" beacon-commit-delay-blocks)" = 256 ] \
+     && [ "$(grep -c '^beacon-commitment: ' "$ST/record-beacon.txt")" = 26 ] && [ "$(grep -c '^reference-block-window:' "$ST/record-beacon.txt")" = 1 ] \
+     && grep -q 'OWNER VALUES TO CONFIRM' "$ST/record-beacon.txt" && grep -q 'ON ITS OWN HOST and sends ONLY the printed commitment' "$ST/record-beacon.txt" \
+     && grep -q 'nobody else ever' "$ST/record-beacon.txt" && grep -q 'OFFLINE, ENCRYPTED' "$ST/record-beacon.txt" \
+     && [ "$(_cut_record_value "$ST/record-beacon.txt" rollback)" = fixture ]; then
+    ok "the cut record gets the window, the delay (owner values to confirm), 26 beacon-commitment: lines and the operator seed procedure, once"
+  else bad "record_beacon: $(tail -3 "$ST/record-beacon.txt")"; fi
+  # A fake rand-node for check-beacon-seed.sh: `address` prints FAKE_ADDR; `beacon commitment` names
+  # FAKE_FILE_CHAIN / FAKE_FILE_VALIDATOR on stderr and the file's newest commitment on stdout (or
+  # fails with FAKE_COMMIT_FAIL); `beacon status` prints height FAKE_H and FAKE_INFORCE opened (or
+  # exits 1 with FAKE_STATUS_FAIL), as rand-node's beacon_cmd does.
+  # shellcheck disable=SC2016  # the fake's own source
+  printf '%s\n' '#!/usr/bin/env bash' \
+    'case "$1 $2" in' \
+    '  "address --key") echo "address: $FAKE_ADDR"; echo "public_key: ab"; echo "peer_id: x";;' \
+    '  "beacon commitment") [ -z "${FAKE_COMMIT_FAIL:-}" ] || { echo "Error: $FAKE_COMMIT_FAIL" >&2; exit 1; }' \
+    '      echo "chain ${FAKE_FILE_CHAIN:-22}, validator ${FAKE_FILE_VALIDATOR:-$FAKE_ADDR}, 1 chain(s); newest commitment:" >&2' \
+    '      python3 -c "import json,sys; print(json.load(open(sys.argv[1]))[\"seeds\"][-1][\"commitment\"])" "$4/beacon.seed.json";;' \
+    '  "beacon status") [ -z "${FAKE_STATUS_FAIL:-}" ] || { echo "Error: $FAKE_STATUS_FAIL" >&2; exit 1; }' \
+    '      echo "validator $FAKE_ADDR on chain 22 at height ${FAKE_H:-0}; beacon value 5e5e"' \
+    '      echo "commitment in force $FAKE_INFORCE: the seed file opens it; remaining reveals: 1048575";;' \
+    '  *) exit 3;;' 'esac' > "$ST/fake-node-beacon"; chmod +x "$ST/fake-node-beacon"
+  read -r BA BC < <(python3 -c 'import json,sys; c=json.load(open(sys.argv[1]))["beacon"]["commitments"][4]; print(c["validator"], c["commitment"])' "$ST/good.json")
+  mkdir -p "$ST/vd"; printf '{}' > "$ST/vd/node.key.json"
+  seedfile() {  # <commitment…>: a seed file whose chains have these commitments (the seeds are fixtures)
+    python3 -c 'import json,sys; json.dump({"version": 1, "chain_id": 22, "validator": "x", "seeds": [{"seed": "00" * 32, "links": 8, "commitment": c} for c in sys.argv[2:]]}, open(sys.argv[1], "w"))' "$ST/vd/beacon.seed.json" "$@"
+    chmod 600 "$ST/vd/beacon.seed.json"
+  }
+  seed_check() {  # <want ok|refuse> <phrase> <description> [env…] -- [args…]
+    local want=$1 phrase=$2 what=$3; shift 3
+    local envs=(); while [ "$1" != -- ]; do envs+=("$1"); shift; done; shift
+    if env NODE="$ST/fake-node-beacon" FAKE_ADDR="$BA" FAKE_INFORCE="$BC" "${envs[@]}" bash deploy/check-beacon-seed.sh --genesis "$ST/good.json" \
+         --datadir "$ST/vd" --key "$ST/vd/node.key.json" "$@" >"$ST/log" 2>&1; then r=ok; else r=refuse; fi
+    if [ "$r" = "$want" ] && grep -qF -- "$phrase" "$ST/log"; then ok "check-beacon-seed: $what — $(tail -1 "$ST/log" | cut -c1-110)"
+    else bad "check-beacon-seed: $what — got $r: $(tail -1 "$ST/log")"; fi
+  }
+  seedfile "$BC"
+  seed_check ok "beacon seed OK: validator $BA, chain 22, genesis commitment ${BC:0:12}" "the host's seed file opens its genesis commitment (offline)" --
+  seed_check ok "the node at height 0 holds $BC in force, opened, 1048575 reveals left" "and the running node holds it in force (--rpc, beacon status)" -- --rpc http://127.0.0.1:9
+  seed_check refuse "beacon status\` failed" "beacon status exits non-zero (no seed opens the commitment in force)" FAKE_STATUS_FAIL="commitment in force ab: NO seed in the file opens it" -- --rpc http://127.0.0.1:9
+  seed_check refuse "at height 0 the node holds" "at height 0 the node holds another commitment in force (another genesis)" FAKE_INFORCE="$(printf 'cd%.0s' $(seq 32))" -- --rpc http://127.0.0.1:9
+  seed_check ok "at height 7 holds $(printf 'cd%.0s' $(seq 32)) in force" "above height 0 the commitment in force may be its last reveal" FAKE_H=7 FAKE_INFORCE="$(printf 'cd%.0s' $(seq 32))" -- --rpc http://127.0.0.1:9
+  seed_check refuse "a seed file copied from another host" "a seed file of another validator (copied between hosts)" FAKE_FILE_VALIDATOR=OTHERvalidator --
+  seed_check refuse "is for chain 21, the genesis is chain 22's" "a seed file for another chain" FAKE_FILE_CHAIN=21 --
+  seed_check refuse "refused $ST/vd/beacon.seed.json: Error: seed 0 does not give" "a seed file whose seeds do not re-derive (rand-node refuses it)" FAKE_COMMIT_FAIL="seed 0 does not give its recorded commitment" --
+  seed_check refuse "lists no commitment for this key's address" "a key that is no genesis validator's" FAKE_ADDR=NOTaVALIDATOR --
+  seedfile "$(printf 'cd%.0s' $(seq 32))"
+  seed_check refuse "no seed in $ST/vd/beacon.seed.json opens this validator's genesis commitment" "a seed file that does not open the genesis commitment (the wrong seed)" --
+  seedfile "$BC" "$(printf 'cd%.0s' $(seq 32))"
+  seed_check ok "beacon seed OK" "the genesis commitment on an older chain of the file passes, with a warning" --
+  grep -q 'an OLDER chain' "$ST/log" || bad "check-beacon-seed: no warning for an older chain"
+  seedfile "$BC"; chmod 644 "$ST/vd/beacon.seed.json"
+  seed_check refuse "is mode 0o644, not 0600" "a seed file readable by others" --
+  rm -f "$ST/vd/beacon.seed.json"
+  seed_check refuse "run \`rand-node beacon init" "no seed file on the host" --
+  seedfile "$BC"
+  if env NODE="$ST/fake-node-beacon" FAKE_ADDR="$BA" bash deploy/check-beacon-seed.sh --genesis "$ST/good-v10skipped.json" --datadir "$ST/vd" --key "$ST/vd/node.key.json" >"$ST/log" 2>&1; then
+    bad "check-beacon-seed: a genesis without a beacon — accepted"
+  elif grep -q 'has no beacon section' "$ST/log"; then ok "check-beacon-seed: a genesis without a beacon is refused (nothing to check)"
+  else bad "check-beacon-seed: no beacon — wrong refusal: $(tail -1 "$ST/log")"; fi
   echo "selftest: $pass passed, $fail failed"
   [ "$fail" = 0 ]; exit
 fi
@@ -2691,6 +3265,16 @@ if [ "${DRY_RUN:-}" = 1 ]; then
     TREASURY=$ST/treasury.txt
   fi
   export TREASURY
+  if [ ! -f "$BEACON_TSV" ]; then
+    # No BEACON_TSV: one fresh random PLACEHOLDER commitment per validator (py_fixtures) — opened by
+    # no seed, so a chain from this file could never propose. The real ones are the operators'.
+    echo "cut-chain22: DRY RUN — no BEACON_TSV ($BEACON_TSV): 26 random PLACEHOLDER beacon commitments → $ST/beacon.tsv" >&2
+    BEACON_TSV=$ST/beacon.tsv
+  fi
+  # The fixture register's bonded validators carry synthetic addresses; the beacon takes the ones
+  # their public keys derive (the cut refuses a mismatch; the dry run says it).
+  FIXTURE_ADDRESSES_OK=1
+  export BEACON_TSV FIXTURE_ADDRESSES_OK
   DRY_PLACEHOLDERS=$([ -n "$PERPS_MAX_WINDOW_HEIGHTS" ] || printf 'max_window_heights '; [ -n "$MULTISIG_MAX_ACCOUNTS" ] || printf 'max_accounts')
   echo "cut-chain22: DRY RUN — synthetic chain-21 snapshot, balances and inputs under $ST (from $CHAIN21_GENESIS); no network; $OUT is NOT chain 22"
 fi
@@ -2728,7 +3312,7 @@ fi
 # (loudly) by DRY_RUN, which decides each from the inputs and the binary in hand. (Chain 21's
 # FEES/MULTISIG/AUTH_MULTISIG skips are gone: chain 21 runs those sections, so every build that can
 # cut chain 22 has their flags, and the real cut and the dry run alike refuse one without them.)
-for s in PERPS AUDIT_V10; do
+for s in PERPS AUDIT_V10 BLOCK_CONTEXT; do
   v=${s}_SKIPPED_FROM_ENV
   [ -n "${!v}" ] || continue
   if [ "${DRY_RUN:-}" = 1 ]; then
@@ -2752,6 +3336,9 @@ require_cut_record_mentions "$CUT_RECORD" 'PERP-101|sparse.windows|max_window_he
 # no node policy can refuse a valid block. So the record must say how chain 22's validators hold
 # it (OPEN 9): every validator given the memory (≥ 8 GB), or another decision the owner names.
 require_cut_record_mentions "$CUT_RECORD" 'CON-601|validator.memory|key.build' "CON-601 (how every validator holds a max_tier-18 state-proof key build, about 3.6 GB: monorepo#23)" reason carries clients
+# The two features the owner added on 2026-11-18: the record says the chain carries them.
+require_cut_record_mentions "$CUT_RECORD" '#168|#184|reference.block|block.context' "the EVM block context (#168, program_state.reference_block_window)" reason carries
+require_cut_record_mentions "$CUT_RECORD" '#189|beacon|PREVRANDAO' "the randomness beacon (#189, genesis beacon)" reason carries
 # Chain 21's state the cut drops on the operator's word (OPEN 3–5): the record's drops: line names it.
 [ "${MULTISIG_NOT_CARRIED_OK:-}" != 1 ] || require_cut_record_mentions "$CUT_RECORD" 'treasury|multisig' "dropped multisig register (MULTISIG_NOT_CARRIED_OK=1)" drops
 [ "${PERPS_STATE_NOT_CARRIED_OK:-}" != 1 ] || require_cut_record_mentions "$CUT_RECORD" 'perp' "dropped perps exchange state (PERPS_STATE_NOT_CARRIED_OK=1)" drops
@@ -2762,10 +3349,10 @@ export SNAPSHOT_FILE BALANCES_FILE
 for bin in "$NODE" "$WALLET"; do
   [ -x "$bin" ] || { echo "cut-chain22: $bin is not executable — the binaries of the cut build (v0.8.5 or later)" >&2; exit 1; }
 done
-for f in "$SNAPSHOT_FILE" "$VALIDATORS_TSV" "$ALLOC_ADDRESSES" "$ZUSD_CARRY" "$CHAIN21_GENESIS" "$TREASURY" "$PERP_IMAGE" ${FAUCET_RECIPIENTS:+"$FAUCET_RECIPIENTS"}; do
+for f in "$SNAPSHOT_FILE" "$VALIDATORS_TSV" "$ALLOC_ADDRESSES" "$ZUSD_CARRY" "$CHAIN21_GENESIS" "$TREASURY" "$PERP_IMAGE" "$BEACON_TSV" ${FAUCET_RECIPIENTS:+"$FAUCET_RECIPIENTS"}; do
   [ -f "$f" ] || { echo "cut-chain22: missing $f" >&2; exit 1; }
 done
-for f in "$SNAPSHOT_FILE" "$VALIDATORS_TSV" "$ALLOC_ADDRESSES" "$ZUSD_CARRY" "$TREASURY" ${FAUCET_RECIPIENTS:+"$FAUCET_RECIPIENTS"}; do
+for f in "$SNAPSHOT_FILE" "$VALIDATORS_TSV" "$ALLOC_ADDRESSES" "$ZUSD_CARRY" "$TREASURY" "$BEACON_TSV" ${FAUCET_RECIPIENTS:+"$FAUCET_RECIPIENTS"}; do
   refuse_in_tree_key "$f"
 done
 for n in $BONDED; do refuse_in_tree_key "$REGISTRATIONS/$n.txt"; done
@@ -2831,6 +3418,24 @@ else
     fi
   done
 fi
+# #168 / #189: a build that knows program_state.reference_block_window and the beacon lists their
+# genesis flags (the cut splices both sections — the flags are refused on the base file — but an
+# older build would refuse the window inside program_state (deny_unknown_fields) and could not
+# hash the beacon; the field probe would catch it, this says it first).
+for flag in --program-state-reference-block-window --beacon-commitment; do
+  grep -qE -- "(^|[[:space:]])$flag([[:space:]=<,]|\$)" <<<"$HELP" && continue
+  if [ "${DRY_RUN:-}" = 1 ]; then
+    [ -n "$BLOCK_CONTEXT_SKIPPED" ] || cat >&2 <<EOF
+cut-chain22: ⚠⚠⚠ BLOCK CONTEXT SKIPPED ⚠⚠⚠ — $NODE genesis has no $flag: a build before the EVM block
+cut-chain22:     context (#184) and the randomness beacon (#189). The dry run goes on WITHOUT
+cut-chain22:     program_state.reference_block_window and the beacon section, and without their probes;
+cut-chain22:     the REAL cut refuses.
+EOF
+    BLOCK_CONTEXT_SKIPPED=1; export BLOCK_CONTEXT_SKIPPED
+  else
+    echo "cut-chain22: $NODE genesis has no $flag — a build before the EVM block context (#184) / the randomness beacon (#189); chain 22 carries both (owner, 2026-11-18)" >&2; exit 1
+  fi
+done
 NODE_VERSION=$("$NODE" --version 2>/dev/null || true)
 if [ -z "$EXPECT_NODE_VERSION" ]; then
   if [ "${DRY_RUN:-}" = 1 ]; then echo "cut-chain22: ⚠ DRY RUN with '$NODE_VERSION' and no EXPECT_NODE_VERSION — the real cut refuses that unless NODE_VERSION_OK=1" >&2
@@ -2884,6 +3489,13 @@ T21=$(treasury_id_of "$CHAIN21_GENESIS")
 echo "cut-chain22: chain 21's treasury id ${T21:0:12}… (rand-node multisig id over its genesis account)"
 
 py_validators
+
+# The beacon (#189): BEACON_TSV joined by name with the validators, at the addresses their public
+# keys derive (this rand-node's), → $TMP/beacon.json, which py_splice puts last into the file.
+if [ -z "${BLOCK_CONTEXT_SKIPPED:-}" ]; then
+  derive_validator_addresses
+  py_beacon
+fi
 
 # The treasury: TREASURY → $TMP/multisig.json, its id derived offline by this rand-node.
 py_treasury
@@ -3023,6 +3635,12 @@ fi
 cp "$OUT" "$FINAL_OUT"; OUT=$FINAL_OUT
 CS_RECORDED="appended to $CUT_RECORD as constraint-set-row:, an OPEN item"
 record_constraint_set_row "$CUT_RECORD" "$CS_ROW" || CS_RECORDED="⚠ NOT written to $CUT_RECORD (append failed) — copy it there by hand"
+BC_RECORDED="no beacon (BLOCK CONTEXT SKIPPED)"
+if [ -z "${BLOCK_CONTEXT_SKIPPED:-}" ]; then
+  BC_RECORDED="appended to $CUT_RECORD (reference-block-window:, beacon-commit-delay-blocks:, 26 beacon-commitment: lines, the operator procedure)"
+  record_beacon "$CUT_RECORD" "$REFERENCE_BLOCK_WINDOW" "$BEACON_COMMIT_DELAY_BLOCKS" "$TMP/beacon-record.txt" \
+    || BC_RECORDED="⚠ NOT written to $CUT_RECORD (append failed) — copy $TMP/beacon-record.txt there by hand"
+fi
 TS=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['timestamp_ms'])" "$OUT")
 AGE=$(( ( $(date +%s) * 1000 - TS ) / 1000 ))
 
@@ -3039,6 +3657,8 @@ cut-chain22: bridge.fees: mint $BRIDGE_MINT_BPS bps, burn $BRIDGE_BURN_BPS bps, 
 cut-chain22: staking: chain 21's (max_stake_entry_bps_per_epoch $STAKE_ENTRY_BPS, admission_by_vote); no slashing
 cut-chain22: program_state: cell_fee $PROGRAM_STATE_CELL_FEE$([ -n "${AUDIT_V10_SKIPPED:-}" ] && echo ", refuse_panics SKIPPED — NOT what chain 22 will be" || echo ", refuse_panics true (PST-1)")
 cut-chain22: tokens: incremental_root true (TOK-1)
+cut-chain22: block context: $([ -n "${BLOCK_CONTEXT_SKIPPED:-}" ] && echo "SKIPPED — NOT what chain 22 will be" || echo "program_state.reference_block_window $REFERENCE_BLOCK_WINDOW (#168) — OWNER VALUE TO CONFIRM (OPEN 9)")
+cut-chain22: beacon: $([ -n "${BLOCK_CONTEXT_SKIPPED:-}" ] && echo "SKIPPED — NOT what chain 22 will be" || echo "26 commitments from $BEACON_TSV, commit_delay_blocks $BEACON_COMMIT_DELAY_BLOCKS (#189) — OWNER VALUE TO CONFIRM (OPEN 10); $BC_RECORDED")
 cut-chain22: fees: $FEES_JSON (no subsidy_net_of_fees: aggregation is refused until re-measured)
 cut-chain22: perps: $([ -n "${PERPS_SKIPPED:-}" ] && echo "SKIPPED (no PERP_PROVER) — NOT what chain 22 will be" || echo "BTC-PERP on zUSD (asset 1), lot 100000, tick 100000000, 20x, maintenance 250 bps, fees 5/2 bps; max_tier 18, 24 inputs a block, 64 blocks a proof, min deposit 100000000 (1 zUSD)")
 cut-chain22: perps audit v10: $([ -n "${PERPS_SKIPPED:-}${AUDIT_V10_SKIPPED:-}" ] && echo "SKIPPED — NOT what chain 22 will be" || echo "bound_payouts true (PERP-6), initial_collateral absent (0), sparse_windows true + max_window_heights $PERPS_MAX_WINDOW_HEIGHTS (PERP-101), engine_program_log_height $ENGINE_PROGRAM_LOG_HEIGHT (CON-60), max_pending_digests $PERPS_MAX_PENDING_DIGESTS (PERP-5, decided 2026-11-05)")
@@ -3053,9 +3673,10 @@ cut-chain22: next: the second operator rebuilds the hash from this file on anoth
 cut-chain22: record in $CUT_RECORD: the genesis hash, the TREASURY ID and the PERPS GENESIS ROOT above (treasury-id: / perps-genesis-root: lines).
 cut-chain22: CONSTRAINT-SET ROW — OPEN (issue #166): add this line to CHAIN_CONSTRAINT_SETS in crates/randprotocol-node/src/constraint_set.rs (raise the array's length), run \`cargo test -p randprotocol-node --lib constraint_set\`, commit; $CS_RECORDED; check-limits (next line) refuses until the tree has it:
     $CS_ROW
+cut-chain22: before each validator's node starts, ON ITS HOST: deploy/check-beacon-seed.sh --genesis $OUT --datadir <datadir> --key <node key> (its beacon.seed.json opens its genesis commitment); after the start, the same with --rpc 127.0.0.1:8545
 cut-chain22: after launch: NODE=… $0 check-limits <first node's RPC> $OUT   (before the first bundle, deposit and state proof)
 cut-chain22: operations: msauth-vk-production.bin (sha256 68facb06…cd30) beside rand-node on every chain-22 node; NTP on every validator (perps block time is consensus input); a perp-view service and a prover host (~22 GB a proof) whose perp-prover builds sparse jobs (durian 28cebfb+); token collateral is outside the supply audit (M6).
 
 ⚠  Stamped $AGE s ago; the chain's clock starts there. Launch within MINUTES, or delete $OUT and re-cut.
 EOF
-[ "${DRY_RUN:-}" != 1 ] || echo "cut-chain22: DRY RUN — every step above ran on synthetic inputs; $OUT is NOT chain 22, launch nothing from it. max_window_heights $PERPS_MAX_WINDOW_HEIGHTS and max_accounts $MULTISIG_MAX_ACCOUNTS are $([ -n "$DRY_PLACEHOLDERS" ] && echo "PLACEHOLDERS ($DRY_PLACEHOLDERS)" || echo "the operator's").$([ -n "${PERPS_SKIPPED:-}" ] && echo ' ⚠ PERPS SKIPPED.')$([ -n "${AUDIT_V10_SKIPPED:-}" ] && echo ' ⚠ AUDIT_V10 SKIPPED.')"
+[ "${DRY_RUN:-}" != 1 ] || echo "cut-chain22: DRY RUN — every step above ran on synthetic inputs; $OUT is NOT chain 22, launch nothing from it. max_window_heights $PERPS_MAX_WINDOW_HEIGHTS and max_accounts $MULTISIG_MAX_ACCOUNTS are $([ -n "$DRY_PLACEHOLDERS" ] && echo "PLACEHOLDERS ($DRY_PLACEHOLDERS)" || echo "the operator's").$([ -n "${PERPS_SKIPPED:-}" ] && echo ' ⚠ PERPS SKIPPED.')$([ -n "${AUDIT_V10_SKIPPED:-}" ] && echo ' ⚠ AUDIT_V10 SKIPPED.')$([ -n "${BLOCK_CONTEXT_SKIPPED:-}" ] && echo ' ⚠ BLOCK CONTEXT SKIPPED.')"
