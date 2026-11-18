@@ -34,8 +34,12 @@ struct Net {
     next: u64,
 }
 
-/// One node. `anonymous_tx_only` is what a node of v0.9.0 or later runs by default; off is a
-/// v0.8.x node's default (both transaction lanes subscribed and relayed).
+async fn start(gen: &Genesis, seed: u8, bootstrap: Vec<libp2p::Multiaddr>, dandelion: DandelionConfig) -> TestNode {
+    start_on_lanes(gen, seed, bootstrap, dandelion, false).await
+}
+
+/// [`start`], choosing the node's transaction lanes: `anonymous_tx_only` is what a node of v0.9.0
+/// or later runs by default, off is a v0.8.x node's default (both lanes subscribed and relayed).
 async fn start_on_lanes(gen: &Genesis, seed: u8, bootstrap: Vec<libp2p::Multiaddr>, dandelion: DandelionConfig, anonymous_tx_only: bool) -> TestNode {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("genesis.json"), gen.to_json()).unwrap();
@@ -89,7 +93,12 @@ impl Net {
         let mut nodes: Vec<TestNode> = Vec::new();
         for (i, cfg) in configs.iter().enumerate() {
             let boot = nodes.iter().map(common::cluster::bootstrap_addr).collect();
-            nodes.push(start_on_lanes(&gen, 1 + i as u8, boot, cfg.clone(), anonymous_only.contains(&i)).await);
+            let node = if anonymous_only.contains(&i) {
+                start_on_lanes(&gen, 1 + i as u8, boot, cfg.clone(), true).await
+            } else {
+                start(&gen, 1 + i as u8, boot, cfg.clone()).await
+            };
+            nodes.push(node);
         }
         let n = nodes.len();
         let capable = configs.iter().filter(|c| c.enabled).count();
