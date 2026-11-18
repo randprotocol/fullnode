@@ -207,7 +207,14 @@ describe the v0.8.3/v0.8.4 roll, when that copy was still on by default.
    still hears every transaction on `tx/2` from the others, and a not-yet-flagged node still
    publishes on both. A node from before v0.8.3 left on the chain would stop hearing the flagged
    nodes' transactions (it would still get them in blocks).
-3. The next release can make `--anonymous-tx-only` the default and drop the legacy topic.
+3. **From v0.9.0 `--anonymous-tx-only` is the default** (monorepo#27): a node reads its own
+   version, so the legacy topic is left with the version bump, with no flag on any unit and no
+   flag day. A v0.9.0 node and a v0.8.3–v0.8.x node exchange every transaction on `tx/2`, which
+   both speak, so the release rolls one host at a time in any order. A chain that still has a node
+   from before v0.8.3 runs its v0.9.0 nodes with `--legacy-tx-relay` (keep subscribing and
+   relaying there) and, where that old node must hear a node's own transactions over gossip,
+   `--legacy-tx-publish`. Chain 21 has had no such node since the v0.8.5 roll. Before v0.9.0 the
+   flag stays what step 2 says: optional, per host.
    (Audit v12 made the step in between: the legacy topic is still subscribed and relayed by
    default, but a node's own transactions go there only under `--legacy-tx-publish`. A node from
    before v0.8.3 left on the chain then hears a new node's transactions in blocks, and over gossip
@@ -232,10 +239,34 @@ fluff no node shows it over RPC, serves it to a peer or proposes it (`docs/archi
 | `--dandelion-fluff-prob` | `0.1` | q; a stem runs about 1/q relays |
 | `--dandelion-embargo-ms` | `3000` | b; every holder, the submitter included, waits b + min(Exp(b/4), b) (audit v12, PRIV-604); keep it at or above 3000, twice the 1.5 s stem acknowledgement timeout |
 
-**Origin hiding is design intent until it is measured again.** The first-spy test that found the
-submitter first in 27 of 27 traces has not been re-run against v0.8.3 or later, and until audit v12
-every fluff was also published on the signed legacy topic, naming its fluffer (PRIV-601). Treat
-the stem's protection as unmeasured until that test is re-run on a fleet with the v12 fixes.
+**Origin hiding is design intent until it is measured again on the fleet.** The first-spy test
+that found the submitter first in 27 of 27 traces has not been re-run against a fleet of v0.8.3 or
+later, and until audit v12 every fluff was also published on the signed legacy topic, naming its
+fluffer (PRIV-601). Treat the stem's protection on chain 21 as unmeasured until that run is
+recorded.
+
+What is measured, in process, on every CI run (`tests/dandelion.rs`,
+`a_first_spy_names_the_submitter_without_dandelion_and_rarely_with_it`; monorepo#27): five nodes
+on loopback and an observer connected to all of them that guesses each transaction's origin as the
+peer that first forwarded it. With Dandelion off the test requires the guess to be the submitter
+for at least 8 of 10 transactions; with it on at the defaults, over a fleet that mixes nodes on
+the anonymous lane only with nodes on both lanes, at most 10 of 20; and no copy may reach the
+observer on the signed legacy topic. It prints both counts. Five loopback nodes are not the
+fleet: a stem among five nodes ends back at its submitter about one time in five, and loopback has
+no link delay. Run it with
+
+```
+cargo test -p randprotocol-node --release --test dandelion a_first_spy -- --nocapture
+```
+
+**The fleet run, to record** (owner; it needs hosts, so no test here does it): with every
+validator's `rand_getMempoolInfo` sampled at 20 Hz or faster, as in the 27-trace run, submit at
+least 27 transactions through one node's RPC, one at a time, and for each note the host whose
+mempool counted it first. Record the count of traces in which that host was the entry node, the
+release and `git_sha` the fleet ran (`rand_getVersion`), and that no unit carried
+`--legacy-tx-publish` (`systemctl cat rand-node | grep -c legacy-tx-publish` is 0 on every host).
+The stem hides which node a transaction entered at from the *gossip*; a node that is itself the
+entry node's stem successor still sees the stem, so sample mempools, not stem traffic.
 
 **Rollout.** Nothing to coordinate: it is on by default and rolls with the binary, in any order.
 A node sends a stem only to a peer whose identify lists the stem protocol, so a node that predates
@@ -251,7 +282,7 @@ connection is re-established at the restart).
    the legacy `tx` topic. The legacy copy names its publisher, which is now the fluffing relay,
    not the submitter: Dandelion already moves what the signature gives away off the submitter in
    this phase.
-2. *Phase 2, `--anonymous-tx-only`.* Nothing names a publisher at all; what remains is timing,
+2. *Phase 2, `--anonymous-tx-only` (the default from v0.9.0).* Nothing names a publisher at all; what remains is timing,
    which the stem moves a random walk away from the submitter.
 3. The legacy topic gone, the transaction lane is anonymous gossip without `flood_publish`, fed
    only by fluffs.
