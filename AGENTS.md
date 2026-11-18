@@ -6,16 +6,36 @@ invariants, and known traps.
 
 ## Project memory (state as of 2026-11-08)
 
-### Releases on chain 21 since v0.8.2 (status as of 2026-11-08)
+### Releases on chain 21 since v0.8.2 (status as of 2026-11-17)
 
-Chain 21 runs **v0.8.5**. Every release below is node-only (no wire, storage-format or consensus
-change except v0.8.4's storage note); `CHANGELOG.md` has each one's rows.
+Chain 21 runs **v0.8.6** (by its roll record; see the record's amendment). Every release below is
+node-only: it rolled onto the live chain and changed no consensus rule. v0.8.5 and v0.8.6 change
+no wire or storage format; v0.8.4 changes the storage format, one way; v0.8.3 **does** change the
+wire, additively — the stem protocol `/rand/<chain>/stem/1` and the anonymous transaction lane
+(`/rand/<chain>/txsub`, topic `rand/<chain>/tx/2`) — and rolled node by node (this list said "no
+wire change" for it until 2026-11-17, against its own CHANGELOG entry; audit v14, DOC-601).
+`CHANGELOG.md` has each one's rows.
 
+**What the fleet-wide `v0.8.6` tags mean (audit v14, CLI-751).** At the node release the tag
+`v0.8.6` was also put on the other repositories of the set. Outside this repository it marks the
+monorepo snapshot at the node release, **not a release of that repository**: the clients tag
+`v0.8.6` names no wallet release (the newest wallet is 0.8.3), and the circuits tag `v0.8.6` is 20
+commits past the circuits commit the v0.8.6 node pins (`b3e21d9`). Build a wallet from the clients
+tag `v0.8.3`; the circuits the node runs are its pin, not the circuits tag.
+
+- **v0.8.6** (tag `6591c884`, tagged 2026-11-08 19:20 UTC; audit v13 rows): rolled 2026-11-09
+  00:16–02:22 UTC one host at a time, rand-node sha256 `61c2a8bb…` from the user-signed
+  `SHA256SUMS`; the hand-placed `nofile.conf` moved aside (PROC-702). All of that is the roll
+  record's word (`deploy/roll-records/v0.8.6.record`): no probe output was committed with it, its
+  host count (24 of 25, archive2 skipped) disagrees with v0.8.5's (25 with archive2 outside them)
+  and waits for the 2026-11-17 fleet probe, and the loop that ran was uncommitted — it is
+  `deploy/roll-fleet.sh` since (audit v14, DOC-751, PROC-751). Later rolls: `roll-fleet.sh`, which
+  writes the record itself.
 - **v0.8.5** (tag `d8efd472`, 2026-11-04; audit v12 rows): rolled 2026-11-04 17:46–19:52 UTC to all
   25 inventory hosts (archive2 offline, skipped) plus the durian site node, rand-node binary sha256
   `2cdb3d18…`, from the user-signed `SHA256SUMS`; `rand-node.service.d/50-limits.conf` (PROC-601)
   written on every host. Fleet probes of 2026-11-07: 25/25 on 0.8.5. Roll record:
-  `deploy/roll-records/v0.8.5.record`. Follow-ups: the audit v13 rows (CHANGELOG, Unreleased) —
+  `deploy/roll-records/v0.8.5.record`. Follow-ups: the audit v13 rows (CHANGELOG, v0.8.6) —
   among them every host's hand-placed `nofile.conf`, which still overrides `50-limits.conf`'s
   `LimitNOFILE` until the next roll removes it (PROC-702).
 - **v0.8.4** (tag `e1f75f11`, 2026-11-01): the perps-digest fix for the 2026-11-01 OOM kills and
@@ -26,7 +46,7 @@ change except v0.8.4's storage note); `CHANGELOG.md` has each one's rows.
 
 ### v0.8.2 (2026-10-27; tagged `6154732d` and released; node-only on chain 21)
 
-Superseded on the fleet by v0.8.3–v0.8.5 (above). The entry as written before the tag:
+Superseded on the fleet by v0.8.3–v0.8.6 (above). The entry as written before the tag:
 
 Merges `fix/prover-ram`, `audit/v10-node` and `audit/v10-perps` and bumps the workspace to 0.8.2
 (`CHANGELOG.md`, v0.8.2, has every row). The consensus rules among them (PST-1

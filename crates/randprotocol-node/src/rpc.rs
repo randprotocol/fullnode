@@ -3156,7 +3156,7 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
                             let nf = import.vk.nullifier(&n.cm);
                             (Some(word8_to_hex(&nf)), Some(storage.nullifier_height(&nf)?.is_some()))
                         }
-                        crate::viewing::Role::Sent => (None, None),
+                        crate::viewing::Role::Sent | crate::viewing::Role::SentUnverified => (None, None),
                     };
                     notes.push(json!({
                         "index": n.index, "cm": word8_to_hex(&n.cm), "height": n.height,

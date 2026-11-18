@@ -287,20 +287,36 @@ class Pool:
             # job`, which a wallet reads as final (seen 2026-10-01: a member wedged mid-proof, and
             # the first status poll came back `unknown job`, so the send was abandoned).
             return self.exchange(b, "POST", body, headers)
-        # The router restarted and forgot the job: ask every member. One that holds it answers for
-        # it; `unknown job` is only the answer when every member answered and none holds it.
-        silent = False
-        last = None
+        # The router restarted and forgot the job: ask every member. Only a member that answers
+        # *for* the job (HTTP 200, a JSON-RPC reply with a `result`) holds it and is remembered
+        # (PROV-1001: an HTTP error, a non-JSON body or any other JSON-RPC error used to pin the
+        # job to that member for JOB_TTL_SECS, so its real holder was never asked again).
+        # `unknown job` is the answer only when every member said exactly that. A member that was
+        # silent or answered with something that is not JSON-RPC makes it an outage (503, the
+        # wallet retries); a member's own well-formed refusal (a refused Origin, say) is relayed
+        # as it is, and nothing is remembered.
+        outage = False
+        refusal = None
+        unknown = None
         for b in self.by_load_all():
             got = self.exchange(b, "POST", body, headers)
             if got is None:
-                silent = True
+                outage = True
                 continue
-            last = got
-            if error_code(parse(got[2])) != UNKNOWN_JOB:
+            reply = parse(got[2])
+            if got[0] == 200 and isinstance(reply, dict) and "result" in reply and "error" not in reply:
                 self.remember(job, b)
                 return got
-        return None if silent else last
+            code = error_code(reply)
+            if code == UNKNOWN_JOB:
+                unknown = got
+            elif got[0] == 200 and code is not None:
+                refusal = refusal or got
+            else:
+                outage = True
+        if outage:
+            return None
+        return refusal or unknown
 
     def info(self, body, headers):
         for b in self.by_load():

@@ -44,6 +44,45 @@ impl EnvelopeFormat {
 }
 
 /// The 32 little-endian bytes of a word octet.
+/// Who a note's creator field (`from`) says made it, for a party whose own `pk` is known (audit
+/// v14, VK-751).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Creator {
+    /// The party itself: a bundle output, whose `from` the bundle proof binds to the spender's
+    /// own `pk`.
+    Own,
+    /// A word the chain fixes ([`CHAIN_CREATORS`]): the note was appended by an action, not by a
+    /// spend, and names no creator at all.
+    Chain,
+    /// Another key's `pk`: someone else's bundle output.
+    Other,
+}
+
+/// The `from` words the chain itself fixes: zero (a bridge deposit and its fee note, a faucet
+/// mint, a genesis alloc, a staking or aggregation payout), `rpl-mint` (a token mint), `rpl2-pay`
+/// (a program's or a public multisig's payout) and `rpl3-pay` (a perps withdrawal). No `pk` is
+/// one of them: a `pk` is a hash of a key.
+pub const CHAIN_CREATORS: [Word8; 4] = [
+    [0; 8],
+    crate::ledger::tokens::MINT_FROM,
+    crate::ledger::program_state::PROGRAM_FROM,
+    crate::ledger::perps::PERP_FROM,
+];
+
+/// Audit v14, VK-751: what `from` says about who created a note, for the party whose `pk` is
+/// `own_pk`. An envelope's sender part opening under a viewing key's `ovk` shows only that
+/// whoever sealed it held that key — a delegated prover, an auditor and a node it was imported
+/// into all do — so a history row is "sent" only when this is [`Creator::Own`].
+pub fn creator_of(from: &Word8, own_pk: &Word8) -> Creator {
+    if from == own_pk {
+        Creator::Own
+    } else if CHAIN_CREATORS.contains(from) {
+        Creator::Chain
+    } else {
+        Creator::Other
+    }
+}
+
 pub fn word8_to_bytes(w: &Word8) -> [u8; 32] {
     let mut out = [0u8; 32];
     for (i, x) in w.iter().enumerate() {

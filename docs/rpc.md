@@ -437,9 +437,19 @@ not the history: the cursor persists between calls.
 A row is one matched leaf, in tree order. `role` is `"received"` for a note the key owns (the
 envelope opened as receiver *and* the note names the key's `pk` — an envelope anyone can seal to
 a public address is not proof of ownership) and `"sent"` for a note the key created for someone
-else, opened through the outgoing viewing key. A `received` row carries the note's `nullifier`
+else: the envelope's sender part opened through the outgoing viewing key *and* the note's
+creator field (`from`) is the key's own `pk`, which the bundle proof binds to the spender. The
+sender part opening is not enough on its own (audit v14, VK-751): anyone who holds the viewing
+key — a delegated prover, an auditor, a node it was imported into — can wrap an envelope's
+sender part under it. So a leaf whose sender part opens but whose `from` is another key's `pk`
+is not a row at all, and one whose `from` is a word the chain fixes — zero (a bridge deposit, a
+faucet mint), `rpl-mint` (a token mint), `rpl2-pay` (a program or multisig payout), `rpl3-pay`
+(a perps withdrawal) — has role `"sent_unverified"`: such a note names no creator, so the
+submitter who sealed it may be this key's wallet (it relayed the deposit, minted the token) or
+anyone else holding the viewing key. Show a `sent_unverified` row as unconfirmed and never add
+it to a total of payments sent. A `received` row carries the note's `nullifier`
 (a function of the viewing key) and whether the chain has published it — refreshed on every call;
-a `sent` row has neither, because the note is not the key's to nullify. Amounts are strings, as
+a `sent` or `sent_unverified` row has neither, because the note is not the key's to nullify. Amounts are strings, as
 everywhere chain state is served. The note's `memo` is the sender's encrypted memo (spec
 2026-09-26 §2.3) if it opened one — `null` for no memo, or an envelope this key opened but whose
 memo field was malformed (a malformed memo never costs the payee the note itself, just the text).

@@ -12,9 +12,89 @@ stopped at v0.4 until 2026-09-30, when the entries v0.5 to v0.6.7 were written f
 
 ## Unreleased
 
-Nothing yet.
+Node, wallet and viewing (audit v14 addendum rows; node-local policy and client-side reading only: no wire, storage-format or consensus change):
 
-## v0.8.6 — 2026-11-09 (chain 21, node-only; audit v13 rows; no wire, storage-format or consensus change)
+- **CON-701, the first minute** (Medium, was Partial): without `--max-state-proof-tier` a node
+  holds its state-proof tier cap at 16 or lower from its start until the first re-reading of the
+  memory left, a minute later; a fresh process's small resident size no longer reads 18 on an
+  8 GB host. The startup warm follows the held cap and builds the shapes above it once a
+  re-reading admits their tier. The flag still wins and is never re-read. Not closed: nothing
+  measures that the node has reached its working size at that first re-reading.
+- **CON-752**: the cap's wiring is pinned by tests: the host reading, the startup default, the
+  status tick's call, the refresh's recurrence and the least-of rule of the cgroup walk (a fixture
+  tree, so it runs on macOS; the real Linux readers have a Linux-only test).
+- **CON-751** (docs): `docs/perps.md`, `docs/node-hardware.md` and `docs/cli.md` give the default
+  cap per host size. A 2 GB validator under `MemoryHigh=85%` reads 14 or 12 at rest and does not
+  pool or relay a cold tier-16 state proof unless `--max-state-proof-tier 16` is set; the v0.8.5
+  entry's "16 on 2 GB and 4 GB hosts" is true of that release's host-total rule only.
+- **VK-751**: a note is `sent` only when its creator field is the key's own address, in the
+  wallet and in the node's viewing scan. A leaf whose sender part opens but whose creator is a
+  chain-fixed word (a relayed deposit, a mint, a payout, a perps withdrawal) is `sent_unverified`
+  (a new `role` value in `rand_getViewingNotes`; "(sender unverified)" in `rand history`); one
+  created by another key is no row. A holder of a wallet's viewing key can no longer plant sent
+  payments in its history. Rows an existing wallet store already holds are reclassified by a
+  rescan. The explorer and the wallet apps carry the same rule in their own repositories.
+- **VK-1003, VK-1004**: `program_code` and `assets()` refuse out-of-range or wrong-typed reply
+  values instead of truncating them or reading zero.
+- **LED-1001**: the perps digest log loads an out-of-order stored document in one pass (it was
+  quadratic: 4,096 descending entries took seconds); the stored bytes are unchanged.
+- **PROV-1001** (`deploy/prover/router.py`): a job the router has forgotten is remembered only
+  against a member that answers for it (HTTP 200 with a JSON-RPC `result`). An HTTP error, a body
+  that is not JSON-RPC or another JSON-RPC error used to pin the job to that member for an hour;
+  the first two are now an outage (503) and a member's own refusal is relayed, neither remembered.
+
+Deploy and records (audit v14 addendum rows; no node code, no host touched):
+
+- **The one-at-a-time roll is a committed script: `deploy/roll-fleet.sh`** (PROC-751). The v0.8.5
+  and v0.8.6 rolls ran from a throwaway loop round `update-droplet.sh`; the rejoin gate their
+  records describe was in no file. `roll-fleet.sh` reads the inventory (`NODES_ENV`), verifies the
+  signed `SHA256SUMS` before any host (unsigned refused without `ALLOW_UNSIGNED=1`), rolls one host
+  at a time through `update-droplet.sh`, and after each polls the host and a reference node until
+  the host is active on the release's binary, within `--within` (5) blocks of the reference with
+  at least `--min-peers` (10) peers, and the reference has moved; after `--timeout` (900 s) the
+  roll **stops**. `--skip`, `--last`, `--ref`, `--dry-run`. It writes the roll record itself:
+  both sha256s and how they were authenticated, the gate's numbers, the hosts skipped, and per
+  host the timestamps and the values the gate read. `SELFTEST=1 bash deploy/roll-fleet.sh` runs
+  it against sandboxed hosts (66 checks).
+- **`update-droplet.sh` and `PRUNE_ARGS`** (PROC-751): from 2026-09-24 (`65f75553`) to 2026-11-08
+  (`7e640561`, v0.8.6) the new-binary path expanded `${PRUNE_ARGS}` under `set -u`, so it aborted
+  on any new binary unless `PRUNE_ARGS` was set, before the service was stopped or anything installed.
+  The fix is v0.8.6's (`${PRUNE_ARGS:-}`); the script's header now says so, and the selftest runs
+  that path with `PRUNE_ARGS` unset and set.
+- **The limits selftest runs what the hosts are sent** (PROC-701): its `ssh` stub only recorded
+  each remote command, so an install step sent inside `if false; then … fi` stayed 40 of 40.
+  `deploy/lib/host-sandbox.sh` now runs each remote command in a temp root per host with a fake
+  `systemctl` that models drop-in order, reload and start; the checks read the host's files and
+  the `LimitNOFILE` its service started with. `vps-setup.sh` is run there too (it was only
+  searched as text: with the line that loads the library deleted, the selftest stayed green and a
+  fresh host got no drop-in), and now fails loudly when the library or its script is missing.
+  66 checks; a dead-branch install in each roll path, the deleted library load and each of the
+  three call-site deletions turn it red.
+- **A legacy drop-in keeps what else it sets** (PROC-702 residual): the clean-up moved the whole
+  file aside, so a drop-in that also set an `Environment=` or `ExecStartPre=` lost it; such a file
+  is now rewritten without its `LimitNOFILE`/`MemoryHigh` lines (the original kept as
+  `<name>.removed`), and a file that sets nothing else is moved as before. A key written with
+  blanks round the `=` (`LimitNOFILE = 65536`) is matched.
+- **Records and dates** (DOC-751, DOC-601): the v0.8.6 entry's date is the tag's in UTC
+  (2026-11-08; it said 2026-11-09, the roll's date) and has its roll line; the v0.8.5 CON-601
+  entry points at v0.8.6, not at an empty Unreleased; `AGENTS.md` and `docs/deploy.md` say chain
+  21 runs v0.8.6; `AGENTS.md`'s release list no longer calls v0.8.3 "no wire change" (it added the
+  stem and anonymous-lane protocols) and says what the v0.8.6 tags on the other repositories mean
+  (CLI-751); `deploy/roll-records/v0.8.6.record` carries an amendment of 2026-11-17 (its probe
+  line, its host count, the procedure that ran).
+- **The msauth proof figures** (MSC-751): `docs/multisig.md`, `docs/cli.md`, `docs/prover.md`,
+  `docs/shielded.md`, `docs/node-hardware.md`, `docs/zkvm.md` and the chain-21 runbook said no
+  multisig authorisation proof had completed and to plan for 96 GB. One Production proof completed
+  on 2026-11-06 (M = 3, tier 18, 3.7 MB, 69 minutes, peak RSS 92.9 GiB ≈ 99.7 GB): at least
+  128 GB. It has not been submitted on chain 21 by a wallet flow; the logs are the operator's.
+
+## v0.8.6 — 2026-11-08 (chain 21, node-only; audit v13 rows; no wire, storage-format or consensus change; rolled 2026-11-09)
+
+Rolled 2026-11-09 00:16–02:22 UTC, one host at a time: tag `6591c884` (tagged 2026-11-08 19:20 UTC),
+rand-node sha256 `61c2a8bb…` from the user-signed `SHA256SUMS`, by the roll record
+(`deploy/roll-records/v0.8.6.record`). Read the record with its amendment of 2026-11-17: no probe
+output was committed with it, its host count is to be settled by a fleet probe, and the loop
+that ran is committed only since (`deploy/roll-fleet.sh`).
 
 - **Chain-22 cut (`deploy/cut-chain22-genesis.sh`):** the genesis sets
   `perps.max_pending_digests = 65536`, the owner's decision of 2026-11-05 for chain 22's perps
@@ -83,7 +163,7 @@ Node (audit v12 consensus-adjacent rows):
   (`StateProofAboveNodeTier`: not cached, no peer penalised). The default is the highest tier
   whose documented key-build peak fits in three quarters of the host's RAM: 16 on 2 GB and 4 GB
   hosts, 18 from about 5.73 GB, 20 from about 22.9 GB (audit v13, CON-701, sizes it from the
-  memory left instead; see Unreleased). The startup warm skips shapes above the cap too. A
+  memory left instead; see v0.8.6). The startup warm skips shapes above the cap too. A
   block carrying such a proof still applies and builds its key: that residual waits for chain
   22's genesis engine pin. Also, the state-proof pre-key checks now refuse a FRI transcript of the
   wrong structure (commit rounds, proof-of-work words and openings of unequal counts, no round,
