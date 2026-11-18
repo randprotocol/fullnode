@@ -4166,8 +4166,21 @@ impl Node {
                     // hands the hashes back; the compact form is built from that list, so the
                     // wire and the cache never disagree about a body's id (CON-102).
                     let Block { header, transactions, signature } = b;
+                    // The randomness beacon (genesis `beacon`): the block's first transaction is
+                    // the proposer's reveal, which no peer can hold, so it rides with the hashes
+                    // rather than cost every validator a fetch. Only on a chain with the section:
+                    // every other chain's frames are what they were.
+                    let reveal = transactions
+                        .first()
+                        .filter(|t| self.gs.ledger.beacon().is_some() && matches!(t.action, randprotocol_core::Action::BeaconReveal { .. }))
+                        .cloned();
                     let hashes = self.recent_txs.remember_all(transactions);
-                    self.net.broadcast(GossipMessage::CompactProposal(CompactBlock::with_hashes(header, signature, hashes))).await;
+                    let compact = CompactBlock::with_hashes(header, signature, hashes);
+                    let msg = match reveal {
+                        Some(tx) => GossipMessage::CompactProposalPrefilled { compact, prefilled: vec![tx] },
+                        None => GossipMessage::CompactProposal(compact),
+                    };
+                    self.net.broadcast(msg).await;
                 }
                 Action::Broadcast(m) | Action::SendTo(_, m) => {
                     self.net.broadcast(GossipMessage::Consensus(m)).await;
@@ -4589,6 +4602,8 @@ impl Node {
                 GossipMessage::Transaction(tx) => self.on_gossiped_tx(tx, id).await?,
                 // Reported once, on the pre-screen's verdict, inside (spec 2026-10-08 §5).
                 GossipMessage::CompactProposal(c) => self.on_compact_proposal(c, id).await?,
+                // The beacon's form: the same path, with the bodies the leader sent along.
+                GossipMessage::CompactProposalPrefilled { compact, prefilled } => self.on_compact_proposal_prefilled(compact, prefilled, id).await?,
                 GossipMessage::Status(s) => {
                     let ahead = s.height > self.hs.committed_height() + 1;
                     let outcome = on_status_gossip(
@@ -5087,6 +5102,16 @@ impl Node {
     /// cannot be checked against a set this replica lacks, so handing it on would re-open the
     /// amplification. Such a block reaches the replica by sync once the set is known.
     async fn on_compact_proposal(&mut self, c: CompactBlock, id: GossipId) -> Result<()> {
+        self.on_compact_proposal_prefilled(c, Vec::new(), id).await
+    }
+
+    /// [`Node::on_compact_proposal`] with the bodies the leader sent along
+    /// (`GossipMessage::CompactProposalPrefilled`, the randomness beacon). A prefilled body is
+    /// kept only on a beacon chain, only after the header's signature and the hash list passed
+    /// the pre-screen, and only if it is a `BeaconReveal` whose hash is the first of that list —
+    /// the one transaction a beacon block's peers cannot hold. Everything else in the list is
+    /// dropped unread; its bytes are charged to the forwarder's budget with the frame's.
+    async fn on_compact_proposal_prefilled(&mut self, c: CompactBlock, prefilled: Vec<Transaction>, id: GossipId) -> Result<()> {
         use admission::Acceptance;
         use randprotocol_core::consensus::GossipPrecheck;
         let now = Instant::now();
@@ -5095,7 +5120,7 @@ impl Node {
             self.report(id, GossipOutcome::Report(Acceptance::Ignore)).await;
             return Ok(());
         }
-        let bytes = bincode::serialized_size(&c).unwrap_or(u64::MAX) as f64;
+        let bytes = bincode::serialized_size(&c).unwrap_or(u64::MAX).saturating_add(bincode::serialized_size(&prefilled).unwrap_or(u64::MAX)) as f64;
         // Spent in place: `TokenBucket` is `Copy`. The entry exists: `on_consensus_gossip` made it.
         let bucket = &mut self.peers.entry(forwarder).or_default().consensus_byte_bucket;
         if !self.consensus_byte_limiter.allow_n(bucket, bytes, now) {
@@ -5135,6 +5160,16 @@ impl Node {
         }
         self.note_first_compact(key, &c, hash);
         self.report(id, GossipOutcome::Report(Acceptance::Accept)).await;
+        // The leader's reveal, filed where the rebuild below looks (the recent cache). The
+        // pre-screen verified the leader's signature over the header and held the hash list to
+        // the header's root, so a body whose hash is the list's first is the block's own.
+        if self.gs.ledger.beacon().is_some() {
+            if let Some(tx) = prefilled.into_iter().next() {
+                if matches!(tx.action, randprotocol_core::Action::BeaconReveal { .. }) && tx.bundle.is_none() && c.tx_hashes.first() == Some(&tx.hash()) {
+                    self.recent_txs.remember_all([tx]);
+                }
+            }
+        }
         // Every proposal that passed the pre-screen, parked or not, rebuilt or not (final review
         // I2), as the full path counts every proposal it hands on; only these, since an
         // `Ignore`d header's signature was never verified.

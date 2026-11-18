@@ -627,7 +627,7 @@ impl Topics {
     fn for_message(&self, msg: &GossipMessage) -> &IdentTopic {
         match msg {
             GossipMessage::Consensus(_) => &self.consensus,
-            GossipMessage::CompactProposal(_) => &self.consensus,
+            GossipMessage::CompactProposal(_) | GossipMessage::CompactProposalPrefilled { .. } => &self.consensus,
             GossipMessage::Transaction(_) => &self.tx,
             GossipMessage::Status(_) => &self.status,
             GossipMessage::PeerBinding(_) => &self.peers,
@@ -2516,6 +2516,7 @@ mod tests {
             (GossipMessage::Status(Status { height: 1, head_hash: Hash::ZERO, view: 1, floor: 0 }), "rand/7/status"),
             (GossipMessage::PeerBinding(PeerBinding::sign(&key, &Hash::ZERO, &PeerId::random(), 1)), "rand/7/peers"),
             (GossipMessage::CompactProposal(CompactBlock::of(&block)), "rand/7/consensus"),
+            (GossipMessage::CompactProposalPrefilled { compact: CompactBlock::of(&block), prefilled: Vec::new() }, "rand/7/consensus"),
         ];
         for (msg, topic) in cases {
             assert_eq!(t.for_message(&msg).to_string(), topic);

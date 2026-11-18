@@ -3502,6 +3502,27 @@ async fn beacon_validators_agree_on_the_value_across_a_restart() {
     }
     let before = nodes[0].rpc.call("rand_getBeacon", json!([])).await.unwrap();
     assert_eq!((&before["enabled"], &before["commit_delay_blocks"]), (&json!(true), &json!(BEACON_DELAY)));
+
+    // On the wire a beacon block's proposal is the prefilled compact form (tag 5): the hashes
+    // and the one body no peer can hold, the reveal — never the plain form, never a full block.
+    let mut obs = Observer::start(CHAIN_ID, vec![bootstrap_addr(&nodes[0])]).await;
+    let _ = obs.pump(Duration::from_secs(2)).await;
+    let seen = obs.pump(Duration::from_secs(3)).await;
+    let mut prefilled = 0;
+    for s in seen.iter().filter(|s| s.topic.as_str().ends_with("/consensus")) {
+        match bincode::deserialize::<GossipMessage>(&s.data) {
+            Ok(GossipMessage::CompactProposalPrefilled { compact, prefilled: bodies }) => {
+                assert_eq!(bodies.len(), 1, "one body rides along");
+                assert!(matches!(bodies[0].action, Action::BeaconReveal { .. }));
+                assert_eq!(compact.tx_hashes.first(), Some(&bodies[0].hash()));
+                prefilled += 1;
+            }
+            Ok(GossipMessage::CompactProposal(_)) => panic!("a plain compact proposal on a beacon chain"),
+            Ok(GossipMessage::Consensus(ConsensusMessage::Proposal(_))) => panic!("a full proposal frame"),
+            _ => {}
+        }
+    }
+    assert!(prefilled > 0, "the observer saw no proposal");
     assert_eq!(before["validators"].as_array().unwrap().len(), 4);
 
     // Stop the fourth validator; the other three are a quorum and go on (its slots time out).
