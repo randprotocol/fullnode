@@ -47,6 +47,32 @@ pub const CONTEXT_VERSION: u32 = 1;
 /// The fixed words before the cells: version, the four counts, `burn_r` (2), the inflow kind,
 /// `burn_asset`, `burn_a` (2).
 pub const CONTEXT_HEADER_WORDS: usize = 11;
+/// Word 0 of the context of an [`Action::InvokeAt`] (issue #168, `docs/evm-block-context.md`):
+/// version 1's content with the [`BLOCK_CONTEXT_WORDS`] block-context words between the header
+/// and the cells.
+pub const CONTEXT_VERSION_BLOCK: u32 = 2;
+/// The block-context words of a version-2 context, at context words
+/// `CONTEXT_HEADER_WORDS .. CONTEXT_HEADER_WORDS + BLOCK_CONTEXT_WORDS` (11..28) — before the
+/// cells, so no offset depends on how many cells or payouts the transition has. Each `CTX_*`
+/// constant below is an offset from the start of the context.
+pub const BLOCK_CONTEXT_WORDS: usize = 17;
+/// `ref_height`, the reference block's height: low word, then high (as `burn_r` is).
+pub const CTX_REF_HEIGHT: usize = 11;
+/// The reference block's time in **seconds** (`timestamp_ms / 1000`): low word, then high.
+pub const CTX_TIMESTAMP: usize = 13;
+/// The chain id (genesis `chain_id`): low word, then high.
+pub const CTX_CHAIN_ID: usize = 15;
+/// The gas price in force for the reference block's transactions, in RAND units per unit of
+/// gas ([`BlockFacts::basefee`]): low word, then high.
+pub const CTX_BASEFEE: usize = 17;
+/// 1 when [`CTX_RANDOMNESS`] holds a beacon value, else 0. Always 0 today: the chain has no
+/// beacon, and the words are reserved so the layout does not move when one lands.
+pub const CTX_HAS_RANDOMNESS: usize = 19;
+/// Eight words (a `Word8`, as a cell value is) of beacon output for the reference block. All
+/// zero while [`CTX_HAS_RANDOMNESS`] is 0.
+pub const CTX_RANDOMNESS: usize = 20;
+/// The first word after the block context: where a version-2 context's cells start.
+pub const CONTEXT_HEADER_WORDS_BLOCK: usize = CONTEXT_HEADER_WORDS + BLOCK_CONTEXT_WORDS;
 /// The largest `cell_fee` a genesis may set: 1 000 RAND a cell.
 pub const MAX_CELL_FEE: u64 = 1_000 * crate::types::UNITS_PER_RAND;
 
@@ -138,6 +164,25 @@ impl Transition {
         CONTEXT_HEADER_WORDS + 16 * (self.reads.len() + self.writes.len()) + 3 * (self.pays.len() + self.mints.len())
     }
 
+    /// [`Transition::context_words`] for a version-2 context ([`Transition::context_at`]).
+    pub fn context_words_at(&self) -> usize {
+        self.context_words() + BLOCK_CONTEXT_WORDS
+    }
+
+    /// The version-2 context (issue #168): [`Transition::context`] with word 0 =
+    /// [`CONTEXT_VERSION_BLOCK`] and `block` — the reference block's words, which the ledger
+    /// fills from its own ring ([`BlockFacts::context_words`]), never the transaction — between
+    /// the header and the cells.
+    pub fn context_at(&self, burn_r: u64, burn_asset: u32, burn_a: u64, block: &[u32; BLOCK_CONTEXT_WORDS]) -> Vec<u32> {
+        let v1 = self.context(burn_r, burn_asset, burn_a);
+        let mut w = Vec::with_capacity(self.context_words_at());
+        w.push(CONTEXT_VERSION_BLOCK);
+        w.extend_from_slice(&v1[1..CONTEXT_HEADER_WORDS]);
+        w.extend_from_slice(block);
+        w.extend_from_slice(&v1[CONTEXT_HEADER_WORDS..]);
+        w
+    }
+
     /// The words a program reads after the call binding (spec §5). The three burn fields are the
     /// transaction's bundle's; they are not part of the action, so they are passed in.
     pub fn context(&self, burn_r: u64, burn_asset: u32, burn_a: u64) -> Vec<u32> {
@@ -161,6 +206,45 @@ impl Transition {
             w.push(p.asset);
             w.push(p.amount as u32);
             w.push((p.amount >> 32) as u32);
+        }
+        w
+    }
+}
+
+/// What the chain defines about one closed block for a proof that names it as its reference
+/// block (issue #168, `docs/evm-block-context.md`). The ledger keeps the last
+/// `program_state.reference_block_window` of them ([`Ledger::block_facts`]), recorded at each
+/// block's end beside its anchor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlockFacts {
+    pub height: u64,
+    /// The block header's `timestamp_ms`.
+    pub timestamp_ms: u64,
+    /// RAND units per unit of gas that the block's own calls were priced at: the ledger's live
+    /// `gas_price` at the block's start, before the block-end controller moves it (the genesis
+    /// `gas.gas_price` on a chain without `gas.dynamic`; 0 on a chain without a `gas` section).
+    pub basefee: u64,
+}
+
+impl BlockFacts {
+    /// The block's time in seconds, as the EVM's `TIMESTAMP` has it.
+    pub fn timestamp_secs(&self) -> u64 {
+        self.timestamp_ms / 1000
+    }
+
+    /// The [`BLOCK_CONTEXT_WORDS`] words a version-2 context carries for this block on chain
+    /// `chain_id`, in the order of the `CTX_*` offsets. The randomness flag and its eight words
+    /// are zero: there is no beacon.
+    pub fn context_words(&self, chain_id: u64) -> [u32; BLOCK_CONTEXT_WORDS] {
+        let mut w = [0u32; BLOCK_CONTEXT_WORDS];
+        for (at, v) in [
+            (CTX_REF_HEIGHT, self.height),
+            (CTX_TIMESTAMP, self.timestamp_secs()),
+            (CTX_CHAIN_ID, chain_id),
+            (CTX_BASEFEE, self.basefee),
+        ] {
+            w[at - CONTEXT_HEADER_WORDS] = v as u32;
+            w[at - CONTEXT_HEADER_WORDS + 1] = (v >> 32) as u32;
         }
         w
     }
@@ -209,12 +293,33 @@ pub struct ProgramStateConfig {
     /// policy). Bound into the genesis hash only when `true`, so a file without it hashes as before.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub refuse_panics: bool,
+    /// Issue #168 (`docs/evm-block-context.md`): how many closed blocks an [`Action::InvokeAt`]
+    /// may name as its reference block — the ledger keeps that many [`BlockFacts`] and fills the
+    /// version-2 context from them. 0, the default — chain 21 and every chain cut before the
+    /// field — is off: no facts are kept and every `InvokeAt` is refused
+    /// ([`ProgramStateError::ReferenceBlockDisabled`]). When set it is inside the proof window's
+    /// bounds and the chain bounds its block time (`Genesis::validate`). Written to the file and
+    /// bound into the genesis hash only when nonzero, so a file without it hashes as before.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub reference_block_window: u64,
+}
+
+fn is_zero(v: &u64) -> bool {
+    *v == 0
 }
 
 impl ProgramStateConfig {
     pub fn check(&self) -> Result<(), String> {
         if self.cell_fee > MAX_CELL_FEE {
             return Err(format!("program_state.cell_fee {} exceeds {MAX_CELL_FEE}", self.cell_fee));
+        }
+        let w = self.reference_block_window;
+        if w != 0 && !(super::MIN_PROOF_WINDOW_BLOCKS..=super::MAX_PROOF_WINDOW_BLOCKS).contains(&w) {
+            return Err(format!(
+                "program_state.reference_block_window {w} is outside {}..={} (0 or absent switches it off)",
+                super::MIN_PROOF_WINDOW_BLOCKS,
+                super::MAX_PROOF_WINDOW_BLOCKS
+            ));
         }
         Ok(())
     }
@@ -363,6 +468,18 @@ pub enum ProgramStateError {
     /// program panicked on what it was shown, so the transition was not accepted.
     #[error("the program panicked: its call proof publishes the panic sentinel 0xdeadbeef in output 7, so the transition was refused, not accepted")]
     ProgramPanicked,
+    /// Issue #168: an `InvokeAt` on a chain whose genesis sets no
+    /// `program_state.reference_block_window`.
+    #[error("block context is disabled on this chain: its genesis sets no program_state.reference_block_window")]
+    ReferenceBlockDisabled,
+    /// Issue #168: the reference block has left the window. The proof was made too long ago; it
+    /// has to be made again against a recent block.
+    #[error("reference block {ref_height} is too old: the oldest block this chain still serves context for is {oldest} (window {window})")]
+    StaleReferenceBlock { ref_height: u64, oldest: u64, window: u64 },
+    /// Issue #168: the reference block is not a closed block below the one this transaction
+    /// would be in — it is the including block itself or one after it, or no block has closed.
+    #[error("reference block {ref_height} is not closed yet: the newest block with context is {newest:?}")]
+    FutureReferenceBlock { ref_height: u64, newest: Option<u64> },
 }
 
 /// What an action reaching this module that it does not own gets (see `tokens::NOT_TOKENS`).
@@ -385,10 +502,8 @@ pub fn created_cells(state: &ProgramState, program: &ProgramId, writes: &[Cell])
 /// The cell term of an invoke's fee floor, for the ledger's fee checks: `cell_fee` per cell
 /// created. Zero for every other action and on a chain without the section.
 pub fn cell_fee_of(ledger: &Ledger, action: &Action) -> u64 {
-    match (ledger.program_state(), action) {
-        (Some(state), Action::Invoke { program, transition, .. }) => {
-            state.cell_fee.saturating_mul(created_cells(state, program, &transition.writes))
-        }
+    match (ledger.program_state(), action.invoke()) {
+        (Some(state), Some(i)) => state.cell_fee.saturating_mul(created_cells(state, i.program, &i.transition.writes)),
         _ => 0,
     }
 }
@@ -544,11 +659,17 @@ fn check_state(
 /// another transaction writing a cell this one read, or draining the vault it pays from, makes it
 /// inapplicable for good unless the state comes back, and it must leave the pool rather than be
 /// offered to every block. Nothing here costs a hash or a proof. `Ok` for every other action.
+///
+/// Issue #168: an `InvokeAt` whose reference block has left the window is inapplicable for good
+/// the same way — its proof is over that block's facts — and is refused here first.
 pub fn still_applies(ledger: &Ledger, tx: &Transaction) -> Result<(), TxError> {
-    let Action::Invoke { program, transition, .. } = &tx.action else {
+    let Some(crate::types::InvokeParts { program, transition, ref_height, .. }) = tx.action.invoke() else {
         return Ok(());
     };
     let state = ledger.program_state().ok_or(ProgramStateError::Disabled)?;
+    if let Some(h) = ref_height {
+        ledger.block_facts_at(h)?;
+    }
     // The counts first, as `check_shape` has them: this may run before `validate` has (a pool's
     // pre-screen), and an oversized transition must not buy a lookup per entry.
     if transition.reads.len() > MAX_READS {
@@ -571,16 +692,24 @@ pub(super) fn validate(
     action: &Action,
     executor: &dyn ConfidentialExecutor,
 ) -> Result<(), TxError> {
-    let Action::Invoke { program, transition, .. } = action else {
+    let Some(crate::types::InvokeParts { program, transition, ref_height, .. }) = action.invoke() else {
         return Err(NOT_PROGRAM_STATE);
     };
     // The gate is absolute: on a chain without the section nothing about an invoke is looked at.
     let state = ledger.program_state().ok_or(ProgramStateError::Disabled)?;
+    // Issue #168: the second gate, as absolute — without genesis
+    // `program_state.reference_block_window` an `InvokeAt` is refused before its transition is
+    // read — and then the reference block itself: a closed block this ledger still holds the
+    // facts of. On the head's ledger (a pool) that is `h ≤ tip`; on a block's it is
+    // `h < including` and `including − h ≤ window`.
+    if let Some(h) = ref_height {
+        ledger.block_facts_at(h)?;
+    }
     check_shape(tx, transition)?;
     // The program, and the segment rule against its public input's length.
     let record = ledger.program(program).ok_or(TxError::UnknownProgram(*program))?;
     let public = record.public_len as usize;
-    let context = transition.context_words();
+    let context = if ref_height.is_some() { transition.context_words_at() } else { transition.context_words() };
     if !segment_fits(public, context) {
         let max = (public_table_rows(public + TX_BINDING_WORDS) as usize - 1).saturating_sub(public + TX_BINDING_WORDS);
         return Err(ProgramStateError::ContextTooLong { context, public, max }.into());
@@ -609,12 +738,16 @@ pub(super) fn apply(
     action: &Action,
     executor: &dyn ConfidentialExecutor,
 ) -> Result<(), TxError> {
-    let Action::Invoke { program, transition, .. } = action else {
+    let Some(crate::types::InvokeParts { program, transition, ref_height, .. }) = action.invoke() else {
         return Err(NOT_PROGRAM_STATE);
     };
     // The gate again, before any write (see `tokens::apply`).
     if ledger.program_state().is_none() {
         return Err(ProgramStateError::Disabled.into());
+    }
+    // And the reference block's (issue #168), for the same reason.
+    if let Some(h) = ref_height {
+        ledger.block_facts_at(h)?;
     }
     let m = moves(ledger, tx, program, transition)?;
     let time = tx.bundle.as_ref().ok_or(TxError::MissingBundle)?.time;
@@ -728,7 +861,7 @@ pub(crate) mod tests {
         let mut l = Ledger::new(CHAIN, HC, [(k.address(), entry)].into_iter().collect(), &StubExecutor);
         l.set_tokens(Some(TokenRegistry::new(REG_FEE)));
         if section {
-            l.set_program_state(Some(ProgramState::from_config(&ProgramStateConfig { cell_fee: CELL_FEE, refuse_panics: false })));
+            l.set_program_state(Some(ProgramState::from_config(&ProgramStateConfig { cell_fee: CELL_FEE, refuse_panics: false, reference_block_window: 0 })));
         }
         l.set_genesis_supply(1_000_000_000_000, 10);
         l.set_height(1);
@@ -788,7 +921,7 @@ pub(crate) mod tests {
 
     fn reprove(l: &Ledger, tx: &mut Transaction) {
         let record = l.program(&pid()).expect("deployed");
-        let segment = l.invoke_segment(record, tx).expect("an invoke with a bundle");
+        let segment = l.invoke_segment(record, tx).expect("a segment").expect("an invoke with a bundle");
         let call = StubExecutor::make_proof_with_public(&pid(), 10, [9, 8, 7, 6, 5, 4, 3, 2], &segment);
         let Action::Invoke { proof, .. } = &mut tx.action else { panic!("an invoke") };
         *proof = call;
@@ -819,7 +952,7 @@ pub(crate) mod tests {
     fn invoke_publishing(l: &Ledger, seed: u32, t: Transition, outputs: [u32; 8]) -> Transaction {
         let mut tx = invoke(l, seed, (0, 0, 0), t);
         let record = l.program(&pid()).expect("deployed");
-        let segment = l.invoke_segment(record, &tx).expect("an invoke with a bundle");
+        let segment = l.invoke_segment(record, &tx).expect("a segment").expect("an invoke with a bundle");
         let Action::Invoke { proof, .. } = &mut tx.action else { panic!("an invoke") };
         *proof = StubExecutor::make_proof_with_public(&pid(), 10, outputs, &segment);
         StubExecutor::bind(&mut tx);
@@ -1043,7 +1176,7 @@ pub(crate) mod tests {
                 Action::Invoke { program: pid(), proof: Vec::new(), input_envelope: None, transition: t.clone() },
             );
             let record = proved_on.program(&pid()).expect("deployed");
-            let segment = proved_on.invoke_segment(record, &tx).expect("an invoke with a bundle");
+            let segment = proved_on.invoke_segment(record, &tx).expect("a segment").expect("an invoke with a bundle");
             let Action::Invoke { proof, .. } = &mut tx.action else { panic!("an invoke") };
             *proof = StubExecutor::make_proof_with_public(&pid(), 10, [9, 8, 7, 6, 5, 4, 3, 2], &segment);
             StubExecutor::bind_in(&mut tx, judge.binding_domain());
@@ -1356,6 +1489,366 @@ pub(crate) mod tests {
         assert!(segment_fits(200, 47) && !segment_fits(200, 48), "a 256-row table");
         assert_eq!((public_table_rows(0), public_table_rows(127), public_table_rows(128)), (128, 128, 256));
         assert_eq!(PROGRAM_FROM[..2], [0x326c_7072, 0x7961_702d]);
+    }
+
+    // ── Issue #168: the reference block (`docs/evm-block-context.md`) ──────────────────────────
+
+    const WINDOW: u64 = 256;
+
+    /// [`ledger`] under `program_state.reference_block_window` = [`WINDOW`], with a bundle
+    /// window wider than it so a refusal below is the reference block's and not the bundle's.
+    fn ledger_at() -> Ledger {
+        let mut l = ledger();
+        l.set_reference_block_window(WINDOW);
+        l.set_proof_window_blocks(Some(1024));
+        l
+    }
+
+    /// End the block `l` is applying, as a proposer and a replica both do, and open the next at
+    /// `timestamp_ms`.
+    fn next_block(l: &mut Ledger, timestamp_ms: u64) {
+        let h = l.height();
+        l.close_block(h, &proposer().address(), 0, 0, &StubExecutor);
+        l.set_height(h + 1);
+        l.set_timestamp_ms(timestamp_ms);
+    }
+
+    /// An `InvokeAt` naming `ref_height`, its call proof left empty and its bundle bound.
+    fn unproved_at(l: &Ledger, seed: u32, ref_height: u64, t: Transition) -> Transaction {
+        StubExecutor::bound(Transaction::shielded(
+            CHAIN,
+            bundle(l, seed, FEE, 0, 0, 0),
+            Action::InvokeAt { program: pid(), proof: Vec::new(), input_envelope: None, transition: t, ref_height },
+        ))
+    }
+
+    /// `tx` with its stub call proof made over `segment`, and its bundle bound again.
+    fn prove_over(tx: &mut Transaction, segment: &[u32]) {
+        let Action::InvokeAt { proof, .. } = &mut tx.action else { panic!("an invoke-at") };
+        *proof = StubExecutor::make_proof_with_public(&pid(), 10, [9, 8, 7, 6, 5, 4, 3, 2], segment);
+        StubExecutor::bind(tx);
+    }
+
+    /// An `InvokeAt` proved over the segment `l` builds for it — `l` must hold `ref_height`.
+    fn invoke_at(l: &Ledger, seed: u32, ref_height: u64, t: Transition) -> Transaction {
+        let mut tx = unproved_at(l, seed, ref_height, t);
+        let segment = l.invoke_segment(l.program(&pid()).unwrap(), &tx).expect("the block is held").expect("a bundle");
+        prove_over(&mut tx, &segment);
+        tx
+    }
+
+    fn write_one() -> Transition {
+        Transition { reads: vec![cell(1, 0)], writes: vec![cell(1, 5)], ..empty() }
+    }
+
+    /// The version-2 context is the program ABI: pinned word for word, the block words at fixed
+    /// offsets before the cells.
+    #[test]
+    fn the_block_context_words_are_pinned() {
+        assert_eq!((CONTEXT_VERSION, CONTEXT_VERSION_BLOCK), (1, 2));
+        assert_eq!((CONTEXT_HEADER_WORDS, BLOCK_CONTEXT_WORDS, CONTEXT_HEADER_WORDS_BLOCK), (11, 17, 28));
+        assert_eq!((CTX_REF_HEIGHT, CTX_TIMESTAMP, CTX_CHAIN_ID, CTX_BASEFEE, CTX_HAS_RANDOMNESS, CTX_RANDOMNESS), (11, 13, 15, 17, 19, 20));
+        let facts = BlockFacts { height: (0x11 << 32) | 0x22, timestamp_ms: ((0x33u64 << 32) | 0x44) * 1000 + 999, basefee: (0x55 << 32) | 0x66 };
+        assert_eq!(facts.timestamp_secs(), (0x33 << 32) | 0x44, "seconds, rounded down");
+        let block = facts.context_words((0x77 << 32) | 0x88);
+        assert_eq!(block, [0x22, 0x11, 0x44, 0x33, 0x88, 0x77, 0x66, 0x55, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        let t = Transition {
+            reads: vec![Cell { key: [1, 2, 3, 4, 5, 6, 7, 8], value: [11, 12, 13, 14, 15, 16, 17, 18] }],
+            writes: vec![Cell { key: [21, 22, 23, 24, 25, 26, 27, 28], value: [31, 32, 33, 34, 35, 36, 37, 38] }],
+            inflow: Inflow::Burn,
+            pays: vec![pay(3, (7 << 32) | 9, 1)],
+            mints: vec![pay(4, 5, 2)],
+        };
+        // Version 2, then version 1's ten header words unchanged.
+        let mut want = vec![2, 1, 1, 1, 1, 0xdddd_dddd, 0xcccc_cccc, 2, 6, 0xbbbb_bbbb, 0xaaaa_aaaa];
+        // 11..28: ref_height, timestamp (s), chain id, basefee — low word first — the randomness
+        // flag, eight randomness words.
+        want.extend([0x22, 0x11, 0x44, 0x33, 0x88, 0x77, 0x66, 0x55, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        // 28..: cells and payouts exactly as version 1 has them from word 11.
+        want.extend([1, 2, 3, 4, 5, 6, 7, 8, 11, 12, 13, 14, 15, 16, 17, 18]);
+        want.extend([21, 22, 23, 24, 25, 26, 27, 28, 31, 32, 33, 34, 35, 36, 37, 38]);
+        want.extend([3, 9, 7, 4, 5, 0]);
+        let got = t.context_at(0xcccc_cccc_dddd_dddd, 6, 0xaaaa_aaaa_bbbb_bbbb, &block);
+        assert_eq!(got, want);
+        assert_eq!(got.len(), t.context_words_at());
+        let v1 = t.context(0xcccc_cccc_dddd_dddd, 6, 0xaaaa_aaaa_bbbb_bbbb);
+        assert_eq!((&got[1..11], &got[28..]), (&v1[1..11], &v1[11..]), "version 1's words, moved by the block and nothing else");
+        assert_eq!(empty().context_at(0, 0, 0, &[0; 17]).len(), 28);
+    }
+
+    /// With the window on, an `InvokeAt` naming a held block validates and applies, and what the
+    /// executor is asked to verify is `public ‖ call_binding ‖` the version-2 context whose block
+    /// words are the ledger's own record of that block: the proof here is made over a segment
+    /// written out by hand, so it verifies only if the ledger built exactly those words.
+    #[test]
+    fn an_invoke_at_is_verified_over_the_reference_blocks_words_and_applies() {
+        let mut l = ledger_at();
+        // No `gas` section, so the live price is only a ledger value here; with a high word.
+        l.set_gas_prices(gas::GasPrices { gas_price: (3 << 32) | 100, byte_price: 800 });
+        let secs: u64 = (5 << 32) | 77;
+        next_block(&mut l, secs * 1000 + 999); // block 1 closes; block 2 opens at `secs`
+        next_block(&mut l, secs * 1000 + 5_000); // block 2 closes; block 3 opens
+        assert_eq!(l.height(), 3);
+        assert_eq!(
+            l.block_facts().iter().copied().collect::<Vec<_>>(),
+            vec![
+                BlockFacts { height: 1, timestamp_ms: 1_000_000, basefee: (3 << 32) | 100 },
+                BlockFacts { height: 2, timestamp_ms: secs * 1000 + 999, basefee: (3 << 32) | 100 },
+            ]
+        );
+        let mut tx = unproved_at(&l, 20, 2, write_one());
+        let binding = tx.call_binding(&crate::types::BindingDomain::ChainId);
+        let mut context = vec![2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0];
+        context.extend([2, 0, 77, 5, CHAIN as u32, 0, 100, 3]); // height, seconds, chain id, basefee
+        context.extend([0u32; 9]); // no randomness: the flag, then eight zero words
+        context.extend(cell(1, 0).key.iter().chain(&cell(1, 0).value).chain(&cell(1, 5).key).chain(&cell(1, 5).value));
+        assert_eq!(context.len(), 28 + 32);
+        let segment = [binding.as_slice(), context.as_slice()].concat(); // the program has no public words
+        let record = l.program(&pid()).unwrap().clone();
+        assert_eq!(l.invoke_segment(&record, &tx), Ok(Some(segment.clone())));
+        // The offsets, from the start of the segment: the context follows the eight binding words.
+        let ctx = &segment[TX_BINDING_WORDS..];
+        assert_eq!(ctx[0], CONTEXT_VERSION_BLOCK);
+        assert_eq!((ctx[CTX_REF_HEIGHT], ctx[CTX_REF_HEIGHT + 1]), (2, 0));
+        assert_eq!((ctx[CTX_TIMESTAMP], ctx[CTX_TIMESTAMP + 1]), (77, 5));
+        assert_eq!((ctx[CTX_CHAIN_ID], ctx[CTX_CHAIN_ID + 1]), (7, 0));
+        assert_eq!((ctx[CTX_BASEFEE], ctx[CTX_BASEFEE + 1]), (100, 3));
+        assert_eq!(ctx[CTX_HAS_RANDOMNESS], 0);
+        assert_eq!(ctx[CTX_RANDOMNESS..CTX_RANDOMNESS + 8], [0; 8]);
+        assert_eq!(l.block_context(2).unwrap().1[..], ctx[CONTEXT_HEADER_WORDS..CONTEXT_HEADER_WORDS_BLOCK]);
+
+        // A proof over any other words is not this transaction's: block 1's facts under height
+        // 2, a second off, another chain id, the version-1 context, a set randomness flag.
+        let other = |edit: &dyn Fn(&mut Vec<u32>)| {
+            let mut s = segment.clone();
+            edit(&mut s);
+            let mut t = tx.clone();
+            prove_over(&mut t, &s);
+            l.validate(&t, &StubExecutor)
+        };
+        let at = |k: usize| TX_BINDING_WORDS + k;
+        for (name, edit) in [
+            ("block 1's time", (&|s: &mut Vec<u32>| s[at(CTX_TIMESTAMP)] = 1_000) as &dyn Fn(&mut Vec<u32>)),
+            ("a second later", &|s| s[at(CTX_TIMESTAMP)] += 1),
+            ("another chain", &|s| s[at(CTX_CHAIN_ID)] += 1),
+            ("another price", &|s| s[at(CTX_BASEFEE)] -= 1),
+            ("another height", &|s| s[at(CTX_REF_HEIGHT)] = 1),
+            ("randomness claimed", &|s| s[at(CTX_HAS_RANDOMNESS)] = 1),
+            ("version 1", &|s| {
+                s[at(0)] = 1;
+                s.drain(at(CONTEXT_HEADER_WORDS)..at(CONTEXT_HEADER_WORDS_BLOCK));
+            }),
+        ] {
+            assert!(matches!(other(edit), Err(TxError::InvalidProof(_))), "{name}: {:?}", other(edit));
+        }
+
+        prove_over(&mut tx, &segment);
+        assert_eq!(l.validate(&tx, &StubExecutor), Ok(()));
+        assert_eq!(still_applies(&l, &tx), Ok(()));
+        let receipt = apply(&mut l, &tx).unwrap().expect("a call's receipt");
+        assert_eq!((receipt.program, receipt.outputs), (pid(), [9, 8, 7, 6, 5, 4, 3, 2]));
+        assert_eq!(l.program_state().unwrap().cell(&pid(), &key(1)), cell(1, 5).value);
+        // An invoke's fee rules: the cell fee is charged on the cell it creates.
+        let cheap = {
+            let mut t = unproved_at(&l, 40, 2, Transition { writes: vec![cell(9, 1)], ..empty() });
+            t.bundle = Some(bundle(&l, 40, gas::BUNDLE_BASE + CELL_FEE - 1, 0, 0, 0));
+            StubExecutor::bound(t)
+        };
+        assert!(matches!(refusal(&l, &cheap), TxError::FeeTooLow { .. }), "{:?}", refusal(&l, &cheap));
+        assert_eq!(cell_fee_of(&l, &cheap.action), CELL_FEE);
+        assert_eq!(gas::fee_floor(&cheap.action), gas::fee_floor(&invoke(&l, 41, (0, 0, 0), empty()).action));
+        // And its payout notes are derived as an invoke's are.
+        let fund = invoke(&l, 50, (1_000, 0, 0), empty());
+        apply(&mut l, &fund).unwrap();
+        let paying = invoke_at(&l, 60, 1, Transition { pays: vec![pay(0, 600, 1)], ..empty() });
+        let Action::InvokeAt { transition, .. } = &paying.action else { unreachable!() };
+        let time = paying.bundle.as_ref().unwrap().time;
+        assert_eq!(l.derived_commitments(&paying, &StubExecutor), vec![payout_commitment(&transition.pays[0], time, &StubExecutor)]);
+        apply(&mut l, &paying).unwrap();
+        assert_eq!(l.program_state().unwrap().vault(&pid(), 0), 400);
+    }
+
+    /// The window off — chain 21, and every chain cut before the field: the new form is refused
+    /// outright at validation and at apply, a block's end records nothing, and an ordinary
+    /// invoke is what it was. Without the section the first gate answers, as for an invoke.
+    #[test]
+    fn without_the_window_an_invoke_at_is_refused_and_no_block_facts_are_kept() {
+        let mut l = ledger();
+        assert_eq!(l.reference_block_window(), 0);
+        next_block(&mut l, 2_000_000);
+        next_block(&mut l, 3_000_000);
+        assert!(l.block_facts().is_empty(), "nothing is recorded");
+        assert_eq!(l.block_facts_at(1), Err(ProgramStateError::ReferenceBlockDisabled));
+        let tx = unproved_at(&l, 20, 1, write_one());
+        assert_eq!(refusal(&l, &tx), ps(ProgramStateError::ReferenceBlockDisabled));
+        assert_eq!(still_applies(&l, &tx), Err(ps(ProgramStateError::ReferenceBlockDisabled)));
+        assert_eq!(l.invoke_segment(l.program(&pid()).unwrap(), &tx), Err(ps(ProgramStateError::ReferenceBlockDisabled)), "no segment, never a call's");
+        let before = l.clone();
+        assert_eq!(apply(&mut l, &tx), Err(ps(ProgramStateError::ReferenceBlockDisabled)));
+        assert!(l == before, "nothing written");
+        // Even with a proof over words a window would have given it.
+        let mut on = l.clone();
+        on.set_reference_block_window(WINDOW);
+        on.record_block_facts(1, 0);
+        let proved = invoke_at(&on, 21, 1, write_one());
+        assert_eq!(on.validate(&proved, &StubExecutor), Ok(()));
+        assert_eq!(refusal(&l, &proved), ps(ProgramStateError::ReferenceBlockDisabled));
+        // An ordinary invoke is untouched by any of it.
+        let plain = invoke(&l, 30, (0, 0, 0), write_one());
+        assert_eq!(l.validate(&plain, &StubExecutor), Ok(()));
+        apply(&mut l, &plain).unwrap();
+        // Without the section: `Disabled`, before the window is asked about.
+        let bare = ledger_with(false);
+        assert_eq!(refusal(&bare, &unproved_at(&bare, 20, 1, write_one())), ps(ProgramStateError::Disabled));
+        // Switching the window off drops what a ledger held.
+        on.set_reference_block_window(0);
+        assert!(on.block_facts().is_empty());
+        on.restore_block_facts(vec![BlockFacts { height: 1, timestamp_ms: 1, basefee: 0 }]);
+        assert!(on.block_facts().is_empty(), "and a store's rows are not taken up");
+    }
+
+    /// The reference block must be a closed block inside the window: at a block's apply,
+    /// strictly below the including height and at most `window` behind it; on the head's ledger
+    /// (a pool), at most the tip. Each failure has its own error, validation and apply agree,
+    /// and `still_applies` — the pool's question at every tip — gives validation's verdict.
+    #[test]
+    fn a_reference_block_outside_the_window_is_refused_by_name() {
+        let mut l = ledger_at();
+        next_block(&mut l, 2_000_000);
+        next_block(&mut l, 3_000_000);
+        assert_eq!(l.height(), 3, "applying block 3: blocks 1 and 2 are closed");
+        // The including block itself, and one after it.
+        for h in [3, 4, u64::MAX] {
+            let tx = unproved_at(&l, 20, h, write_one());
+            let want = ps(ProgramStateError::FutureReferenceBlock { ref_height: h, newest: Some(2) });
+            assert_eq!(refusal(&l, &tx), want, "{h}");
+            assert_eq!(still_applies(&l, &tx), Err(want.clone()), "{h}");
+            assert_eq!(apply(&mut l.clone(), &tx), Err(want), "{h}");
+        }
+        // Block 0 is never a reference block: nothing closed it.
+        let zero = unproved_at(&l, 20, 0, write_one());
+        assert_eq!(refusal(&l, &zero), ps(ProgramStateError::StaleReferenceBlock { ref_height: 0, oldest: 1, window: WINDOW }));
+        // Before any block has closed there is nothing to name.
+        let fresh = ledger_at();
+        assert_eq!(
+            refusal(&fresh, &unproved_at(&fresh, 20, 1, write_one())),
+            ps(ProgramStateError::FutureReferenceBlock { ref_height: 1, newest: None })
+        );
+
+        // Proved against block 2 while it was the newest closed block.
+        let tx = invoke_at(&l, 30, 2, write_one());
+        assert_eq!(l.validate(&tx, &StubExecutor), Ok(()));
+        // The last block that may include it is 2 + WINDOW.
+        while l.height() < 2 + WINDOW {
+            let ts = l.timestamp_ms() + 1_000;
+            next_block(&mut l, ts);
+        }
+        assert_eq!(l.block_facts().len() as u64, WINDOW);
+        assert_eq!(l.block_facts().front().map(|f| f.height), Some(2));
+        assert_eq!(l.validate(&tx, &StubExecutor), Ok(()), "including − h = window");
+        assert_eq!(still_applies(&l, &tx), Ok(()));
+        let mut applied = l.clone();
+        apply(&mut applied, &tx).unwrap();
+        assert_eq!(applied.program_state().unwrap().cell(&pid(), &key(1)), cell(1, 5).value);
+        // One block later it has left the window, for good.
+        let ts = l.timestamp_ms() + 1_000;
+        next_block(&mut l, ts);
+        let stale = ps(ProgramStateError::StaleReferenceBlock { ref_height: 2, oldest: 3, window: WINDOW });
+        assert_eq!(refusal(&l, &tx), stale);
+        assert_eq!(still_applies(&l, &tx), Err(stale.clone()));
+        let before = l.clone();
+        assert_eq!(apply(&mut l, &tx), Err(stale));
+        assert!(l == before, "nothing written");
+        // In a block: the block is refused with the transaction's error.
+        assert!(l.apply_transactions(std::slice::from_ref(&tx), &proposer().address(), &StubExecutor).is_err());
+    }
+
+    /// The ring: one entry per closed block, the newest `window`, re-recording a height replaces
+    /// it; inside the ledger's equality (a node holding other facts would refuse proofs its
+    /// peers accept) and outside the state root (derived from the chain, like the anchors).
+    /// `basefee` is the gas price the block *opened* at — what its own calls paid — not the one
+    /// the block-end controller leaves for the next block.
+    #[test]
+    fn the_block_facts_ring_follows_the_chain() {
+        let mut l = ledger_at();
+        l.set_gas(Some(gas::GasConfig {
+            gas_price: 100,
+            byte_price: 800,
+            bundle_gas_limit: gas::bundle_gas_limit_pin(),
+            metering: gas::GasMetering::Circuit,
+            dynamic: Some(gas::DynamicGas {
+                target_block_bytes: 1 << 20,
+                target_block_gas: 20_000,
+                adjust_bps: 1250,
+                min_gas_price: 100,
+                min_byte_price: 800,
+                max_gas_price: None,
+                max_byte_price: None,
+                byte_load: None,
+            }),
+        }));
+        let root = l.state_root();
+        let off = {
+            let mut o = l.clone();
+            o.set_reference_block_window(0);
+            o
+        };
+        assert_eq!(off.state_root(), root, "the window is a parameter, not state");
+        // Block 1 uses twice its gas target: the price rises 12.5 % for block 2.
+        l.close_block(1, &proposer().address(), 0, 40_000, &StubExecutor);
+        assert_eq!(l.gas_prices().gas_price, 112);
+        assert_eq!(l.block_facts().back(), Some(&BlockFacts { height: 1, timestamp_ms: 1_000_000, basefee: 100 }));
+        l.set_height(2);
+        l.set_timestamp_ms(1_004_000);
+        l.close_block(2, &proposer().address(), 0, 20_000, &StubExecutor);
+        assert_eq!(l.block_facts().back(), Some(&BlockFacts { height: 2, timestamp_ms: 1_004_000, basefee: 112 }));
+        // Outside the root, inside equality.
+        let mut same_state = l.clone();
+        same_state.record_block_facts(2, 113);
+        assert_eq!(same_state.block_facts().len(), 2, "re-recording a height replaces its entry");
+        assert_eq!(same_state.state_root(), l.state_root());
+        assert!(same_state != l);
+        same_state.record_block_facts(2, 112);
+        assert!(same_state == l);
+        // The newest `window`.
+        for h in 3..=WINDOW + 5 {
+            l.set_height(h);
+            l.close_block(h, &proposer().address(), 0, 20_000, &StubExecutor);
+        }
+        assert_eq!(l.block_facts().len() as u64, WINDOW);
+        assert_eq!((l.block_facts().front().unwrap().height, l.block_facts().back().unwrap().height), (6, WINDOW + 5));
+        assert_eq!(l.block_facts_at(6).map(|f| f.height), Ok(6));
+        assert_eq!(l.block_facts_at(5), Err(ProgramStateError::StaleReferenceBlock { ref_height: 5, oldest: 6, window: WINDOW }));
+        // A restored ring is trimmed to the window in force.
+        let all: Vec<BlockFacts> = l.block_facts().iter().copied().collect();
+        let mut narrow = l.clone();
+        narrow.set_reference_block_window(WINDOW);
+        narrow.restore_block_facts(all.clone());
+        assert!(narrow == l);
+        let mut wide = (1..6).map(|h| BlockFacts { height: h, timestamp_ms: 0, basefee: 0 }).collect::<Vec<_>>();
+        wide.extend(all);
+        narrow.restore_block_facts(wide);
+        assert!(narrow == l, "older rows than the window are dropped");
+    }
+
+    /// The segment rule counts the block words: a transition that fits version 1's context to
+    /// the word does not fit version 2's.
+    #[test]
+    fn the_segment_rule_counts_the_block_context() {
+        let mut l = ledger_at();
+        next_block(&mut l, 2_000_000);
+        let t = Transition {
+            reads: (1..=3).map(|i| cell(i, 0)).collect(),
+            writes: (1..=3).map(|i| cell(i, 7)).collect(),
+            mints: (0..4).map(|i| pay(2, 5, 10 + i)).collect(),
+            ..empty()
+        };
+        assert_eq!((t.context_words(), t.context_words_at()), (119, 136));
+        assert_eq!(l.validate(&invoke(&l, 20, (0, 0, 0), t.clone()), &StubExecutor), Ok(()), "version 1: exactly fits");
+        assert_eq!(
+            refusal(&l, &unproved_at(&l, 30, 1, t)),
+            ps(ProgramStateError::ContextTooLong { context: 136, public: 0, max: 119 })
+        );
     }
 
     /// The state-root component and its place in the root: pinned, and absent without the section.

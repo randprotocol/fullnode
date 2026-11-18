@@ -444,6 +444,10 @@ async fn every_field_the_downstream_repos_read_is_served_with_its_type() {
         // The voted RAND price on a chain without `fees.usd_subsidy`: `null`, which the aggregate
         // daemon reads as "the RAND schedule".
         exactly("rand_getRandPrice", json!([]), "rand-node `aggregate` (`aggregate_pass`), `price status`", Value::Null),
+        // Issue #168: block context on a chain without `program_state.reference_block_window`
+        // (chain 21): `{"enabled": false}`, the shape of every other gated read. No consumer
+        // yet — the wallet's `InvokeAt` path waits on the chain-22 cut (docs/evm-block-context.md).
+        exactly("rand_getBlockContext", json!([]), "docs/evm-block-context.md §6 (no consumer yet)", json!({ "enabled": false })),
         exactly(
             "rand_getProgramCells",
             json!([unknown, { "after": null, "limit": 10 }]),
@@ -703,7 +707,7 @@ async fn the_wallet_reads_the_limits_it_derives_caps_from() {
             bound_note_value: None,
             incremental_root: None,
         });
-        g.program_state = Some(randprotocol_core::ledger::program_state::ProgramStateConfig { cell_fee: 10_000_000, refuse_panics: false });
+        g.program_state = Some(randprotocol_core::ledger::program_state::ProgramStateConfig { cell_fee: 10_000_000, refuse_panics: false, reference_block_window: 0 });
     })
     .await;
     let unknown = "ab".repeat(32);

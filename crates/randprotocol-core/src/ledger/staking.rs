@@ -686,13 +686,13 @@ impl Ledger {
     /// (`ProgramStateError::TooManyPayouts`), as it does an invoke without a bundle.
     pub fn derived_commitments(&self, tx: &Transaction, executor: &dyn ConfidentialExecutor) -> Vec<Word8> {
         match (&tx.action, &tx.bundle) {
-            (Action::Invoke { transition, .. }, Some(b)) => {
+            (Action::Invoke { transition, .. } | Action::InvokeAt { transition, .. }, Some(b)) => {
                 if transition.pays.len() + transition.mints.len() > super::program_state::MAX_PAYOUTS {
                     return Vec::new();
                 }
                 transition.payouts().map(|p| super::program_state::payout_commitment(p, b.time, executor)).collect()
             }
-            (Action::Invoke { .. }, None) => Vec::new(),
+            (Action::Invoke { .. } | Action::InvokeAt { .. }, None) => Vec::new(),
             // RPL-3: a state proof's payout notes, each computed from its pending request
             // (`perps::payout_commitments`, capped before anything is hashed).
             (Action::PerpStateProof { .. }, None) => super::perps::payout_commitments(self, tx, executor),

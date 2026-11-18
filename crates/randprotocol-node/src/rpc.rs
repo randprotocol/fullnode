@@ -730,7 +730,7 @@ pub const PUBLIC_METHODS: &[&str] = &[
     "rand_getAggregate", "rand_getAggregators", "rand_getUnsealed",
     "rand_getVesting", "rand_getVestingSchedule", "rand_getVestingSummary",
     "rand_getPerps", "rand_getPerpAccount", "rand_getPerpAccounts", "rand_getPerpInputs",
-    "rand_getMultisig", "rand_getRandPrice",
+    "rand_getMultisig", "rand_getRandPrice", "rand_getBlockContext",
 ];
 
 /// The public listener's burst and refill, for **every caller together**: there is one address
@@ -993,6 +993,15 @@ pub struct ProgramStateLimits {
     pub max_reads: usize,
     pub max_writes: usize,
     pub max_payouts: usize,
+    /// Issue #168: genesis `program_state.reference_block_window` — how many closed blocks an
+    /// `InvokeAt` may name (`rand_getBlockContext`). Absent on a chain without it, so chain
+    /// 21's object is unchanged.
+    #[serde(skip_serializing_if = "is_zero_u64")]
+    pub reference_block_window: u64,
+}
+
+fn is_zero_u64(v: &u64) -> bool {
+    *v == 0
 }
 
 /// `rand_getLimits`' `multisig` object.
@@ -1038,7 +1047,13 @@ impl ChainLimits {
             proof_window_blocks: ledger.proof_window_blocks(),
             program_state: ledger.program_state().map(|p| {
                 use randprotocol_core::ledger::program_state::{MAX_PAYOUTS, MAX_READS, MAX_WRITES};
-                ProgramStateLimits { cell_fee: p.cell_fee, max_reads: MAX_READS, max_writes: MAX_WRITES, max_payouts: MAX_PAYOUTS }
+                ProgramStateLimits {
+                    cell_fee: p.cell_fee,
+                    max_reads: MAX_READS,
+                    max_writes: MAX_WRITES,
+                    max_payouts: MAX_PAYOUTS,
+                    reference_block_window: ledger.reference_block_window(),
+                }
             }),
             multisig: ledger.multisig().map(|m| {
                 use randprotocol_core::ledger::multisig::{MAX_PAYOUTS, MAX_SIGNERS};
@@ -2097,7 +2112,7 @@ fn derived_note_cms_with(
             vec![mint_commitment(&m.recipient, m.amount, *index, m.time, &m.r, executor)]
         }
         // Stamped with the bundle's `time`, as the ledger stamps them.
-        (Action::Invoke { transition, .. }, Some(b)) => {
+        (Action::Invoke { transition, .. } | Action::InvokeAt { transition, .. }, Some(b)) => {
             transition.payouts().map(|p| payout_commitment(p, b.time, executor)).collect()
         }
         // Multisig: a pay's notes, stamped with the action's own `time` (it rides no bundle).
@@ -2245,7 +2260,7 @@ fn header_json(b: &randprotocol_core::Block, sealed: bool, fees: Option<&randpro
             // in the action, stamped with its own `time`.
             matches!(
                 t.action,
-                Action::BridgeAttest { .. } | Action::TokenMint { .. } | Action::RegisterToken { .. } | Action::Invoke { .. } | Action::MultisigPay { .. }
+                Action::BridgeAttest { .. } | Action::TokenMint { .. } | Action::RegisterToken { .. } | Action::Invoke { .. } | Action::InvokeAt { .. } | Action::MultisigPay { .. }
             )
                 || (fees.is_some() && matches!(t.action, Action::BridgeBurn { .. }))
         })
@@ -2277,7 +2292,7 @@ fn public_rebuild_copy(t: &Transaction) -> Transaction {
         bundle.auth_proof = Vec::new();
     }
     match &mut s.action {
-        Action::Invoke { proof, .. } => *proof = Vec::new(),
+        Action::Invoke { proof, .. } | Action::InvokeAt { proof, .. } => *proof = Vec::new(),
         Action::BridgeAttest { pq_signatures, .. } => *pq_signatures = Vec::new(),
         // A multisig pay carries no proof and no bundle: the copy is the transaction itself
         // (its hash is its real id), signatures and all.
@@ -2800,16 +2815,21 @@ fn tx_json_with(
         // the bundle's burn fields were to the program (`inflow`; the amounts are the bundle's
         // `burn_r` / `burn_a` / `burn_asset` above), and every note paid out or minted. The
         // wallet's public-note scan keys on the kind string `invoke`: do not rename it.
-        Action::Invoke { program, proof, input_envelope, transition } => {
+        //
+        // Issue #168: an `InvokeAt` is rendered the same way under the kind `invoke_at`, with
+        // the reference block it names (`ref_height`); an `invoke`'s object is unchanged.
+        Action::Invoke { program, proof, input_envelope, transition }
+        | Action::InvokeAt { program, proof, input_envelope, transition, .. } => {
             use randprotocol_core::ledger::program_state::Inflow;
+            let ref_height = t.action.invoke().and_then(|i| i.ref_height);
             // A payout note's `time` is the bundle's. An invoke always rides one; without it
             // (no committed transaction is) the notes are not computable and 0 is rendered.
             let time = t.bundle.as_ref().map_or(0, |b| b.time);
             let payouts = |ps: &[randprotocol_core::ledger::program_state::Payout]| {
                 ps.iter().map(|p| payout_json(p, time, executor)).collect::<Vec<_>>()
             };
-            json!({
-                "kind": "invoke", "program": program.to_hex(), "proof_len": proof.len(),
+            let mut v = json!({
+                "kind": if ref_height.is_some() { "invoke_at" } else { "invoke" }, "program": program.to_hex(), "proof_len": proof.len(),
                 "input_envelope_len": input_envelope.as_ref().map(|e| e.len() as u64),
                 "transition": {
                     "reads": transition.reads.iter().map(cell_json).collect::<Vec<_>>(),
@@ -2822,7 +2842,11 @@ fn tx_json_with(
                     "pays": payouts(&transition.pays),
                     "mints": payouts(&transition.mints),
                 },
-            })
+            });
+            if let Some(h) = ref_height {
+                v["ref_height"] = json!(h);
+            }
+            v
         }
         // Multisig accounts. A create names its salt, threshold and how many signers (the keys
         // are on the raw transaction, and `rand_getMultisig` lists them once the account exists);
@@ -3274,6 +3298,56 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
                 .into_iter()
                 .map(|(asset, amount)| json!({ "asset": asset, "amount": amount.to_string() }))
                 .collect::<Vec<_>>()))
+        }
+        // Issue #168 (`docs/evm-block-context.md`): what the chain defines about a recent closed
+        // block for a proof that names it as its reference block — the values, and the exact
+        // words a version-2 invoke context carries for it (context words 11..28), which a
+        // prover feeds its guest and the ledger rebuilds at admission. `[]` or `[null]` is the
+        // newest closed block. `{"enabled": false}` on a chain without genesis
+        // `program_state.reference_block_window`; a height outside the window is -32602 with
+        // the ledger's own wording. Served from the stored ring, as of the committed head.
+        "rand_getBlockContext" => {
+            use randprotocol_core::ledger::program_state as ps;
+            let window = st.limits.program_state.as_ref().map_or(0, |p| p.reference_block_window);
+            if window == 0 {
+                return Ok(json!({ "enabled": false }));
+            }
+            let asked: Option<u64> = match p.get(0) {
+                None | Some(Value::Null) => None,
+                Some(_) => Some(param(p, 0, "height")?),
+            };
+            let storage = st.storage.clone();
+            let facts = blocking(st, move || storage.newest_block_facts(window as usize)).await?;
+            let (Some(oldest), Some(newest)) = (facts.first().map(|f| f.height), facts.last().map(|f| f.height)) else {
+                return Err(RpcError::not_found("no block has closed yet: block 0 is not a reference block"));
+            };
+            let height = asked.unwrap_or(newest);
+            let Some(f) = facts.iter().find(|f| f.height == height) else {
+                let e = if height > newest {
+                    ps::ProgramStateError::FutureReferenceBlock { ref_height: height, newest: Some(newest) }
+                } else {
+                    ps::ProgramStateError::StaleReferenceBlock { ref_height: height, oldest, window }
+                };
+                return Err(RpcError::invalid_params(e.to_string()));
+            };
+            let words = f.context_words(st.chain_id);
+            let randomness: [u32; 8] = words[ps::CTX_RANDOMNESS - ps::CONTEXT_HEADER_WORDS..][..8].try_into().expect("eight words");
+            Ok(json!({
+                "enabled": true,
+                "height": f.height,
+                "timestamp": f.timestamp_secs(),
+                "timestamp_ms": f.timestamp_ms,
+                "chain_id": st.chain_id,
+                "basefee": f.basefee.to_string(),
+                "has_randomness": words[ps::CTX_HAS_RANDOMNESS - ps::CONTEXT_HEADER_WORDS] != 0,
+                "randomness": word8_to_hex(&randomness),
+                "window": window,
+                "oldest": oldest,
+                "newest": newest,
+                "context_version": ps::CONTEXT_VERSION_BLOCK,
+                "offset": ps::CONTEXT_HEADER_WORDS,
+                "words": words.to_vec(),
+            }))
         }
         // ---- perps (RPL-3) ----
         // The exchange's public state, read from the head's stored section; `{"enabled": false}`
@@ -8150,6 +8224,66 @@ pub(crate) mod tests {
         b2.receipts = probe.apply_block(&b2.block, &StubExecutor).unwrap();
         st.storage.commit(std::slice::from_ref(&b2), &ledger, &[], &StubExecutor).unwrap();
         (dir, st, invoke, transition)
+    }
+
+    /// Issue #168: `rand_getBlockContext` serves a closed block's facts and the exact words the
+    /// ledger splices into a version-2 context for it — the same words, read off the ledger —
+    /// defaults to the newest closed block, names a height outside the window, and answers
+    /// `{"enabled": false}` on a chain without the window.
+    #[tokio::test]
+    async fn get_block_context_serves_the_words_the_ledger_builds() {
+        use fixtures::{ref_block_genesis_file, ref_block_next, REF_T0_MS, REF_WINDOW};
+        let gs = ref_block_genesis_file(7).build(&StubExecutor).unwrap();
+        let (_dir, st) = state_for(&gs);
+        assert_eq!(st.limits.program_state.as_ref().unwrap().reference_block_window, REF_WINDOW);
+        assert_eq!(ok(&st, "rand_getLimits", json!([])).await["program_state"]["reference_block_window"], json!(REF_WINDOW));
+        let e = call(&st, "rand_getBlockContext", json!([])).await.unwrap_err();
+        assert!(e.message.contains("no block has closed"), "{}", e.message);
+        let mut ledger = gs.ledger.clone();
+        let mut parent = fixtures::ref_block_genesis_parent(&gs);
+        for _ in 0..3 {
+            parent = ref_block_next(&st.storage, &parent, &mut ledger, vec![]);
+        }
+        let secs = (REF_T0_MS + 2 * 4_000) / 1000;
+        let (facts, words) = ledger.block_context(2).unwrap();
+        assert_eq!(facts.timestamp_secs(), secs);
+        assert_eq!(
+            ok(&st, "rand_getBlockContext", json!([2])).await,
+            json!({
+                "enabled": true,
+                "height": 2,
+                "timestamp": secs,
+                "timestamp_ms": REF_T0_MS + 8_000,
+                "chain_id": 7,
+                "basefee": "100",
+                "has_randomness": false,
+                "randomness": "00".repeat(32),
+                "window": REF_WINDOW,
+                "oldest": 1,
+                "newest": 3,
+                "context_version": 2,
+                "offset": 11,
+                "words": words.to_vec(),
+            })
+        );
+        assert_eq!(words[..8], [2, 0, secs as u32, (secs >> 32) as u32, 7, 0, 100, 0]);
+        // No height, or null: the newest closed block.
+        for params in [json!([]), json!([null])] {
+            assert_eq!(ok(&st, "rand_getBlockContext", params).await["height"], json!(3));
+        }
+        // Outside the window, by name; a non-number is a parameter error too.
+        for (h, needle) in [(json!(4), "not closed yet"), (json!(0), "too old"), (json!("x"), "height")] {
+            let e = call(&st, "rand_getBlockContext", json!([h])).await.unwrap_err();
+            assert_eq!(e.code, -32602, "{h}");
+            assert!(e.message.contains(needle), "{h}: {}", e.message);
+        }
+        assert!(PUBLIC_METHODS.contains(&"rand_getBlockContext"));
+
+        // A chain without the window: off, and `rand_getLimits` has no such key.
+        let (_dir, plain, _, _) = rpl2_state();
+        assert_eq!(ok(&plain, "rand_getBlockContext", json!([])).await, json!({ "enabled": false }));
+        assert_eq!(ok(&plain, "rand_getBlockContext", json!([1])).await, json!({ "enabled": false }));
+        assert!(ok(&plain, "rand_getLimits", json!([])).await["program_state"].get("reference_block_window").is_none());
     }
 
     /// An invoke's payout and mint notes are public (recipient, amount, asset, blinding, the

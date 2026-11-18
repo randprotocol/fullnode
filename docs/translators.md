@@ -676,7 +676,10 @@ compute-heavy programs: at the measured ~90 cycles saved per instruction, a prog
 | `ORIGIN` | equals `CALLER` (one call, no relayer); 2 gas |
 | `GASPRICE`, `COINBASE`, `TIMESTAMP`, `NUMBER`, `PREVRANDAO`, `GASLIMIT`, `SELFBALANCE`, `BASEFEE`, `BLOCKHASH` | trap (status 2), as in the interpreter |
 
-The nine block-context opcodes trap until there is a design for binding them. A private input word
+The design for binding them is `docs/evm-block-context.md` (issue #168: a reference block the
+transaction names, whose facts the validator puts in the public segment); its node side is built
+and gated off, and these opcodes keep trapping until the guest side lands with constraint set 10.
+The nine block-context opcodes trap until then. A private input word
 is bound only to the salted `H_IN`, which a verifier cannot open, so it cannot carry a block fact
 a prover could not forge. Binding them needs a chain decision on which block a proof is checked
 against. Until then, a contract that reads the time or the block number (a permit deadline, for

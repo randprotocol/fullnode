@@ -1034,7 +1034,7 @@ impl Mempool {
                 .gas_call_floor(limit, randprotocol_core::gas::call_bytes(proof, input_envelope.as_ref()))
                 .map(|f| f.saturating_add(prove_base))
                 .unwrap_or(p.floor),
-            (a @ Action::Invoke { proof, input_envelope, .. }, Some(limit)) => ledger
+            (a @ (Action::Invoke { proof, input_envelope, .. } | Action::InvokeAt { proof, input_envelope, .. }), Some(limit)) => ledger
                 .gas_call_floor(limit, randprotocol_core::gas::call_bytes(proof, input_envelope.as_ref()))
                 .map(|f| f.saturating_add(randprotocol_core::ledger::program_state::cell_fee_of(ledger, a)).saturating_add(prove_base))
                 .unwrap_or(p.floor),
@@ -1475,7 +1475,7 @@ impl Mempool {
         // the Calls have been placed is filled with the transfers held back, in their order, so
         // the reservation costs no block space. With no Call ready the cap is the block's.
         // An RPL-2 `Invoke` is a call that pays the byte price too, so it counts as one here.
-        let call_ready = ready.iter().any(|(_, p, _)| matches!(p.tx.action, Action::Call { .. } | Action::Invoke { .. }));
+        let call_ready = ready.iter().any(|(_, p, _)| matches!(p.tx.action, Action::Call { .. } | Action::Invoke { .. } | Action::InvokeAt { .. }));
         let flat_cap = if call_ready { max_bytes / 4 * 3 } else { max_bytes };
         let mut out = Vec::new();
         let mut held_back = Vec::new();
@@ -1492,7 +1492,7 @@ impl Mempool {
                 // still travel.
                 continue;
             }
-            let flat = !matches!(p.tx.action, Action::Call { .. } | Action::Invoke { .. }) && !is_governance(&p.tx.action);
+            let flat = !matches!(p.tx.action, Action::Call { .. } | Action::Invoke { .. } | Action::InvokeAt { .. }) && !is_governance(&p.tx.action);
             if flat && flat_bytes + len > flat_cap {
                 held_back.push(p);
                 continue;
@@ -4485,6 +4485,49 @@ mod tests {
         assert_eq!(m.candidates(&after, 10), vec![], "never offered again");
         m.prune(&after);
         assert!(m.is_empty(), "the stale invoke left the pool at the tip that made it stale");
+    }
+
+    /// Issue #168: a pooled `InvokeAt` whose reference block has left the window can never
+    /// apply again — its proof is over that block's facts — so it leaves the pool at the tip
+    /// that made it stale, with the ledger's own verdict, instead of being offered to every
+    /// block until its anchor scrolls out. Not a cacheable verdict: it is this node's tip.
+    #[test]
+    fn a_pooled_invoke_at_is_evicted_when_its_reference_block_leaves_the_window() {
+        use fixtures::{ref_block_chain, ref_block_next, rpl2_cell, rpl2_invoke_at_tx, rpl2_transition, REF_WINDOW};
+        use randprotocol_core::ledger::program_state::{ProgramStateError, Transition};
+        let (_dir, s, _gs, mut l, b1) = ref_block_chain(7);
+        let step = |k| Transition { reads: vec![rpl2_cell(k, 0)], writes: vec![rpl2_cell(k, 5)], ..rpl2_transition() };
+        // The head is block 1; the transaction names it.
+        let tx = rpl2_invoke_at_tx(&l, 10, 1, step(1));
+        let mut m = Mempool::new(100);
+        m.insert(tx.clone(), &l, &StubExecutor).unwrap();
+        assert_eq!(m.candidates(&l, 10).len(), 1);
+        // A reference block above the tip is refused at the door, by name.
+        let mut ahead = tx.clone();
+        if let Action::InvokeAt { ref_height, .. } = &mut ahead.action {
+            *ref_height = 2;
+        }
+        let future = TxError::ProgramState(ProgramStateError::FutureReferenceBlock { ref_height: 2, newest: Some(1) });
+        assert_eq!(Mempool::new(10).precheck(&ahead, &l, &StubExecutor).unwrap_err(), MempoolError::Invalid(future.clone()));
+        assert!(!crate::admission::is_permanent(&future), "the tip will get there");
+
+        // The chain moves on without it. While block 1 is in the window it stays pooled.
+        let mut parent = b1;
+        for _ in 0..REF_WINDOW - 1 {
+            parent = ref_block_next(&s, &parent, &mut l, vec![]);
+        }
+        assert_eq!(l.block_facts().front().map(|f| f.height), Some(1), "tip {}: block 1 is the oldest held", parent.block.height());
+        assert!(Mempool::applies(&tx, &tx.commitments(), None, &l).is_ok());
+        assert_eq!(m.candidates(&l, 10).len(), 1, "still offered at the last block that may include it");
+        // One more block and it is out, for good.
+        ref_block_next(&s, &parent, &mut l, vec![]);
+        let stale = TxError::ProgramState(ProgramStateError::StaleReferenceBlock { ref_height: 1, oldest: 2, window: REF_WINDOW });
+        assert_eq!(Mempool::applies(&tx, &tx.commitments(), None, &l).unwrap_err(), stale);
+        assert_eq!(l.validate(&tx, &StubExecutor).unwrap_err(), stale, "the ledger's own verdict");
+        assert!(!crate::admission::is_permanent(&stale), "a verdict on this node's tip, not on the bytes");
+        assert_eq!(m.candidates(&l, 10), vec![], "never offered again");
+        m.prune(&l);
+        assert!(m.is_empty(), "the expired invoke left the pool");
     }
 
     // ---------------------------------- RPL-3: perp actions

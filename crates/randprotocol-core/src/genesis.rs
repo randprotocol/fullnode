@@ -1146,6 +1146,14 @@ impl Genesis {
                     return Err(GenesisError::BadProgramState(format!("program_state needs `{name}`")));
                 }
             }
+            // Issue #168: block context hands a block's time to programs, so it is offered only
+            // where block time is consensus input and bounded — never backwards, never more
+            // than a step ahead (`Ledger::bounds_block_time`: a `bridge` or a `perps` section).
+            if p.reference_block_window != 0 && self.bridge.is_none() && self.perps.is_none() {
+                return Err(GenesisError::BadProgramState(
+                    "program_state.reference_block_window needs bounded block time: a `bridge` or a `perps` section".into(),
+                ));
+            }
         }
         // RPL-3: the section's own bounds, then what it stands on — RPL-2's list, since a deposit
         // rides the token-aware bundle and a state proof is a call-style proof under the
@@ -1459,6 +1467,7 @@ impl Genesis {
         if let Some(p) = &self.program_state {
             ledger.set_program_state(Some(crate::ledger::program_state::ProgramState::from_config(p)));
             ledger.set_refuse_panicked_invokes(p.refuse_panics);
+            ledger.set_reference_block_window(p.reference_block_window);
         }
         // The incremental nullifier root (spec 2026-10-05 §4.1): the genesis ledger holds no
         // nullifiers, so the range starts empty and the header's state root already carries it.
@@ -1855,6 +1864,13 @@ impl Genesis {
         // when `true`, so chain 21 and every genesis cut before the field hash byte for byte as before.
         if self.program_state.as_ref().is_some_and(|p| p.refuse_panics) {
             commit.extend_from_slice(b"program_state_refuse_panics");
+        }
+        // Issue #168 (`program_state.reference_block_window`), after `refuse_panics` — last —
+        // tagged, and only when nonzero, so chain 21 and every genesis cut before the field hash
+        // byte for byte as before.
+        if let Some(w) = self.program_state.as_ref().map(|p| p.reference_block_window).filter(|w| *w != 0) {
+            commit.extend_from_slice(b"program_state_reference_block_window");
+            commit.extend_from_slice(&w.to_be_bytes());
         }
         #[cfg(test)]
         tests::LAST_GENESIS_COMMIT.with(|c| *c.borrow_mut() = commit.clone());
@@ -4543,7 +4559,7 @@ mod tests {
     fn program_state_refuse_panics_is_committed_only_when_true_and_sets_the_rule() {
         use crate::ledger::program_state::ProgramStateConfig;
         let mut off = rpl2_ready();
-        off.program_state = Some(ProgramStateConfig { cell_fee: 10_000_000, refuse_panics: false });
+        off.program_state = Some(ProgramStateConfig { cell_fee: 10_000_000, refuse_panics: false, reference_block_window: 0 });
         let mut on = off.clone();
         on.program_state.as_mut().unwrap().refuse_panics = true;
         assert!(!off.to_json().contains("refuse_panics"), "absent from the file when false");
@@ -4564,6 +4580,73 @@ mod tests {
         assert_eq!(&with[without.len()..], b"program_state_refuse_panics");
     }
 
+    /// Issue #168: `program_state.reference_block_window` is absent from the file and the hash
+    /// when 0 (so a section without it — chain 21's — hashes as before), bound when set — tagged,
+    /// last, big-endian — round-trips, and sets the ledger's window; the state root does not move
+    /// (a parameter, not state). It is refused outside the proof window's bounds, and on a chain
+    /// whose block time nothing bounds.
+    #[test]
+    fn program_state_reference_block_window_is_committed_only_when_set_and_needs_bounded_block_time() {
+        use crate::ledger::program_state::ProgramStateConfig;
+        use crate::ledger::{MAX_PROOF_WINDOW_BLOCKS, MIN_PROOF_WINDOW_BLOCKS};
+        let mut off = rpl2_ready();
+        off.bridge = Some(bridge_cfg());
+        off.program_state = Some(ProgramStateConfig { cell_fee: 10_000_000, refuse_panics: false, reference_block_window: 0 });
+        let with_window = |w: u64| {
+            let mut g = off.clone();
+            g.program_state.as_mut().unwrap().reference_block_window = w;
+            g
+        };
+        let on = with_window(256);
+        assert!(!off.to_json().contains("reference_block_window"), "absent from the file when 0");
+        assert!(on.to_json().contains("\"reference_block_window\": 256"));
+        assert_eq!(Genesis::from_json(&on.to_json()).unwrap(), on, "it round-trips");
+        assert_eq!(Genesis::from_json(&off.to_json()).unwrap(), off);
+        let (a, b) = (build(&off), build(&on));
+        assert_ne!(a.hash(), b.hash(), "the rule is a different chain");
+        assert_ne!(b.hash(), build(&with_window(257)).hash(), "and so is another window");
+        assert_eq!(a.ledger.state_root(), b.ledger.state_root(), "a parameter, not state");
+        assert_eq!((a.ledger.reference_block_window(), b.ledger.reference_block_window()), (0, 256));
+        assert!(a.ledger.block_facts().is_empty() && b.ledger.block_facts().is_empty(), "block 0 is no reference block");
+        // The hash of a section without the field is the hash a pre-field build computed: the
+        // committed bytes end exactly where they did.
+        build(&off);
+        let without = LAST_GENESIS_COMMIT.with(|c| c.borrow().clone());
+        assert!(!without.windows(36).any(|w| w == b"program_state_reference_block_window"));
+        build(&on);
+        let with = LAST_GENESIS_COMMIT.with(|c| c.borrow().clone());
+        assert_eq!(&with[..without.len()], &without[..]);
+        assert_eq!(&with[without.len()..], [&b"program_state_reference_block_window"[..], &256u64.to_be_bytes()[..]].concat());
+        // After `refuse_panics` when both are set.
+        let mut both = on.clone();
+        both.program_state.as_mut().unwrap().refuse_panics = true;
+        build(&both);
+        let both_commit = LAST_GENESIS_COMMIT.with(|c| c.borrow().clone());
+        assert!(both_commit.ends_with(&[&b"program_state_refuse_panicsprogram_state_reference_block_window"[..], &256u64.to_be_bytes()[..]].concat()));
+
+        // The proof window's bounds.
+        for ok in [MIN_PROOF_WINDOW_BLOCKS, MAX_PROOF_WINDOW_BLOCKS] {
+            assert_eq!(build(&with_window(ok)).ledger.reference_block_window(), ok);
+        }
+        for bad in [1, MIN_PROOF_WINDOW_BLOCKS - 1, MAX_PROOF_WINDOW_BLOCKS + 1, u64::MAX] {
+            match with_window(bad).build(&StubExecutor) {
+                Err(GenesisError::BadProgramState(why)) => assert!(why.contains("reference_block_window"), "{bad}: {why}"),
+                other => panic!("{bad}: {:?}", other.map(|s| s.hash())),
+            }
+        }
+        // Bounded block time: without a bridge (and without perps) the window is refused, and
+        // the section without the window still builds.
+        let mut unbounded = on.clone();
+        unbounded.bridge = None;
+        match unbounded.build(&StubExecutor) {
+            Err(GenesisError::BadProgramState(why)) => assert!(why.contains("bounded block time"), "{why}"),
+            other => panic!("{:?}", other.map(|s| s.hash())),
+        }
+        assert!(b.ledger.bounds_block_time());
+        unbounded.program_state.as_mut().unwrap().reference_block_window = 0;
+        assert!(!build(&unbounded).ledger.bounds_block_time());
+    }
+
     /// RPL-2: the `program_state` section switches the ledger's program state on, empty, and is
     /// bound into the hash and the state root only when present. It needs the four sections it
     /// stands on, and its one parameter is bounded.
@@ -4576,7 +4659,7 @@ mod tests {
         assert!(bare.ledger.program_state().is_none());
 
         let mut on = plain.clone();
-        on.program_state = Some(ProgramStateConfig { cell_fee: 10_000_000, refuse_panics: false });
+        on.program_state = Some(ProgramStateConfig { cell_fee: 10_000_000, refuse_panics: false, reference_block_window: 0 });
         let g = build(&on);
         let state = g.ledger.program_state().expect("the section seeds an empty program state");
         assert_eq!((state.cell_fee, state.cell_count(), state.rand_held()), (10_000_000, 0, 0));
@@ -4584,7 +4667,7 @@ mod tests {
         assert_ne!(g.ledger.state_root(), bare.ledger.state_root(), "and its root is in the state root");
         assert!(g.ledger.audit().invariant_holds() == bare.ledger.audit().invariant_holds(), "no value is seeded");
         let mut dearer = on.clone();
-        dearer.program_state = Some(ProgramStateConfig { cell_fee: 10_000_001, refuse_panics: false });
+        dearer.program_state = Some(ProgramStateConfig { cell_fee: 10_000_001, refuse_panics: false, reference_block_window: 0 });
         assert_ne!(build(&dearer).hash(), g.hash(), "the cell fee is bound");
         assert_eq!(build(&dearer).ledger.state_root(), g.ledger.state_root(), "a parameter, not state");
         assert_eq!(Genesis::from_json(&on.to_json()).unwrap(), on, "it round-trips");
@@ -4610,10 +4693,10 @@ mod tests {
         off.confidential = false;
         assert!(matches!(off.build(&StubExecutor), Err(GenesisError::BadProgramState(_))));
         let mut over = on.clone();
-        over.program_state = Some(ProgramStateConfig { cell_fee: MAX_CELL_FEE + 1, refuse_panics: false });
+        over.program_state = Some(ProgramStateConfig { cell_fee: MAX_CELL_FEE + 1, refuse_panics: false, reference_block_window: 0 });
         assert!(matches!(over.build(&StubExecutor), Err(GenesisError::BadProgramState(_))));
         let mut edge = on;
-        edge.program_state = Some(ProgramStateConfig { cell_fee: MAX_CELL_FEE, refuse_panics: false });
+        edge.program_state = Some(ProgramStateConfig { cell_fee: MAX_CELL_FEE, refuse_panics: false, reference_block_window: 0 });
         edge.build(&StubExecutor).unwrap();
     }
 
@@ -4684,7 +4767,7 @@ mod tests {
         assert!(Genesis::from_json(&stray).is_err(), "a stray key is refused");
         // Beside RPL-2's section too.
         let mut both = on.clone();
-        both.program_state = Some(crate::ledger::program_state::ProgramStateConfig { cell_fee: 10_000_000, refuse_panics: false });
+        both.program_state = Some(crate::ledger::program_state::ProgramStateConfig { cell_fee: 10_000_000, refuse_panics: false, reference_block_window: 0 });
         assert!(build(&both).ledger.perps().is_some() && build(&both).ledger.program_state().is_some());
 
         // What it stands on, one missing at a time.

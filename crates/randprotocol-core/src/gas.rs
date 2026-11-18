@@ -333,7 +333,7 @@ pub fn fee_floor(action: &Action) -> u64 {
         Action::Deploy { words, public, .. } => BUNDLE_BASE + deploy_fee(words.len() + public.len()),
         // RPL-2: an invoke carries a call proof and pays a call's floor. Its cell fee is a
         // ledger fact (`program_state::cell_fee_of`) and is added where the ledger is at hand.
-        Action::Call { .. } | Action::Invoke { .. } => BUNDLE_BASE + CALL_BASE,
+        Action::Call { .. } | Action::Invoke { .. } | Action::InvokeAt { .. } => BUNDLE_BASE + CALL_BASE,
         // A bond is the one staking action that rides on a bundle — the bundle is what burns the
         // stake out of the pool — so it pays the plain base like a transfer.
         Action::Bond { .. } => BUNDLE_BASE,

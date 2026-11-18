@@ -291,6 +291,13 @@ const META_PERPS: &str = "perps";
 /// a commit writes the new heights, not the whole log. A `META_PERPS` row from before v0.8.4 holds
 /// them inline; the first commit moves them here in the same batch.
 const META_PERP_DIGEST_PREFIX: &[u8] = b"perp-digest/";
+/// Issue #168: one closed block's facts per row (`bincode(BlockFacts)`), in `CF_META` under this
+/// prefix and the height big-endian — the reference-block ring (`Ledger::block_facts`), the
+/// anchors' twin: written at a commit for the heights it covers, rewritten wholesale by
+/// `truncate_to`, read back by `restore_reference_block_window`. Rows below the ring's oldest
+/// entry are deleted at each commit. No row exists on a chain without genesis
+/// `program_state.reference_block_window`, so such a store is byte for byte what it was.
+const META_BLOCK_FACTS_PREFIX: &[u8] = b"block-facts/";
 /// CON-60: `bincode(Vec<ProofShape>)`, the state-proof shapes this node has seen verify or
 /// commit, most recent last — what the startup warm builds and pins. A node cache, never
 /// consensus; a build that does not know the key ignores it.
@@ -808,7 +815,7 @@ fn created_notes(
         // envelope to record), so they never arrive through `cb.deposits` and are rebuilt here:
         // one per payout, pays then mints, each with the payout's own envelope and the
         // commitment `program_state::apply` computed — stamped with the *bundle's* `time`.
-        Action::Invoke { transition, .. } => {
+        Action::Invoke { transition, .. } | Action::InvokeAt { transition, .. } => {
             let time = tx
                 .bundle
                 .as_ref()
@@ -898,7 +905,7 @@ pub fn derived_note_count(tx: &randprotocol_core::Transaction) -> usize {
         Action::RegisterToken { initial, .. } => usize::from(initial.is_some()),
         // RPL-2: one note per payout, which `created_notes` rebuilds above — the one action that
         // derives more than one. A count of the transition's own lists, nothing decoded.
-        Action::Invoke { transition, .. } => transition.pays.len() + transition.mints.len(),
+        Action::Invoke { transition, .. } | Action::InvokeAt { transition, .. } => transition.pays.len() + transition.mints.len(),
         // RPL-3: one note per payout of a positive amount, which the ledger appends as a
         // `Deposit` right after the (bundle-less) proof — every payout's request is pending on
         // a committed proof, so each such payout is a note. A list over the cap derives nothing
@@ -2709,7 +2716,7 @@ impl Storage {
                 Some(r) => receipts.push(r),
                 None => {
                     // An RPL-2 `Invoke` leaves a call's receipt too.
-                    if matches!(tx.action, Action::Call { .. } | Action::Invoke { .. }) {
+                    if matches!(tx.action, Action::Call { .. } | Action::Invoke { .. } | Action::InvokeAt { .. }) {
                         return Err(StorageError::Corrupt(format!(
                             "receipt for call {} in block {h} missing",
                             tx.hash()
@@ -3362,6 +3369,58 @@ impl Storage {
         Ok(())
     }
 
+    /// Issue #168: give `ledger` (fresh from `load_ledger`) the genesis
+    /// `program_state.reference_block_window` and the block facts stored for it —
+    /// [`Storage::restore_proof_window`]'s twin, called beside it. A no-op without the field: no
+    /// row is read, so chain 21 loads exactly as before.
+    pub fn restore_reference_block_window(&self, ledger: &mut Ledger, gs: &GenesisState) -> Result<()> {
+        let window = gs.ledger.reference_block_window();
+        if window != 0 {
+            ledger.set_reference_block_window(window);
+            ledger.restore_block_facts(self.newest_block_facts(window as usize)?);
+        }
+        Ok(())
+    }
+
+    fn block_facts_key(height: u64) -> Vec<u8> {
+        let mut key = META_BLOCK_FACTS_PREFIX.to_vec();
+        key.extend_from_slice(&height.to_be_bytes());
+        key
+    }
+
+    fn block_facts_height(key: &[u8]) -> Option<u64> {
+        Some(u64::from_be_bytes(key.strip_prefix(META_BLOCK_FACTS_PREFIX)?.try_into().ok()?))
+    }
+
+    /// The newest `n` stored block facts, oldest first.
+    pub fn newest_block_facts(&self, n: usize) -> Result<Vec<randprotocol_core::ledger::program_state::BlockFacts>> {
+        let top = Self::block_facts_key(u64::MAX);
+        let mut facts = Vec::new();
+        for item in self.db.iterator_cf(self.cf(CF_META), IteratorMode::From(&top, rocksdb::Direction::Reverse)) {
+            if facts.len() >= n {
+                break;
+            }
+            let (k, v) = item?;
+            let Some(height) = Self::block_facts_height(&k) else { break };
+            facts.push(bincode::deserialize(&v).map_err(|e| StorageError::Corrupt(format!("block facts {height}: {e}")))?);
+        }
+        facts.reverse();
+        Ok(facts)
+    }
+
+    /// Stage the deletion of every block-facts row below `below` (all of them at `u64::MAX`,
+    /// plus the top row).
+    fn stage_delete_block_facts(&self, batch: &mut WriteBatch, below: u64) -> Result<()> {
+        for item in self.db.iterator_cf(self.cf(CF_META), IteratorMode::From(META_BLOCK_FACTS_PREFIX, rocksdb::Direction::Forward)) {
+            let (k, _) = item?;
+            match Self::block_facts_height(&k) {
+                Some(h) if h < below || below == u64::MAX => batch.delete_cf(self.cf(CF_META), k),
+                _ => break,
+            }
+        }
+        Ok(())
+    }
+
     /// The newest `n` stored block-end roots, oldest first: the anchor window `load_ledger`
     /// reads ([`randprotocol_core::ledger::ANCHOR_WINDOW`] rows), and what `reload_ledger` re-reads
     /// on a chain whose genesis `proof_window_blocks` is wider (issue #118). The family keeps
@@ -3754,6 +3813,17 @@ impl Storage {
             if (first_height..=last_height).contains(h) {
                 batch.put_cf(self.cf(CF_ANCHORS), height_key(*h), word8_to_bytes(root));
             }
+        }
+        // Issue #168: and its facts, beside the anchor, with the rows that left the ring
+        // deleted. The ring is empty without genesis `program_state.reference_block_window`,
+        // and then nothing is read or written here.
+        if let Some(oldest) = ledger_after.block_facts().front() {
+            for f in ledger_after.block_facts() {
+                if (first_height..=last_height).contains(&f.height) {
+                    batch.put_cf(self.cf(CF_META), Self::block_facts_key(f.height), bincode::serialize(f)?);
+                }
+            }
+            self.stage_delete_block_facts(&mut batch, oldest.height)?;
         }
         if next_index != ledger_after.next_index() {
             return Err(StorageError::Corrupt(format!(
@@ -4431,6 +4501,9 @@ impl Storage {
         let loaded = self.load_ledger(executor).and_then(|mut stored| {
             stored.set_gas(gs.ledger.gas().cloned());
             self.restore_proof_window(&mut stored, gs)?;
+            // The reference-block ring (issue #168) the same way: inside the equality, and read
+            // only under the genesis window.
+            self.restore_reference_block_window(&mut stored, gs)?;
             stored.set_tokens_incremental_root(gs.ledger.tokens().is_some_and(|t| t.incremental_root()));
             // The nullifier range needs no line here: its row loaded it, and the replayed ledger
             // started from `gs.ledger`, which carries the flag, so `stored == ledger` compares ranges.
@@ -4728,6 +4801,15 @@ impl Storage {
         }
         for (h, root) in ledger.anchors() {
             batch.put_cf(self.cf(CF_ANCHORS), height_key(*h), word8_to_bytes(root));
+        }
+        // Issue #168: the reference-block ring likewise, wholesale — a row above `height` would
+        // hand a proof the facts of a block this chain no longer passes through. Only on a
+        // chain with the window: without it there are no rows and nothing is walked.
+        if ledger.reference_block_window() != 0 {
+            self.stage_delete_block_facts(&mut batch, u64::MAX)?;
+            for f in ledger.block_facts() {
+                batch.put_cf(self.cf(CF_META), Self::block_facts_key(f.height), bincode::serialize(f)?);
+            }
         }
         for item in self.db.iterator_cf(self.cf(CF_VALIDATORS), IteratorMode::Start) {
             let (k, _) = item?;
@@ -5617,7 +5699,7 @@ pub(crate) mod fixtures {
         });
         g.hardening_v6 = Some(true);
         g.hc_auth = Some(word8_to_hex(&HCA));
-        g.program_state = Some(randprotocol_core::ledger::program_state::ProgramStateConfig { cell_fee: CELL_FEE, refuse_panics: false });
+        g.program_state = Some(randprotocol_core::ledger::program_state::ProgramStateConfig { cell_fee: CELL_FEE, refuse_panics: false, reference_block_window: 0 });
         g
     }
 
@@ -5726,7 +5808,7 @@ pub(crate) mod fixtures {
             Action::Invoke { program, proof: Vec::new(), input_envelope: None, transition },
         );
         let record = ledger.program(&program).expect("the fixture program is deployed");
-        let segment = ledger.invoke_segment(record, &tx).expect("an invoke with a bundle");
+        let segment = ledger.invoke_segment(record, &tx).expect("a segment").expect("an invoke with a bundle");
         let call = StubExecutor::make_proof_with_public(&program, 10, [9, 8, 7, 6, 5, 4, 3, 2], &segment);
         let Action::Invoke { proof, .. } = &mut tx.action else { unreachable!() };
         *proof = call;
@@ -5760,6 +5842,90 @@ pub(crate) mod fixtures {
         let b1 = make_block(&gs.block, &mut ledger, rpl2_setup_txs(&gs.ledger), &key(1));
         s.commit(std::slice::from_ref(&b1), &ledger, &[], &StubExecutor).unwrap();
         (dir, s, gs, ledger, b1)
+    }
+
+    // ---- Issue #168: a chain with `program_state.reference_block_window` ----
+
+    /// The window the reference-block fixture chain runs.
+    pub(crate) const REF_WINDOW: u64 = 256;
+    /// Block `h` of the fixture chain is stamped `REF_T0_MS + h · 4 000`.
+    pub(crate) const REF_T0_MS: u64 = 1_700_000_000_000;
+
+    /// [`rpl2_genesis_file`] with `program_state.reference_block_window` = [`REF_WINDOW`] and
+    /// the `perps` section beside it, which bounds block time (the window needs that).
+    pub(crate) fn ref_block_genesis_file(chain_id: u64) -> Genesis {
+        let mut g = rpl2_genesis_file(chain_id);
+        g.perps = Some(perps_config());
+        g.timestamp_ms = REF_T0_MS;
+        g.program_state.as_mut().unwrap().reference_block_window = REF_WINDOW;
+        // A bundle window wider than the reference window, so a transaction that outlives its
+        // reference block is refused for that and not for its anchor.
+        g.proof_window_blocks = Some(1024);
+        g
+    }
+
+    /// The next block of the fixture chain, built as a proposer builds one — the transactions,
+    /// the block-end steps (`close_block`, which records the block's facts), the header — and
+    /// committed to `s`. Receipts are the replica's own.
+    pub(crate) fn ref_block_next(s: &Storage, parent: &CommittedBlock, ledger: &mut Ledger, txs: Vec<Transaction>) -> CommittedBlock {
+        let height = parent.block.height() + 1;
+        let at_ms = REF_T0_MS + height * 4_000;
+        let mut probe = ledger.clone();
+        ledger.set_height(height);
+        ledger.set_timestamp_ms(at_ms);
+        ledger.apply_transactions(&txs, &key(1).address(), &StubExecutor).unwrap();
+        ledger.close_block(height, &key(1).address(), 0, 0, &StubExecutor);
+        let mut b = make_block_unchecked_at(parent, ledger, txs, &key(1), at_ms);
+        b.receipts = probe.apply_block(&b.block, &StubExecutor).expect("a replica applies the proposer's block");
+        s.commit(std::slice::from_ref(&b), ledger, &[], &StubExecutor).unwrap();
+        b
+    }
+
+    /// The genesis block as the parent [`ref_block_next`] builds block 1 on.
+    pub(crate) fn ref_block_genesis_parent(gs: &GenesisState) -> CommittedBlock {
+        CommittedBlock {
+            block: gs.block.clone(),
+            pruned: Vec::new(),
+            qc: QuorumCertificate::genesis(gs.block.hash()),
+            receipts: Vec::new(),
+            deposits: Vec::new(),
+            aggregates: Vec::new(),
+            perp_words: None,
+        }
+    }
+
+    /// An opened store holding the reference-block fixture chain one block in
+    /// ([`rpl2_setup_txs`]), with the ledger after that block and the block itself.
+    pub(crate) fn ref_block_chain(chain_id: u64) -> (tempfile::TempDir, Storage, GenesisState, Ledger, CommittedBlock) {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Storage::open(dir.path()).unwrap();
+        let gs = ref_block_genesis_file(chain_id).build(&StubExecutor).unwrap();
+        s.init_genesis(&gs).unwrap();
+        let mut ledger = gs.ledger.clone();
+        let b1 = ref_block_next(&s, &ref_block_genesis_parent(&gs), &mut ledger, rpl2_setup_txs(&gs.ledger));
+        (dir, s, gs, ledger, b1)
+    }
+
+    /// [`rpl2_invoke_tx`] as an `InvokeAt` naming `ref_height`, proved over the segment
+    /// `ledger` builds for it — `ledger` must hold that block's facts.
+    pub(crate) fn rpl2_invoke_at_tx(
+        ledger: &Ledger,
+        seed: u32,
+        ref_height: u64,
+        transition: randprotocol_core::ledger::program_state::Transition,
+    ) -> Transaction {
+        let (program, _) = rpl2_program();
+        let mut tx = Transaction::shielded(
+            ledger.chain_id(),
+            v3_bundle(ledger, seed, RPL2_FEE, (0, 0, 0)),
+            Action::InvokeAt { program, proof: Vec::new(), input_envelope: None, transition, ref_height },
+        );
+        let record = ledger.program(&program).expect("the fixture program is deployed");
+        let segment = ledger.invoke_segment(record, &tx).expect("the reference block is held").expect("a bundle");
+        let call = StubExecutor::make_proof_with_public(&program, 10, [9, 8, 7, 6, 5, 4, 3, 2], &segment);
+        let Action::InvokeAt { proof, .. } = &mut tx.action else { unreachable!() };
+        *proof = call;
+        StubExecutor::bound(tx)
     }
 
     // ---- RPL-3: a chain with the `perps` section, and the transactions it admits ----
@@ -9788,6 +9954,109 @@ mod tests {
     /// And the notes an invoke pays out are leaves the wire does not carry: a block holding an
     /// invoke with three payouts followed by another transaction indexes every note at the leaf
     /// the ledger gave it (`commit` returns `Corrupt` if the counts disagree).
+    /// Issue #168: the reference-block ring is stored beside the anchors and comes back with
+    /// them — at a restart (`reload_ledger`), in the replay audit, and after a truncation — so a
+    /// restarted node builds the same segment for an `InvokeAt` as the node that admitted it.
+    #[test]
+    fn block_facts_are_persisted_restored_truncated_and_audited() {
+        use randprotocol_core::ledger::program_state::{BlockFacts, ProgramStateError, Transition};
+        let (_dir, s, gs, mut ledger, b1) = ref_block_chain(7);
+        let fact = |h: u64| BlockFacts { height: h, timestamp_ms: REF_T0_MS + h * 4_000, basefee: 100 };
+        let rows = |s: &Storage| s.newest_block_facts(usize::MAX).unwrap();
+        assert_eq!(rows(&s), vec![fact(1)], "block 1's facts, written with block 1; none for genesis");
+        let b2 = ref_block_next(&s, &b1, &mut ledger, vec![]);
+        let step = |k| Transition { reads: vec![rpl2_cell(k, 0)], writes: vec![rpl2_cell(k, 5)], ..rpl2_transition() };
+        // Built while block 3 is next: it names block 2, and a second one names block 1.
+        let tx = rpl2_invoke_at_tx(&ledger, 10, 2, step(1));
+        let later = rpl2_invoke_at_tx(&ledger, 30, 1, step(2));
+        let b3 = ref_block_next(&s, &b2, &mut ledger, vec![tx.clone()]);
+        assert_eq!(b3.receipts.len(), 1, "an invoke-at leaves a call's receipt");
+        assert_eq!(rows(&s), vec![fact(1), fact(2), fact(3)]);
+        assert_eq!(ledger.block_facts().iter().copied().collect::<Vec<_>>(), rows(&s));
+
+        // A restart: the plain load knows no genesis and holds no ring; the reload restores it.
+        let bare = s.load_ledger(&StubExecutor).unwrap();
+        assert!(bare.block_facts().is_empty() && bare.reference_block_window() == 0);
+        let mut reloaded = crate::node::reload_ledger(&s, &gs, &StubExecutor).unwrap();
+        assert_eq!(reloaded.reference_block_window(), REF_WINDOW);
+        assert_eq!(reloaded, ledger);
+        // `reload_ledger` leaves the position to its caller (`HotStuff::new` sets the head's).
+        reloaded.set_height(3);
+        assert_eq!(reloaded.validate(&later, &StubExecutor), Ok(()), "the transaction still validates after the restart");
+        let (program, _) = rpl2_program();
+        let record = ledger.program(&program).unwrap();
+        assert_eq!(reloaded.invoke_segment(record, &later), ledger.invoke_segment(record, &later));
+        // The replay audit rebuilds the ring from the blocks and finds the stored one equal.
+        assert_eq!(s.verify_chain(&gs, VerifyMode::Quick, &StubExecutor).unwrap().problem, None);
+
+        // A stale row (block 2's time, a second off) is a snapshot that does not match the chain,
+        // and the repair rewrites the rows from the replay.
+        let stale = BlockFacts { timestamp_ms: fact(2).timestamp_ms + 1_000, ..fact(2) };
+        s.db.put_cf(s.cf(CF_META), Storage::block_facts_key(2), bincode::serialize(&stale).unwrap()).unwrap();
+        let check = s.verify_chain(&gs, VerifyMode::Quick, &StubExecutor).unwrap();
+        assert!(check.problem.is_some(), "a ring that is not the chain's is a problem");
+        assert_eq!(check.last_good, 3, "the blocks themselves are fine");
+        s.truncate_to(&gs, 3, &check.ledger).unwrap();
+        assert_eq!(rows(&s), vec![fact(1), fact(2), fact(3)]);
+        assert_eq!(s.verify_chain(&gs, VerifyMode::Quick, &StubExecutor).unwrap().problem, None);
+
+        // A truncation to block 1 drops the rows above it: block 2 is no reference block there.
+        let at_1 = {
+            let mut l = gs.ledger.clone();
+            l.apply_block(&b1.block, &StubExecutor).unwrap();
+            l
+        };
+        s.truncate_to(&gs, 1, &at_1).unwrap();
+        assert_eq!(rows(&s), vec![fact(1)]);
+        let back = crate::node::reload_ledger(&s, &gs, &StubExecutor).unwrap();
+        assert_eq!(
+            back.block_facts_at(2),
+            Err(ProgramStateError::FutureReferenceBlock { ref_height: 2, newest: Some(1) }),
+            "nothing above the new head is served"
+        );
+        assert_eq!(back.block_facts_at(1), Ok(&fact(1)));
+
+        // More blocks than the window: the rows that left the ring are deleted at the commit.
+        let (_dir, s, gs, mut ledger, mut parent) = ref_block_chain(7);
+        for _ in 0..REF_WINDOW + 2 {
+            parent = ref_block_next(&s, &parent, &mut ledger, vec![]);
+        }
+        let kept = rows(&s);
+        assert_eq!(kept.len() as u64, REF_WINDOW);
+        assert_eq!((kept[0].height, kept.last().unwrap().height), (4, REF_WINDOW + 3));
+        assert_eq!(crate::node::reload_ledger(&s, &gs, &StubExecutor).unwrap(), ledger);
+    }
+
+    /// Issue #168, the other side: on a chain without the window — chain 21 — no block-facts
+    /// row is ever written, by a commit or a truncation, so the store's layout is what it was;
+    /// and a row another build left there is not taken up.
+    #[test]
+    fn a_chain_without_the_window_stores_no_block_facts() {
+        let (_dir, s, gs, mut ledger, b1) = rpl2_chain(7);
+        let meta_keys = |s: &Storage| -> Vec<Vec<u8>> {
+            s.db.iterator_cf(s.cf(CF_META), IteratorMode::Start).map(|r| r.unwrap().0.to_vec()).collect()
+        };
+        let before = meta_keys(&s);
+        let mut parent = b1;
+        for _ in 0..3 {
+            ledger.set_height(parent.block.height() + 1);
+            ledger.close_block(parent.block.height() + 1, &key(1).address(), 0, 0, &StubExecutor);
+            let b = make_block_unchecked(&parent, &ledger, vec![], &key(1));
+            s.commit(std::slice::from_ref(&b), &ledger, &[], &StubExecutor).unwrap();
+            parent = b;
+        }
+        assert!(ledger.block_facts().is_empty());
+        assert_eq!(meta_keys(&s), before, "three commits added no meta key");
+        assert!(s.newest_block_facts(usize::MAX).unwrap().is_empty());
+        s.truncate_to(&gs, 4, &ledger).unwrap();
+        assert_eq!(meta_keys(&s), before, "nor did a truncation");
+        let facts = randprotocol_core::ledger::program_state::BlockFacts { height: 2, timestamp_ms: 2, basefee: 0 };
+        s.db.put_cf(s.cf(CF_META), Storage::block_facts_key(2), bincode::serialize(&facts).unwrap()).unwrap();
+        let reloaded = crate::node::reload_ledger(&s, &gs, &StubExecutor).unwrap();
+        assert!(reloaded.block_facts().is_empty() && reloaded.reference_block_window() == 0);
+        assert_eq!(reloaded, ledger);
+    }
+
     #[test]
     fn program_state_is_persisted_restored_and_audited() {
         use randprotocol_core::ledger::program_state::{payout_commitment, Inflow, ProgramState, Transition};

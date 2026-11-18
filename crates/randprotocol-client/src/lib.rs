@@ -165,6 +165,7 @@ pub fn action_kind(action: &randprotocol_core::Action) -> &'static str {
         A::MultisigPay { .. } => "multisig_pay",
         A::MultisigRotate { .. } => "multisig_rotate",
         A::SetRandPrice { .. } => "set_rand_price",
+        A::InvokeAt { .. } => "invoke_at",
     }
 }
 

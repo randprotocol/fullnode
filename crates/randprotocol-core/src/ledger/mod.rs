@@ -557,7 +557,7 @@ pub fn non_canonical_proofs(tx: &Transaction, check: &dyn Fn(&[u8]) -> Option<St
     }
     // An RPL-2 `Invoke` carries a call proof too, and the call binding blanks it exactly as it
     // blanks a call's.
-    if let Action::Call { proof, .. } | Action::Invoke { proof, .. } = &tx.action {
+    if let Action::Call { proof, .. } | Action::Invoke { proof, .. } | Action::InvokeAt { proof, .. } = &tx.action {
         if let Some(why) = check(proof) {
             return Some(TxError::NonCanonicalProof(format!("call proof: {why}")));
         }
@@ -793,6 +793,17 @@ pub struct Ledger {
     /// outside the state root and equality, restored by `reload_ledger`; `false` on chain 21 and
     /// every chain cut before the field.
     refuse_panicked_invokes: bool,
+    /// Issue #168: genesis `program_state.reference_block_window` — how many closed blocks an
+    /// `InvokeAt` may name as its reference block; 0, chain 21 and every chain cut before the
+    /// field, is off. A parameter like `refuse_panicked_invokes`: outside the state root and
+    /// equality, restored by `reload_ledger`.
+    reference_block_window: u64,
+    /// Issue #168: the facts of the last `reference_block_window` closed blocks, oldest first —
+    /// the anchors' twin ([`Ledger::record_block_facts`], at each block's end). What a version-2
+    /// invoke context is filled from. Derived from the chain (each header's time, the gas price
+    /// its block opened at), outside the state root like the anchors, inside equality like
+    /// them, persisted and restored beside them. Empty, always, with the window off.
+    block_facts: VecDeque<program_state::BlockFacts>,
     /// Issue #118: genesis `proof_window_blocks`, the one window that replaces both
     /// [`ANCHOR_WINDOW`] and [`TIME_WINDOW`] when set — how old a bundle's anchor and its `time`
     /// may be — read through [`Ledger::proof_window`]. `None`, every chain through 19, is today's
@@ -866,6 +877,10 @@ impl PartialEq for Ledger {
             && self.nullifiers == o.nullifiers
             && self.nullifier_mmr == o.nullifier_mmr
             && self.anchors == o.anchors
+            // The reference-block ring (issue #168): what an `InvokeAt`'s context is filled
+            // from, so a node holding other facts would refuse proofs its peers accept. Empty on
+            // both sides without `program_state.reference_block_window`.
+            && self.block_facts == o.block_facts
             && self.validators == o.validators
             && self.programs == o.programs
             && self.bridge == o.bridge
@@ -967,6 +982,8 @@ impl Ledger {
             hc_auth_multisig: None,
             testnet: false,
             refuse_panicked_invokes: false,
+            reference_block_window: 0,
+            block_facts: VecDeque::new(),
             proof_window_blocks: None,
             aggregators: BTreeMap::new(),
             retired_aggregator_nonces: BTreeMap::new(),
@@ -1041,6 +1058,8 @@ impl Ledger {
             hc_auth_multisig: None,
             testnet: false,
             refuse_panicked_invokes: false,
+            reference_block_window: 0,
+            block_facts: VecDeque::new(),
             proof_window_blocks: None,
             aggregators: BTreeMap::new(),
             retired_aggregator_nonces: BTreeMap::new(),
@@ -1290,7 +1309,7 @@ impl Ledger {
     /// destroys.
     fn burnable_floor(&self, tx: &Transaction, call: Option<&crate::program::CallOutcome>) -> u64 {
         match (&tx.action, call) {
-            (Action::Call { proof, input_envelope, .. } | Action::Invoke { proof, input_envelope, .. }, Some(outcome)) => {
+            (Action::Call { proof, input_envelope, .. } | Action::Invoke { proof, input_envelope, .. } | Action::InvokeAt { proof, input_envelope, .. }, Some(outcome)) => {
                 let bytes = gas::call_bytes(proof, input_envelope.as_ref());
                 // Spec §4.2 (cs8): under the `gas` section the declared limit at the prices in
                 // force plus the bytes — the tier floor is gone on such a chain. Without the
@@ -1541,14 +1560,26 @@ impl Ledger {
     /// fields. Built from the transaction alone — never from this ledger's cells — so a proof's
     /// verdict is a function of the transaction's bytes. `None` for any other action or a
     /// bundle-less transaction.
-    pub fn invoke_segment(&self, record: &ProgramRecord, tx: &Transaction) -> Option<Vec<u32>> {
-        let Action::Invoke { transition, .. } = &tx.action else { return None };
-        let b = tx.bundle.as_ref()?;
-        Some(program_state::invoke_segment(
+    ///
+    /// Issue #168: an `InvokeAt`'s context is version 2, whose block words are **this ledger's**
+    /// record of the reference block the transaction names ([`Ledger::block_context`]) — the one
+    /// part of a segment that is not the transaction's bytes. `Err` when this ledger has no such
+    /// record (the window is off, or the block is outside it): there is then no segment, and the
+    /// caller must refuse rather than fall back to a call's. The facts of a closed block never
+    /// change on a branch, and a verify cache is keyed on the segment, so a cached verdict still
+    /// stands only for the words it was reached on.
+    pub fn invoke_segment(&self, record: &ProgramRecord, tx: &Transaction) -> Result<Option<Vec<u32>>, TxError> {
+        let Some(invoke) = tx.action.invoke() else { return Ok(None) };
+        let Some(b) = tx.bundle.as_ref() else { return Ok(None) };
+        let context = match invoke.ref_height {
+            None => invoke.transition.context(b.burn_r, b.burn_asset, b.burn_a),
+            Some(h) => invoke.transition.context_at(b.burn_r, b.burn_asset, b.burn_a, &self.block_context(h)?.1),
+        };
+        Ok(Some(program_state::invoke_segment(
             self.program_public(&record.id).unwrap_or(&[]),
             &tx.call_binding(&self.binding_domain),
-            &transition.context(b.burn_r, b.burn_asset, b.burn_a),
-        ))
+            &context,
+        )))
     }
 
     /// The vesting register (genesis vesting), `None` on a chain without the section.
@@ -1883,6 +1914,91 @@ impl Ledger {
         self.refuse_panicked_invokes = on;
     }
 
+    /// Issue #168: genesis `program_state.reference_block_window`; 0 is off.
+    pub fn reference_block_window(&self) -> u64 {
+        self.reference_block_window
+    }
+
+    /// Set by genesis from `program_state.reference_block_window`, and by `reload_ledger` on
+    /// every restart. A narrower window (and 0 above all) drops the facts outside it at once.
+    pub fn set_reference_block_window(&mut self, window: u64) {
+        self.reference_block_window = window;
+        self.trim_block_facts();
+    }
+
+    /// The facts of the closed blocks an `InvokeAt` may still name, oldest first. Empty with
+    /// the window off.
+    pub fn block_facts(&self) -> &VecDeque<program_state::BlockFacts> {
+        &self.block_facts
+    }
+
+    /// Install the ring a node persisted (`restore_anchors`' twin), trimmed to the window in
+    /// force — so with the window off whatever a store held is dropped.
+    pub fn restore_block_facts(&mut self, facts: Vec<program_state::BlockFacts>) {
+        self.block_facts = facts.into_iter().collect();
+        self.trim_block_facts();
+    }
+
+    fn trim_block_facts(&mut self) {
+        let window = self.reference_block_window as usize;
+        while self.block_facts.len() > window {
+            self.block_facts.pop_front();
+        }
+    }
+
+    /// Record block `height`'s facts at its end ([`Ledger::close_block`]): this ledger's block
+    /// time, and `basefee`, the gas price the block opened at. A no-op with the window off.
+    /// Idempotent per height, like [`Ledger::record_anchor`].
+    pub fn record_block_facts(&mut self, height: u64, basefee: u64) {
+        if self.reference_block_window == 0 {
+            return;
+        }
+        let facts = program_state::BlockFacts { height, timestamp_ms: self.timestamp_ms, basefee };
+        if let Some(entry) = self.block_facts.iter_mut().find(|f| f.height == height) {
+            *entry = facts;
+            return;
+        }
+        self.block_facts.push_back(facts);
+        self.trim_block_facts();
+    }
+
+    /// The facts of reference block `ref_height` (issue #168), or why an `InvokeAt` naming it
+    /// is refused here: the window is off; the block is at or above the one being applied (or
+    /// above the tip, on a head ledger); or it has left the window. The ring holds exactly the
+    /// last `window` closed blocks, so on a block's ledger "held" is `ref_height < including`
+    /// and `including − ref_height ≤ window`, and on the head's it is `ref_height ≤ tip` and
+    /// `tip − ref_height < window`.
+    pub fn block_facts_at(&self, ref_height: u64) -> Result<&program_state::BlockFacts, program_state::ProgramStateError> {
+        use program_state::ProgramStateError as E;
+        let window = self.reference_block_window;
+        if window == 0 {
+            return Err(E::ReferenceBlockDisabled);
+        }
+        let (Some(oldest), Some(newest)) = (self.block_facts.front(), self.block_facts.back()) else {
+            return Err(E::FutureReferenceBlock { ref_height, newest: None });
+        };
+        if ref_height > newest.height {
+            return Err(E::FutureReferenceBlock { ref_height, newest: Some(newest.height) });
+        }
+        // By position first (the ring is contiguous on a running chain), by search otherwise.
+        let at = ref_height.checked_sub(oldest.height).and_then(|i| self.block_facts.get(i as usize));
+        match at.filter(|f| f.height == ref_height).or_else(|| self.block_facts.iter().find(|f| f.height == ref_height)) {
+            Some(f) => Ok(f),
+            None => Err(E::StaleReferenceBlock { ref_height, oldest: oldest.height, window }),
+        }
+    }
+
+    /// The words a version-2 invoke context carries for reference block `ref_height`
+    /// (`program_state::BlockFacts::context_words` on this chain's id), with the facts they
+    /// encode — what `rand_getBlockContext` serves and what [`Ledger::invoke_segment`] splices in.
+    pub fn block_context(
+        &self,
+        ref_height: u64,
+    ) -> Result<(program_state::BlockFacts, [u32; program_state::BLOCK_CONTEXT_WORDS]), program_state::ProgramStateError> {
+        let facts = *self.block_facts_at(ref_height)?;
+        Ok((facts, facts.context_words(self.chain_id)))
+    }
+
     /// Issue #118: the genesis `proof_window_blocks`, `None` on a chain whose file does not set
     /// it. Served as is by `rand_getLimits`; the rules read [`Ledger::proof_window`].
     pub fn proof_window_blocks(&self) -> Option<u64> {
@@ -2044,7 +2160,7 @@ impl Ledger {
             let n = if paying {
                 match &tx.action {
                     // An RPL-2 `Invoke` pays the byte price on its call proof as a `Call` does.
-                    Action::Call { proof, input_envelope, .. } | Action::Invoke { proof, input_envelope, .. } => {
+                    Action::Call { proof, input_envelope, .. } | Action::Invoke { proof, input_envelope, .. } | Action::InvokeAt { proof, input_envelope, .. } => {
                         gas::call_bytes(proof, input_envelope.as_ref())
                     }
                     _ => 0,
@@ -2315,7 +2431,7 @@ impl Ledger {
             // token through `burn_a` — which `perps::validate` holds to the section's asset.
             Action::TokenBurn { .. }
             | Action::BridgeBurn { .. }
-            | Action::Invoke { .. }
+            | Action::Invoke { .. } | Action::InvokeAt { .. }
             | Action::PerpDeposit { .. } => {}
             // Multisig: a create and a deposit may set all three, like an `Invoke`; the module's
             // own rules decide what the burn funds (`multisig::validate`, after its gate).
@@ -2587,7 +2703,7 @@ impl Ledger {
             Action::RegisterToken { initial: Some(m), .. } => self.check_note_envelope(&m.envelope)?,
             // RPL-2: every note a transition pays out carries a note envelope. The count is
             // capped first, so a transaction cannot buy unbounded envelope checks.
-            Action::Invoke { transition, .. } => {
+            Action::Invoke { transition, .. } | Action::InvokeAt { transition, .. } => {
                 let payouts = transition.pays.len() + transition.mints.len();
                 if payouts > program_state::MAX_PAYOUTS {
                     return Err(program_state::ProgramStateError::TooManyPayouts(payouts).into());
@@ -2619,7 +2735,7 @@ impl Ledger {
                 return Err(TxError::ProgramPublicTooLarge)
             }
             // RPL-3: a state proof's STARK is held to the same cap as a call's.
-            Action::Call { proof, .. } | Action::Invoke { proof, .. } | Action::PerpStateProof { proof, .. }
+            Action::Call { proof, .. } | Action::Invoke { proof, .. } | Action::InvokeAt { proof, .. } | Action::PerpStateProof { proof, .. }
                 if proof.len() > self.max_proof_bytes =>
             {
                 return Err(TxError::ProofTooLarge)
@@ -2665,7 +2781,7 @@ impl Ledger {
             // `CALL_BASE` in that role). Every other action, and every chain without the
             // section, keeps `fee_floor`.
             let min = match &tx.action {
-                Action::Call { proof, input_envelope, .. } | Action::Invoke { proof, input_envelope, .. } => self
+                Action::Call { proof, input_envelope, .. } | Action::Invoke { proof, input_envelope, .. } | Action::InvokeAt { proof, input_envelope, .. } => self
                     .gas_call_floor(1, gas::call_bytes(proof, input_envelope.as_ref()))
                     .unwrap_or_else(|| gas::fee_floor(&tx.action)),
                 _ => gas::fee_floor(&tx.action),
@@ -2794,7 +2910,7 @@ impl Ledger {
             // transition's own rules, the vault, the cells read and the payout notes. The cell
             // fee is decided here, before either proof: it is a ledger fact like a registration
             // fee, and a transaction that cannot pay it buys no verification.
-            a @ Action::Invoke { program, input_envelope, .. } => {
+            a @ (Action::Invoke { program, input_envelope, .. } | Action::InvokeAt { program, input_envelope, .. }) => {
                 if !self.confidential {
                     return Err(TxError::ConfidentialDisabled);
                 }
@@ -2901,7 +3017,7 @@ impl Ledger {
         }
         // 10. the call's own proof, then its fee: the tier's, and the byte term for proof and
         // envelope bytes past the free allowance (spec §7)
-        if let (Some(record), Action::Call { proof, .. } | Action::Invoke { proof, .. }) = (call_record, &tx.action)
+        if let (Some(record), Action::Call { proof, .. } | Action::Invoke { proof, .. } | Action::InvokeAt { proof, .. }) = (call_record, &tx.action)
         {
             // Verified, never decoded (the verified-fold spec): the outcome the tier's fee floor
             // and the receipt are read from is the verifier's own, cached on a node.
@@ -2921,7 +3037,11 @@ impl Ledger {
             // arguments and a node's verify cache answers the second: what depends on this
             // ledger's state — the cells read — was compared in step 7 and is never inside the
             // proof's verdict.
-            let outcome = match self.invoke_segment(record, tx) {
+            //
+            // Issue #168: an `InvokeAt`'s segment also carries this ledger's record of the
+            // reference block (`invoke_segment`); step 7 already refused a block it does not
+            // hold, and `?` refuses again rather than verify such a proof as a plain call's.
+            let outcome = match self.invoke_segment(record, tx)? {
                 Some(segment) => executor.verify_invoke(record, proof, &segment),
                 None if self.hardening_v6 => {
                     let segment = self.hardened_call_segment(record, &tx.call_binding(&self.binding_domain));
@@ -2935,7 +3055,7 @@ impl Ledger {
             // shown. Such an invoke is not an acceptance of its transition. A plain `Call`'s
             // outputs are data the chain does nothing with, so only an invoke is judged.
             if self.refuse_panicked_invokes
-                && matches!(tx.action, Action::Invoke { .. })
+                && matches!(tx.action, Action::Invoke { .. } | Action::InvokeAt { .. })
                 && program_state::panicked(&outcome.outputs)
             {
                 return Err(program_state::ProgramStateError::ProgramPanicked.into());
@@ -3188,10 +3308,10 @@ impl Ledger {
             Action::SetRandPrice { price_micros_per_rand, nonce, votes } => {
                 rand_price::apply_set_price(self, *price_micros_per_rand, *nonce, votes)?
             }
-            Action::Call { program, input_envelope, .. } | Action::Invoke { program, input_envelope, .. } => {
+            Action::Call { program, input_envelope, .. } | Action::Invoke { program, input_envelope, .. } | Action::InvokeAt { program, input_envelope, .. } => {
                 // RPL-2: the transition first — vault, supplies, cells, payout notes — then the
                 // receipt, which is a call's. Every refusal was decided by `validate_inner`.
-                if let a @ Action::Invoke { .. } = &tx.action {
+                if let a @ (Action::Invoke { .. } | Action::InvokeAt { .. }) = &tx.action {
                     program_state::apply(self, tx, a, executor)?;
                 }
                 let o = verified.call.expect("validate_inner returns the outcome for calls");
@@ -3520,6 +3640,9 @@ impl Ledger {
         executor: &dyn ConfidentialExecutor,
     ) {
         self.sweep_expired_excesses(height, proposer);
+        // Issue #168: the gas price this block's calls were priced at, read before the
+        // controller moves it — the reference block's `basefee`.
+        let opening_gas_price = self.gas_prices().gas_price;
         if let Some(d) = self.gas.as_ref().and_then(|g| g.dynamic.as_ref()) {
             let p = self.gas_prices();
             // Under a ceiling (audit v6, POOL-2) the step is the same and then clamped; without
@@ -3553,6 +3676,9 @@ impl Ledger {
             perps::close_block(self, height, executor);
         }
         self.record_anchor(height);
+        // Issue #168: and the block's facts beside its anchor (a no-op without genesis
+        // `program_state.reference_block_window`).
+        self.record_block_facts(height, opening_gas_price);
         // Spec §12's invariant, checked once per block in a debug build: every bridged token's
         // supply is exactly the sum of what its source-chain coins are holding locked. It holds
         // by construction — `lock`/`release` move both sides together and are the only writers of

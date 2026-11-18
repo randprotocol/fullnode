@@ -142,7 +142,7 @@ fn the_genesis_command_writes_the_program_state_section_when_asked() {
     let run = genesis(&with, &[all.as_slice(), &["--program-state-cell-fee", "10000000"]].concat());
     assert!(run.status.success(), "{}", String::from_utf8_lossy(&run.stderr));
     let w = read(&with);
-    assert_eq!(w.program_state, Some(ProgramStateConfig { cell_fee: 10_000_000, refuse_panics: false }));
+    assert_eq!(w.program_state, Some(ProgramStateConfig { cell_fee: 10_000_000, refuse_panics: false, reference_block_window: 0 }));
     let executor = randprotocol_node::node::executor_for_profile(&w.fri_profile).unwrap();
     let state = w.build(executor.as_ref()).unwrap();
     assert_eq!(state.ledger.program_state().map(|s| s.cell_fee), Some(10_000_000));
@@ -157,12 +157,24 @@ fn the_genesis_command_writes_the_program_state_section_when_asked() {
     let run = genesis(&strict, &[all.as_slice(), &["--program-state-cell-fee", "10000000", "--program-state-refuse-panics"]].concat());
     assert!(run.status.success(), "{}", String::from_utf8_lossy(&run.stderr));
     let s = read(&strict);
-    assert_eq!(s.program_state, Some(ProgramStateConfig { cell_fee: 10_000_000, refuse_panics: true }));
+    assert_eq!(s.program_state, Some(ProgramStateConfig { cell_fee: 10_000_000, refuse_panics: true, reference_block_window: 0 }));
     let strict_state = s.build(executor.as_ref()).unwrap();
     assert!(strict_state.ledger.refuse_panicked_invokes());
     assert_ne!(strict_state.hash(), state.hash(), "the rule is bound by the genesis hash");
     let lone = genesis(&dir.path().join("lone.json"), &[all.as_slice(), &["--program-state-refuse-panics"]].concat());
     assert!(!lone.status.success() && String::from_utf8_lossy(&lone.stderr).contains("needs --program-state-cell-fee"));
+
+    // Issue #168: `--program-state-reference-block-window` is a field of the section too, and
+    // the section is refused with it on a chain that does not bound its block time (this one has
+    // neither a bridge nor perps); out of the proof window's bounds it is refused by name.
+    let window = |args: &[&str]| genesis(&dir.path().join("window.json"), &[all.as_slice(), args].concat());
+    let lone = window(&["--program-state-reference-block-window", "256"]);
+    assert!(!lone.status.success() && String::from_utf8_lossy(&lone.stderr).contains("needs --program-state-cell-fee"));
+    let unbounded = window(&["--program-state-cell-fee", "10000000", "--program-state-reference-block-window", "256"]);
+    assert!(!unbounded.status.success() && String::from_utf8_lossy(&unbounded.stderr).contains("bounded block time"), "{}", String::from_utf8_lossy(&unbounded.stderr));
+    let small = window(&["--program-state-cell-fee", "10000000", "--program-state-reference-block-window", "255"]);
+    assert!(!small.status.success() && String::from_utf8_lossy(&small.stderr).contains("reference_block_window 255"), "{}", String::from_utf8_lossy(&small.stderr));
+    assert!(!dir.path().join("window.json").exists(), "nothing is written for a refused genesis");
 
     // Each flag it stands on, missing one at a time, refused by name; and a fee past the bound.
     let without = |skip: &str| -> Vec<&str> {
