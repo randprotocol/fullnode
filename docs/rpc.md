@@ -181,19 +181,48 @@ the_27_oct_burst_shape_stays_inside_the_2gb_default_budget` sends bursts of ~2.9
 (5.8 MB hex bodies) at once to an RPC on a 1 967 MB host's default budget, and
 `node::tests::a_submission_burst_is_either_pooled_or_told_busy_never_acknowledged_and_dropped`
 does the same to the node loop: bytes in flight never exceed the budget, each submission is
-answered once, with its hash or `-32005`, and every hash answered is pooled or stemmed. Note what
-the budget does not do: each such submission counts ~8.7 MB (body plus decoded transaction), so
-the 27 Oct burst of eight (~70 MB) fits a 2 GB host's ~117 MiB budget outright and is not
-refused; about fourteen fit before `-32005`. The budget bounds counted bytes, not RSS — the
-verifier's scratch is outside it — so a 2 GB validator's protection against that burst is the
-`MemoryHigh=85%` drop-in every roll writes (PROC-601) and the 4 GB validator minimum
-(`docs/node-hardware.md`). Two paths drop an acknowledged transaction by design and are not the
+answered once, with its hash or `-32005`, and every hash answered is pooled or stemmed.
+
+Those two watch the budget's own counter. **`tests/burst_memory.rs` measures the memory**
+(monorepo#26): one real node — its own store, RPC listener and swarm — on the budget a 1 967 MB
+host gets on chain 21 and a genesis with chain 21's size limits, in a test binary whose
+allocator counts every live heap byte. It sends 8, 16 and 24 transactions of the 27 Oct size at
+once over RPC, then 8 over gossip. What it found on v0.8.6, where a body was charged its length
+once and that host's budget was 117 MiB:
+
+| at once | v0.8.6: peak heap over idle | now |
+|---|---|---|
+| 8 over RPC | 140 MiB, none told busy | 128 MiB, 3 told busy |
+| 16 over RPC | 276 MiB, 3 told busy | 128 MiB, 11 told busy |
+| 24 over RPC | 344 MiB (2.9 × the budget), 8 told busy | 131 MiB, 19 told busy |
+| 8 over gossip (the publisher's copies included) | 64 MiB | 66 MiB |
+
+A 5.8 MB body costs about 18 MB of heap while it is handled: the body, the parsed JSON string,
+the decoded bytes and the transaction. So **a POST body is now charged three times its declared
+length** (`admission::body_charge`), and the budget's floor — one largest submission — counts the
+body the same way; on chain 21 that floor (134 889 472 bytes, ~129 MiB) is past RAM/16 on a 2 GB
+host and is that host's budget. The measured heap now stays at about the budget whatever the
+size of the burst (the test fails past 1.25 times it), the node is back at its idle heap once the
+burst is answered, and what is over the budget hears `-32005` before its body is read. The price:
+of the 27 Oct eight arriving in the same instant at a 2 GB host, about five are judged and three
+are told to retry (a 4 GB host's 256 MiB has room for about thirteen by the same count; not
+measured).
+
+What the measurement leaves out: the test's transactions carry a proof of the right size that
+does not verify (CI does not prove), so the verifier's scratch for a proof that goes all the way
+through is not in the figure, nor is RocksDB's memory. After a gossip burst the node keeps one
+copy of each body in its recent-transaction cache (four blocks' worth at most, by design), which
+is outside the budget. So a 2 GB validator still relies on the `MemoryHigh=85%` drop-in every
+roll writes (PROC-601) and swap, and 4 GB remains the validator minimum
+(`docs/node-hardware.md`); `deploy/probe-memory.sh` records each host's RAM, swap, `MemoryHigh`,
+resident memory and budget. Two paths drop an acknowledged transaction by design and are not the
 budget's: the pool's byte cap evicting it for a better payer, and a stemmed transaction whose
 embargo fluff no longer pools (its nullifier spent meanwhile). A re-run of the burst on live 2 GB
 hosts has not been done.
 
 **Busy, retry: `-32005`** (issue #157). Every POST body is charged against the node's admission
-byte budget before it is read, and held until the answer; a transaction is charged again, by its
+byte budget before it is read — three times its declared length, what it costs while it is
+handled (OPS-602) — and held until the answer; a transaction is charged again, by its
 decoded size, while it waits for verification — a peer's stem (issue #145) included. A request the budget cannot take now is answered at
 once with HTTP 503, `Retry-After: 1` and
 
@@ -1198,7 +1227,8 @@ otherwise looks identical to a node that is behind and working:
 - `admission_bytes` / `admission_budget_bytes` (issue #157) — bytes charged right now against the
   admission budget, and the budget (`--admission-budget-mb`; default 1/16 of the host's RAM within
   64–256 MiB, never under one largest transaction). The charges are every POST body being served
-  and every transaction waiting for or under verification, gossiped or submitted. At the budget,
+  (three times its length, OPS-602) and every transaction waiting for or under verification,
+  gossiped or submitted. At the budget,
   `rand_sendTransaction` answers `-32005` and gossiped transactions are shed with `Ignore`.
 
 `is_validator` says this node holds a validator key; `active_validator`

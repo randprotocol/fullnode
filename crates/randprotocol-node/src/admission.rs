@@ -628,10 +628,11 @@ impl VerifyLimits {
 /// bytes. Each of those holders now takes an [`AdmissionCharge`] from this one budget and gives it
 /// back when it is done:
 ///
-/// - the RPC: a POST's declared body length (`Content-Length`, else the body cap), held from
-///   before the body is read until the response is built (`rpc::charge_body`). A
-///   `rand_sendTransaction` waits for its verdict inside that window, so its hex body stays
-///   charged throughout;
+/// - the RPC: [`body_charge`] of a POST's declared body length (`Content-Length`, else the body
+///   cap) — [`BODY_HELD_FACTOR`] times it, what the body is measured to cost while it is handled
+///   (audit v12, OPS-602) — held from before the body is read until the response is built
+///   (`rpc::charge_body`). A `rand_sendTransaction` waits for its verdict inside that window, so
+///   its hex body stays charged throughout;
 /// - the verify queue: [`charge_of`] the decoded transaction, from when it is queued (gossip or
 ///   RPC) until its verdict has been handled (`Verdict::charge`).
 ///
@@ -643,6 +644,24 @@ impl VerifyLimits {
 pub struct AdmissionBudget {
     sem: std::sync::Arc<tokio::sync::Semaphore>,
     limit: usize,
+}
+
+/// Audit v12, OPS-602 (monorepo#26): how many bytes of heap the RPC holds per byte of a POST
+/// body while it handles it. Three, measured: the body as read, the parsed JSON (a
+/// `rand_sendTransaction`'s hex string is all but the whole body, copied), and — the hex being
+/// two characters a byte — the decoded bytes and the transaction built from them, half a body
+/// each. `tests/burst_memory.rs` measures it on a real node with a counting allocator: eight
+/// 5.8 MB bodies at once held 140 MiB, 3.2 per body byte with the allocator's slack.
+///
+/// Through v0.8.6 a body was charged its length once, so the budget admitted about three times
+/// the heap it named: on a 2 GB validator's 117 MiB default, 24 such submissions at once held
+/// 344 MiB before any was told busy — the 27 Oct burst's shape, and more than such a host has
+/// to spare.
+pub const BODY_HELD_FACTOR: usize = 3;
+
+/// What a POST body declared as `declared` bytes is charged: [`BODY_HELD_FACTOR`] times it.
+pub fn body_charge(declared: usize) -> usize {
+    declared.saturating_mul(BODY_HELD_FACTOR)
 }
 
 /// Bytes held against an [`AdmissionBudget`]; dropping it gives them back.
@@ -710,11 +729,12 @@ impl AdmissionBudget {
         share.max(floor)
     }
 
-    /// One largest `rand_sendTransaction` in flight: its body at the RPC's cap plus the decoded
-    /// transaction at the block cap. A budget under this could refuse a valid transaction for
-    /// ever, so `--admission-budget-mb` below it is refused at startup.
+    /// One largest `rand_sendTransaction` in flight: what its body at the RPC's cap is charged
+    /// ([`body_charge`]) plus the decoded transaction at the block cap. A budget under this could
+    /// refuse a valid transaction for ever, so `--admission-budget-mb` below it is refused at
+    /// startup.
     pub fn floor_for(max_body_bytes: usize, max_block_bytes: usize) -> usize {
-        max_body_bytes.saturating_add(max_block_bytes)
+        body_charge(max_body_bytes).saturating_add(max_block_bytes)
     }
 
     /// Take `bytes` now, or say why not. Never waits. A charge larger than the whole budget is
@@ -2532,7 +2552,7 @@ mod tests {
     fn the_default_admission_budget_follows_the_host() {
         const MIB: usize = 1 << 20;
         let floor = AdmissionBudget::floor_for(8_867_840, 4 * MIB);
-        assert_eq!(floor, 8_867_840 + 4 * MIB);
+        assert_eq!(floor, 3 * 8_867_840 + 4 * MIB, "the body at what it is charged, plus the transaction");
         // The fleet's 2 GB droplets (1 967 MB): ~117 MiB.
         assert_eq!(AdmissionBudget::default_for(1_967 * 1_000_000, floor), 1_967 * 1_000_000 / 16);
         assert_eq!(AdmissionBudget::default_for(4 << 30, floor), 256 * MIB, "4 GiB: the ceiling");
@@ -2541,6 +2561,25 @@ mod tests {
         assert_eq!(AdmissionBudget::default_for(0, floor), 256 * MIB, "RAM unknown");
         // A chain whose largest submission is past the share: the submission wins.
         assert_eq!(AdmissionBudget::default_for(1 << 30, 300 * MIB), 300 * MIB);
+    }
+
+    /// Audit v12, OPS-602: a POST body is charged three times its declared length — what it is
+    /// measured to hold (`tests/burst_memory.rs`) — and chain 21's largest submission still fits
+    /// the budget its floor gives a 2 GB host.
+    #[test]
+    fn a_body_is_charged_what_it_is_held_as() {
+        assert_eq!(BODY_HELD_FACTOR, 3);
+        assert_eq!(body_charge(0), 0);
+        assert_eq!(body_charge(5_800_000), 17_400_000);
+        assert_eq!(body_charge(usize::MAX), usize::MAX, "saturates");
+        // Chain 21: a 38 322 176-byte body cap and a 19 922 944-byte block cap.
+        let floor = AdmissionBudget::floor_for(38_322_176, 19_922_944);
+        assert_eq!(floor, 134_889_472);
+        let budget = AdmissionBudget::default_for(1_967 * 1_000_000, floor);
+        assert_eq!(budget, floor, "past RAM/16 on a 1 967 MB host, so the floor is the budget");
+        let b = AdmissionBudget::new(budget);
+        let _body = b.try_charge(body_charge(38_322_176)).expect("the largest body fits");
+        let _tx = b.try_charge(19_922_944).expect("and its transaction beside it");
     }
 
     /// Issue #157: a transaction is charged its bincode length, computed without encoding it.
