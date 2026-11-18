@@ -102,6 +102,19 @@ fn peak_above(base: usize) -> usize {
     PEAK.load(Ordering::Relaxed).saturating_sub(base)
 }
 
+/// What is live above `base` once it falls to `limit` or less, or when `within` runs out:
+/// a burst's last copies are freed shortly after its answers, not with them.
+async fn settled(base: usize, limit: usize, within: Duration) -> usize {
+    let deadline = tokio::time::Instant::now() + within;
+    loop {
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        let held = LIVE.load(Ordering::Relaxed).saturating_sub(base);
+        if held <= limit || tokio::time::Instant::now() >= deadline {
+            return held;
+        }
+    }
+}
+
 const MIB: usize = 1 << 20;
 /// The fleet's 2 GB droplet, as the kernel reports it.
 const HOST_RAM: u64 = 1_967 * 1_000_000;
@@ -315,8 +328,11 @@ async fn the_27_oct_burst_costs_a_real_node_a_bounded_heap() {
         let peak = peak_above(base);
         let busy = answers.iter().filter(|a| **a == Answer::Busy).count();
         let refused: Vec<&String> = answers.iter().filter_map(|a| if let Answer::Refused(m) = a { Some(m) } else { None }).collect();
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        let after = LIVE.load(Ordering::Relaxed).saturating_sub(base);
+        // Answered is not yet released: a request told busy can still be dropping its body, and
+        // the last proof checks can still be finishing on a loaded runner (a fixed 500 ms left
+        // 28 MiB once on CI, run 44284862601). Wait for the heap to settle, up to a deadline; a
+        // leak still fails the assertion below.
+        let after = settled(base, 16 * MIB, Duration::from_secs(15)).await;
         eprintln!(
             "burst memory: {size} x {:.1} MB over RPC ({:.0} MB counted if all were admitted): peak heap +{:.1} MiB ({:.2} of the budget); refused on the proof {}, busy {}; +{:.1} MiB left after",
             tx_len as f64 / 1e6,
