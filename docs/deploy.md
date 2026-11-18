@@ -29,8 +29,9 @@ Since this table was written: **chain 19** (v0.6.7, genesis `a3defc93…228a`, 2
 2026-10-01 06:17 UTC, `deploy/cut-chain20-genesis.sh`, `deploy/cut-records/chain20.record`; now on
 v0.7.1; retired at the chain-21 cut). **Chain 21** (v0.8.0, genesis `ca76c276…ca9a`, cut
 2026-10-12, all 26 validators switched at 10:31 UTC, `deploy/cut-records/` and
-`docs/chain21-cut-runbook.md`) is the chain that runs; since 2026-11-04 on **v0.8.5** (node-only
-rolls v0.8.2 → v0.8.3 → v0.8.4 → v0.8.5; `deploy/roll-records/v0.8.5.record`, `CHANGELOG.md`).
+`docs/chain21-cut-runbook.md`) is the chain that runs; since 2026-11-09 on **v0.8.6** (node-only
+rolls v0.8.2 → v0.8.3 → v0.8.4 → v0.8.5 → v0.8.6; `deploy/roll-records/v0.8.5.record`,
+`deploy/roll-records/v0.8.6.record` with its amendment of 2026-11-17, `CHANGELOG.md`).
 The paragraph below is the cut's preparation record:
 `deploy/cut-chain21-genesis.sh` carries chain 20's shape and value plus three new sections —
 `fees` (`burn_base`, `burn_floor`), `perps` (RPL-3: BTC-PERP on zUSD) and `multisig` (the
@@ -293,6 +294,31 @@ publishes them with `SHA256SUMS` and a build attestation; the release notes name
 binaries come from that release, not from a hand build ("Release trust", below). The workflow has
 not yet produced a release: the first tag after 2026-09-30 is its first run.
 
+**The one-at-a-time roll: `deploy/roll-fleet.sh` (audit v14, PROC-751).** A node-only release
+that may run mixed rolls one host at a time, each back in step before the next. Until 2026-11-17
+that procedure was in no committed script — `update-droplet.sh` rolls one host and waits for
+nothing, and the v0.8.5 and v0.8.6 rolls ran from a throwaway loop round it. It is now:
+
+```bash
+gh release download <tag> -R randprotocol/fullnode -D rel     # with SHA256SUMS and SHA256SUMS.sig
+NODES_ENV=<the operator's fleet list> RELEASE_SUMS=rel/SHA256SUMS RELEASE_SIG=rel/SHA256SUMS.sig \
+  BUILD_DIR=<where the release's rand-node and rand lie on the build host> \
+  deploy/roll-fleet.sh --release <tag> [--skip NAME,…] [--last NAME,…] [--dry-run]
+```
+
+It verifies the signed `SHA256SUMS` before any host is contacted (unsigned is refused without
+`ALLOW_UNSIGNED=1`), runs `update-droplet.sh` on one host, then polls that host and a reference
+node until the host's service is active on the release's `rand-node`, its height is within
+`--within` (default 5) blocks of the reference's, it has at least `--min-peers` (default 10)
+peers, and the reference has moved past the height it had before the host was stopped. A host
+that is not back within `--timeout` (default 900 s) **stops the roll**; so does a failed update or
+a reference that does not answer. An unreachable host is left out only by `--skip`, by name. The
+script writes the roll record (`deploy/roll-records/<tag>-<UTC time>.record`): both sha256s and
+how they were authenticated, the gate's numbers, the hosts skipped, and one line per host with its
+timestamps and the values the gate read — commit that file as the roll's record. Hosts outside
+the inventory (the third-party site node) and the msauth key blob are not its business.
+`SELFTEST=1 bash deploy/roll-fleet.sh` runs it against sandboxed hosts.
+
 **A merged fleet fix must name its roll (audit v12, PROC-601).** The open-files fix (#159) sat
 merged three days and rolled only under the 31 Oct halt; `MemoryHigh=85%` (#157) was merged into
 two unit templates no roll script writes, so 0 of 26 hosts carried it. Before a fleet-affecting fix
@@ -301,10 +327,11 @@ called done:
 
 - [ ] it is reachable by the roll path: a unit or limit lives in `deploy/lib/unit-limits.sh` (or
       a script `deploy/update-droplet.sh` and `deploy/roll-all.sh` run), never only in a template
-      a fresh host gets (`SELFTEST=1 bash deploy/lib/unit-limits.sh` asserts both roll scripts
-      write the drop-in and no other script spells the values);
-- [ ] the PR or issue names the roll that ships it — the tag, and `update-droplet.sh` one at a
-      time or `roll-all.sh` — and a date, within a day of the incident it answers;
+      a fresh host gets (`SELFTEST=1 bash deploy/lib/unit-limits.sh` runs both roll scripts and
+      `vps-setup.sh` against sandboxed hosts and reads the drop-in each host then holds, and
+      checks no other script spells the values);
+- [ ] the PR or issue names the roll that ships it — the tag, and `roll-fleet.sh` (one at a
+      time) or `roll-all.sh` — and a date, within a day of the incident it answers;
 - [ ] after the roll, the fix is read back from every host (`systemctl show rand-node -p
       MemoryHigh -p LimitNOFILE`, `rand-node --version`), and the fleet snapshot in the
       configuration repository is refreshed;
@@ -556,7 +583,7 @@ What a release is from the next tag on, and who is trusted for what:
    `deploy/roll-all.sh` take `RELEASE_SUMS` and `RELEASE_SIG`, verify first, and read the expected
    sha256s from the signed file. Without them they print that the install is unsigned and refuse,
    unless `ALLOW_UNSIGNED=1` says so on purpose. `SELFTEST=1 bash deploy/lib/verify-release.sh`
-   runs the cases on throwaway keys (20 checks).
+   runs the cases on throwaway keys (22 checks).
 
    ```bash
    gh release download <tag> -R randprotocol/fullnode -D rel     # rand-node, rand, rand-prover, SHA256SUMS, SHA256SUMS.sig (and SHA256SUMS.sig2 ... when the threshold is above 1)

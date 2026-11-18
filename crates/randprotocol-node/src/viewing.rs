@@ -20,7 +20,7 @@
 //! to a public address, not a note of this party's.
 
 use crate::storage::{Storage, StorageError};
-use randprotocol_core::notes::{Envelope, Word8};
+use randprotocol_core::notes::{creator_of, Creator, Envelope, Word8};
 use randprotocol_core::{Action, Transaction};
 use randprotocol_zkvm::address::envelope_from_core;
 use randprotocol_zkvm::notes::{Note, ViewingKey};
@@ -45,8 +45,14 @@ pub const MAX_SCAN_ROWS: u64 = 10_000;
 pub enum Role {
     /// A note this party owns: the envelope opened as receiver and the note names the party.
     Received,
-    /// A note this party created for someone else — history only, opened through `ovk`.
+    /// A note this party created for someone else — history only: opened through `ovk`, and
+    /// the note's creator field is this party's `pk` (audit v14, VK-751).
     Sent,
+    /// The envelope's sender part opens through this party's `ovk`, but the note's creator field
+    /// is a word the chain fixes (a deposit, a mint, a payout): whoever submitted that action
+    /// sealed it, which may be this party or anyone else holding the viewing key. Never counted
+    /// as sent (audit v14, VK-751).
+    SentUnverified,
 }
 
 impl Role {
@@ -54,6 +60,7 @@ impl Role {
         match self {
             Role::Received => "received",
             Role::Sent => "sent",
+            Role::SentUnverified => "sent_unverified",
         }
     }
 }
@@ -249,7 +256,7 @@ impl Registry {
 /// reused here.
 ///
 /// The ownership check matters exactly as it does for the wallet: an envelope opening is not
-/// proof of ownership. Anyone can seal an envelope to a published `kem_ek` carrying a note owned
+/// proof of ownership, nor of authorship (audit v14, VK-751, below). Anyone can seal an envelope to a published `kem_ek` carrying a note owned
 /// by some other `pk` — a shielded address is public by design — and such a row is garbage, not
 /// a receipt: the bundle guest forces every input's owner to the derived `pk_self`, so no proof
 /// can ever spend it.
@@ -262,8 +269,18 @@ pub fn classify(vk: &ViewingKey, cm: Word8, envelope: &Envelope) -> Option<(Role
     }
     // Still worth the sender path: an envelope this party sealed for someone else opens through
     // `ovk`, not through the KEM, so the two openings are independent.
+    // That opening shows only that whoever sealed the envelope held this viewing key — and a
+    // delegated prover, an auditor and this very node all hold it (audit v14, VK-751). The
+    // note's creator field says who made it: this party (the bundle proof binds `from` to the
+    // spender's `pk`), nobody the chain can name (an action's note, `from` a chain-fixed word),
+    // or another key — which is not a row of this party's at all.
     if let Some((key, note)) = env.open_as_sender(cm, vk) {
-        return Some((Role::Sent, note, env.memo(cm, &key)));
+        let role = match creator_of(&note.from, &vk.pk()) {
+            Creator::Own => Role::Sent,
+            Creator::Chain => Role::SentUnverified,
+            Creator::Other => return None,
+        };
+        return Some((role, note, env.memo(cm, &key)));
     }
     None
 }
@@ -478,6 +495,60 @@ mod tests {
         assert_eq!(classify(&alice(), cm, &env), Some((Role::Received, note, Some("x".to_string()))));
         // Bob sent it: the same memo opens for him too, through `ovk`.
         assert_eq!(classify(&bob(), cm, &env), Some((Role::Sent, note, Some("x".to_string()))));
+    }
+
+    /// Audit v14, VK-751: the sender part opening under a key's `ovk` shows only that whoever
+    /// sealed it held the viewing key. Mallory holds Alice's (she proved for her, audited her, or
+    /// runs the node it was imported into) and plants payments in Alice's history: an output of
+    /// her own bundle — `from` is Mallory's `pk`, as the bundle proof binds it — whose sender
+    /// part she wraps under Alice's key. It is no row of Alice's, in either envelope format, and
+    /// stays the receipt it is for its payee.
+    #[test]
+    fn vk751_a_holder_of_the_viewing_key_cannot_plant_a_sent_row() {
+        use randprotocol_core::notes::EnvelopeFormat;
+        use randprotocol_zkvm::address::seal_note_as;
+        let mallory = SpendKey([66; 8]).viewing_key();
+        let alices_copy = ViewingKey { nk: alice().nk };
+        let planted = note_for(&bob(), &mallory, 1_000_000);
+        let cm = planted.commitment();
+        for format in [EnvelopeFormat::Legacy, EnvelopeFormat::Memo] {
+            let env = seal_note_as(format, &alices_copy, &address_of(&bob()), &planted, &TxKey([7; 32]), "").unwrap();
+            // The envelope does open under Alice's key as sender — that was the whole test before.
+            assert!(envelope_from_core(&env).open_as_sender(cm, &alice()).is_some());
+            assert_eq!(classify(&alice(), cm, &env), None, "not a row of Alice's: another key created the note");
+            assert!(matches!(classify(&bob(), cm, &env), Some((Role::Received, n, _)) if n == planted), "Bob's receipt is untouched");
+        }
+        // Planted on Alice herself: sealed to her, owned by her, sender part under her own key.
+        // It is a receipt (she does own the note) and only that.
+        let to_alice = note_for(&alice(), &mallory, 5);
+        let env = sealed(&alices_copy, &alice(), &to_alice, &TxKey([8; 32]));
+        assert_eq!(classify(&alice(), to_alice.commitment(), &env), Some((Role::Received, to_alice, None)));
+        // And a genuine payment of Alice's is still sent.
+        let paid = note_for(&bob(), &alice(), 500);
+        assert_eq!(classify(&alice(), paid.commitment(), &sealed(&alice(), &bob(), &paid, &TxKey([9; 32]))), Some((Role::Sent, paid, None)));
+    }
+
+    /// Audit v14, VK-751: the notes an action appends carry a `from` word the chain fixes, not
+    /// their submitter's `pk` — a bridge deposit and a faucet mint (zero), a token mint
+    /// (`rpl-mint`), a program's or a multisig's payout (`rpl2-pay`), a perps withdrawal
+    /// (`rpl3-pay`) — and the wallet that submits one seals the envelope under its own key. So
+    /// the wallet that relayed a deposit or minted a token still opens the leaf as sender, and
+    /// nothing in the note says it was that wallet rather than another holder of the viewing
+    /// key: the row is kept, under its own role, never as `sent`.
+    #[test]
+    fn vk751_a_relayed_deposit_a_mint_and_a_payout_are_sent_unverified_not_sent_and_not_dropped() {
+        use randprotocol_core::ledger::{perps::PERP_FROM, program_state::PROGRAM_FROM, tokens::MINT_FROM};
+        for (what, from) in [("a deposit or faucet mint", [0u32; 8]), ("a token mint", MINT_FROM), ("a payout", PROGRAM_FROM), ("a perps withdrawal", PERP_FROM)] {
+            let note = Note::new(bob().pk(), from, 700, 2, 9);
+            let env = sealed(&alice(), &bob(), &note, &TxKey([7; 32]));
+            assert_eq!(classify(&alice(), note.commitment(), &env), Some((Role::SentUnverified, note, None)), "{what}: the submitter's row");
+            assert_eq!(classify(&bob(), note.commitment(), &env), Some((Role::Received, note, None)), "{what}: the recipient's");
+            // To the submitter itself (a deposit to one's own address): the receipt, as before.
+            let own = Note::new(alice().pk(), from, 700, 2, 9);
+            let env = sealed(&alice(), &alice(), &own, &TxKey([8; 32]));
+            assert_eq!(classify(&alice(), own.commitment(), &env), Some((Role::Received, own, None)), "{what}: to oneself");
+        }
+        assert_eq!((Role::Sent.as_str(), Role::SentUnverified.as_str(), Role::Received.as_str()), ("sent", "sent_unverified", "received"));
     }
 
     #[test]

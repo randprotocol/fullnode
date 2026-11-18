@@ -464,6 +464,39 @@ fn word8_at(v: &Value, field: &str) -> Result<Word8> {
 }
 
 /// A hex byte string field of an RPC reply.
+/// `v` as an unsigned integer that fits `T`: a string, a negative, a fraction, `null`, an object
+/// and a number past `T`'s range are each an error naming `what` — never a truncation and never
+/// a default (audit v14, VK-1003 and VK-1004).
+fn uint_at<T: TryFrom<u64>>(v: &Value, what: &str) -> Result<T> {
+    let n = v.as_u64().with_context(|| format!("{what} is not an unsigned integer: {v}"))?;
+    T::try_from(n).map_err(|_| anyhow!("{what} is out of range: {n}"))
+}
+
+/// A `rand_getProgramCode` reply: `base_pc` and every word a `u32`, or an error (audit v14,
+/// VK-1003: they were read with `as u32`, and a word that was not a number as zero).
+fn parse_program_code(v: &Value) -> Result<(u32, Vec<u32>)> {
+    let base_pc = uint_at(&v["base_pc"], "base_pc")?;
+    let words = v["words"].as_array().context("words is not a list")?;
+    let words = words.iter().enumerate().map(|(i, w)| uint_at(w, &format!("words[{i}]"))).collect::<Result<Vec<u32>>>()?;
+    Ok((base_pc, words))
+}
+
+/// A `rand_getAssets` reply: each row's `index` a `u32` and `chain` a `u16`, or an error (audit
+/// v14, VK-1004: index 2^32 + 3 on chain 65 538 was read as asset 3 on chain 2).
+fn parse_asset_rows(v: &Value) -> Result<Vec<AssetRow>> {
+    let rows = v.as_array().context("getAssets did not return a list")?;
+    rows.iter()
+        .map(|r| {
+            Ok(AssetRow {
+                index: uint_at(&r["index"], "index")?,
+                chain: uint_at(&r["chain"], "chain")?,
+                token: bytes_at(r, "token")?,
+                asset_id: r["asset_id"].as_str().context("asset_id")?.to_string(),
+            })
+        })
+        .collect()
+}
+
 fn bytes_at(v: &Value, field: &str) -> Result<Vec<u8>> {
     let s = v.get(field).and_then(|x| x.as_str()).with_context(|| format!("{field} missing"))?;
     hex::decode(s).with_context(|| format!("{field} is not hex"))
@@ -1066,9 +1099,7 @@ impl RpcClient {
         if v.is_null() {
             return Ok(None);
         }
-        let base_pc = v["base_pc"].as_u64().context("base_pc")? as u32;
-        let words = v["words"].as_array().context("words")?.iter().map(|w| w.as_u64().unwrap_or(0) as u32).collect();
-        Ok(Some((base_pc, words)))
+        parse_program_code(&v).map(Some)
     }
 
     /// A program's deploy-time public input (`rand_getProgramPublic`): its words, empty for a
@@ -1542,17 +1573,7 @@ impl RpcClient {
     /// this chain's token registry. Empty without a bridge.
     pub async fn assets(&self) -> Result<Vec<AssetRow>> {
         let v = self.call("rand_getAssets", json!([])).await?;
-        let rows = v.as_array().context("getAssets did not return a list")?;
-        rows.iter()
-            .map(|r| {
-                Ok(AssetRow {
-                    index: r["index"].as_u64().context("index")? as u32,
-                    chain: r["chain"].as_u64().context("chain")? as u16,
-                    token: bytes_at(r, "token")?,
-                    asset_id: r["asset_id"].as_str().context("asset_id")?.to_string(),
-                })
-            })
-            .collect()
+        parse_asset_rows(&v)
     }
 
     /// The outbound burn message with this sequence, verbatim, for guardians to sign. `None` for
@@ -1799,6 +1820,58 @@ pub(crate) mod socks_stub {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Audit v14, VK-1003: `program_code` read a node's reply with `as u32` and a default of
+    /// zero, so a `base_pc` of 2^32 + 4096 and the words `[1, "str", null, 2^32 + 7, -1, 1.5, {},
+    /// u64::MAX]` came back as `(4096, [1, 0, 0, 7, 0, 0, 0, u32::MAX])` with no error. Every one
+    /// of those is refused now, naming the word; a well-formed reply reads as before.
+    #[test]
+    fn vk1003_program_code_refuses_out_of_range_and_wrong_typed_values() {
+        let good = json!({ "base_pc": 4096, "words": [1, 0, 7, u32::MAX] });
+        assert_eq!(parse_program_code(&good).unwrap(), (4096, vec![1, 0, 7, u32::MAX]));
+        assert_eq!(parse_program_code(&json!({ "base_pc": 0, "words": [] })).unwrap(), (0, vec![]));
+        // The audit's reply, whole.
+        let bad = json!({ "base_pc": (1u64 << 32) + 4096, "words": [1, "str", null, (1u64 << 32) + 7, -1, 1.5, {}, u64::MAX] });
+        assert!(parse_program_code(&bad).is_err(), "{:?}", parse_program_code(&bad));
+        // And each fault alone.
+        let e = parse_program_code(&json!({ "base_pc": (1u64 << 32) + 4096, "words": [1] })).unwrap_err().to_string();
+        assert!(e.contains("base_pc"), "{e}");
+        for (i, word) in [json!("str"), json!(null), json!((1u64 << 32) + 7), json!(-1), json!(1.5), json!({}), json!(u64::MAX)].into_iter().enumerate() {
+            let e = match parse_program_code(&json!({ "base_pc": 4096, "words": [1, word.clone()] })) {
+                Ok(got) => panic!("word {i} ({word}) was read as {got:?}"),
+                Err(e) => e.to_string(),
+            };
+            assert!(e.contains("words[1]"), "{e}");
+        }
+        for bad in [json!({ "words": [1] }), json!({ "base_pc": "4096", "words": [1] }), json!({ "base_pc": -4096, "words": [1] }), json!({ "base_pc": 4096 }), json!({ "base_pc": 4096, "words": 1 })] {
+            assert!(parse_program_code(&bad).is_err(), "{bad}");
+        }
+    }
+
+    /// Audit v14, VK-1004: `assets()` read index 2^32 + 3 on chain 65 538 as asset 3 on chain 2.
+    /// An index past `u32` or a chain past `u16` is refused, as a non-numeric, negative or
+    /// missing one already was.
+    #[test]
+    fn vk1004_assets_refuses_an_index_or_a_chain_out_of_range() {
+        let row = |index: Value, chain: Value| json!([{ "index": index, "chain": chain, "token": "ab", "asset_id": "cd" }]);
+        let good = parse_asset_rows(&row(json!(3), json!(2))).unwrap();
+        assert_eq!(good, vec![AssetRow { index: 3, chain: 2, token: vec![0xab], asset_id: "cd".into() }]);
+        assert_eq!(parse_asset_rows(&row(json!(u32::MAX), json!(u16::MAX))).unwrap()[0].index, u32::MAX);
+        // The audit's row.
+        let got = parse_asset_rows(&row(json!((1u64 << 32) + 3), json!(65_538)));
+        assert!(got.is_err(), "read as {got:?}");
+        let e = parse_asset_rows(&row(json!((1u64 << 32) + 3), json!(2))).unwrap_err().to_string();
+        assert!(e.contains("index"), "{e}");
+        let e = parse_asset_rows(&row(json!(3), json!(65_538))).unwrap_err().to_string();
+        assert!(e.contains("chain"), "{e}");
+        for (index, chain) in [(json!("3"), json!(2)), (json!(-3), json!(2)), (json!(null), json!(2)), (json!(3), json!(1.5)), (json!(3), json!(-2)), (json!(3.0), json!(2))] {
+            assert!(parse_asset_rows(&row(index.clone(), chain.clone())).is_err(), "{index} {chain}");
+        }
+        // One bad row refuses the list: a registry read is all or nothing.
+        let mixed = json!([{ "index": 3, "chain": 2, "token": "ab", "asset_id": "cd" }, { "index": (1u64 << 32) + 3, "chain": 2, "token": "ab", "asset_id": "cd" }]);
+        assert!(parse_asset_rows(&mixed).is_err());
+        assert!(parse_asset_rows(&json!({})).is_err());
+    }
 
     #[test]
     fn hex32_takes_both_spellings_and_rejects_the_wrong_length() {

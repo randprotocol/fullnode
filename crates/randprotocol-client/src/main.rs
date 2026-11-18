@@ -2447,6 +2447,9 @@ async fn run() -> Result<()> {
                     let to = contact_name_for(&contacts, &s.to_pk)
                         .map(|n| memo_display::sanitize(&n))
                         .unwrap_or_else(|| randprotocol_core::notes::word8_to_hex(&s.to_pk));
+                    // Audit v14, VK-751: a note whose creator the chain fixes (a relayed deposit, a
+                    // mint, a payout) is shown, marked: the chain does not say this wallet sealed it.
+                    let to = if s.sender_unverified { format!("{to} (sender unverified)") } else { to };
                     println!("{}", history_row(s.index, &format_amount(s.amount), s.height, &to, &memo_column(&s.memo, memo)));
                 }
             }

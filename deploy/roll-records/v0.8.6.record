@@ -19,3 +19,28 @@ unit: 50-limits.conf unchanged on every host; the hand-placed nofile.conf of 202
 durian site node: binaries in their own directory beside v0.8.5's, the unit's ExecStart edited (backup kept), msauth-vk-production.bin copied from the release (sha unchanged); back at the chain's height with 25 peers
 
 verified: 2026-11-09 02:30 UTC probe, 24/24 reachable hosts report rand-node 0.8.6 with sha 61c2a8bb, heights moving together; the public RPC answers rand_status
+
+# ── Amendment 2026-11-17 (audit v14 addendum: DOC-751, PROC-751). The lines above are as written
+# on 2026-11-09 and are not changed; this block says what they do not establish.
+#
+# (a) The probe. The `verified:` line cites a probe at 2026-11-09 02:30 UTC. The commit that added
+#     this file (2b00a48f, PR #165) was merged at 02:25:37 UTC, before the time it cites, and no
+#     probe output was committed with it (the audit found no probe after 7 November in any
+#     repository of the set). The line is the operator's statement, not a stored measurement.
+#
+# (b) The host count. The v0.8.5 record and the fleet probes of 2026-11-07 count 25 live hosts with
+#     archive2 outside them; this record says "24 of the 25 inventory hosts" with archive2 skipped.
+#     Either one host that ran v0.8.5 on 7 November is neither rolled nor named here, or this
+#     record counts archive2 among the 25 where the earlier one did not. The records cannot settle
+#     which.
+#
+# (c) The procedure. The window line's "one host at a time, each back in step … before the next"
+#     was done, by the operator's notes, by an uncommitted driver loop round deploy/update-droplet.sh
+#     (per host, with BUILD_HOST=e and BUILD_DIR=/root/rel-v0.8.6, then a wait for the rejoin;
+#     `ssh -n` inside the host loop): no committed script held the rejoin gate. That loop is committed since as deploy/roll-fleet.sh,
+#     which writes its record itself. The loop's own output for this roll was not kept in this
+#     repository.
+
+amendment: 2026-11-17 — the verification line's 02:30 UTC probe postdates this file's merge (02:25:37 UTC) and no probe output was committed; the procedure that ran was an uncommitted driver loop round update-droplet.sh, committed since as deploy/roll-fleet.sh
+
+HOST-COUNT: settled by the fleet probe of 2026-11-17 07:14 UTC (monorepo configuration/fleet/probe-2026-11-17.md): the inventory has 26 rows; 25 answered and all 25 report rand-node 0.8.6 with sha256 61c2a8bb6a9da8667be9d539d9e45a49465c2230f3cc5028ac392833c66f3ad4, each holding a staged binary dated 2026-11-09 between 00:16 and 01:47 UTC; archive2 did not answer. This record's "24 of the 25" is therefore one short on both numbers: 25 of 26, archive2 skipped. The probe reads file dates and the running version, not restart times: it does not show the order of the roll or the state at 02:30 UTC on 9 November.

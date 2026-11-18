@@ -550,16 +550,36 @@ bridged one.
     12, 14, 16, 18, 20). Its default is the highest tier whose key-build peak — 16 MiB · 4^((T −
     10)/2): 1 GiB at 16, 4 GiB at 18, 16 GiB at 20 — fits in three quarters of the memory left:
     the host's RAM, or its cgroup v2 `memory.high`/`memory.max` (this cgroup's or an ancestor's)
-    when lower, less the node's resident size, measured at startup and every minute after (audit
+    when lower, less the node's resident size, measured every minute (audit
     v13, CON-701: v0.8.5 used the host's RAM alone, so host e — 7.9 GB, the node at ~5 GB under
-    `MemoryHigh=85%` — kept 18). **18 needs about 5.73 GB left and 20 about 22.9 GB**: 16 on 2 GB
-    and 4 GB hosts, and on an 8 GB host once its node has grown; with no cgroup or resident
-    reading (macOS) the host's RAM alone; with the OS reporting no size, no cap. A state proof above the cap whose shape the node has no key for is refused
+    `MemoryHigh=85%` — kept 18). From its start until the first of those readings, a minute
+    later, a node holds **at most 16** whatever it reads (audit v14, CON-701: a process that has
+    not grown yet reads headroom it will not have — host e read 18 for its first minute);
+    a startup reading below 16 still applies. **16 needs about 1.43 GB left, 18 about 5.73 GB
+    and 20 about 22.9 GB** (14 needs 358 MB, 12 needs 90 MB). What that gives under the fleet's
+    `MemoryHigh=85%`, by the rule's arithmetic (no host was measured):
+
+    | host | ceiling (85 %) | cap by the node's resident size |
+    |---|---|---|
+    | 2 GB (1.985 GB) | 1.69 GB | 16 under 256 MB; **14** up to 1.33 GB; **12** up to 1.60 GB; 10 past it — so 14 or 12 at rest (a node rests near 1.4 GB there) |
+    | 4 GB | 3.3 GB | 16 under about 1.9 GB resident; 14 up to about 2.9 GB |
+    | 8 GB (7.9 GB) | 6.7 GB | 18 under about 1 GB (never in the first minute); 16 up to 5.28 GB; 14 past it |
+    | 16 GB | 13.6 GB | 18 under about 7.9 GB resident; 16 past it |
+
+    **A 2 GB validator therefore does not pool or relay a cold tier-16 state proof under the
+    default** (audit v14, CON-751; v0.8.5's host-total rule gave 16 there, and its 4 GB hosts
+    keep 16 only while the node stays under about 1.9 GB): such a proof reaches the chain through
+    nodes with more memory, a block carrying it still applies everywhere, and a shape whose key
+    the node already holds is never refused. An operator who wants tier 16 pooled on a 2 GB host
+    sets `--max-state-proof-tier 16` and takes the ~1 GiB build on swap. With no cgroup or
+    resident reading (macOS) the rule is the host's RAM alone (16 below 5.73 GB); with the OS
+    reporting no size, no cap after the first minute. A state proof above the cap whose shape the node has no key for is refused
     first in the pool's pre-screen, from its header alone — before the ledger's segment, the
     executor's pre-key rules, a cold-build token or the verify queue: `this node admits no state
     proof above tier T to its pool …` (`StateProofAboveNodeTier`, not cached, no peer penalised).
     So it is not verified, pooled, relayed or proposed by that node; a node with more memory
-    admits it. The startup warm skips shapes above the cap. A proof whose key the node holds
+    admits it. The startup warm skips shapes above the cap it starts with (so above 16 without
+    the flag) and builds those the first later reading admits, off the consensus loop. A proof whose key the node holds
     passes at any tier. **The residual: a block.** Node policy cannot refuse a valid block (that
     would fork the node off the chain), so a block carrying a tier-18 state proof still makes
     every validator build its key, and a host under ~8 GB can be killed applying it. Chain 22's

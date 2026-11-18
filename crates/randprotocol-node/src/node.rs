@@ -118,6 +118,11 @@ pub struct NodeHandle {
     /// What Dandelion++ did on this node (issue #145): for tests and in-process readers only,
     /// never served over RPC ([`DandelionStats`]).
     pub dandelion: Arc<DandelionStats>,
+    /// The state-proof tier cap the node's pool started with (audit v14, CON-701: under
+    /// `--max-state-proof-tier` the flag; otherwise the held startup default,
+    /// [`crate::mempool::startup_state_proof_tier_cap`]). For tests and in-process readers; the
+    /// node re-reads its own on the status tick.
+    pub state_proof_tier_cap: u8,
 }
 
 impl NodeHandle {
@@ -1385,6 +1390,14 @@ struct Node {
     /// Audit v13, CON-701: when the host-sized state-proof tier cap was last re-measured
     /// ([`Node::refresh_state_proof_tier_cap`]); only without `--max-state-proof-tier`.
     tier_cap_checked_at: Option<Instant>,
+    /// CON-701: the memory-left reading the default cap follows
+    /// ([`crate::mempool::host_state_proof_tier_cap`]); a field so a test can stand in for the
+    /// host (audit v14, CON-752).
+    tier_cap_reader: TierCapReader,
+    /// Audit v14, CON-701: the engine shapes the startup warm left out because their tier is
+    /// above the cap held at startup. Warmed once a re-reading admits their tier
+    /// ([`Node::refresh_state_proof_tier_cap`]); never under `--max-state-proof-tier`.
+    deferred_perp_warm: DeferredPerpWarm,
     /// Transaction hashes this node has already refused for a reason about their bytes, so a
     /// re-gossiped copy costs a hash lookup instead of a proof verification.
     refused: admission::RefusedCache,
@@ -1477,8 +1490,34 @@ struct Node {
 /// One more is delivered on the loop as before, so a burst costs no more than it used to.
 const OFFLOOP_APPLIES: usize = 4;
 
-/// Audit v13, CON-701: how often the host-sized state-proof tier cap is re-measured.
+/// Audit v13, CON-701: how often the host-sized state-proof tier cap is re-measured — and, audit
+/// v14, how long after its start a node holds the startup cap
+/// ([`crate::mempool::STATE_PROOF_TIER_CAP_AT_START`]) before the first re-reading may raise it.
 const STATE_PROOF_TIER_CAP_REFRESH: Duration = Duration::from_secs(60);
+
+/// CON-701: the memory-left reading of the default state-proof tier cap.
+type TierCapReader = Arc<dyn Fn() -> u8 + Send + Sync>;
+
+/// Audit v14, CON-701: engine shapes waiting for a re-reading that admits their tier.
+type DeferredPerpWarm = Arc<std::sync::Mutex<Vec<randprotocol_core::confidential::ProofShape>>>;
+
+/// Audit v14, CON-701: the state-proof tier cap a node starts with. `--max-state-proof-tier`
+/// (`flag`) wins outright. Otherwise it is the memory-left reading held down to
+/// [`crate::mempool::STATE_PROOF_TIER_CAP_AT_START`]: a process that has not loaded its working
+/// set yet reads far more headroom than it will have, so the reading may lower the cap at
+/// startup and may raise it only from the first re-reading on.
+fn startup_tier_cap(flag: Option<u8>, measure: &dyn Fn() -> u8) -> u8 {
+    flag.unwrap_or_else(|| crate::mempool::startup_state_proof_tier_cap(measure()))
+}
+
+/// Audit v14, CON-701: `shapes` split at `cap` — those the node may build a key for now, and
+/// those above it, in their order.
+fn split_at_tier_cap(
+    shapes: Vec<randprotocol_core::confidential::ProofShape>,
+    cap: u8,
+) -> (Vec<randprotocol_core::confidential::ProofShape>, Vec<randprotocol_core::confidential::ProofShape>) {
+    shapes.into_iter().partition(|s| s.tier <= cap)
+}
 /// CON-60 (c): how many committed blocks back the startup warm looks for state proofs whose
 /// shapes it builds and pins (beside the shapes the node recorded).
 pub const PERP_WARM_SCAN_BLOCKS: u64 = 4096;
@@ -2915,8 +2954,15 @@ pub async fn start_with(cfg: NodeConfig, rpc_options: RpcOptions, net_options: N
     // — its pool and its startup warm. Node policy: a block carrying a proof above it still
     // applies and builds the key (chain 22's genesis engine pin is the consensus fix). Audit v13,
     // CON-701: by default sized from the memory left — the host's RAM or its cgroup's ceiling,
-    // less the node's resident size — and re-measured on the status tick.
-    let state_proof_tier_cap = cfg.state_proof_tier_cap.unwrap_or_else(crate::mempool::host_state_proof_tier_cap);
+    // less the node's resident size — and re-measured on the status tick. Audit v14, CON-701:
+    // that reading is held down to 16 here, where the process has not grown yet, until the
+    // first re-reading ([`startup_tier_cap`]).
+    let tier_cap_reader: TierCapReader = Arc::new(crate::mempool::host_state_proof_tier_cap);
+    let state_proof_tier_cap = startup_tier_cap(cfg.state_proof_tier_cap, tier_cap_reader.as_ref());
+    // The engine shapes the warm leaves out under the held cap, for the re-reading to pick up;
+    // none under the flag, which no re-reading moves.
+    let deferred_perp_warm = DeferredPerpWarm::default();
+    let warm_deferred = cfg.state_proof_tier_cap.is_none().then(|| deferred_perp_warm.clone());
     if let Some(p) = hs.committed_ledger().perps() {
         if p.config.max_tier > state_proof_tier_cap {
             tracing::warn!(
@@ -3004,7 +3050,19 @@ pub async fn start_with(cfg: NodeConfig, rpc_options: RpcOptions, net_options: N
             // Then the engine's keys (after the bundle's, which every block needs) — none above
             // the node's tier cap (CON-601): a key build there is past this host's memory, and a
             // node that died warming one would die again at every restart.
-            let perp_shapes: Vec<_> = perp_shapes.into_iter().filter(|s| s.tier <= state_proof_tier_cap).collect();
+            // Audit v14, CON-701: that is the cap held at startup, so a shape above it waits for
+            // the re-reading that admits its tier rather than being built on a fresh process's
+            // reading.
+            let (perp_shapes, above) = split_at_tier_cap(perp_shapes, state_proof_tier_cap);
+            if let Some(deferred) = warm_deferred {
+                if !above.is_empty() {
+                    tracing::info!(
+                        "{} state-proof verifier keys above tier {state_proof_tier_cap} wait for the first re-reading of the memory left (CON-701)",
+                        above.len()
+                    );
+                }
+                *deferred.lock().unwrap_or_else(|e| e.into_inner()) = above;
+            }
             for shape in &perp_shapes {
                 ex.warm_perp(shape);
             }
@@ -3049,6 +3107,7 @@ pub async fn start_with(cfg: NodeConfig, rpc_options: RpcOptions, net_options: N
     let mut mempool = Mempool::new(10_000);
     mempool.set_faucet_minters(admission::faucet_minters(&gs));
     mempool.set_state_proof_tier_cap(state_proof_tier_cap);
+    let pool_tier_cap = mempool.state_proof_tier_cap();
     if let Some(p) = cfg.gas_policy {
         mempool.set_gas_policy(p);
     }
@@ -3098,6 +3157,8 @@ pub async fn start_with(cfg: NodeConfig, rpc_options: RpcOptions, net_options: N
         disk_trend: crate::disk::DiskTrend::default(),
         disk_warned_at: None,
         tier_cap_checked_at: Some(Instant::now()),
+        tier_cap_reader,
+        deferred_perp_warm,
         refused: admission::RefusedCache::new(admission::REFUSED_CACHE_ENTRIES),
         proof_refused: admission::ProofRefusedCache::new(admission::PROOF_REFUSED_ENTRIES),
         limiter: admission::PeerLimiter::new(admission::PEER_TX_BURST, admission::PEER_TX_PER_SEC),
@@ -3162,6 +3223,7 @@ pub async fn start_with(cfg: NodeConfig, rpc_options: RpcOptions, net_options: N
         public_rpc_task,
         startup: startup_verify,
         dandelion: dandelion_stats,
+        state_proof_tier_cap: pool_tier_cap,
     })
 }
 
@@ -3225,20 +3287,23 @@ impl Node {
                         self.propose(view).await?;
                     }
                 },
-                _ = status_tick.tick() => {
-                    self.check_disk();
-                    self.refresh_state_proof_tier_cap();
-                    self.broadcast_status().await;
-                    self.announce_binding().await;
-                    self.persist_reserved_sources().await;
-                    self.expire_parked_requests().await;
-                }
+                _ = status_tick.tick() => self.on_status_tick().await,
                 _ = sync_tick.tick() => self.maybe_sync().await,
                 // Dandelion++'s fail-safe (issue #145): a stem transaction not seen on gossip by
                 // its embargo is fluffed here.
                 _ = sleep_until(self.dandelion.stempool.next_deadline()) => self.on_embargo().await,
             }
         }
+    }
+
+    /// The status tick's work, every 3 s.
+    async fn on_status_tick(&mut self) {
+        self.check_disk();
+        self.refresh_state_proof_tier_cap();
+        self.broadcast_status().await;
+        self.announce_binding().await;
+        self.persist_reserved_sources().await;
+        self.expire_parked_requests().await;
     }
 
     /// Audit v13, CON-701: re-measure the host-sized state-proof tier cap once a minute, since the
@@ -3250,7 +3315,7 @@ impl Node {
             return;
         }
         self.tier_cap_checked_at = Some(Instant::now());
-        let cap = crate::mempool::host_state_proof_tier_cap();
+        let cap = (self.tier_cap_reader)();
         let was = self.mempool.state_proof_tier_cap();
         if cap != was {
             tracing::info!(
@@ -3258,6 +3323,28 @@ impl Node {
             );
             self.mempool.set_state_proof_tier_cap(cap);
         }
+        self.warm_deferred_perp_shapes(cap);
+    }
+
+    /// Audit v14, CON-701: warm, off the loop, the engine shapes the startup warm left out under
+    /// the held cap and `cap` now admits; the rest keep waiting.
+    fn warm_deferred_perp_shapes(&mut self, cap: u8) {
+        let ready = {
+            let mut deferred = self.deferred_perp_warm.lock().unwrap_or_else(|e| e.into_inner());
+            let (ready, wait) = split_at_tier_cap(std::mem::take(&mut *deferred), cap);
+            *deferred = wait;
+            ready
+        };
+        if ready.is_empty() {
+            return;
+        }
+        let ex = self.executor.clone();
+        tokio::task::spawn_blocking(move || {
+            for shape in &ready {
+                ex.warm_perp(shape);
+            }
+            tracing::info!("{} state-proof verifier keys warmed after the first re-reading of the memory left", ready.len());
+        });
     }
 
     /// Free space under `DISK_LOW_FACTOR` times the startup minimum (audit v4 OPS-3).
@@ -8169,6 +8256,8 @@ mod tests {
             disk_trend: crate::disk::DiskTrend::default(),
             disk_warned_at: None,
             tier_cap_checked_at: None,
+            tier_cap_reader: Arc::new(crate::mempool::host_state_proof_tier_cap),
+            deferred_perp_warm: DeferredPerpWarm::default(),
             refused: admission::RefusedCache::new(16),
             proof_refused: admission::ProofRefusedCache::new(16),
             limiter: admission::PeerLimiter::new(admission::PEER_TX_BURST, admission::PEER_TX_PER_SEC),
@@ -8602,22 +8691,131 @@ mod tests {
         bundle_tx(ledger, [[40 + i; 8], [50 + i; 8]], [[60 + i; 8], [70 + i; 8]], bundle_fee())
     }
 
+    /// A reader standing in for the host's memory-left reading: it answers `cap` and counts its
+    /// calls.
+    fn counting_reader(cap: u8) -> (TierCapReader, Arc<AtomicUsize>) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let c = calls.clone();
+        (Arc::new(move || {
+            c.fetch_add(1, SeqCst);
+            cap
+        }), calls)
+    }
+
     /// Audit v13, CON-701: without `--max-state-proof-tier` the status tick re-sizes the cap from
-    /// the memory left now, at most once a minute; with the flag it never moves.
+    /// the memory left now, at most once a minute; with the flag it never moves. Audit v14,
+    /// CON-752: "the memory left now" is the node's reader, read once per refresh, and a minute
+    /// later it is read again.
     #[tokio::test]
     async fn the_host_sized_tier_cap_is_re_measured_and_the_flag_pins_it() {
         let (_d, storage, gs, hs) = replica_past_a_boundary();
         let (mut node, _seen) = bare_node(storage, gs, hs);
+        let (reader, calls) = counting_reader(12);
+        node.tier_cap_reader = reader;
         node.mempool.set_state_proof_tier_cap(3);
         node.refresh_state_proof_tier_cap();
-        assert_eq!(node.mempool.state_proof_tier_cap(), crate::mempool::host_state_proof_tier_cap());
+        assert_eq!((node.mempool.state_proof_tier_cap(), calls.load(SeqCst)), (12, 1), "the reader's answer is the pool's cap");
         node.mempool.set_state_proof_tier_cap(3);
         node.refresh_state_proof_tier_cap();
-        assert_eq!(node.mempool.state_proof_tier_cap(), 3, "not again within the minute");
+        assert_eq!((node.mempool.state_proof_tier_cap(), calls.load(SeqCst)), (3, 1), "not again within the minute");
+        // 59 s on: still not. 61 s on: read again, and stamped, so not a third time at once.
+        let ago = |s: u64| Instant::now().checked_sub(Duration::from_secs(s));
+        node.tier_cap_checked_at = ago(59);
+        assert!(node.tier_cap_checked_at.is_some(), "this host's clock reaches a minute back");
+        node.refresh_state_proof_tier_cap();
+        assert_eq!((node.mempool.state_proof_tier_cap(), calls.load(SeqCst)), (3, 1), "59 s after the last reading");
+        node.tier_cap_checked_at = ago(61);
+        node.refresh_state_proof_tier_cap();
+        assert_eq!((node.mempool.state_proof_tier_cap(), calls.load(SeqCst)), (12, 2), "re-read a minute after the last reading");
+        node.mempool.set_state_proof_tier_cap(3);
+        node.refresh_state_proof_tier_cap();
+        assert_eq!((node.mempool.state_proof_tier_cap(), calls.load(SeqCst)), (3, 2), "and the minute starts again");
+        // The flag: never re-read, however long ago.
         node.tier_cap_checked_at = None;
         node.cfg.state_proof_tier_cap = Some(3);
         node.refresh_state_proof_tier_cap();
-        assert_eq!(node.mempool.state_proof_tier_cap(), 3, "--max-state-proof-tier is the override");
+        assert_eq!((node.mempool.state_proof_tier_cap(), calls.load(SeqCst)), (3, 2), "--max-state-proof-tier is the override");
+    }
+
+    /// Audit v14, CON-701: a node without `--max-state-proof-tier` starts at the lower of its
+    /// memory-left reading and 16 — a fresh process reads far more headroom than the node will
+    /// have — and the flag wins outright, above or below 16, with the host never read.
+    #[test]
+    fn con701_the_startup_tier_cap_is_held_and_the_flag_wins() {
+        for (measured, want) in [(18, 16), (20, 16), (u8::MAX, 16), (16, 16), (14, 14), (10, 10)] {
+            assert_eq!(startup_tier_cap(None, &move || measured), want, "a reading of {measured}");
+        }
+        let unread = || -> u8 { panic!("the flag is set: the host is not read") };
+        for flag in [10, 14, 16, 18, 20] {
+            assert_eq!(startup_tier_cap(Some(flag), &unread), flag);
+        }
+    }
+
+    /// Audit v14, CON-752: the status tick is what re-reads the cap. One tick on a node whose
+    /// last reading is a minute old reads the host and moves the pool's cap; the node's loop
+    /// runs that tick (`run`'s `status_tick` arm), shown here on the real loop by the reader
+    /// being called.
+    #[tokio::test]
+    async fn con752_the_status_tick_refreshes_the_tier_cap() {
+        let (_d, storage, gs, hs) = replica_past_a_boundary();
+        let (mut node, _seen) = bare_node(storage, gs, hs);
+        let (reader, calls) = counting_reader(14);
+        node.tier_cap_reader = reader;
+        node.mempool.set_state_proof_tier_cap(16);
+        node.on_status_tick().await;
+        assert_eq!((node.mempool.state_proof_tier_cap(), calls.load(SeqCst)), (14, 1));
+
+        // And the loop itself: its first status tick fires at once.
+        let (_d, storage, gs, hs) = replica_past_a_boundary();
+        let (mut node, _seen, applied) = bare_node_full(storage, gs, hs, false);
+        let (reader, calls) = counting_reader(14);
+        node.tier_cap_reader = reader;
+        let (_events_tx, events) = mpsc::channel(1);
+        let (_cmds_tx, cmds) = mpsc::channel(1);
+        let (_verdicts_tx, verdicts) = mpsc::channel(1);
+        let task = tokio::spawn(node.run(events, cmds, verdicts, applied, Vec::new()));
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while calls.load(SeqCst) == 0 && Instant::now() < deadline && !task.is_finished() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(calls.load(SeqCst), 1, "the loop's status tick re-read the cap, once");
+        task.abort();
+    }
+
+    /// Audit v14, CON-701: the startup warm follows the held cap, and what it leaves out is
+    /// warmed when a re-reading admits its tier — not before, and never under the flag.
+    #[tokio::test]
+    async fn con701_shapes_above_the_held_cap_are_warmed_once_a_re_reading_admits_them() {
+        let shape = |tier: u8| randprotocol_core::confidential::ProofShape {
+            tier,
+            program_log_height: 1,
+            input_log_height: 1,
+            keccak_log_height: 1,
+            sha256_log_height: 1,
+            public_log_height: 1,
+        };
+        let (now, later) = split_at_tier_cap(vec![shape(18), shape(14), shape(20), shape(16)], 16);
+        assert_eq!((now, later), (vec![shape(14), shape(16)], vec![shape(18), shape(20)]));
+
+        let (_d, storage, gs, hs) = replica_past_a_boundary();
+        let (mut node, _seen) = bare_node(storage, gs, hs);
+        let waiting = |node: &Node| node.deferred_perp_warm.lock().unwrap().clone();
+        *node.deferred_perp_warm.lock().unwrap() = vec![shape(18), shape(20)];
+        // A re-reading that still says 16 warms neither.
+        node.tier_cap_reader = counting_reader(16).0;
+        node.refresh_state_proof_tier_cap();
+        assert_eq!(waiting(&node), vec![shape(18), shape(20)]);
+        // One that says 18 takes the tier-18 shape and leaves the tier-20 one waiting.
+        node.tier_cap_checked_at = None;
+        node.tier_cap_reader = counting_reader(18).0;
+        node.refresh_state_proof_tier_cap();
+        assert_eq!(node.mempool.state_proof_tier_cap(), 18);
+        assert_eq!(waiting(&node), vec![shape(20)]);
+        // Under the flag nothing is re-read and nothing is taken.
+        node.tier_cap_checked_at = None;
+        node.cfg.state_proof_tier_cap = Some(20);
+        node.refresh_state_proof_tier_cap();
+        assert_eq!(waiting(&node), vec![shape(20)]);
     }
 
     // ------------------------------------------- Dandelion++ (issue #145)

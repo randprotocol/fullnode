@@ -28,6 +28,14 @@ follows `push` within minutes.
 
 ## Known risk, stated plainly
 
+> **Update 2026-11-17 (audit v14, MSC-751).** The text below is the risk as stated at the cut
+> (2026-10-12) and is kept as written. Since then: On 6 November 2026 one Production-profile proof completed: M = 3 signatures, tier 18, a proof of 3.7 MB, 69 minutes, peak RSS 92.9 GiB (≈ 99.7 GB).
+> So the prove does complete, on a host of **at least 128 GB** (the "≥ 96 GB" below was a guess and
+> is too small), and the auth proof is under the 6 MiB `max_proof_bytes`. The logs are held privately in the operator's configuration records, not in this repository.
+> That proof has **not** been submitted on chain 21 by a wallet flow, so the end-to-end path (a
+> wallet's private-multisig spend admitted by a chain-21 node) is still untested; whether the proof
+> was checked against the pinned verifier key is not recorded in this repository.
+
 **The msauth prove has never completed.** A Test-FRI prove of the multisig auth guest peaked at a
 **76.4 GB** footprint and was killed on a 48 GB Mac. No multisig-private spend can be proven on any
 hardware the operator has, and none can be added. So:

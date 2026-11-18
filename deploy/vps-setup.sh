@@ -55,8 +55,13 @@ RestartSec=3
 [Install]
 WantedBy=multi-user.target
 UNIT
+# The limits drop-in (PROC-601). The library's load and the script it prints are separate commands
+# so that `set -e` stops the setup when either fails: as `bash -c "$(…)"` a missing function left an
+# empty script, bash ran it happily, and the host started with no drop-in (audit v14, PROC-701).
 . deploy/lib/unit-limits.sh
-bash -c "$(unit_limits_install_script rand-node)"
+LIMITS_SCRIPT=$(unit_limits_install_script rand-node /etc/systemd/system)
+[ -n "$LIMITS_SCRIPT" ] || { echo "vps-setup: deploy/lib/unit-limits.sh printed no install script" >&2; exit 1; }
+bash -c "$LIMITS_SCRIPT"
 systemctl daemon-reload
 systemctl enable rand-node
 systemctl restart rand-node

@@ -256,11 +256,13 @@ proof's length: the per-transaction cap is `max_proof_bytes`, as for every proof
 
 **Cost.** The guest runs 85 830 / 169 068 / 251 946 cycles at M = 1 / 2 / 3 (a Dilithium2 verify is
 80 572 cycles with the MODQ chip, against 880 102 in software), inside tier 18's 262 143. The
-Production msauth proof's size and prove time are **not yet measured**: the estimate is ≥ 3.4 MB for
-the auth proof and ≈ 4.8 MB with the bundle proof. So the node's floor beside `hc_auth_multisig` is
+Production msauth proof has been measured once (6 November 2026, M = 3; the logs are held privately
+in the operator's configuration records): 3.7 MB, 69 minutes, peak RSS 92.9 GiB ≈ 99.7 GB, so a
+machine with at least 128 GB. The estimate made before it was ≥ 3.4 MB for the auth proof and
+≈ 4.8 MB with the bundle proof. So the node's floor beside `hc_auth_multisig` is
 a 4 MiB `max_proof_bytes`, and chain 21 is cut at 6 MiB (`max_proof_bytes` 6 291 456,
 `max_block_bytes` 19 922 944 = 3 × 6 MiB + 1 MiB) — the decided chain-21 values; asserted by the cut script on `feat/chain21-msauth` (`a7379a6c`), which merges after this branch. The proof
-is made on the wallet's own machine (tier 18; no such proof has yet been completed — a Test-profile attempt was stopped at ≈ 76 GB before it finished, so the footprint is above that; `docs/prover.md` §8, `docs/multisig.md` "Status: not yet proved"). Verifying it needs the
+is made on the wallet's own machine (tier 18; one Production proof has completed, on 6 November 2026: M = 3, 3.7 MB, 69 minutes, peak RSS 92.9 GiB ≈ 99.7 GB, so a host of at least 128 GB; none has been submitted on chain 21 by a wallet flow; `docs/prover.md` §8, `docs/multisig.md` "Status: proved once, not yet spent on chain 21"). Verifying it needs the
 tier-18 verifier key, which every validator loads from a pinned 23 754-byte blob instead of building
 (`docs/deploy.md`, `docs/node-hardware.md` §9).
 

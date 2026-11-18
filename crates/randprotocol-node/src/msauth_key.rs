@@ -567,4 +567,32 @@ mod tests {
         assert_eq!(handle.status.read().unwrap().msauth_key, MsauthKeySource::Absent);
         handle.shutdown().await;
     }
+
+    /// Audit v14, CON-701 and CON-752 (here for this module's `start` fixtures): a node started
+    /// without `--max-state-proof-tier` gives its pool the held startup default — never above 16,
+    /// whatever a fresh process reads on this host — and one started with the flag gives it the
+    /// flag, above 16 or below.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_node_starts_at_the_held_tier_cap_unless_the_flag_sets_it() {
+        let start = |cap: Option<u8>| {
+            async move {
+                let key = randprotocol_core::Keypair::from_seed([9; 32]).unwrap();
+                let dir = tempfile::tempdir().unwrap();
+                std::fs::write(dir.path().join("genesis.json"), msauth_genesis(&key, false).to_json()).unwrap();
+                let mut cfg = node_config(dir.path(), &key, MsauthKeyOptions::default());
+                cfg.state_proof_tier_cap = cap;
+                let handle = crate::node::start(cfg).await.expect("the node starts");
+                let got = handle.state_proof_tier_cap;
+                handle.shutdown().await;
+                got
+            }
+        };
+        let held = start(None).await;
+        assert!(held <= crate::mempool::STATE_PROOF_TIER_CAP_AT_START, "the default at startup is held at 16, got {held}");
+        assert!(randprotocol_core::ledger::perps::TIERS.contains(&held), "and is a tier, never `no cap`: {held}");
+        // This host's bare reading is the rule's; the held default is the lower of it and 16.
+        assert_eq!(held, crate::mempool::host_state_proof_tier_cap().min(16));
+        assert_eq!(start(Some(18)).await, 18, "the flag wins above the held cap");
+        assert_eq!(start(Some(12)).await, 12, "and below it");
+    }
 }
