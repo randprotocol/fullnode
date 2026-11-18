@@ -184,6 +184,87 @@ Docs (issue #119, AGG-E2E-2; no code change):
   the build that cuts, which constraint set 10 moves from `792a66d4…` to `a3d5c38b…`, issue
   #166). `docs/deploy.md`, `docs/compute-optimization.md` and `README.md` follow.
 
+Node, network and deploy (monorepo audit-v14 issues, merged 2026-11-18/19; no consensus change —
+what each needs before it takes effect is in its PR):
+
+- **A committed systemd drop-in turns the public RPC listener on** (VK-2; deploy only, no
+  consensus or network change): `deploy/systemd/rand-node.service.d/60-public-rpc.conf` sets
+  `RAND_NODE_PUBLIC_RPC=127.0.0.1:8546`, which `--public-rpc` now also reads; `DROPIN=1
+  deploy/enable-public-rpc.sh` installs it. New `deploy/check-public-rpc.sh` checks a listener,
+  tunnel end or host — the viewing-key methods, `rand_mint`, `rand_getPeers` and batches must be
+  refused by the node's public listener — and its output is the deploy record's evidence. The live
+  hop's check is still to be run and stored. (#186)
+- **`deploy/sign-release.sh` no longer erases existing signatures** (PROC-5; release tooling
+  only): without a flag it refuses where a `SHA256SUMS.sig*` exists; `--append` adds a second
+  holder's signature beside the first, refusing a duplicate signer or a signature set that is not
+  over this `SHA256SUMS`; `--replace` starts over. Self-tests for the two- and three-holder flow
+  and for k-of-n verification run in CI. Still one release key listed and a threshold of 1: the
+  second key and the raise to 2 are the owner's. (#188)
+- **A node stems around a successor that acknowledged a stem and went silent before it publishes**
+  (PRIV-604; network behaviour local to the node, no wire or consensus change): the first time a
+  held transaction's embargo runs out the node sends it to a successor that has not had it, under
+  a fresh embargo, and publishes it itself only when that one runs out too or it has no such
+  successor. Before, the submitter of a transaction whose successor dropped it was the node that
+  published it. (#183)
+- **A request body is charged against the admission budget at three times its length** (OPS-602;
+  node-local, no consensus or network change): `tests/burst_memory.rs` measures the 27 Oct burst
+  on a real node with a counting allocator and found a 5.8 MB body held about 18 MB while the
+  budget counted it once — 24 at once held 344 MiB on a 2 GB host's 117 MiB budget. The budget's
+  floor counts the largest body the same way (129 MiB on chain 21, which is now a 2 GB host's
+  default). Measured heap now stays at about the budget for any burst size; over-budget
+  submissions hear `-32005` before their body is read. New `deploy/probe-memory.sh` records each
+  host's RAM, swap, `MemoryHigh`, resident memory and budget. Not re-run on live 2 GB hosts; the
+  test's proofs do not verify, so verifier scratch is unmeasured. (#185)
+- **From v0.9.0 a node gossips transactions on the anonymous lane only by default** (PRIV-601;
+  network only, no consensus change): the default follows the node's own version — a v0.8.x node
+  still subscribes and relays on the legacy signed topic unless `--anonymous-tx-only`, a v0.9.0
+  node leaves it unless the new `--legacy-tx-relay` (or `--legacy-tx-publish`). Interoperates with
+  every node since v0.8.3. `tests/dandelion.rs` now runs a first-spy measurement in process; the
+  fleet run is still to be recorded, so origin hiding on chain 21 remains design intent. (#180)
+- **`rand_getScanLeaves` is refused by default from v0.9.0** (RPC-201; RPC only, no consensus
+  change): the default now follows the node's own version — served before v0.9.0 unless
+  `--disable-scan-leaves`, refused from v0.9.0 unless the new `--enable-scan-leaves` — so the flip
+  the owner decided on 2026-11-05 happens with the version bump. No change on a v0.8.x node. A
+  serving node logs a warning at its 1st, 2nd, 4th, … served call (the count only), so the journal
+  shows whether wallets before v0.8.3 still scan through it. (#179)
+- **`rand` refuses the retired RandProtocol prover keys** (VK-9; wallet CLI and pool router, no
+  consensus or network change): the build carries the list (the shared key retired 2026-10-01 and
+  the four members retired 2026-10-22), never stores a pairing with one and never sends one
+  anything, so a pairing file from an older `rand prover pair --trusted` is refused at the update
+  — run `rand prover pair --trusted` again. The pool answers a retired member's URL with HTTP 410
+  and a reason instead of an empty 404. Wallets 0.6.9–0.8.0 still pin those keys and must be
+  updated; no release can change that. (#187)
+- **A state proof that pays more than the exchange can hold is not pooled** (PERP-6, node policy
+  on every chain; consensus unchanged): the pool's pre-screen and its direct insert refuse a
+  `PerpStateProof` whose payouts total more than `Mempool::payout_ceiling` — the chain's count
+  under genesis `perps.bound_payouts`; otherwise `initial_collateral + rand_in − rand_out` for
+  RAND collateral and the token's total supply for a token — so it is not verified, pooled,
+  relayed or proposed by this node (`StateProofOverpays`: not cached, no peer penalised). On chain
+  21 a block that carries one still applies; the validity rule is `bound_payouts`, at the chain-22
+  cut. (#173)
+- **`rand-node run --max-multisig-accounts <COUNT>`** (MSA-4, node policy; consensus unchanged):
+  once the multisig register holds that many accounts, the node's pool refuses a `CreateMultisig`
+  (`MultisigAtNodeCap`: not cached, no peer penalised), so it is not verified, pooled, relayed or
+  proposed there. Off by default. For a chain whose genesis sets no `multisig.max_accounts` (chain
+  21): a block carrying a create still applies, so the register is bounded only when every
+  proposer sets the flag. The validity rule stays genesis `multisig.max_accounts`, an operator
+  input of the chain-22 cut. (#176)
+- **Chain-22 cut: the record must say how validators hold the tier-18 key build** (CON-601,
+  CON-60; deploy script only): `deploy/cut-chain22-genesis.sh` refuses a cut record whose
+  `reason:`, `carries:` and `clients:` lines name neither `CON-601`, `validator memory` nor `key
+  build`. The engine pin bounds the shapes a state proof may declare, not what a key costs to
+  build: a block carrying a `max_tier`-18 proof makes every validator build a ~3.6 GB key, which
+  node policy cannot refuse. Listed as OPEN 9 in the script and in `docs/deploy.md`. (#174)
+- **PERP-101, the `max_window_heights` decision** (docs and a test; no behaviour change):
+  `docs/perps.md` tabulates what the chain-22 input costs — heartbeat interval, state proofs a day
+  on an idle chain (`heights / max_window_heights`, so the lower bound 64 needs as many proofs as
+  chain 21's dense rule), back-pressure distance — and a ledger test pins the proof counts. (#177)
+- **Prover pool router: an IPv6 /64 is one address, and active addresses split the capacity**
+  (VK-10, audit v13; `deploy/prover/router.py`, deploy only): the submit meter keys an IPv6 client
+  on its /64, and when more than 1/`SUBMIT_SHARE` addresses were admitted a submit in the last ten
+  minutes each one's refill is an equal split of the pool's capacity instead of `SUBMIT_SHARE`
+  each. Three addresses alone still take about 90% (README). Needs a router roll. (#178)
+
 ## v0.8.6 — 2026-11-08 (chain 21, node-only; audit v13 rows; no wire, storage-format or consensus change; rolled 2026-11-09)
 
 Rolled 2026-11-09 00:16–02:22 UTC, one host at a time: tag `6591c884` (tagged 2026-11-08 19:20 UTC),
