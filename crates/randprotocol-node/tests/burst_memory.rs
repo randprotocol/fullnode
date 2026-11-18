@@ -209,9 +209,10 @@ enum Answer {
 /// POST each prepared body at once; every one must be answered with JSON, never reset.
 async fn burst(addr: std::net::SocketAddr, bodies: &[&'static [u8]]) -> Vec<Answer> {
     let client = reqwest::Client::new();
-    let sends = bodies.iter().map(|b| {
+    let mut sends = Vec::new();
+    for b in bodies {
         let (client, b) = (client.clone(), *b);
-        tokio::spawn(async move {
+        sends.push(tokio::spawn(async move {
             let resp = client.post(format!("http://{addr}/")).header("content-type", "application/json").body(b).send().await.expect("answered, not reset");
             let v: Value = resp.json().await.expect("a JSON answer");
             if v.get("result").is_some_and(Value::is_string) {
@@ -221,10 +222,10 @@ async fn burst(addr: std::net::SocketAddr, bodies: &[&'static [u8]]) -> Vec<Answ
             } else {
                 Answer::Refused(v["error"]["message"].as_str().unwrap_or_default().to_string())
             }
-        })
-    });
+        }));
+    }
     let mut out = Vec::new();
-    for s in sends.collect::<Vec<_>>() {
+    for s in sends {
         out.push(s.await.unwrap());
     }
     out
