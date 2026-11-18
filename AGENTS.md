@@ -6,6 +6,22 @@ invariants, and known traps.
 
 ## Project memory (state as of 2026-11-08)
 
+### Aggregation's memory docs re-anchored (issue #119, AGG-E2E-2; 2026-11-18, branch `docs/i119-aggregation-memory`, docs only)
+
+`docs/node-hardware.md` §4 and `docs/aggregation.md` ("What is still open") now lead with the
+vendored build (circuits `b3e21d9`, constraint set 9, rVM phase 5): production N = 1 / 2 / 3 at
+rVM tiers 18 / 19 / 20 (emulated), N = 1 projected ≈ 32–75 GB (≥ 96 GB host), the tree's leaf and
+step at tier 19 with the 256 GB droplet as the class on record. **Nothing at the production
+profile has been proved since constraint set 8** (376.9 GB, circuits `d38d6cf`): that table is
+kept as history — "≥ 512 GB" is outdated, not disproven — and the older figures quoted in the
+entries below (≈ 240, ≈ 170–175, ≈ 64–75 GB) were projections that never ran. Still open on #119:
+the targeted forgery (not built, circuits `recursion/docs/02-aggregate.md`), one measured
+production run (flat N = 1 and the tree's leaf and step), and the bundle shape plus
+`aggregate_program_digest` on the build that cuts (`792a66d4…` here, `a3d5c38b…` at constraint
+set 10). **Rule for these docs:** say measured or projected, the profile, the host and the
+circuits commit for every memory number; an rVM tier is not an RV32 tier (the 92.9 GiB msauth
+proof is RV32 tier 18).
+
 ### The constraint-set guard (issue #166, ZKVM-201; 2026-11-17, branch `fix/zkvm-201`)
 
 The guard half of #166; the re-vendor to constraint set 10 is not done and is the owner's call

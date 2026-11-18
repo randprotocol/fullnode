@@ -35,7 +35,7 @@ prices block space and proving as two separate goods.
 | validator RAM | ~650 MiB resident | `docs/node-hardware.md` §2.1 |
 | mempool admission | 4 blocking verification workers, queue 64 deep | `docs/architecture.md` §8 |
 | wallet proof, tier 14 | 107.5 s on 1 thread, 13.9 s on 16 (M4 Max); 6.2 GB | `docs/node-hardware.md` §6 |
-| recursion, N = 1, production | **376.9 GB host memory, 8 131 s** at constraint set 8 (tier 21); N = 2 ≈ 750 GB (estimate). After the phase-2 row cuts (circuits `75b7893`, 2026-10-04): tier 20, projected ≈ 240 GB, not yet proved | `docs/aggregation.md` item 3; `circuits/recursion/docs/04-phase2-row-cuts.md` |
+| recursion, N = 1, production | **376.9 GB host memory, 8 131 s** measured at constraint set 8 (tier 21; N = 2 ≈ 750 GB, an estimate) — the only production measurement, superseded and not repeated. On the build vendored on 2026-11-18 (circuits `b3e21d9`, rVM phase 5): rVM tier 18, 235 744 rows, projected ≈ 32–75 GB, not yet proved (`docs/node-hardware.md` §4) | `docs/aggregation.md` item 3; `circuits/recursion/docs/04-phase2-row-cuts.md` |
 | aggregate proof | 1 563 226 bytes (N = 1, constraint set 8) | `docs/aggregation.md` §6 |
 | aggregate verify, warm, test profile | ~1–2 s | `docs/aggregation.md` §6 |
 | state root | nullifier root recomputed `O(n)` per block | `docs/architecture.md` §5 |
@@ -51,6 +51,10 @@ prices block space and proving as two separate goods.
    But one production aggregate of a *single* bundle needed 377 GB of host memory and 2¼ hours
    at constraint set 8, and N = 2 did not fit on any single host. The phase-2 row cuts (§4.1)
    take N = 1 to tier 20, projected near 240 GB; still no market forms around that machine.
+   (Written 2026-10-04. Since rVM phase 5, N = 1 is tier 18 and N = 2 tier 19, with N = 1
+   projected at ≈ 32–75 GB; no production proof has run since constraint set 8, so the 377 GB
+   is outdated, not disproven, and the newer figures are projections — `docs/node-hardware.md`
+   §4.)
 3. **Then the node's own hot path.** None of these binds at 7 tx/s; all of them bind before
    1 000: the `O(n)` nullifier root, the per-block ledger clone, one Dilithium2 vote (2 420 bytes)
    per validator per block, the leader pushing a whole block body to every peer, and the four
@@ -276,7 +280,8 @@ set 9: `8bc2cecb…d8c7`, with `inner_vk_digest` `1b0c4b00…ddc7`, `docs/aggreg
 against 86.41, the inner RV32 profile untouched). Measured on the tier-18 test twin: peak live
 heap 33.27 GB (quotient layout) → 26.88 GB (phase 3) → **15.64 GB** (rate ¼), verify 7.07 →
 3.53 s; the test N = 2 aggregate (tier 19) proved on the 48 GB laptop. Production N = 1 projected
-**≈ 64–75 GB** (a ≥ 96 GB host) — a projection until a production proof runs. New at phase 3:
+**≈ 64–75 GB** (a ≥ 96 GB host) — a projection until a production proof runs (since phases 4
+and 5, ≈ 32–75 GB with N = 1 at tier 18, still unproved: `docs/node-hardware.md` §4). New at phase 3:
 the reduce chip caps an aggregate at **production N ≤ 5** (`REDUCE_MAX_LOG_HEIGHT = 20`), so N = 6
 and 7 no longer verify inside tier 22; the node admits N ≤ 5 (`docs/aggregation.md`).
 
@@ -319,7 +324,9 @@ the size of one ordinary GPU-proved shard in comparable systems.
 > the inner proofs, and the rVM's own proofs run at rate ¼ with 92 queries and 24 grinding bits
 > (docs/07), not "40 queries": rate ¼ needs ~120 queries at the same proven bound only if the
 > grinding stays at 20 (docs/06 §7 item 2). The old N = 1 "377 GB" is ≈ 110–130 GB projected since
-> phase 3 (≈ 64–75 GB at rate ¼, docs/07). What shipped is the per-level design of circuits
+> phase 3 (≈ 64–75 GB at rate ¼, docs/07; ≈ 32–75 GB since phase 4, docs/09, and none of these
+> was ever run). The "tier-21 production steps" of point (4) are tier 19 since rVM phase 5
+> (docs/10 §4), with no new memory projection. What shipped is the per-level design of circuits
 > `recursion/docs/08-tree-aggregation.md`: `rv32n` leaves of L proofs, `rv32t` 2-to-1 steps, a
 > per-level genesis step list whose last entry repeats as a fixed point.
 
@@ -353,7 +360,7 @@ leaf, which is the number the §4.4 targets are set against.
 
 | measurement | today | target | why this number |
 |---|---|---|---|
-| leaf step, B = 16 (32 inner proofs), one 80 GB GPU | not possible (377 GB for N = 1 on CPU at constraint set 8; ≈ 240 GB projected after the row cuts; production N = 1 projected ≈ 64–75 GB at rate ¼, the ≤ 64 GB class at the edge, not met; N ≤ 5 is the rVM's ceiling) | ≤ 64 GB host, ≤ 60 s | fits one commodity GPU host; 16 bundles a minute a GPU |
+| leaf step, B = 16 (32 inner proofs), one 80 GB GPU | not possible (377 GB for N = 1 on CPU at constraint set 8, the only production measurement; ≈ 240 GB projected after the row cuts; ≈ 64–75 GB at rate ¼; ≈ 32–75 GB since rVM phase 4, N = 1 at tier 18 since phase 5 — projections, never run, so the ≤ 64 GB class is not shown met; N ≤ 5 is the rVM's ceiling) | ≤ 64 GB host, ≤ 60 s | fits one commodity GPU host; 16 bundles a minute a GPU |
 | 2-to-1 step | — | ≤ 64 GB host, ≤ 30 s | same host; tree depth 4 adds ≤ 2 min |
 | **GPU-seconds per covered transaction, amortised** | ~8 000 s CPU | **≤ 0.5 GPU-s** | §6.6 sizes the market on it |
 | rVM prover threads | 4.7× on 16 threads (`parallel` feature, tier 16, peak heap unchanged) | — | a wall-time lever only; the heap model holds under threads |
@@ -549,7 +556,7 @@ for which hardware, and attaches the conditions.
 
 The sale gates in the draft stand, and this page adds one: **the validator and prover sale does
 not open until the §4.4 leaf-step target is measured on an 80 GB GPU.** Selling aggregator seats
-against a 377 GB machine (≈ 240 GB projected after the row cuts) would be selling hardware nobody can run.
+against a 377 GB machine (measured at constraint set 8; ≈ 32–75 GB projected for the build vendored on 2026-11-18, unmeasured) would be selling hardware nobody has measured.
 
 ### 6.6 Does it pay? Worked numbers
 
