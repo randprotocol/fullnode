@@ -67,6 +67,9 @@
 #      heights, so funding, marks and liquidations run at least that often), and back-pressure
 #      holds new orders at 4 × it past the proved height (docs/perps.md "Sparse windows"). The
 #      v11 perps report leaves it to the owner ("choose max_window_heights for chain 22").
+#      What each value costs (heartbeat interval, state proofs a day on an idle chain, the
+#      back-pressure distance) is tabulated in docs/perps.md, "Sparse windows": at the lower
+#      bound, 64, an idle chain needs as many proofs as chain 21's dense rule does.
 #      Input: PERPS_MAX_WINDOW_HEIGHTS, no default.
 #   2. multisig.max_accounts (MSA-4). No documented value; the documented default is ABSENT
 #      (unbounded — chain 21's rule, which would not close MSA-4). It counts the seeded treasury,
