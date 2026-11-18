@@ -166,6 +166,8 @@ pub fn action_kind(action: &randprotocol_core::Action) -> &'static str {
         A::MultisigRotate { .. } => "multisig_rotate",
         A::SetRandPrice { .. } => "set_rand_price",
         A::InvokeAt { .. } => "invoke_at",
+        A::BeaconReveal { .. } => "beacon_reveal",
+        A::BeaconCommit { .. } => "beacon_commit",
     }
 }
 

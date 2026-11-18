@@ -273,6 +273,10 @@ pub fn reload_ledger_from(
     // with the block facts stored for it: a node that came back without them would refuse every
     // `InvokeAt` its peers apply — a fork at the first one after its restart.
     storage.restore_reference_block_window(&mut ledger, gs)?;
+    // And the randomness beacon (genesis `beacon`): its state is in the root and decides which
+    // reveal a block must open with — a node that came back without it would refuse every block
+    // its peers build. Read only under the section; `commit_delay_blocks` is the file's.
+    storage.restore_beacon(&mut ledger, gs)?;
     // And the consensus signing domain (audit v4): `load_ledger` comes back at v0, and a node
     // that kept it on a v1 chain would refuse every peer's proposal at the ledger's own
     // signature check.
@@ -1417,6 +1421,10 @@ struct Node {
     consensus_limiter: admission::PeerLimiter,
     /// The byte policy over every peer's `consensus_byte_bucket` ([`consensus_byte_limiter`], CN-4).
     consensus_byte_limiter: admission::PeerLimiter,
+    /// This validator's beacon seed file (genesis `beacon`): the reveal source the replica
+    /// proposes with, kept so a rebuilt replica (`HotStuff::resume` after a sync) gets it again.
+    /// `None` on an observer and on every chain without the section.
+    beacon_seeds: Option<Arc<crate::beacon::SeedSource>>,
     /// The policy over every peer's `binding_bucket` ([`crate::peer_bindings::on_binding_gossip`]).
     binding_limiter: admission::PeerLimiter,
     /// The policy over every peer's `stem_bucket` (Dandelion++, issue #145).
@@ -2776,6 +2784,31 @@ pub async fn start_with(cfg: NodeConfig, rpc_options: RpcOptions, net_options: N
             profile: core_profile(&gs.fri_profile),
         }));
     }
+    // The randomness beacon (genesis `beacon`): a validator proposes with the reveal its seed
+    // file gives for the commitment the chain holds. A missing or unusable file does not stop
+    // the node — it votes, and misses its own slots until `rand-node beacon recommit` — but it
+    // is said here, once, loudly. Observers and chains without the section never open the file.
+    let beacon_seeds = match (gs.ledger.beacon().is_some(), cfg.validator) {
+        (true, true) => {
+            let me = key.address();
+            let seeds = Arc::new(crate::beacon::SeedSource::open(&cfg.datadir, gs.chain_id, me));
+            let head = hs.committed_ledger();
+            match head.beacon().and_then(|b| b.due_commitment(&me, head.height().saturating_add(1))) {
+                Some(c) => match seeds.reveal_and_remaining(&c) {
+                    Some((_, left)) => tracing::info!("beacon: the seed file opens this validator's commitment; {left} reveals left"),
+                    None => tracing::error!(
+                        "beacon: no seed in {} opens this validator's commitment {}: it will MISS ITS SLOTS until a new commitment is registered (`rand-node beacon recommit`)",
+                        crate::beacon::seed_path(&cfg.datadir).display(),
+                        hex::encode(c)
+                    ),
+                },
+                None => tracing::warn!("beacon: this validator has no commitment in force: it will miss its slots until one is (`rand-node beacon recommit`, then the commit delay)"),
+            }
+            hs.set_reveal_source(seeds.clone());
+            Some(seeds)
+        }
+        _ => None,
+    };
 
     // Network. The sync and gossip byte limits follow the genesis block cap (call limits
     // spec §8), computed once here and handed to the swarm and the serve path.
@@ -3169,6 +3202,7 @@ pub async fn start_with(cfg: NodeConfig, rpc_options: RpcOptions, net_options: N
         status_limiter: admission::PeerLimiter::new(STATUS_GOSSIP_BURST, STATUS_GOSSIP_PER_SEC),
         consensus_limiter: admission::PeerLimiter::new(CONSENSUS_GOSSIP_BURST, CONSENSUS_GOSSIP_PER_SEC),
         consensus_byte_limiter: consensus_byte_limiter(max_block_bytes),
+        beacon_seeds,
         binding_limiter: admission::PeerLimiter::new(
             crate::peer_bindings::BINDING_GOSSIP_BURST,
             crate::peer_bindings::BINDING_GOSSIP_PER_SEC,
@@ -5888,6 +5922,11 @@ impl Node {
                 profile: core_profile(&self.gs.fri_profile),
             }));
         }
+        // Nor does the beacon's reveal source: without it a validator that synced would never
+        // propose again on a beacon chain.
+        if let Some(seeds) = &self.beacon_seeds {
+            self.hs.set_reveal_source(seeds.clone());
+        }
         self.timeout = None;
         self.propose_at = None;
         let acts = self.hs.start();
@@ -8324,6 +8363,7 @@ mod tests {
             status_limiter: admission::PeerLimiter::new(STATUS_GOSSIP_BURST, STATUS_GOSSIP_PER_SEC),
             consensus_limiter: admission::PeerLimiter::new(CONSENSUS_GOSSIP_BURST, CONSENSUS_GOSSIP_PER_SEC),
             consensus_byte_limiter: consensus_byte_limiter(max_block_bytes),
+            beacon_seeds: None,
             binding_limiter: admission::PeerLimiter::new(
                 crate::peer_bindings::BINDING_GOSSIP_BURST,
                 crate::peer_bindings::BINDING_GOSSIP_PER_SEC,
