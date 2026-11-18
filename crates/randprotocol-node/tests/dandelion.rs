@@ -63,6 +63,7 @@ async fn start_on_lanes(gen: &Genesis, seed: u8, bootstrap: Vec<libp2p::Multiadd
             verify_workers: None,
             apply_inline: false,
             state_proof_tier_cap: None,
+            multisig_account_cap: None,
             prune_history: None,
             gas_policy: None,
             msauth: Default::default(),

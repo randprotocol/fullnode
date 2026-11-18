@@ -436,6 +436,7 @@ mod tests {
             verify_workers: None,
             apply_inline: false,
             state_proof_tier_cap: None,
+            multisig_account_cap: None,
             prune_history: None,
             gas_policy: None,
             msauth,

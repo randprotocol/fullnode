@@ -108,6 +108,13 @@ pub enum MempoolError {
     /// penalised, and a block carrying one still applies.
     #[error("the state proof pays {want} collateral units, more than the {ceiling} the exchange can hold; this node does not pool it")]
     StateProofOverpays { want: u128, ceiling: u128 },
+    /// MSA-4, node policy: a `CreateMultisig` while the register already holds this node's
+    /// `--max-multisig-accounts` ([`Mempool::set_multisig_account_cap`]). The ledger refuses a
+    /// create itself only past genesis `multisig.max_accounts` (`RegisterFull`), which chain 21
+    /// does not set; this is what this node pools, relays and proposes, never a verdict on the
+    /// transaction: not cached, no peer penalised, and a block carrying one still applies.
+    #[error("the multisig register holds {held} accounts, this node's limit of {cap} for new ones; it does not pool a CreateMultisig")]
+    MultisigAtNodeCap { held: u64, cap: u64 },
     /// Issue #157: the admission byte budget ([`crate::admission::AdmissionBudget`]) cannot take
     /// this transaction now. Retryable, never cached, no peer penalised; `rand_sendTransaction`
     /// answers it as `-32005`.
@@ -470,6 +477,9 @@ pub struct Mempool {
     /// CON-601: the highest state-proof tier this node verifies for its pool when the key is not
     /// built ([`MempoolError::StateProofAboveNodeTier`]); `u8::MAX`, no cap, unless set.
     state_proof_tier_cap: u8,
+    /// MSA-4: the register size at which this node stops pooling `CreateMultisig`
+    /// ([`MempoolError::MultisigAtNodeCap`], `--max-multisig-accounts`); `None`, no cap.
+    multisig_account_cap: Option<u64>,
 }
 
 /// CON-60 (b): the burst of verifier-key builds for state-proof shapes this node has no key for
@@ -745,7 +755,26 @@ impl Mempool {
             lineage_keys: ColdKeyBudget::default(),
             last_cost: std::sync::Mutex::new(None),
             state_proof_tier_cap: u8::MAX,
+            multisig_account_cap: None,
         }
+    }
+
+    /// MSA-4: refuse, at the pre-screen and the direct insert, every `CreateMultisig` while the
+    /// ledger's multisig register holds `cap` accounts or more
+    /// ([`MempoolError::MultisigAtNodeCap`]); `None`, the default, is no cap. Node policy, never
+    /// a validity rule: for a chain whose genesis sets no `multisig.max_accounts`.
+    pub fn set_multisig_account_cap(&mut self, cap: Option<u64>) {
+        self.multisig_account_cap = cap;
+    }
+
+    /// MSA-4: `Err` for a `CreateMultisig` on a register at this node's cap — one length read.
+    fn multisig_create_gate(&self, tx: &Transaction, ledger: &Ledger) -> Result<(), MempoolError> {
+        let (Some(cap), Action::CreateMultisig { .. }) = (self.multisig_account_cap, &tx.action) else { return Ok(()) };
+        let held = ledger.multisig().map_or(0, |r| r.len() as u64);
+        if held >= cap {
+            return Err(MempoolError::MultisigAtNodeCap { held, cap });
+        }
+        Ok(())
     }
 
     /// CON-601: refuse, at the pre-screen, every state proof above `tier` whose key this node has
@@ -1148,6 +1177,8 @@ impl Mempool {
         ledger.validate(&tx, executor).map_err(MempoolError::Invalid)?;
         // PERP-6: after the ledger's own verdict, so a `bound_payouts` chain answers by its rule.
         Self::state_proof_payout_gate(&tx, ledger)?;
+        // MSA-4: after the ledger's own verdict (a chain with `max_accounts` answers by its rule).
+        self.multisig_create_gate(&tx, ledger)?;
         // The pool's policies (the faucet minter rule, COV-2's call screen) after the ledger's own
         // verdict: this path runs no `precheck`, and it is the one a local `rand_mint` takes.
         self.pool_policy(&tx, ledger).map_err(MempoolError::Invalid)?;
@@ -1295,6 +1326,7 @@ impl Mempool {
     ) -> Result<Claims, MempoolError> {
         self.state_proof_tier_gate(tx, executor)?;
         Self::state_proof_payout_gate(tx, ledger)?;
+        self.multisig_create_gate(tx, ledger)?;
         let c = self.pool_conflicts(tx, ledger, executor)?;
         Self::applies(tx, &c.commitments, c.claim, ledger).map_err(MempoolError::Invalid)?;
         self.pool_policy(tx, ledger).map_err(MempoolError::Invalid)?;
@@ -5093,6 +5125,42 @@ mod tests {
         assert!(m.precheck(&perp_state_proof_tx(&l, 1, [7; 8], vec![], 0), &l, ex).is_ok(), "a proof paying nothing passes");
         // No perps section: no ceiling, nothing to gate.
         assert_eq!(Mempool::payout_ceiling(&fixtures::genesis_with(1, vec![]).ledger), None);
+    /// MSA-4, node policy for a chain without genesis `multisig.max_accounts` (chain 21): with
+    /// `--max-multisig-accounts` set, a `CreateMultisig` is not pooled once the register holds
+    /// that many accounts — at the pre-screen and on the direct insert — while the ledger still
+    /// finds it valid. `Ignore` to gossip, not cached, not retryable. Under the cap, or with no
+    /// cap (the default), a create is pooled; other multisig actions are never gated.
+    #[test]
+    fn msa4_a_create_multisig_past_the_node_cap_is_not_pooled() {
+        use fixtures::{bundle, key, multisig_genesis, multisig_id, multisig_pay_tx, MULTISIG_CREATE_FEE};
+        let gs = multisig_genesis(7);
+        let l = gs.ledger.clone();
+        assert_eq!(l.multisig().unwrap().len(), 1, "the fixture's one seeded account");
+        assert!(l.multisig().unwrap().max_accounts.is_none(), "chain 21's shape: no genesis cap");
+        let create = StubExecutor::bound(Transaction::shielded(
+            7,
+            bundle(&l, [[1; 8], [2; 8]], [[3; 8], [4; 8]], randprotocol_core::gas::BUNDLE_BASE + MULTISIG_CREATE_FEE),
+            Action::CreateMultisig { salt: [5; 32], signers: vec![key(71).public_key().clone(), key(72).public_key().clone()], threshold: 1 },
+        ));
+        let ex = &StubExecutor;
+        assert_eq!(l.validate(&create, ex), Ok(()), "valid to the ledger");
+        let mut m = Mempool::new(100);
+        assert!(m.precheck(&create, &l, ex).is_ok(), "no cap by default");
+        m.set_multisig_account_cap(Some(1));
+        let refusal = MempoolError::MultisigAtNodeCap { held: 1, cap: 1 };
+        assert_eq!(m.precheck(&create, &l, ex).unwrap_err(), refusal);
+        assert_eq!(m.insert(create.clone(), &l, ex).unwrap_err(), refusal);
+        assert_eq!(m.insert_verified(create.clone(), &l, ex).unwrap_err(), refusal);
+        assert!(m.is_empty() && !refusal.is_retryable());
+        let mut refused = crate::admission::RefusedCache::new(8);
+        assert_eq!(crate::admission::acceptance_for_pool(&refusal, create.hash(), &mut refused), crate::admission::Acceptance::Ignore);
+        assert!(refused.get(&create.hash()).is_none(), "not cached: the create is valid on this chain");
+        // The existing account still pays: only a create is gated.
+        let pay = multisig_pay_tx(&l, multisig_id(7), 0, vec![fixtures::rpl2_payout(0, randprotocol_core::UNITS_PER_RAND, 1)], &[0, 1]);
+        assert!(m.insert(pay, &l, ex).is_ok());
+        // Under the cap a create is pooled.
+        m.set_multisig_account_cap(Some(2));
+        assert!(m.insert(create, &l, ex).is_ok());
     }
 
     /// CON-601: a node's state-proof tier cap refuses a cold proof above it at the pool's

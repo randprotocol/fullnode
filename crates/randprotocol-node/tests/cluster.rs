@@ -916,6 +916,7 @@ async fn a_build_whose_bundle_guest_differs_from_genesis_refuses_to_start() {
         verify_workers: None,
         apply_inline: false,
         state_proof_tier_cap: None,
+        multisig_account_cap: None,
         prune_history: None,
         gas_policy: None,
         msauth: Default::default(),

@@ -34,6 +34,14 @@ change):
   evm-block-context.md` §11.4. The guest's `PREVRANDAO` read waits for the constraint-set-10
   re-vendor; `deploy/cut-chain22-genesis.sh` does not carry the section yet.
 
+- **`rand-node run --max-multisig-accounts <COUNT>`** (MSA-4, node policy; consensus unchanged):
+  once the multisig register holds that many accounts, the node's pool refuses a `CreateMultisig`
+  (`MultisigAtNodeCap`: not cached, no peer penalised), so it is not verified, pooled, relayed or
+  proposed there. Off by default. For a chain whose genesis sets no `multisig.max_accounts`
+  (chain 21): a block carrying a create still applies, so the register is bounded only when every
+  proposer sets the flag. The validity rule stays genesis `multisig.max_accounts`, an operator
+  input of the chain-22 cut.
+
 Core and node (issue #168, ZKVM-203; **genesis-gated, on no chain** — chain 21's genesis hash,
 wire, storage and behaviour are unchanged):
 
