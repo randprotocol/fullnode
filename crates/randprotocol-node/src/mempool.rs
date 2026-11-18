@@ -4487,6 +4487,49 @@ mod tests {
         assert!(m.is_empty(), "the stale invoke left the pool at the tip that made it stale");
     }
 
+    /// Issue #168: a pooled `InvokeAt` whose reference block has left the window can never
+    /// apply again — its proof is over that block's facts — so it leaves the pool at the tip
+    /// that made it stale, with the ledger's own verdict, instead of being offered to every
+    /// block until its anchor scrolls out. Not a cacheable verdict: it is this node's tip.
+    #[test]
+    fn a_pooled_invoke_at_is_evicted_when_its_reference_block_leaves_the_window() {
+        use fixtures::{ref_block_chain, ref_block_next, rpl2_cell, rpl2_invoke_at_tx, rpl2_transition, REF_WINDOW};
+        use randprotocol_core::ledger::program_state::{ProgramStateError, Transition};
+        let (_dir, s, _gs, mut l, b1) = ref_block_chain(7);
+        let step = |k| Transition { reads: vec![rpl2_cell(k, 0)], writes: vec![rpl2_cell(k, 5)], ..rpl2_transition() };
+        // The head is block 1; the transaction names it.
+        let tx = rpl2_invoke_at_tx(&l, 10, 1, step(1));
+        let mut m = Mempool::new(100);
+        m.insert(tx.clone(), &l, &StubExecutor).unwrap();
+        assert_eq!(m.candidates(&l, 10).len(), 1);
+        // A reference block above the tip is refused at the door, by name.
+        let mut ahead = tx.clone();
+        if let Action::InvokeAt { ref_height, .. } = &mut ahead.action {
+            *ref_height = 2;
+        }
+        let future = TxError::ProgramState(ProgramStateError::FutureReferenceBlock { ref_height: 2, newest: Some(1) });
+        assert_eq!(Mempool::new(10).precheck(&ahead, &l, &StubExecutor).unwrap_err(), MempoolError::Invalid(future.clone()));
+        assert!(!crate::admission::is_permanent(&future), "the tip will get there");
+
+        // The chain moves on without it. While block 1 is in the window it stays pooled.
+        let mut parent = b1;
+        for _ in 0..REF_WINDOW - 1 {
+            parent = ref_block_next(&s, &parent, &mut l, vec![]);
+        }
+        assert_eq!(l.block_facts().front().map(|f| f.height), Some(1), "tip {}: block 1 is the oldest held", parent.block.height());
+        assert!(Mempool::applies(&tx, &tx.commitments(), None, &l).is_ok());
+        assert_eq!(m.candidates(&l, 10).len(), 1, "still offered at the last block that may include it");
+        // One more block and it is out, for good.
+        ref_block_next(&s, &parent, &mut l, vec![]);
+        let stale = TxError::ProgramState(ProgramStateError::StaleReferenceBlock { ref_height: 1, oldest: 2, window: REF_WINDOW });
+        assert_eq!(Mempool::applies(&tx, &tx.commitments(), None, &l).unwrap_err(), stale);
+        assert_eq!(l.validate(&tx, &StubExecutor).unwrap_err(), stale, "the ledger's own verdict");
+        assert!(!crate::admission::is_permanent(&stale), "a verdict on this node's tip, not on the bytes");
+        assert_eq!(m.candidates(&l, 10), vec![], "never offered again");
+        m.prune(&l);
+        assert!(m.is_empty(), "the expired invoke left the pool");
+    }
+
     // ---------------------------------- RPL-3: perp actions
 
     /// Two withdrawal requests on one nonce of one account are both valid at the tip, so both

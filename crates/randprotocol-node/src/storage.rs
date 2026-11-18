@@ -5858,6 +5858,9 @@ pub(crate) mod fixtures {
         g.perps = Some(perps_config());
         g.timestamp_ms = REF_T0_MS;
         g.program_state.as_mut().unwrap().reference_block_window = REF_WINDOW;
+        // A bundle window wider than the reference window, so a transaction that outlives its
+        // reference block is refused for that and not for its anchor.
+        g.proof_window_blocks = Some(1024);
         g
     }
 
