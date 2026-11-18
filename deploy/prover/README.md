@@ -39,9 +39,16 @@ capacity — the members the router's two-second poll finds up, times `MEMBER_JO
 (default 0.6, one bundle in ~70 s on a c-8). With two members up that is 0.36 a minute: one
 address is admitted at most ~23 submits an hour against the ~72 the pool clears, under a third,
 and the refill rises and falls with the members that answer. `SUBMIT_PER_MIN`, if set, is only a
-ceiling on that refill. **What this does not do:** it bounds one address, not the pool — three
-addresses at their full share still take ~95% of it, and an attacker with many addresses (the
-meter keys on nginx's `X-Real-IP`) can hold the pool; each member's own slots (`--max-queue 1`) and
+ceiling on that refill. Since audit v13 two more rules apply. An IPv6 address is metered as its
+/64 (one host holds a whole /64; an IPv4-mapped address is its IPv4 address). And when more than
+1/`SUBMIT_SHARE` addresses were admitted a submit in the last ten minutes, each one's refill is
+an equal split of the capacity between them instead of `SUBMIT_SHARE` each, so all of them
+together are admitted about what the pool clears (plus each one's burst), and any three of six
+about half. **What this does not do:** three addresses alone still take ~90% of the pool (0.3
+each is their equal split too), and an attacker with many IPv4 addresses or many /64s (the meter
+keys on nginx's `X-Real-IP`) takes a share in proportion to their number and pushes every other
+address's refill down with it; the capacity is members up times a configured
+`MEMBER_JOBS_PER_MIN`, not a measured throughput. Each member's own slots (`--max-queue 1`) and
 nginx's per-address limit are what remain. The figures before audit v12 (fixed 2 + 1 a minute)
 let one address take ~61 of the 72 (~85%), which this README then called "cannot hold the pool".
 Set the variables in `/etc/rand-prover-pool/router.env` (an old `SUBMIT_PER_MIN=1` there is now a
