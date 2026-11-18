@@ -1613,12 +1613,16 @@ from the same commit.
 3. **Distribute the file byte-identically** (re-cutting re-randomises the deposit notes, so the
    hash differs every run — cut once, copy everywhere).
 4. **Bring the fleet up as usual**; each node logs the startup key-build's wall time once
-   (`aggregation: aggregate program built and the verifier keys for tiers [20, 21, 22] warmed`).
+   (`aggregation: aggregate program built and the verifier keys for tiers [18, 19, 20, 21] × reduce
+   heights … warmed` on the build vendored today, circuits `b3e21d9`; the tiers are the build's
+   `admitted_tiers`).
 5. **Aggregators register** (`rand-node aggregator register --bond --payout` prints the
    signed registration; the bond burns through the wallet's `submit` as the register bundle's
-   burn) and run **`rand-node aggregate --watch`** on a proof machine (≥ 256 GB at N=1 after the
-   phase-2 row cuts, a projection until the tier-20 proof runs — `docs/node-hardware.md` §4; the GPU
-   node for N≥2 — see `docs/aggregation.md`'s machine classes), pointed at any fleet RPC.
+   burn) and run **`rand-node aggregate --watch`** on a proof machine, pointed at any fleet RPC. Its size is
+   not measured: on the build vendored today production N = 1 is an rVM tier-18 proof projected at
+   ≈ 32–75 GB, so ≥ 96 GB, and no host class is projected for N ≥ 2; the one production
+   measurement (376.9 GB, constraint set 8) is superseded and has not been repeated
+   (`docs/node-hardware.md` §4; `docs/aggregation.md`, "What is still open").
 5a. **On a tree chain** (a genesis with an `aggregation_tree` section, `docs/aggregation.md` §3.8;
    none yet): the section's values are measured like step 1's — the leaf and each listed level's
    heights read off a leaf, steps and root proved on the production build, the pins
@@ -1633,9 +1637,11 @@ from the same commit.
    `rand_status.aggregation.tree`'s hex into it; that is the same section for humans. Every node checks every pin at startup and refuses to start on a mismatch (`aggregation_tree
    pins: …; refusing to start`); a healthy node logs **`aggregation_tree pins: ok`** before the
    warm thread, then `aggregation_tree: N root keys warmed`. Aggregators run **`rand-node aggregate
-   --watch --layout tree`** on a host of the step class (circuits docs/08 §3: tier-21 production
-   steps, ≈ 122–197 GB projected at rate ¼ — the 256 GB droplet class; the measured number is
-   pending the droplet), pointed at any fleet RPC. The ops check is `rand_status.aggregation.tree`
+   --watch --layout tree`** on a host of the step class, pointed at any fleet RPC. That class is the
+   256 GB droplet by projection only: circuits docs/08 §3 projected ≈ 122–197 GB at rate ¼ for
+   tier-21 production steps; since rVM phases 4 and 5 the leaf and step are tier 19 (docs/10 §4)
+   with no new projection, and the measured number is pending the droplet
+   (`docs/node-hardware.md` §4.1). The ops check is `rand_status.aggregation.tree`
    (the section verbatim) beside the startup log line.
 6. **Ops checks**: `rand_status`'s `aggregation` section (registered, unsealed, the schedule
    index), `rand_getUnsealed` for the work list, `rand_getSupply` for the four counters

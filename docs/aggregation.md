@@ -20,7 +20,7 @@ have.
 | role | hardware | admitted by | does | paid by |
 |---|---|---|---|---|
 | **proposer** (HotStuff leader) | CPU | stake (`docs/staking.md`, the S2 register) | orders transactions, verifies one aggregate proof per sealed block (~0.8 s cold, ~16 ms warm) | the verification share of fees, as today |
-| **aggregator** (prover) | GPU; measured: ≥ 512 GB host memory for one production proof (§ "Before enabling aggregation", item 3) | permissionless, a registered payout address | proves one recursive STARK that verifies N bundle proofs; submits it for a sealing block | the proving share of fees **plus a block subsidy in newly minted RAND** |
+| **aggregator** (prover) | GPU; host memory for one production proof is a projection (≈ 32–75 GB at N = 1, so ≥ 96 GB; `docs/node-hardware.md` §4). The one measurement, 376.9 GB and so ≥ 512 GB, is constraint set 8's: superseded, not re-measured (§ "Before enabling aggregation", item 3) | permissionless, a registered payout address | proves one recursive STARK that verifies N bundle proofs; submits it for a sealing block | the proving share of fees **plus a block subsidy in newly minted RAND** |
 
 Validators stay CPU-cheap, so a home node can still validate. GPU capital competes in its own
 market and is never a requirement for consensus. The two roles may be the same operator, but
@@ -367,16 +367,23 @@ tree on one machine (`randprotocol_rvm::aggregate::aggregate_tree`: leaves, then
 every proof checked against its pinned shape before the next level is built on it) and signs
 under the tree domain. `--layout flat` (the default) is today's daemon.
 
-**The test-profile values** (circuits docs/08 §5; the node's suite rebuilds and checks them,
-`agg_executor::tests`): leaf `rv32n`, L = 1, tier 18, heights 19/19/14/16; level 1 `rv32t_leaf`
-tier 19, 20/20/15/16; level 2 `rv32t_int` tier 19, 20/20/15/**17** (the reduce table crosses 2^16:
-the step is not its own fixed point); the fixed point is reached at level 3 (`rv32t` at the root's
-shape). `vk_leaf` `188d4b14…acfdcb`, `vk_t_leaf` `6b042444…d8507a`, `vk_int` `a92a0baa…3efbb70`,
-`vk_fix` `4203726c…7e6e355`; programs `T_LEAF_TEST` `2c586636…206ccd34`, `T_INT_TEST`
-`04b16771…dc3c226`, `T_FIX_TEST` `08abf188…795ff396`. A test-profile step proves at ≈ 34 GB
-maximum RSS on a 48 GB laptop. **Production values: pending (droplet; circuits docs/08 §4)** — the
-production depth-2 tree (L = 2, tier-21 steps, ≈ 122–197 GB projected at rate ¼, the 256 GB
-droplet) has not been proved, so no production section, digest or host class is recorded here yet.
+**The test-profile values.** The vendored section is
+`crates/randprotocol-rvm/tests/tree-test-genesis.json` (rVM phase 4 and later): leaf `rv32n`,
+L = 1, tier 18, heights 19/19/14/16; two listed steps, both tier 18 with heights 19/20/15/17,
+`max_depth` 2. As first built (circuits `92b750e`, docs/08 §5, 2026-10-09, before phase 4) the
+steps were tier 19 — level 1 `rv32t_leaf` 20/20/15/16, level 2 `rv32t_int` 20/20/15/**17**, a
+fixed point at level 3 — and that is the tree the one memory measurement is of: a step proved at
+**34.35 GB** and the root at 33.21 GB process maximum RSS on a 48 GB laptop. The tier-18 steps
+were re-proved on 2026-10-11 with no memory figure recorded, and since rVM phase 5 the test
+tree's `rv32t_int` digest and step keys wait on circuits' fixture regeneration (docs/10 §5).
+
+**Production values: pending.** No production leaf, step or root has been proved, so there is no
+production section, digest or measured host class. On the vendored build (circuits `b3e21d9`,
+docs/10 §4) the production L = 2 leaf is 471 105 rows and the `rv32t_leaf` step 508 735, both
+rVM tier 19, by emulation. Circuits docs/08 §3 (older) has them at tier 21, projects a tier-21
+proof at ≈ 122–197 GB at rate ¼ and names the 256 GB droplet; docs/10 gives no memory figure for
+the tier-19 shapes and still names the 256 GB host. That is the host class on record, as a
+projection made two tiers higher (`docs/node-hardware.md` §4.1).
 
 ## Before enabling aggregation
 
@@ -391,9 +398,50 @@ extended to verify the auth proof too, so the pruned form can replace both — a
 with the digest re-measured and re-pinned — or storage is planned on 1.36 MB a transfer. Decide
 before aggregation is switched on.
 
-Aggregation is off on every live chain, and `rand-node` refuses to start on any genesis that
-carries an `aggregation` section (`node::check_build_runs_genesis`). Two reasons hold it there;
-both have to clear before a genesis may switch it on.
+Aggregation is off on every chain. No genesis in `deploy/genesis-chain*.json` (chains 6 to 21)
+carries an `aggregation` section; the chain-21 and chain-22 cut scripts refuse a file that has
+one (`deploy/cut-chain21-genesis.sh`, `deploy/cut-chain22-genesis.sh`: "an aggregation section is
+present"); and `rand-node` refuses to start on any genesis that carries one
+(`check_build_runs_genesis` in `crates/randprotocol-node/src/node.rs`, held by its test
+`startup_refuses_another_guest_and_an_aggregation_section`). Lifting that refusal is a code
+change, made when the list below is empty.
+
+### What is still open (2026-11-18; issue #119)
+
+For the vendored build: circuits `b3e21d9` (`CIRCUITS_PIN`), constraint set 9, rVM phase 5.
+
+- **(a) The targeted forgery is not built.** The forged-aggregate exercise of 2026-09-30 (#45)
+  showed that the fixed rVM refuses a forged stored lane inside a real aggregate, and that the
+  toy vectors accept the forgery once RVM-1's fix is reverted. It did not build the attack the
+  recursion-VM report's §6 describes. Circuits `recursion/docs/02-aggregate.md` ("The
+  forged-aggregate exercise"), unchanged at circuits `main` on 2026-11-18: "a lane *chosen* to
+  cancel a failing check — the recursion-VM report's §6 path — was not constructed, so nothing
+  here claims the unfixed rVM was unforgeable at this scale." The aggregate-scale test stays
+  green on the reverted rVM because the RAM table's read-after-write catches its forgery, not
+  because of RVM-1's fix. Item 2 below has the record.
+- **(b) One measured production-profile run on a real host.** Nothing at the production profile
+  has been proved since constraint set 8 (376.9 GB, the proof then at rVM tier 21). Wanted: the
+  flat production N = 1 aggregate (235 744 rows, rVM tier 18; projected ≈ 32–75 GB, so a
+  **≥ 96 GB host**, a projection), and the tree's production leaf and step (L = 2; 471 105 and
+  508 735 rows, rVM tier 19, emulated; the **256 GB droplet** is the class on record, projected
+  when they were tier 21), with the root and the `production_tree_genesis_values` that follow
+  (circuits `recursion/docs/08-tree-aggregation.md` §3 has the commands; the node-side check is
+  the ignored `agg_executor::tests::production_tree`). Until then every production memory
+  figure in `docs/node-hardware.md` §4 is a projection. Item 3 below has the record.
+- **(c) The bundle shape and `aggregate_program_digest`, on the build that will run.** The
+  admitted shape's heights are re-measured for the hidden-asset bundle and
+  `admitted_shapes[].aggregate_program_digest` is taken on the cut's own build. The digest is
+  not a number to copy from this page: it is `792a66d4…a982` on the vendored build (a node test
+  pins it over the in-repo fixture shape at the production profile) and
+  `a3d5c38b2481d59f91cb8f03ada990facdd7c152d07a7f5d25930fd7d1e883d3` at circuits constraint set
+  10 (circuits `recursion/docs/10-phase5-n2-tier19.md`, "Constraint set 10"), whose re-vendor is
+  a chain cut and is not done (issue #166). Item 1 below, and "The fleet bundle's declared
+  shape" at the end of this page.
+
+Also undecided, from the paragraph above: whether the aggregate program verifies the auth proof
+(AGG-7).
+
+### The record behind each item
 
 1. **The hidden-asset bundle's shape.** The admitted shapes and the recursion fixtures were
    measured for the retired 2-in-2-out guest; they are re-measured for the current bundle guest,
@@ -440,16 +488,26 @@ both have to clear before a genesis may switch it on.
        every real row once the reduce clock is carried).
    - Deferred from the zk scan (ZKQ-6): a DSL-side check that a loop body never reads a
      register before writing it.
-3. **The hardware (measured 2026-09-30, #45).** A production aggregate of one bundle proof
-   (tier 21) peaked at **376.9 GB** and took 8 131 s; N = 2 (tier 22, 2.4 % row headroom) is
-   estimated at ~750 GB and N = 3 at over 1 TB — beyond any single CPU host, with or without the
-   GPU backend (host-resident traces). An aggregator therefore needs ≥ 512 GB for N = 1, and
-   N ≥ 2 needs a design change first (#119). Production N = 2 and N = 3 emulation (no proving)
-   is within the memory and timestamp bounds (`2^27`), and register pressure does not grow with N.
-   The full table is `docs/node-hardware.md` §4.
+3. **The hardware.** The current state is `docs/node-hardware.md` §4. On the vendored build
+   (circuits `b3e21d9`, constraint set 9, rVM phase 5) production N = 1 is 235 744 rows at rVM
+   tier 18, N = 2 471 105 at tier 19 and N = 3 706 466 at tier 20, all by emulation; no
+   production aggregate has been proved on it; and the N = 1 peak is projected at ≈ 32–75 GB, a
+   ≥ 96 GB host, both projections (circuits `recursion/docs/09` §5 and `docs/07` §4; `docs/10`
+   §6 adds no figure).
+   **Measured at constraint set 8 (2026-09-30, #45, circuits `d38d6cf`); superseded.** A
+   production aggregate of one bundle proof (then tier 21) peaked at **376.9 GB** and took
+   8 131 s; N = 2 (tier 22, 2.4 % row headroom) was estimated at ~750 GB and N = 3 at over 1 TB,
+   beyond any single CPU host with or without the GPU backend (host-resident traces). From that
+   came "≥ 512 GB for N = 1" and "N ≥ 2 needs a design change first" (#119). The design changes
+   are the phases below, which took N = 1 from tier 21 to tier 18 and N = 2 from tier 22 to
+   tier 19. These remain the only production-scale measurements: the ≥ 512 GB figure is
+   outdated, not disproven. Production N = 2 and N = 3 emulation (no proving) is within the
+   memory and timestamp bounds (`2^27`), and register pressure does not grow with N.
+   **The pins, phase by phase** (history; each paragraph's values are superseded by the next,
+   and the last is the vendored build's).
    **Phase 2 row cuts (circuits `75b7893`, 2026-10-04):** the production inner proof is 893 606
    cpu rows, so N = 1 lands at tier 20 (N = 2 at 21, N = 3/4 at 22) and projects to ≈ 240 GB — a
-   ≥ 256 GB host, tight, and a projection until proved. On that tree
+   ≥ 256 GB host, tight, a projection that was never run. On that tree
    `admitted_shapes[].aggregate_program_digest` is `c90b3f0a…74d8` and the node admits tiers
    {20, 21, 22} (`recursion/docs/04-phase2-row-cuts.md`, `docs/node-hardware.md` §4).
    **rVM phase 3 and rate ¼ (circuits `71e1a04`, vendored 2026-10-08;
@@ -511,8 +569,8 @@ both have to clear before a genesis may switch it on.
      build or later: the rVM verifier keys (the reduce chip's preprocessed region, the rate-¼
      profile) and the aggregate program digest changed, so an older node refuses every aggregate
      this build accepts and pins a digest no current program produces. No genesis in
-     `deploy/genesis-chain*.json` (chains 6–20, the newest 20) has an `aggregation` section, and
-     `deploy/cut-chain21-genesis.sh` refuses one, so no chain is affected today.
+     `deploy/genesis-chain*.json` (chains 6–21) has an `aggregation` section, and the chain-21
+     and chain-22 cut scripts refuse one, so no chain is affected today.
 
 ### Testing: the recursion fixtures (issue #131)
 
@@ -606,9 +664,9 @@ filled at activation.
 | seal → pruned | sealed at block 46; the pass at head 64 rewrote the record (every 16 blocks, gated at `sealed_at + window`) | capstone |
 | sealed resync, a fresh joiner | **1 rVM verification per sealed window** (the covering aggregate's; a raw sync re-verifies each bundle); the 7-block sealed batch applied in under a second | capstone's verification counter |
 | the capstone end to end | **1873.2 s** (register 97 s → prove 1568 s → seal → prune → resync) | `tests/cluster.rs` |
-| rVM aggregate proof size, test profile | 325–327 KB measured here (the circuits M5.3 record is 328 121 bytes; production measured 2026-09-30 at **1 563 226 bytes** for N=1 under constraint set 8 — under the 2 MiB default cap, not the ~0.5–0.6 MB first estimated) | `circuits/recursion/docs/02-aggregate.md` |
-| tree, test profile (circuits docs/08 §5, 2026-10-09, 48 GB laptop) | leaf `rv32n` L = 1: 169 640 rows, tier 18; step `rv32t_leaf`: 287 107 rows, tier 19, 280 133–280 772 bytes, **34.35 GB** max RSS, 177 s; root `rv32t_int`: 306 985 rows, tier 19, 283 172 bytes, **33.21 GB**, 182 s | circuits `recursion/tests/tree.rs`, `docs/measurements/2026-10-09-tree-test-fixtures-laptop.log` |
-| tree, production (circuits docs/08 §3) | step `rv32t_leaf` at the production leaf shape **1 294 577 rows, tier 21, emulated**; proved leaf/step/root rows, memory and times **pending (droplet)** | circuits `recursion/tests/tree_measure.rs` |
+| rVM aggregate proof size, test profile | 325–327 KB measured here (the circuits M5.3 record is 328 121 bytes; production measured 2026-09-30 at **1 563 226 bytes** for N=1 under constraint set 8, the only production aggregate proved, not re-measured since — under the 2 MiB default cap, not the ~0.5–0.6 MB first estimated) | `circuits/recursion/docs/02-aggregate.md` |
+| tree, test profile as first built (circuits docs/08 §5, 2026-10-09, 48 GB laptop; before rVM phase 4, which put the test steps at tier 18 — no memory figure since) | leaf `rv32n` L = 1: 169 640 rows, tier 18; step `rv32t_leaf`: 287 107 rows, tier 19, 280 133–280 772 bytes, **34.35 GB** max RSS, 177 s; root `rv32t_int`: 306 985 rows, tier 19, 283 172 bytes, **33.21 GB**, 182 s | circuits `recursion/tests/tree.rs`, `docs/measurements/2026-10-09-tree-test-fixtures-laptop.log` |
+| tree, production | step `rv32t_leaf` at the production leaf shape **508 735 rows, rVM tier 19, emulated** on the vendored build (circuits docs/10 §4; 1 294 577 rows, tier 21 in docs/08 §3, before rVM phases 4 and 5); proved leaf/step/root rows, memory and times **pending (droplet)** | circuits `recursion/tests/tree_measure.rs` |
 | the interface conformance vectors | `inner_vk_digest` `33a94ec6…92a1c8`, the 115-word bound list (AGG-2; the stand-in binding of `circuits/recursion/docs/02-aggregate.md`), digest `9833ac5b…fdc868e` — reproduced byte-for-byte by the fullnode's recompute | the conformance suite (`agg_executor.rs`) |
 
 ### The one capstone walk-through
@@ -729,11 +787,13 @@ with an `aggregation` section.
 
 **Enforced at genesis (2026-09-28, IFACE-9).** `Genesis::validate` now refuses an admitted shape
 that is not the bundle header every accepted bundle carries — tier 14, no keccak or sha256 table,
-public height 4 (`BUNDLE_PROOF_TIER`, `BUNDLE_PUBLIC_LOG_HEIGHT` in core, pinned to the zkVM's
-own numbers by an `agg_executor` test) — and `rand-node genesis` refuses one the rVM cannot build
+the bundle's public height (`BUNDLE_PROOF_TIER`, `BUNDLE_PUBLIC_LOG_HEIGHT` in core, pinned to the zkVM's
+own numbers by an `agg_executor` test; the height was 4 when this was written and is 7 today) — and `rand-node genesis` refuses one the rVM cannot build
 an inner verifier key for (`InnerShape::try_of`, via `agg_executor::check_admitted_shape`).
-`deploy/cut-chain9-genesis.sh`'s default public height is 4 accordingly; the program, input and
-mem heights are still the re-measurement above.
+`deploy/cut-chain9-genesis.sh`'s default public height was set to 4 accordingly and is still 4,
+which today's validation refuses; that script is chain 9's record, and a cut with aggregation
+starts from the re-measurement above (the open list's item (c)), program, input and mem heights
+included.
 
 Related: `docs/block-space.md` (the numbers and the three remedies), `docs/fees.md`,
 `docs/supply.md`, `docs/staking.md`, `docs/zkvm.md`.

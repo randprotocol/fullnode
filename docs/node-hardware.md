@@ -241,13 +241,113 @@ A wallet that cannot hold that peak can hand the bundle proof to a delegated pro
 
 ## 4. Aggregator
 
-An aggregator proves one rVM STARK over N bundle proofs and submits it for a sealing window. It
-needs only an RPC endpoint and a registered aggregator key. It runs only on a chain whose genesis
-carries an `aggregation` section; none does today.
+An aggregator proves one rVM STARK over N bundle proofs (or a tree of them) and submits it for a
+sealing window. It needs only an RPC endpoint and a registered aggregator key. It runs only on a
+chain whose genesis carries an `aggregation` section; none does, and `rand-node` refuses to start
+on one (`node::check_build_runs_genesis`; [`aggregation.md`](aggregation.md#before-enabling-aggregation)).
 
-Measured 2026-09-30/10-01 on a 64-vCPU, 503 GB droplet (constraint set 8, circuits `feat/issue-45`
-`d38d6cf`, peak RSS from `/usr/bin/time -v`; issue #45). Every peak is 4–8× what earlier docs
-derived from the trace sizes.
+**The state on 2026-11-18 (issue #119).** No production-profile aggregate has been proved since
+constraint set 8 (2026-09-30). For the build this repository vendors, every production row count
+is emulated or counted and every production memory figure is a projection. The constraint-set-8
+runs (§4.3) are the only production-scale measurements that exist. The "≥ 512 GB host" they led
+to is outdated, since the same aggregate is three rVM tiers lower now, but it is not disproven:
+nothing has been run to replace it.
+
+An "rVM tier" in this section is the recursion machine's, sized in rows. It is not the RV32
+zkVM's tier of §5, sized in cycles: the 92.9 GiB tier-18 msauth proof of §9 is an RV32 proof and
+says nothing about an rVM tier-18 aggregate.
+
+### 4.1 The vendored build: rows, tiers and projected memory
+
+The build is circuits `b3e21d9` (`CIRCUITS_PIN` in `.github/workflows/ci.yml`): constraint set 9,
+rVM phase 5, the rVM's own proofs at rate ¼ (92 queries, 24 grinding bits). Its production
+aggregate program digest is `792a66d4…a982`, and the node admits rVM tiers {18, 19, 20, 21} at
+production and {18, 19, 20} at the test profile (`agg_executor::admitted_tiers`). Circuits `main`
+is constraint set 10, which adds 7 rows an inner proof, moves no tier and moves the production
+digest to `a3d5c38b…83d3` (circuits `recursion/docs/10-phase5-n2-tier19.md`, "Constraint set
+10"). That re-vendor is a chain cut and is not done (issue #166); the numbers here are the
+vendored build's.
+
+| production aggregate | cpu rows | rVM tier | the rows are | peak memory |
+|---|---:|---:|---|---|
+| flat, N = 1 | 235 744 | 18 | emulated | **not measured**; projected ≈ 32–75 GB (below) |
+| flat, N = 2 | 471 105 | 19 | emulated | not measured; no projection at this tier |
+| flat, N = 3 | 706 466 | 20 | emulated | not measured; no projection at this tier |
+| flat, N = 4 | ≈ 941 827 | 20 | arithmetic (235 361 rows a further proof) | not measured; no projection at this tier |
+| flat, N = 5, the rVM's ceiling | ≈ 1 177 188 | 21 | arithmetic | not measured; no projection at this tier |
+| tree leaf, `rv32n`, L = 2 | 471 105 | 19 | emulated | not measured |
+| tree step, `rv32t_leaf` | 508 735 (band 432 420 … 585 040) | 19 (the band's top is tier 20) | emulated | not measured (below) |
+| tree root and any deeper level | not known | not known | the fixed-point level needs a proved production depth-2 tree | not measured |
+
+Source: circuits `recursion/docs/10-phase5-n2-tier19.md` §4 and §6. The test profile on the same
+build: N = 1 / 2 / 3 at 88 486 / 176 589 / 264 692 rows, tiers 18 / 18 / 19; the test tree's
+`rv32t_leaf` step 149 586 rows, tier 18.
+
+**The projection for production N = 1, and the host it asks for.** Three circuits records, oldest
+first; none is a measurement:
+
+- `docs/07` §4 (rate ¼, 2026-10-08, N = 1 then at tier 20): ≈ 64–75 GB, "a ≥ 96 GB host".
+- `docs/09` §5 (phase 4, 2026-10-11, N = 1 then at tier 19): the cpu-sized terms halve and the
+  RAM table does not, so ≈ 32–38 GB is a floor and `docs/07`'s range a ceiling: ≈ 32–75 GB. It
+  names no host class ("a measurement for a larger host, not this record's claim").
+- `docs/10` §6 (phase 5, 2026-10-12, N = 1 now at tier 18; the newest): no number. "At tier 18
+  the cpu table and every term sized by it halve again, while the RAM table does not.
+  Production memory stays a projection until a proof runs on a larger host."
+
+So the current projection is **≈ 32–75 GB**, a range computed one tier higher than the proof now
+sits, and the host that follows from it is **≥ 96 GB**: the only class a circuits record names,
+for the range's top. Both are projections. Of the DigitalOcean sizes this page names, the 128 GB
+`m-16vcpu-128gb` is the smallest above it.
+
+**N = 2 to 5.** `docs/07` §4 projected N = 2 at ≈ 122–142 GB (≥ 192 GB), N = 3 at ≈ 168–197 GB
+(≥ 256 GB) and N = 4 at ≈ 238–284 GB (≥ 384 GB), at the tiers of that day (21, 21, 22). Those
+aggregates are tiers 19, 20 and 20 on the vendored build and no record re-projects them, so this
+page gives no host class for N ≥ 2. Production N ≤ 5 is the rVM's ceiling (the reduce chip,
+`docs/aggregation.md`): the node refuses a larger aggregate by name.
+
+**The tree.** Two circuits records disagree on the step's tier, and the newer one is right for
+this build. `docs/08` §3 and §8 (2026-10-09) put the production leaf and step at tier 21
+(1 171 511 and 1 294 577 rows), project a tier-21 proof at ≈ 122–197 GB and name the **256 GB
+droplet**, one proving process at a time. `docs/10` §4 (2026-10-12, newer) puts the leaf at
+471 105 rows and the step at 508 735, both tier 19, gives no memory figure for them, and still
+names "the 256 GB host" for the production tree (§5). So 256 GB is the host class on record for
+the tree's production leaf and step; what a tier-19 step needs has not been projected or
+measured.
+
+The GPU backend changes none of this: the traces live in host memory. Threads change wall time
+only (4.7× on 16 threads at tier 16 with the peak heap unchanged).
+
+### 4.2 The latest measurements (test profile only)
+
+All on the 48 GB laptop, 16 threads. "Peak live heap" is the heap profiler's count
+(`tests/memprofile.rs`), which is lower than the process's maximum RSS: the tier-18 test leaf
+that read 15.64 GB live read 21.39 GB maximum RSS (circuits `docs/08` §5). macOS RSS alone is
+never a memory number here; it excludes compressed pages.
+
+| what was proved | circuits | rows, rVM tier | measured |
+|---|---|---|---|
+| the exit twin, the test N = 1 aggregate's shape | `d155616` (phase 4, before the MODQ chip of constraint set 9), 2026-10-11 | 104 150, tier 18 | **17.19 GB peak live heap** (16.75 GB at the base `c83b1c7`, 169 366 rows; the +0.44 GB not traced, one run a side) |
+| the same twin, at rate ¼ | `2fbd45b`, 2026-10-08 | 169 366, tier 18 | 15.64 GB peak live heap |
+| the test N = 2 aggregate | phase 4, 2026-10-11 | 208 571, tier 18 | proved and verified; no heap figure printed |
+| the test tree's step and root | the tree branch (`92b750e`), 2026-10-09, before phase 4 | 287 107 and 306 985, tier 19 | **34.35 GB** and **33.21 GB** process maximum RSS |
+
+Not measured on the vendored build (phase 5, `b3e21d9`): the twin, the tier-16 synthetic and the
+test N = 2 aggregate are "pending operator run" in circuits `docs/10` §8, and the test tree's
+fixtures (steps at tier 18 since phase 4) wait on a regeneration that `docs/10` §5 sizes at
+≈ 34 GB. The phase-4 re-proof of the test tree (2026-10-11) recorded no memory figure. What the
+measurements do show: a 48 GB machine has run every test-profile aggregate tried on it since
+rate ¼, flat and tree.
+
+Sources: circuits `recursion/docs/07-rvm-rate-quarter.md` §3, `08-tree-aggregation.md` §5,
+`09-phase4-spans.md` §4.
+
+### 4.3 History: constraint set 8, measured, and the projections since
+
+**Measured at constraint set 8, circuits `feat/issue-45` `d38d6cf`; superseded.** 2026-09-30 and
+10-01, a 64-vCPU, 503 GB droplet, peak RSS from `/usr/bin/time -v` (issue #45). These are the
+only production-scale proofs ever run. Every peak was 4–8× what earlier docs derived from the
+trace sizes, and the runs proved single-threaded (the recursion crate had no `parallel` feature
+before circuits `75b7893`), so the walls are single-core walls.
 
 | aggregate | tier | cpu rows | prove | verify | proof | peak RSS |
 |---|---|---|---|---|---|---|
@@ -258,71 +358,32 @@ derived from the trace sizes.
 | production, N=2 | 22 | 4 094 675 (2.4 % under 2²²) | not attempted | | | ~750 GB estimated |
 | production, N=3 | 23 | 6 141 808 | not attempted | | | over 1 TB estimated |
 
-What it means for hardware:
-
-- **A production aggregator needed a ≥ 512 GB host** for N = 1 at constraint set 8, the smallest
-  useful aggregate (measured); ≈ 240 GB projected after the phase-2 row cuts and ≈ 170–175 GB
-  after the quotient layout, so a ≥ 256 GB host (below), a projection until the tier-20 proof runs.
-  The earlier "≥ 64 GB" class came from a 48.6 GB oracle that the measurement disproved.
-- **rVM phase 3 and rate ¼ (circuits `71e1a04`, vendored 2026-10-08).** Measured on the
-  test profile (48 GB laptop, 16 threads, circuits `recursion/docs/06` §3 and `docs/07` §2): the
-  tier-18 exit twin (169 366 cpu rows, the test N = 1 aggregate's shape) peaks at **26.88 GB**
-  live after phase 3 and **15.64 GB** at rate ¼ (×0.58), verify 7.07 → 3.53 s; the test N = 2
-  aggregate (tier 19) **proved and verified** on that 48 GB host. Projected from the twin's ratio
-  (projections, nothing at production measured): production N = 1 (tier 20) ≈ 110–130 GB at
-  phase 3 → **≈ 64–75 GB at rate ¼, a ≥ 96 GB host**; N = 2 (tier 21) ≈ 122–142 GB (≥ 192 GB);
-  N = 3 (tier 21) ≈ 168–197 GB (≥ 256 GB); N = 4 (tier 22) ≈ 238–284 GB (≥ 384 GB). The ≤ 64 GB
-  class is at the edge, not met. **Production N ≤ 5** is the rVM's ceiling at this tree (the
-  reduce chip, `docs/aggregation.md`): no aggregate over more than five production bundle proofs
-  can be proved or verified, and the node refuses one by name.
-- **N ≥ 2 at production did not fit any single CPU host** on offer at constraint set 8 (the
-  projections above bring N = 2 under 192 GB; unproved), and the GPU backend does not
-  change that: the traces live in host memory. Aggregating more than one proof needs a design
-  change (smaller inner proofs, a different recursion layout, or trace streaming), tracked in
-  issue #119 with the remaining soundness item.
-- These runs proved single-threaded (the recursion crate had no `parallel` feature before circuits `75b7893`), so the 64 vCPUs ran several proofs side by side; the walls above are single-core walls.
+At that constraint set a production aggregator was a ≥ 512 GB host for N = 1, and N ≥ 2 fitted
+no single host. Issue #119 recorded both. Neither describes the vendored build: production N = 1
+is 235 744 rows where it was 2 047 542, and N = 2 is a tier-19 proof where it was tier 22. The
+earlier "≥ 64 GB" class came from a 48.6 GB oracle that these runs disproved.
 
 Sources: `circuits/recursion/docs/02-aggregate.md` ("Constraint set 8, proved"), the #45 closing
 comment, `~/rand-agg-512-results/` on the operator's laptop (all 24 step logs).
 
-**Phase 2 row cuts (circuits `75b7893`, 2026-10-04; `recursion/docs/04-phase2-row-cuts.md`).**
-Three cuts to the inner verifier (hint rows into the sponge buffers, `HINTN`, `COMPRESS`) take the
-production inner proof from 2 047 268 to 893 606 cpu rows, so every rung above lands one tier
-lower. Nothing in this table is a measured proof yet: the memory column weights the
-constraint-set-8 peaks by committed cells, calibrated on a tier-19 live-heap trace
-(`tests/memprofile.rs`, 78.7 GB live when the 48 GB laptop killed it), and the tier-20 production
-proof has not run on a big host.
+**What changed since, in order.** Each row's production figure was a projection when written and
+none was ever run; the test-twin column is measured (peak live heap, 48 GB laptop).
 
-| aggregate | tier (was) | cpu rows | projected peak | after the quotient layout (below) | measured anchor (constraint set 8) |
-|---|---|---|---|---|---|
-| test profile, N=1 | 18 (19) | 231 224 | ≈ 50 GB | **33.27 GB peak live, measured** (the tier-18 twin, 230 950 rows) | 94.5 GB at tier 19 |
-| test profile, N=2 | 19 (20) | 462 039 | — | — | 183.7 GB at tier 20 |
-| test profile, N=3 | 20 (21) | 692 854 | — | — | 221.0 GB at tier 21 |
-| production, N=1 | **20** (21) | 893 880 | ≈ 240 GB | **≈ 170–175 GB**, projected | 376.9 GB at tier 21 |
-| production, N=2 | 21 (22) | 1 787 351 | ≈ 475 GB | — | — |
-| production, N=4 | 22 (23) | 3 574 293 | ≈ 950 GB | — | — |
+| change (circuits) | production N = 1 | projected for production N = 1 | the test twin, measured |
+|---|---|---|---|
+| constraint set 8 (`d38d6cf`) | 2 047 542 rows, tier 21 | 376.9 GB peak RSS, **measured** | 94.5 GB peak RSS (the test N = 1 aggregate, tier 19, the droplet) |
+| phase 2 row cuts (`75b7893`, 2026-10-04) | 893 880 rows, tier 20 | ≈ 240 GB, a ≥ 256 GB host | — (a tier-19 trace held 78.7 GB live when the laptop killed it) |
+| quotient layout (`5ff7676`, 2026-10-05) | unchanged | ≈ 170–175 GB | 33.27 GB (230 950 rows, tier 18) |
+| phase 3 (in `71e1a04`, 2026-10-08) | one inner verification 585 686 rows, tier 20 | ≈ 110–130 GB | 26.88 GB (169 366 rows) |
+| rate ¼ (`71e1a04`, 2026-10-08) | unchanged | ≈ 64–75 GB, a ≥ 96 GB host | 15.64 GB |
+| phase 4, Merkle spans (`d155616`; vendored with the MODQ chip at `d217252`, 2026-10-11) | 316 279 rows (315 718 with the MODQ chip), tier 19 | ≈ 32–75 GB | 16.75 → 17.19 GB (104 150 rows) |
+| phase 5 (`b3e21d9`, vendored 2026-10-15; the build today) | 235 744 rows, tier 18 | no new figure | pending operator run |
 
-So the production N = 1 aggregator is a **≥ 256 GB host** (`m-32vcpu-256gb` is DigitalOcean's
-largest memory droplet), down from ≥ 512 GB — tight after the phase-2 cuts, with room after the
-quotient layout (below); N ≥ 2 still fits no single host. The rest is structural — the register
-table, the blowup — and is listed in
-`docs/compute-optimization.md` §4.1. The rVM also has Plonky3's `parallel` feature now (the same
-two patched crates the prover uses): 4.7× on 16 threads at tier 16 with the peak heap unchanged,
-so threads are a wall-time lever only. The macOS RSS figures the September docs quoted (15–30 GB)
-measured compressed memory, not the working set; only Linux peaks count here. The node admits
-tiers {20, 21, 22} production and {18, 19, 20} test (`agg_executor.rs`).
+The details of each step are in `docs/compute-optimization.md` §4.1 and circuits
+`recursion/docs/04` to `10`; the pins each one moved are in
+[`aggregation.md`](aggregation.md#before-enabling-aggregation), item 3.
 
-**Quotient layout (circuits `5ff7676`, 2026-10-05; `recursion/docs/05-quotient-layout.md`).** The
-rVM commits each instance's quotient chunks as one matrix (a vendored `p3-batch-stark` fork,
-`vendor/p3-batch-stark`; the RV32 wallet machine keeps upstream's per-chunk layout). Measured on
-the 48 GB laptop (peak live heap, the allocator's count, not RSS): the tier-16 synthetic's peak
-9.09 → 6.41 GB (−29 %), prove 40.7 → 32.9 s, proof −19 %; the tier-18 exit twin — the test-profile
-N=1 aggregate's shape, 230 950 rows — proved at **33.27 GB peak live** in 185 s on 16 threads, so a
-**64 GB host runs the test-profile N=1 aggregate with margin** (measured; it replaces the ≈ 50 GB
-projection above). The production N=1 projection moves ≈ 240 → **≈ 170–175 GB** (the tier-16
-ratio ×0.705 and the derived tier-18 quotient-phase ratio ×0.73 applied to 240 GB): a projection
-until the tier-20 production proof runs on a ≥ 256 GB host. The aggregate program digest and the
-admission vectors did not move.
+### 4.4 Setup
 
 Setup, on a chain with an `aggregation` section (`docs/cli.md`, `docs/deploy.md`):
 
@@ -347,12 +408,13 @@ figures below were measured on the single-core build.
 | 14 | 16 383 | the bundle (wallet, test profile) | 5.74 GB whole `rand call` (live provers: 6.2 GB per bundle, 2026-10-27) | 97.0 s | production: 92.2–96.0 s and 1 418 406–1 420 423-byte proofs (chain 13, laptop); memory of the bundle alone not measured yet |
 | 16 | 65 535 | ERC-20 `approve`, translated | test profile, DigitalOcean: 21.7 GB. Production, laptop: 22.9 GB peak RSS for the whole `rand call` | test profile: 786.7 s (13.1 min). Production: 388.7 s | production: proved and committed on chain 13, 3 412 405-byte proof |
 | 18 | 262 143 | ERC-20, about 66 k–162 k cycles | OOM-killed on a 48 GB laptop at 24.7 GB. On a 64 GB droplet: above 47 GB at 25 min, still running | killed after 1 016 s on the laptop | translated `transfer`: 85.0 GB, 3 230.5 s (53.8 min), 811 600 B proof. Interpreter `evm.bin`: 85.5 GB, 3 143.3 s (52.4 min), 805 108 B proof. Verify: 101.4 s (droplet), 50.2 s at 3.66 GB RSS (laptop). Measured on m-16vcpu-128gb, 2026-09-19 |
-| 19 (rVM) | — | rVM aggregate, N=1, test profile (constraint set 8) | **94.5 GB peak RSS** (Linux, 503 GB droplet). The "about 30 GB" quoted before was macOS RSS, which excludes compressed pages | 1568.2 s (loaded shared box); 2 034.6 s (droplet, whole test binary) | after the phase-2 row cuts the same proof is tier 18; after the quotient layout it proved at 33.27 GB peak live heap on the 48 GB laptop (§4) |
+| 19 (rVM) | — | rVM aggregate, N=1, test profile (constraint set 8) | **94.5 GB peak RSS** (Linux, 503 GB droplet). The "about 30 GB" quoted before was macOS RSS, which excludes compressed pages | 1568.2 s (loaded shared box); 2 034.6 s (droplet, whole test binary) | superseded: on the vendored build (rVM phase 5) the same aggregate is 88 486 rows at rVM tier 18. The newest measurement of its shape is the phase-4 exit twin, 17.19 GB peak live heap on the 48 GB laptop (§4.2); not re-measured at phase 5 |
 | 20 | 1 048 575 | SPL Token, about 700 k–770 k cycles | stopped on a 48 GB laptop at about 31 GB (30.77 GB peak footprint); OOM-killed on a 64 GB droplet at 65.1 GB | 10 m 41 s on the droplet before the kill | not yet proven. Extrapolated from the measured tier-16/18 scaling (memory about ×3.9, time about ×4.1 per +2 tiers): about 330 GB and about 3.6 h, more than DigitalOcean's largest memory droplet (m-32vcpu-256gb, 256 GB) |
-| 21 (rVM) | — | rVM aggregate, N=1, production (constraint set 8) | **376.9 GB peak RSS** (the 48.6 GB oracle counted one of four memory terms) | 8 131.3 s | §4; after the phase-2 row cuts the same proof is tier 20, projected ≈ 240 GB (≈ 170–175 GB after the quotient layout), not yet run |
+| 21 (rVM) | — | rVM aggregate, N=1, production (constraint set 8) | **376.9 GB peak RSS** (the 48.6 GB oracle counted one of four memory terms) | 8 131.3 s | the only production aggregate ever proved; superseded, not re-measured. On the vendored build the same aggregate is 235 744 rows at rVM tier 18, projected ≈ 32–75 GB, not yet run (§4.1) |
 
 The cycle column is `2^t − 1` for the RV32 zkVM (`docs/confidential.md`). The rVM (the
-recursion machine) has its own tiers, sized in rows (`docs/zkvm-m4-m5-progress.md`). The tier-18 and tier-20 laptop runs used
+recursion machine) has its own tiers, sized in rows (`docs/zkvm-m4-m5-progress.md`); the two
+rVM rows are constraint set 8's measurements, kept as history, and §4 has the current state. The tier-18 and tier-20 laptop runs used
 `FriProfile::Test` (circuits `evm2rv/README.md`, `sbpf2rv/README.md`).
 
 ### DigitalOcean sizes for proving
@@ -362,7 +424,8 @@ recursion machine) has its own tiers, sized in rows (`docs/zkvm-m4-m5-progress.m
 | a tier-14 bundle (any wallet) | any machine with more than 6.2 GB free (test profile) | measured |
 | tier 18 | a 128 GB droplet (size slug `m-16vcpu-128gb`, Memory-Optimized, 16 vCPU). OOM-killed on a 64 GB droplet (`g-16vcpu-64gb`) at 65.1 GB after 32 min | measured: 85.0 GB (translated) / 85.5 GB (interpreted) peak RSS, 3 230.5 s / 3 143.3 s |
 | tier 20 | more than 64 GB. OOM-killed on a 64 GB droplet (`g-16vcpu-64gb`) at 65.1 GB after 10 m 41 s | not yet proven; extrapolated at about 330 GB and about 3.6 h (see §5), more than DigitalOcean's largest memory droplet (m-32vcpu-256gb, 256 GB) |
-| aggregate N=1, production | a 503 GB droplet at constraint set 8 (376.9 GB peak); ≥ 256 GB projected after the phase-2 row cuts (`m-32vcpu-256gb`; ≈ 170–175 GB projected after the quotient layout, so with room) | measured at constraint set 8 (§4); the tier-20 proof not yet run |
+| aggregate N=1, production | ≥ 96 GB, projected (≈ 32–75 GB projected peak, §4.1); of the sizes in this table the 128 GB `m-16vcpu-128gb` is the smallest above it | not measured on the vendored build (rVM tier 18, 235 744 rows). The one measurement is constraint set 8's: 376.9 GB peak on a 503 GB droplet, the proof then at rVM tier 21 (§4.3); superseded, not re-measured |
+| aggregation tree, production leaf and step | the 256 GB droplet (`m-32vcpu-256gb`), projected when the steps were rVM tier 21; they are tier 19 on the vendored build and not re-projected (§4.1) | not measured |
 
 No proof above tier 14 is part of normal chain operation today. Tier 18 and 20 matter for calls to
 the translated ERC-20 and SPL Token programs ([`translators.md`](translators.md#7-what-works-on-chain-today)).

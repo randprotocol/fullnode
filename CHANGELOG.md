@@ -108,6 +108,24 @@ Deploy and records (audit v14 addendum rows; no node code, no host touched):
   on 2026-11-06 (M = 3, tier 18, 3.7 MB, 69 minutes, peak RSS 92.9 GiB ≈ 99.7 GB): at least
   128 GB. It has not been submitted on chain 21 by a wallet flow; the logs are the operator's.
 
+Docs (issue #119, AGG-E2E-2; no code change):
+
+- **Aggregation's memory figures lead with the vendored build, not with constraint set 8.**
+  `docs/node-hardware.md` §4 (and its §5 and DigitalOcean tables) and `docs/aggregation.md`
+  ("Before enabling aggregation", §1, §3.8, §6) led with the constraint-set-8 measurements
+  (376.9 GB for a production N = 1 aggregate, so "≥ 512 GB"; ~750 GB and over 1 TB estimated for
+  N = 2 and 3) and appended later projections piecemeal. They now state first what holds for the
+  build vendored today (circuits `b3e21d9`, constraint set 9, rVM phase 5): production N = 1 / 2
+  / 3 at 235 744 / 471 105 / 706 466 rows, rVM tiers 18 / 19 / 20, and the tree's production
+  leaf and step at tier 19, all by emulation; N = 1 projected at ≈ 32–75 GB (a ≥ 96 GB host);
+  the 256 GB droplet as the tree's class on record, projected when its steps were tier 21. No
+  production aggregate has been proved since constraint set 8, so those runs stay in the docs as
+  labelled history: superseded, not re-measured, and "≥ 512 GB" outdated rather than disproven.
+  `docs/aggregation.md` gains a short "What is still open" list (the targeted forgery, still not
+  built; one measured production-profile run; the bundle shape and `aggregate_program_digest` on
+  the build that cuts, which constraint set 10 moves from `792a66d4…` to `a3d5c38b…`, issue
+  #166). `docs/deploy.md`, `docs/compute-optimization.md` and `README.md` follow.
+
 ## v0.8.6 — 2026-11-08 (chain 21, node-only; audit v13 rows; no wire, storage-format or consensus change; rolled 2026-11-09)
 
 Rolled 2026-11-09 00:16–02:22 UTC, one host at a time: tag `6591c884` (tagged 2026-11-08 19:20 UTC),

@@ -433,9 +433,11 @@ perpetual-futures exchange behind the `perps` genesis section, unreleased and on
 Next:
 - **Mainnet (v1.0)**, with a fresh genesis and a network marker that makes archive rules into
   consensus rules.
-- **Block aggregation**, off on every chain today. It still needs the end-to-end
-  forged-aggregate exercise (#45), and the production rVM proofs need more than 256 GB of memory
-  under constraint sets 7–8, which the aggregator machine class has to account for.
+- **Block aggregation**, off on every chain today. Still open (#119; `docs/aggregation.md`,
+  "What is still open"): a targeted forgery against the unfixed rVM was never built, no
+  production aggregate has been proved since constraint set 8 (376.9 GB then; ≈ 32–75 GB
+  projected for N = 1 on the build vendored today, unmeasured), and the bundle shape and
+  aggregate digest are taken on the build that cuts.
 - Slashing beyond leader equivocation (vote equivocation is logged, not slashed), and slashing
   stake bonded from a vesting lock (audit v6 STAKE-1 built leader-equivocation slashing and
   jailing behind the genesis `staking.slashing` section — chain 20 does not set it, because one
