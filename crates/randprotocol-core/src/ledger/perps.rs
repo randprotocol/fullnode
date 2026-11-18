@@ -4027,6 +4027,58 @@ pub(crate) mod tests {
         assert_eq!(open.perps().unwrap().pending_digests(), 40);
     }
 
+    /// PERP-5, the apply side alone (audit v13: the test above reaches `apply` only through
+    /// `Ledger::apply_tx`, whose `validate` refuses first, so it stayed green with the apply
+    /// step's own check removed). Here the section's apply step is called directly, as a block's
+    /// application reaches it, on a log at its cap: each of the four input kinds is refused
+    /// `DigestLogFull` and writes nothing, so a block carrying an input past the cap cannot
+    /// apply whatever its proposer validated. An oracle price and a state proof are not inputs
+    /// and still apply — the proof is what drains the log. Off (chain 21's rule), the same
+    /// direct applies all succeed.
+    #[test]
+    fn perp5_the_apply_step_itself_refuses_an_input_on_a_full_log() {
+        let k = kp(50);
+        let direct = |l: &mut Ledger, tx: &Transaction| super::apply(l, tx, &tx.action, &StubExecutor);
+        let filled = |cap: u64| {
+            let mut l = if cap == 0 { sparse_ledger() } else { capped_ledger(cap) };
+            for h in 1..=8u64 {
+                dep(&mut l, &k, 10 * h as u32, RAND).unwrap();
+                close(&mut l, h);
+            }
+            l.set_height(9);
+            l
+        };
+        let inputs = |l: &Ledger| {
+            vec![
+                ("deposit", deposit(l, &k, 999, RAND)),
+                ("order", order(&k, body(1))),
+                ("cancel", bare(signed(CHAIN, &k, Action::PerpCancel { account: id(&k), nonce: 2, target: 2, signature: Signature::empty() }))),
+                ("withdraw", bare(signed(CHAIN, &k, withdraw(&k, 3, 5, 9)))),
+            ]
+        };
+        let full = filled(8);
+        assert_eq!(full.perps().unwrap().pending_digests(), 8, "at the cap");
+        for (name, tx) in inputs(&full) {
+            let mut l = full.clone();
+            assert_eq!(direct(&mut l, &tx), Err(pe(PerpError::DigestLogFull { pending: 8, max: 8 })), "{name}");
+            assert!(l == full, "{name}: nothing written");
+        }
+        // Not inputs: an oracle price applies, and a state proof applies and drains the log.
+        let mut l = full.clone();
+        direct(&mut l, &oracle(&kp(1), &[(0, 2_000_000)], 1)).expect("an oracle price is not an input");
+        let proof = sparse_state_proof(&l, 0, 8, vec![]);
+        direct(&mut l, &proof).expect("a state proof is not an input");
+        assert_eq!(l.perps().unwrap().pending_digests(), 0);
+        for (name, tx) in inputs(&l) {
+            direct(&mut l.clone(), &tx).unwrap_or_else(|e| panic!("{name}: room again, {e:?}"));
+        }
+        // Without the field the same log refuses nothing.
+        let open = filled(0);
+        for (name, tx) in inputs(&open) {
+            direct(&mut open.clone(), &tx).unwrap_or_else(|e| panic!("{name}: no cap, {e:?}"));
+        }
+    }
+
     /// CON-60: under the genesis `engine_program_log_height` pin a state proof declaring another
     /// program height, or a keccak or sha256 table, is refused from its header — the stub would
     /// verify each of them, so the refusal is the ledger's, before the executor (and its key
