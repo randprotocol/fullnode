@@ -76,6 +76,64 @@ harmless ceiling) and restart `rand-prover-router`.
   prover wire — then every member needs that build's `rand-prover` (`TAG=… WANT_SHA_PROVER=…
   install-host.sh`), both `a` and `b` before the pool is used on the new chain.
 
+## Retired keys (VK-9)
+
+| key | what it was | pinned by | retired |
+|---|---|---|---|
+| `RGTF-7HKJ-XZFV-GQ1J` | the key every machine shared | wallet 0.6.8 | 2026-10-01 |
+| `ZEXQ-1JHV-ZT60-KFB5` | member `a` | wallets 0.6.9–0.8.0 | 2026-10-22 |
+| `D2XV-WXVT-PZRC-D7G8` | member `archive2` | wallets 0.6.9–0.8.0 | 2026-10-22 |
+| `SR28-MYT0-GR6A-03DE` | member `nyc3` | wallets 0.6.9–0.8.0 | 2026-10-22 |
+| `GMNX-Q1QD-FEXG-JHJM` | member `sfo3` | wallets 0.6.9–0.8.0 | 2026-10-22 |
+
+**What cannot be done.** A released wallet's pins are compiled in. Nothing the pool serves, and
+nothing a later release does, removes a pin from a wallet 0.6.9–0.8.0 that someone still runs: it
+goes on trusting those four keys at `https://prover.randprotocol.org/m/<name>` until it is
+updated. What that trust is worth to an attacker is bounded by two things, both the operator's:
+whoever holds a retired key's private half, and whoever can answer at that name over TLS. Such a
+wallet would then seal its viewing key (never its spend key) to them.
+
+**What is done.**
+
+- *The current releases refuse the keys.* `rand` carries the table above
+  (`crates/randprotocol-client/src/retired-provers.txt`) and neither stores a pairing with one of
+  those keys nor sends one anything, so a pairing file from before the retirement is refused at
+  the update; a CI test holds the list and the pinned pool apart. Add a line there (and the
+  matching entry in the wallets' list, randprotocol/clients) in the same change that retires a key.
+- *The pool says so.* The router answers `/m/archive2`, `/m/nyc3` and `/m/sfo3` with HTTP 410 and
+  the JSON-RPC error `-32010` "the RandProtocol prover '<name>' was retired … update Rand Wallet
+  (or rand) to the current release" (`PROVER_RETIRED`, default those three; `install-web.sh`
+  writes the nginx locations that pass them to the router). It refuses to start with a retired
+  name among `PROVER_MEMBERS`, so a retired name is never routed to a prover again. `a` kept its
+  name under a new key, so an old wallet asking `/m/a` gets the current `a`, sees another key
+  than its pin and uses nothing. **Wallets 0.6.9–0.8.0 do not show the pool's message**: they
+  report any failed member as "did not answer" and tell the user to try again later. The message
+  reaches `curl`, `rand`, and anyone reading the network tab — not those wallets' users.
+- *Wallets 0.8.2 and later* tell the user to update when a pinned member answers with another
+  key, so the next rotation is announced by the wallet itself.
+
+**What is the owner's** (not in any repository):
+
+1. Destroy the retired keys' private halves wherever a copy remains — the four members' hosts
+   (`/var/lib/rand-prover` on each, including any powered-off or snapshotted droplet) and any
+   operator copy — and record the date here.
+2. Keep `prover.randprotocol.org` (DNS and certificate) under the operator's control for as long
+   as a 0.6.9–0.8.0 wallet may be in use; never point `/m/archive2`, `/m/nyc3` or `/m/sfo3` at
+   anything.
+3. Publish the update notice (below) where wallet users are: the release page of the current
+   wallet, the site, and the stores' "what's new".
+4. Re-run `install-web.sh` so the web droplet carries the retired locations and `PROVER_RETIRED`.
+
+**The notice.**
+
+> Rand Wallet 0.6.9 to 0.8.0 pin four RandProtocol prover keys that were retired on 22 October
+> 2026. Those versions can no longer use the RandProtocol provers — a send that needs them says
+> the provers "cannot be reached" — and they still trust the retired keys. Update to the current
+> Rand Wallet (0.8.1 or later pins the current provers; from 0.8.2 the wallet tells you itself when
+> its pins are out of date). If you use the `rand` command line, update to 0.8.2 or later and run
+> `rand prover pair --trusted` again. Your funds are not at risk: a prover is only ever sent a
+> viewing key, never the key that spends.
+
 ## Files
 
 | file | where it runs | what it is |

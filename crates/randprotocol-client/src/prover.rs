@@ -81,6 +81,43 @@ pub fn trusted_provers() -> Result<Vec<TrustedProver>> {
     Ok(out)
 }
 
+/// RandProtocol prover keys that were retired (VK-9, monorepo#18): `<fingerprint> <date> <what>`
+/// per line. A wallet released before a key was retired still pins it and cannot be told
+/// otherwise; this list is what every release *after* the retirement carries, so an updated
+/// wallet refuses the key wherever it comes from — a pairing file written by an older `rand
+/// prover pair --trusted`, or a link someone hands it.
+pub const RETIRED_PROVERS: &str = include_str!("retired-provers.txt");
+
+/// One line of [`RETIRED_PROVERS`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RetiredProver {
+    pub fingerprint: String,
+    pub retired_on: String,
+    pub what: String,
+}
+
+/// The entry of `list` (the format of [`RETIRED_PROVERS`]) for `fingerprint`, if it is retired.
+pub fn retired_in(list: &str, fingerprint: &str) -> Option<RetiredProver> {
+    list.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')).find_map(|line| {
+        let mut it = line.splitn(3, ' ');
+        let (fp, on, what) = (it.next()?, it.next()?, it.next().unwrap_or(""));
+        (fp == fingerprint).then(|| RetiredProver { fingerprint: fp.to_string(), retired_on: on.to_string(), what: what.to_string() })
+    })
+}
+
+/// [`retired_in`] this build's [`RETIRED_PROVERS`].
+pub fn retired_prover(fingerprint: &str) -> Option<RetiredProver> {
+    retired_in(RETIRED_PROVERS, fingerprint)
+}
+
+/// The refusal for a retired key: what it was, since when, and what to do.
+pub fn retired_refusal(r: &RetiredProver) -> String {
+    format!(
+        "the prover key {} was retired on {} ({}): this wallet sends it nothing and keeps no pairing with it.          Run `rand prover pair --trusted` for the current RandProtocol provers, or pair your own prover",
+        r.fingerprint, r.retired_on, r.what
+    )
+}
+
 /// `--max-prover-fee`'s default: 1 RAND. A prover quoting more is refused before any bundle is
 /// built, whatever the command (review I-1: the quote is the prover's to set, at any time).
 pub const DEFAULT_MAX_PROVER_FEE: u64 = randprotocol_core::UNITS_PER_RAND;
@@ -173,6 +210,7 @@ impl PairedProver {
 
     /// Writes `<key>.prover.json`, mode 0600, replacing any earlier pairing (a re-pair).
     pub fn save(&self, key_file: &Path) -> Result<()> {
+        self.check_not_retired()?;
         let p = PairedProver::path_for(key_file);
         let tmp = p.with_extension("json.tmp");
         // As `Contacts::save`: a stale temp file keeps its own mode through `open(create)`, so it
@@ -222,16 +260,30 @@ impl PairedProver {
         shown(&self.url)
     }
 
+    /// Refuses a pairing whose key is on [`RETIRED_PROVERS`] (VK-9). Checked before a pairing is
+    /// stored and before anything is sent to the prover, so a pairing file an older release wrote
+    /// stops working at the update instead of going on trusting a key the pool no longer holds.
+    pub fn check_not_retired(&self) -> Result<()> {
+        match retired_prover(&self.fingerprint) {
+            Some(r) => Err(anyhow!(retired_refusal(&r))),
+            None => Ok(()),
+        }
+    }
+
     /// What `rand prover show` prints: everything but the token, the name and URL sanitised.
     pub fn show(&self) -> String {
-        format!(
+        let mut out = format!(
             "name: {}\nurl: {}\nfingerprint: {}\nown: {}\nkem_ek: {}",
             self.name.as_deref().map_or_else(|| "-".to_string(), shown),
             self.shown_url(),
             self.fingerprint,
             if self.own { "yes" } else { "no" },
             self.kem_ek
-        )
+        );
+        if let Some(r) = retired_prover(&self.fingerprint) {
+            out.push_str(&format!("\nRETIRED: {}", retired_refusal(&r)));
+        }
+        out
     }
 
     /// What `rand prover pair` shows before it asks (VK-4, audit v6): who is being paired — the
@@ -475,6 +527,8 @@ impl RemoteProver {
         let info = self
             .info
             .get_or_try_init(|| async {
+                // Before any request: a retired key is not asked anything (VK-9).
+                self.paired.check_not_retired()?;
                 let info = self.call("prover_info", json!([])).await?;
                 let got = info["kem_fingerprint"].as_str().unwrap_or("");
                 if got != self.paired.fingerprint {
@@ -509,6 +563,7 @@ impl RemoteProver {
         if *hc != ZkExecutor::hc_hidden_bundle_v3() {
             return Err(anyhow!(PRE_V3_REFUSAL));
         }
+        self.paired.check_not_retired()?;
         let witness_kind = WitnessKind::ViewingKey;
         // What this prover can then see, once, before anything is sent — whatever its pairing's
         // `own` says.
@@ -1176,6 +1231,63 @@ mod tests {
         let link = PairingLink { kem_ek: key.kem_ek().to_vec(), url, token: [9; 32], own: true };
         let e = prove(&quick(PairedProver::from_link(&link, None)), 1000).await.unwrap_err().to_string();
         assert!(e.contains("busy") && e.contains('8'), "{e}");
+    }
+
+    /// VK-9 (monorepo#18): the retired pool keys — the shared key and the four members wallets
+    /// 0.6.9 to 0.8.0 pinned — are on this build's list, none of them is a current member, and
+    /// the list is read as written: a comment or a prefix names nothing.
+    #[test]
+    fn the_retired_pool_keys_are_listed_and_none_is_pinned() {
+        let retired = ["RGTF-7HKJ-XZFV-GQ1J", "ZEXQ-1JHV-ZT60-KFB5", "D2XV-WXVT-PZRC-D7G8", "SR28-MYT0-GR6A-03DE", "GMNX-Q1QD-FEXG-JHJM"];
+        for fp in retired {
+            let r = retired_prover(fp).unwrap_or_else(|| panic!("{fp} is not on the retired list"));
+            assert!(r.retired_on.starts_with("2026-10-"), "{fp}: {r:?}");
+            assert!(!TRUSTED_PROVERS.contains(fp), "{fp} is retired and still pinned");
+            let m = retired_refusal(&r);
+            assert!(m.contains(fp) && m.contains("retired on") && m.contains("rand prover pair --trusted"), "{m}");
+        }
+        for m in trusted_provers().unwrap() {
+            assert_eq!(retired_prover(&m.fingerprint), None, "member {} is on the retired list", m.name);
+        }
+        assert_eq!(retired_prover("RGTF-7HKJ-XZFV"), None, "a prefix is not a key");
+        assert_eq!(retired_prover("#"), None);
+        assert_eq!(retired_in("# AAAA-BBBB-CCCC-DDDD 2026-01-01 a comment\nAAAA-BBBB-CCCC-EEEE 2026-01-02 one  key\n", "AAAA-BBBB-CCCC-DDDD"), None);
+        assert_eq!(
+            retired_in("AAAA-BBBB-CCCC-EEEE 2026-01-02 one  key\n", "AAAA-BBBB-CCCC-EEEE"),
+            Some(RetiredProver { fingerprint: "AAAA-BBBB-CCCC-EEEE".into(), retired_on: "2026-01-02".into(), what: "one  key".into() })
+        );
+    }
+
+    /// VK-9: a pairing with a retired key — as a pairing file from before the retirement holds
+    /// after the wallet is updated — is not stored, is asked nothing (no request reaches the
+    /// prover, which here would answer with that very key), and `show` says why. The same pairing
+    /// with a key that is not retired works: the control.
+    #[tokio::test]
+    async fn a_pairing_with_a_retired_key_is_refused_before_anything_is_sent() {
+        let (good, state) = fake(Finish::Never, false, |_| {}).await;
+        let mut stale = good.clone();
+        stale.fingerprint = "ZEXQ-1JHV-ZT60-KFB5".into();
+
+        let dir = tempfile::tempdir().unwrap();
+        let key_file = dir.path().join("w.key.json");
+        let e = stale.save(&key_file).unwrap_err().to_string();
+        assert!(e.contains("ZEXQ-1JHV-ZT60-KFB5 was retired on 2026-10-22"), "{e}");
+        assert!(!PairedProver::path_for(&key_file).exists(), "nothing stored");
+        assert!(stale.show().contains("RETIRED: the prover key ZEXQ-1JHV-ZT60-KFB5"), "{}", stale.show());
+
+        let calls_before = state.lock().unwrap().seen.len();
+        let remote = quick(stale);
+        let e = remote.info().await.unwrap_err().to_string();
+        assert!(e.contains("was retired on 2026-10-22") && e.contains("rand prover pair --trusted"), "{e}");
+        let e = prove(&remote, 1000).await.unwrap_err().to_string();
+        assert!(e.contains("was retired"), "{e}");
+        assert_eq!(state.lock().unwrap().seen.len(), calls_before, "a request reached the prover");
+
+        // The control: the same prover under its real, unretired key is paired and answers.
+        good.save(&key_file).expect("an unretired pairing is stored");
+        assert!(!good.show().contains("RETIRED"));
+        quick(good).info().await.expect("and asked");
+        assert!(state.lock().unwrap().seen.len() > calls_before);
     }
 
     #[test]

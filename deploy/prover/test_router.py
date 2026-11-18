@@ -302,7 +302,7 @@ class MemberRouteTest(unittest.TestCase):
         self.pool = router.Pool([])
         members = {"a": router.Backend(self.a.url), "b": router.Backend(self.b.url)}
         self.meter = router.SubmitMeter(burst=2, per_min=0)
-        self.server = ThreadingHTTPServer(("127.0.0.1", 0), router.make_handler(self.pool, members, self.meter))
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), router.make_handler(self.pool, members, self.meter, router.DEFAULT_RETIRED + ("a",)))
         self.base = f"http://127.0.0.1:{self.server.server_address[1]}"
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
 
@@ -347,6 +347,34 @@ class MemberRouteTest(unittest.TestCase):
     def test_an_unknown_member_path_is_404(self):
         status, _ = self.call("/m/zz", "prover_info")
         self.assertEqual(status, 404)
+
+    def test_a_retired_member_path_says_it_was_retired_and_reaches_no_prover(self):
+        # VK-9: the members wallets 0.6.9 to 0.8.0 pinned and that are gone.
+        self.assertEqual(router.DEFAULT_RETIRED, ("archive2", "nyc3", "sfo3"))
+        for name in router.DEFAULT_RETIRED:
+            for method in ("prover_info", "prover_submit"):
+                status, r = self.call(f"/m/{name}", method, ["00"])
+                self.assertEqual(status, 410, (name, method))
+                self.assertEqual(r["id"], 9)
+                self.assertEqual(r["error"]["code"], router.RETIRED_CODE)
+                self.assertEqual(r["error"]["data"], {"retired": name})
+                self.assertIn("was retired", r["error"]["message"])
+                self.assertIn("update Rand Wallet", r["error"]["message"])
+        self.assertEqual((self.a.submits, self.b.submits), (0, 0))
+        # A body that is not JSON-RPC still gets the refusal, with a null id.
+        req = urllib.request.Request(self.base + "/m/nyc3", data=b"not json", method="POST")
+        with self.assertRaises(urllib.error.HTTPError) as e:
+            urllib.request.urlopen(req, timeout=5)
+        self.assertEqual(e.exception.code, 410)
+        self.assertIsNone(json.loads(e.exception.read())["id"])
+
+    def test_a_current_member_is_never_treated_as_retired(self):
+        # `a` was re-keyed under its name: the handler was given "a" as retired too, and still
+        # routes it — a live member wins, and main() refuses that configuration outright.
+        _, r = self.call("/m/a", "prover_submit", ["00"])
+        self.assertTrue(r["result"]["job"].startswith("a-"), r)
+        self.assertEqual(router.check_retired({"a": 1, "b": 2}, ("archive2", "a")), ["a"])
+        self.assertEqual(router.check_retired({"a": 1, "b": 2}, router.DEFAULT_RETIRED), [])
 
     def test_a_silent_member_is_a_plain_503(self):
         self.a.stop()
