@@ -39,6 +39,13 @@ The guard half of #166; the re-vendor to constraint set 10 is not done and is th
   chains 14-21 by genesis hash with their set. `check_build_runs_genesis` refuses a listed chain
   of another set, so a bump refuses chain 21 with no row added to
   `CHAINS_THIS_BUILD_CANNOT_RUN` (add one anyway, for its reason). **Every cut adds its row.**
+  The cut prints it and appends it to the cut record (`constraint-set-row:`); `cut-chain22-genesis.sh
+  check-limits` runs `check-constraint-set.sh --chain 22 --genesis-hash <hash>` and exits non-zero
+  until the tree has exactly that row; the table's tests hold it to `deploy/genesis-chain<N>.json`
+  both ways (2026-11-18, branch `fix/i166-cut-row`). The cut build itself cannot hold the row (the
+  hash does not exist yet) and runs the new chain by the marker. Sets for chains 14-20 were
+  checked against the records the same day: all confirmed, the evidence is in the table's doc
+  comment.
 - **`<datadir>/constraint-set`** (the marker): written by `init`, and by `run` before
   `Storage::open` when the datadir has no database or its genesis is listed under this build's
   set. `constraint_set::bind` reads it in `run`, `verify` and `init` before the database opens;

@@ -31,6 +31,14 @@ Node (issue #166, ZKVM-201; node-only, no wire, genesis or consensus change):
 - **`deploy/sync-zkvm.sh` ends on `deploy/check-constraint-set.sh`**: it prints the vendored
   `CONSTRAINT_SET` before and after the sync and exits non-zero when the node's number was left
   behind. CI's `guest-provenance` job runs the same script against circuits at `CIRCUITS_PIN`.
+- **A chain cut says which row it owes `CHAIN_CONSTRAINT_SETS`, and `check-limits` refuses a tree
+  without it.** `deploy/cut-chain22-genesis.sh` prints `(22, "<genesis hash>", <set>),` and appends
+  it to the cut record as `constraint-set-row:`; its `check-limits` runs the new
+  `deploy/check-constraint-set.sh --chain N --genesis-hash <hash> [--binary-set M]` and exits
+  non-zero until the table holds exactly that row at the node's set. The table's unit tests hold
+  it to the committed `deploy/genesis-chain<N>.json` files in both directions and to
+  `CHAINS_THIS_BUILD_CANNOT_RUN`. The sets listed for chains 14-20 were checked against the cut
+  records and the vendored zkVM at each cut: all confirmed, none changed.
 
 Node, wallet and viewing (audit v14 addendum rows; node-local policy and client-side reading only: no wire, storage-format or consensus change):
 
