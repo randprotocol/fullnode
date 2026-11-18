@@ -373,6 +373,12 @@ delay construction (a VDF, or many blocks' values combined).
   validator will make from that chain. The file is bound to one chain id and one address.
   **Never copy `beacon.seed.json` between hosts**, and do not restore it onto a second machine.
   Losing it is recoverable (below); leaking it is not, short of a recommit.
+- **Back the seed up; total loss halts the chain.** A validator that loses its seed misses its
+  own slots until a `BeaconCommit` takes effect. If **every** validator loses its seed at once,
+  no block can be produced, so no `BeaconCommit` can land and the chain halts for good: there
+  is no in-protocol recovery. The owner accepted this on 2026-11-18 as an operational risk
+  covered by backups: keep an offline, encrypted copy of each validator's `beacon.seed.json`
+  (a backup for restoring onto the same validator, never a second running copy).
 - **No position is stored.** The node finds its reveal by walking from the seed to the preimage
   of the commitment the chain holds. Nothing is written before a proposal leaves, so a crash
   cannot desynchronise it, and after an abandoned block the same reveal is given again.
