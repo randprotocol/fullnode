@@ -32,7 +32,7 @@ change):
   level as Ethereum's `PREVRANDAO` — one bit of withholding per slot — and a contract must pin
   `target = NUMBER + k` at bet time or the prover re-rolls across the window: `docs/
   evm-block-context.md` §11.4. The guest's `PREVRANDAO` read waits for the constraint-set-10
-  re-vendor; `deploy/cut-chain22-genesis.sh` does not carry the section yet.
+  re-vendor.
 
 Core and node (issue #168, ZKVM-203; **genesis-gated, on no chain** — chain 21's genesis hash,
 wire, storage and behaviour are unchanged):
@@ -52,6 +52,15 @@ wire, storage and behaviour are unchanged):
   (pinned in `crates/randprotocol-core/tests/invoke_wire_pin.rs`). The EVM guests still trap on
   the block opcodes: reading these words is circuits work on constraint set 10, at the chain-22
   cut. Spec: `docs/evm-block-context.md`.
+
+Deploy (no node change):
+
+- **The chain-22 cut carries `program_state.reference_block_window` and the beacon**
+  (`deploy/cut-chain22-genesis.sh`): `REFERENCE_BLOCK_WINDOW` (256, 256..=4096) and
+  `BEACON_COMMIT_DELAY_BLOCKS` (256), owner values to confirm; `BEACON_TSV` joined by validator
+  name, one distinct 64-hex commitment each; field-probed, read back by check-limits
+  (`rand_getBeacon`, `rand_getBlockContext`), written to the cut record with the operator seed
+  procedure. New `deploy/check-beacon-seed.sh`, run on each validator host before its node starts.
 
 Node (issue #166, ZKVM-201; node-only, no wire, genesis or consensus change):
 

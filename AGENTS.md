@@ -6,6 +6,43 @@ invariants, and known traps.
 
 ## Project memory (state as of 2026-11-08)
 
+### The chain-22 cut script carries block context and the beacon (2026-11-18, branch `feat/chain22-beacon-cut` stacked on `feat/randomness-beacon`, NOT pushed; deploy only)
+
+The owner decided on 2026-11-18 that chain 22 launches with `program_state.reference_block_window`
+(#168) and the beacon (#189). `deploy/cut-chain22-genesis.sh` now carries both; `docs/deploy.md`
+"The next cut: chain 22" has the inputs and the operator seed procedure.
+
+- **Inputs**: `REFERENCE_BLOCK_WINDOW` (default 256, 256..=4096, OPEN 9) and
+  `BEACON_COMMIT_DELAY_BLOCKS` (default 256, 1..=2^20, OPEN 10), both **owner values to
+  confirm**; `BEACON_TSV` (`<name> <64 hex>`, default `~/.rand-chain22/beacon-commitments.tsv`),
+  joined by validator name. Refused: a missing, extra or twice-listed name, a malformed (not 64
+  lowercase hex), shared or all-zero commitment, an empty window (the beacon needs it).
+- **Addresses** in the section are the ones each public key derives (`rand-node admit sign
+  --candidate <pk>` under a throwaway key prints it, submits nothing); a VALIDATORS_TSV or
+  registration address that differs is refused. `FIXTURE_ADDRESSES_OK=1` (DRY_RUN's synthetic
+  register only) warns instead.
+- **Spliced in Python**, like `perps`: `rand-node genesis` validates, and the base file has no
+  bridge or perps, so the window flag is refused there. The real cut gates on `genesis --help`
+  listing both flags; DRY_RUN skips both loudly (`BLOCK_CONTEXT_SKIPPED`).
+- **Field probe**: 38 variants (the audit-v10 eight + window-and-beacon removed, window 257,
+  beacon removed, delay 257, each of the 26 commitments changed alone). Checked against the real
+  0.8.6 build: each moves the hash; removing both gives chain 21's `ca76c276…` back.
+- **check-limits** reads back `rand_getLimits.program_state.{reference_block_window,
+  beacon_commit_delay_blocks}`, `rand_getBlockContext` (`-32001` before block 1 is accepted) and
+  `rand_getBeacon`: every commitment exactly at height 0; above it at most `height` may have moved
+  to their reveal (no BLAKE3 in the script to walk the link).
+- **The seeds are never checked by the cut or check-limits**, which see no host's file.
+  `deploy/check-beacon-seed.sh` runs **on each validator host** (key address → genesis
+  commitment; `beacon commitment` names this address and chain; a chain in the file is that
+  commitment; mode 0600; with `--rpc`, `beacon status` exits 0). It belongs in the future
+  `cutover-fleet-chain22.sh` `start` gate, beside chain 21's msauth `vk_check`.
+- **Cut record**: `reference-block-window:`, `beacon-commit-delay-blocks:`, one
+  `beacon-commitment: <name> <address> <hex>` per validator and the operator procedure (init on
+  its own host, send only the commitment, offline encrypted backup; total seed loss accepted
+  2026-11-18). The record must name both features.
+- SELFTEST 309 → 403, all passing; shellcheck clean. Not exercised: DRY_RUN, the real cut, a
+  live `rand_getBeacon` / `rand_getBlockContext`, the cutover script (does not exist).
+
 ### The randomness beacon (2026-11-18, branch `feat/randomness-beacon` stacked on `feat/i168-reference-block`, NOT pushed; genesis-gated, on no chain)
 
 Spec and operator notes: `docs/evm-block-context.md` §11. Stub executor only: nothing proved.
@@ -56,7 +93,6 @@ Spec and operator notes: `docs/evm-block-context.md` §11. Stub executor only: n
 - **Pool**: `BeaconCommit` claims `(validator, nonce)` under role 11 and ranks with governance;
   `admission::is_permanent` caches `RevealOutsideBlockHead` and `BadSignature`.
 - **Not done**: circuits (`PREVRANDAO` reading words 19–27), a real-prover test,
-  `deploy/cut-chain22-genesis.sh` (it carries neither the window nor the beacon),
   `deploy/fleet-watch.sh` alerts, entry removal for validators that left the register.
 
 ### Block context: the reference block (issue #168, ZKVM-203; 2026-11-18, branch `feat/i168-reference-block`, NOT pushed; genesis-gated, on no chain)
@@ -94,8 +130,8 @@ constraint set 10 and waits for the chain-22 cut. Spec: `docs/evm-block-context.
 - **RPC**: `rand_getBlockContext` (public; `{"enabled": false}` when off);
   `rand_getLimits.program_state.reference_block_window` only when set; `tx_json` kind `invoke_at`.
 - **Not done**: circuits (READ_PUBLIC in evm-core/evm-rt/evm2rv, re-pin), wallet/CLI building an
-  `InvokeAt` (and its note scan learning `invoke_at`), a real-prover test,
-  `deploy/cut-chain22-genesis.sh` (see the branch's report). Stub executor only: no proof made.
+  `InvokeAt` (and its note scan learning `invoke_at`), a real-prover test. The chain-22
+  cut script now carries the window (above). Stub executor only: no proof made.
 
 ### Aggregation's memory docs re-anchored (issue #119, AGG-E2E-2; 2026-11-18, branch `docs/i119-aggregation-memory`, docs only)
 
