@@ -240,7 +240,7 @@ async fn burst(addr: std::net::SocketAddr, bodies: &[&'static [u8]]) -> Vec<Answ
 /// * the heap live above the idle baseline never passes `HEAP_PER_BUDGET_BYTE` times the
 ///   budget, however large the burst: past the budget, submissions are refused before they are
 ///   read, so 24 at once cost no more than 8;
-/// * a burst that is over the budget has some submissions told busy, and some still judged;
+/// * a burst of twice the budget or more has some submissions told busy, and some still judged;
 /// * the node is back at its baseline (within 16 MiB) once the burst is answered: nothing is
 ///   left held;
 /// * and it still answers.
@@ -336,8 +336,10 @@ async fn the_27_oct_burst_costs_a_real_node_a_bounded_heap() {
         assert!(!refused.is_empty(), "nothing reached the verifier");
         if size * per_submission <= budget {
             assert_eq!(busy, 0, "{size} fit the budget outright");
-        } else {
-            assert!(busy > 0, "{size} at once is over the budget and none was told busy");
+        } else if size * per_submission >= 2 * budget {
+            // Only where the burst is at least twice the budget: just over it, an early
+            // submission can be answered before a late one is charged.
+            assert!(busy > 0, "{size} at once is twice the budget or more and none was told busy");
         }
         assert!(peak <= bound, "{size} at once held {} MiB over the baseline; the bound is {} MiB", peak / MIB, bound / MIB);
         assert!(after <= 16 * MIB, "{} MiB still held after the burst was answered", after / MIB);
