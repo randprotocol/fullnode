@@ -554,6 +554,17 @@ pub struct Genesis {
     /// `reload_ledger`), never state.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hc_auth_multisig: Option<String>,
+    /// The randomness beacon (`ledger::beacon`, `docs/evm-block-context.md` §11): the delay a
+    /// new commitment waits and one hash-chain commitment for **every** genesis validator.
+    /// Present, every block opens with its proposer's `BeaconReveal`, validators may register
+    /// new commitments with `BeaconCommit`, and a reference block's context carries the beacon's
+    /// value. It requires `program_state.reference_block_window`: the value reaches a program
+    /// only through a reference block. The **last** field, written only when present, so a file
+    /// without it serialises byte for byte as before; bound into the genesis hash last (after
+    /// `program_state.reference_block_window`), tagged, only when present — chain 21 and every
+    /// genesis cut before it hash as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub beacon: Option<crate::ledger::beacon::BeaconConfig>,
 }
 
 /// The chains whose committed genesis file (`deploy/genesis-chain<N>.json`) carries both
@@ -655,6 +666,10 @@ pub enum GenesisError {
     /// The `program_state` section is out of bounds, or a section it depends on is missing.
     #[error("bad program_state config: {0}")]
     BadProgramState(String),
+    /// The `beacon` section is malformed, does not cover exactly the genesis validators, or a
+    /// section it depends on is missing.
+    #[error("bad beacon config: {0}")]
+    BadBeacon(String),
     /// The `perps` section is out of bounds, names a collateral token this file does not list,
     /// or a section it depends on is missing.
     #[error("bad perps config: {0}")]
@@ -1155,6 +1170,25 @@ impl Genesis {
                 ));
             }
         }
+        // The randomness beacon: the section's own rules; one commitment for every genesis
+        // validator and for nobody else (a validator without one could never propose, and a
+        // commitment for a stranger is a mistake in the file); and the reference-block window,
+        // without which no program could read the value.
+        if let Some(b) = &self.beacon {
+            let commitments = b.parsed().map_err(GenesisError::BadBeacon)?;
+            let validators: BTreeSet<Address> = self.validators.iter().map(|v| v.public_key.address()).collect();
+            for v in &validators {
+                if !commitments.iter().any(|(a, _)| a == v) {
+                    return Err(GenesisError::BadBeacon(format!("validator {} has no beacon commitment", v.to_base58())));
+                }
+            }
+            if let Some((a, _)) = commitments.iter().find(|(a, _)| !validators.contains(a)) {
+                return Err(GenesisError::BadBeacon(format!("{} has a beacon commitment and is not a genesis validator", a.to_base58())));
+            }
+            if self.program_state.as_ref().is_none_or(|p| p.reference_block_window == 0) {
+                return Err(GenesisError::BadBeacon("beacon needs `program_state.reference_block_window`".into()));
+            }
+        }
         // RPL-3: the section's own bounds, then what it stands on — RPL-2's list, since a deposit
         // rides the token-aware bundle and a state proof is a call-style proof under the
         // hardened rules — and then its collateral: RAND (0), or a token this file registers at
@@ -1469,6 +1503,16 @@ impl Genesis {
             ledger.set_refuse_panicked_invokes(p.refuse_panics);
             ledger.set_reference_block_window(p.reference_block_window);
         }
+        // The randomness beacon: every genesis commitment in force, and the value the chain
+        // starts from — before the genesis state root is read, which commits to both.
+        let beacon_commitments = match &self.beacon {
+            Some(b) => {
+                let commitments = b.parsed().map_err(GenesisError::BadBeacon)?;
+                ledger.set_beacon(Some(crate::ledger::beacon::BeaconState::genesis(self.chain_id, b.commit_delay_blocks, &commitments)));
+                Some((b.commit_delay_blocks, commitments))
+            }
+            None => None,
+        };
         // The incremental nullifier root (spec 2026-10-05 §4.1): the genesis ledger holds no
         // nullifiers, so the range starts empty and the header's state root already carries it.
         if self.incremental_nullifier_root == Some(true) {
@@ -1871,6 +1915,18 @@ impl Genesis {
         if let Some(w) = self.program_state.as_ref().map(|p| p.reference_block_window).filter(|w| *w != 0) {
             commit.extend_from_slice(b"program_state_reference_block_window");
             commit.extend_from_slice(&w.to_be_bytes());
+        }
+        // The randomness beacon, after `reference_block_window` — last — tagged, and only when
+        // the file has the section, so chain 21 and every genesis cut before it hash byte for
+        // byte as before: the delay, then every commitment in the file's order, address then
+        // commitment, as parsed (the file's hex case cannot make a second chain).
+        if let Some((delay, commitments)) = &beacon_commitments {
+            commit.extend_from_slice(b"beacon");
+            commit.extend_from_slice(&delay.to_be_bytes());
+            for (v, c) in commitments {
+                commit.extend_from_slice(v.as_bytes());
+                commit.extend_from_slice(c);
+            }
         }
         #[cfg(test)]
         tests::LAST_GENESIS_COMMIT.with(|c| *c.borrow_mut() = commit.clone());
@@ -2327,6 +2383,7 @@ mod tests {
             multisig: None,
             aggregation_tree: None,
             hc_auth_multisig: None,
+            beacon: None,
         }
     }
 
@@ -4550,6 +4607,75 @@ mod tests {
         // A chain with a `tokens` section opens every genesis note; these tests need none.
         g.alloc.clear();
         g
+    }
+
+    /// The randomness beacon: the `beacon` section is absent from the file and the hash without
+    /// it (so chain 21 hashes as before), bound when present — tagged, last, the delay then each
+    /// commitment in file order — round-trips, seeds the ledger's beacon state, and moves the
+    /// genesis state root (it is state). It must cover exactly the genesis validators and needs
+    /// the reference-block window.
+    #[test]
+    fn the_beacon_section_is_committed_only_when_present_and_covers_every_validator() {
+        use crate::ledger::beacon::{genesis_value, BeaconCommitment, BeaconConfig, BeaconEntry};
+        use crate::ledger::program_state::ProgramStateConfig;
+        let mut off = rpl2_ready();
+        off.bridge = Some(bridge_cfg());
+        off.program_state = Some(ProgramStateConfig { cell_fee: 10_000_000, refuse_panics: false, reference_block_window: 256 });
+        let v = off.validators[0].public_key.address();
+        let entry = |a: Address, c: [u8; 32]| BeaconCommitment { validator: a.to_base58(), commitment: hex::encode(c) };
+        let mut on = off.clone();
+        on.beacon = Some(BeaconConfig { commit_delay_blocks: 256, commitments: vec![entry(v, [0xab; 32])] });
+        assert!(!off.to_json().contains("beacon"), "absent from the file without the section");
+        assert!(on.to_json().contains("\"commit_delay_blocks\": 256"));
+        assert_eq!(Genesis::from_json(&on.to_json()).unwrap(), on, "it round-trips");
+        assert_eq!(Genesis::from_json(&off.to_json()).unwrap(), off);
+        let (a, b) = (build(&off), build(&on));
+        assert_ne!(a.hash(), b.hash());
+        assert_ne!(a.ledger.state_root(), b.ledger.state_root(), "the beacon is state");
+        assert!(a.ledger.beacon().is_none());
+        let state = b.ledger.beacon().unwrap();
+        assert_eq!(state.commit_delay_blocks, 256);
+        assert_eq!(state.value, genesis_value(42, &[(v, [0xab; 32])].into()));
+        assert_eq!(state.entries, [(v, BeaconEntry { commitment: Some([0xab; 32]), nonce: 0, pending: None })].into());
+        // The committed bytes of a file without the section end exactly where they did.
+        build(&off);
+        let without = LAST_GENESIS_COMMIT.with(|c| c.borrow().clone());
+        build(&on);
+        let with = LAST_GENESIS_COMMIT.with(|c| c.borrow().clone());
+        assert_eq!(&with[..without.len()], &without[..]);
+        assert_eq!(&with[without.len()..], [&b"beacon"[..], &256u64.to_be_bytes()[..], &v.0[..], &[0xab; 32][..]].concat());
+        // Another delay, another commitment: another chain. The hex's case: the same chain.
+        let mut other = on.clone();
+        other.beacon.as_mut().unwrap().commit_delay_blocks = 257;
+        assert_ne!(build(&other).hash(), b.hash());
+        let mut other = on.clone();
+        other.beacon.as_mut().unwrap().commitments[0].commitment = hex::encode([0xac; 32]);
+        assert_ne!(build(&other).hash(), b.hash());
+        let mut upper = on.clone();
+        upper.beacon.as_mut().unwrap().commitments[0].commitment = hex::encode_upper([0xab; 32]);
+        assert_eq!(build(&upper).hash(), b.hash());
+
+        let refused = |g: &Genesis, want: &str| match g.build(&StubExecutor) {
+            Err(GenesisError::BadBeacon(why)) => assert!(why.contains(want), "{why}"),
+            other => panic!("{want}: {:?}", other.map(|s| s.hash())),
+        };
+        // A validator without a commitment; a commitment for a stranger; the section's own rules.
+        let mut none = on.clone();
+        none.beacon.as_mut().unwrap().commitments.clear();
+        refused(&none, "has no beacon commitment");
+        let mut stranger = on.clone();
+        stranger.beacon.as_mut().unwrap().commitments.push(entry(Address([9; 32]), [0xcd; 32]));
+        refused(&stranger, "not a genesis validator");
+        let mut zero = on.clone();
+        zero.beacon.as_mut().unwrap().commit_delay_blocks = 0;
+        refused(&zero, "commit_delay_blocks");
+        // Without the reference-block window — the field at 0, or no `program_state` at all.
+        let mut no_window = on.clone();
+        no_window.program_state.as_mut().unwrap().reference_block_window = 0;
+        refused(&no_window, "reference_block_window");
+        let mut no_section = on.clone();
+        no_section.program_state = None;
+        refused(&no_section, "reference_block_window");
     }
 
     /// PST-1: `program_state.refuse_panics` is absent from the file and the hash when `false` (so

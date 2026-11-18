@@ -103,6 +103,7 @@ pub fn genesis(key: &Keypair) -> Genesis {
         incremental_nullifier_root: None,
         perps: None,
         hc_auth_multisig: None,
+        beacon: None,
     }
 }
 

@@ -1273,7 +1273,9 @@ impl<'a> PerpAction<'a> {
             | Action::MultisigDeposit { .. }
             | Action::MultisigPay { .. }
             | Action::MultisigRotate { .. }
-            | Action::SetRandPrice { .. } => None,
+            | Action::SetRandPrice { .. }
+            | Action::BeaconReveal { .. }
+            | Action::BeaconCommit { .. } => None,
         }
     }
 

@@ -47,6 +47,14 @@ pub enum GossipMessage {
     /// so the four variants above encode as before; a build without it cannot decode it, which
     /// is why the roll is a flag day (§7).
     CompactProposal(CompactBlock),
+    /// A compact proposal with some bodies sent along (the randomness beacon, genesis `beacon`):
+    /// a beacon chain's block opens with its proposer's `BeaconReveal`, which no peer's pool can
+    /// hold, so every plain compact proposal there would cost each validator a fetch round trip.
+    /// The leader sends that one transaction with the hashes. A receiver keeps a prefilled body
+    /// only if it is a reveal and its hash is the first of the signed list; anything else is
+    /// dropped and the body fetched as before. Sent only on a chain with the section. Appended
+    /// last, so the five variants above encode as before; a build without it cannot decode it.
+    CompactProposalPrefilled { compact: CompactBlock, prefilled: Vec<randprotocol_core::Transaction> },
 }
 
 /// The wire form of a proposal (spec 2026-10-08 §3.1). `tx_hashes` is in block order; the
@@ -359,6 +367,18 @@ mod tests {
         assert_eq!(&bytes[..4], &[4, 0, 0, 0], "the new variant is the fifth");
         assert!(bincode::deserialize::<OldGossipMessage>(&bytes).is_err(), "an old node cannot read it");
         let GossipMessage::CompactProposal(read) = bincode::deserialize::<GossipMessage>(&bytes).unwrap() else { panic!("another variant") };
+        // The beacon's prefilled form is appended after it — tag 5 — and is the compact form's
+        // bytes followed by the transaction list, so the plain form above did not move.
+        let reveal = randprotocol_core::Transaction { chain_id: 7, bundle: None, action: randprotocol_core::Action::BeaconReveal { reveal: [9; 32] } };
+        let prefilled = bincode::serialize(&GossipMessage::CompactProposalPrefilled { compact: compact.clone(), prefilled: vec![reveal.clone()] }).unwrap();
+        assert_eq!(&prefilled[..4], &[5, 0, 0, 0], "the prefilled variant is the sixth");
+        assert_eq!(&prefilled[4..bytes.len()], &bytes[4..]);
+        assert_eq!(prefilled.len(), bytes.len() + 8 + reveal.encode().len(), "one reveal costs its 45 bytes and a length");
+        assert!(bincode::deserialize::<OldGossipMessage>(&prefilled).is_err());
+        match bincode::deserialize::<GossipMessage>(&prefilled).unwrap() {
+            GossipMessage::CompactProposalPrefilled { compact: c, prefilled: p } => assert!(c.hash() == compact.hash() && p == vec![reveal]),
+            _ => panic!("another variant"),
+        }
         assert_eq!(read.header, compact.header);
         assert_eq!(read.tx_hashes, compact.tx_hashes);
         // The rebuild is the block, byte for byte.

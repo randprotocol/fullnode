@@ -448,6 +448,9 @@ async fn every_field_the_downstream_repos_read_is_served_with_its_type() {
         // (chain 21): `{"enabled": false}`, the shape of every other gated read. No consumer
         // yet — the wallet's `InvokeAt` path waits on the chain-22 cut (docs/evm-block-context.md).
         exactly("rand_getBlockContext", json!([]), "docs/evm-block-context.md §6 (no consumer yet)", json!({ "enabled": false })),
+        // The randomness beacon on a chain without the genesis `beacon` section (chain 21):
+        // `{"enabled": false}`. Consumers: `rand-node beacon status` / `recommit`.
+        exactly("rand_getBeacon", json!([]), "rand-node `beacon status`, `beacon recommit`", json!({ "enabled": false })),
         exactly(
             "rand_getProgramCells",
             json!([unknown, { "after": null, "limit": 10 }]),

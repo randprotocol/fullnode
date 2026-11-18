@@ -191,6 +191,15 @@ pub fn is_permanent(e: &TxError) -> bool {
         use randprotocol_core::ledger::rand_price::PriceError as P;
         return matches!(p, P::ZeroPrice | P::VoteOrder | P::BadVote(_));
     }
+    // The randomness beacon's byte-verdicts (genesis `beacon`): a `BeaconReveal` offered as a
+    // transaction — valid only as a block's head, never from the pool or RPC, whatever the state
+    // — and a commit whose signature does not verify under the key of the validator it names
+    // (an address is its key's address, so no later state makes it good). The register, the
+    // nonce and the commitment in force move with the chain and stay out.
+    if let TxError::Beacon(b) = e {
+        use randprotocol_core::ledger::beacon::BeaconError as B;
+        return matches!(b, B::RevealOutsideBlockHead | B::BadSignature(_));
+    }
     // The aggregation register's verdicts, split like `Staking`'s: the byte-verdicts (and the
     // ones against genesis-pinned constants) are cacheable, the register's state is not. A
     // signature is over the transaction's own fields against the entry's key — and an address

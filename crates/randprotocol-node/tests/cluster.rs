@@ -224,6 +224,7 @@ fn genesis_bridge(validators: &[Keypair], funded: &[&Wallet], bridge: Option<Bri
         incremental_nullifier_root: None,
         perps: None,
         hc_auth_multisig: None,
+        beacon: None,
     }
 }
 
@@ -3398,4 +3399,228 @@ async fn a_dynamic_chain_decays_its_prices_to_the_floors_on_empty_blocks() {
     }
     // The moved prices are in every header's state root; proposer and replicas agree on them.
     assert_chains_equal(&nodes);
+}
+
+// ---- the randomness beacon (genesis `beacon`, docs/evm-block-context.md §11) -----------------
+
+/// `commit_delay_blocks` of the beacon cluster chain.
+const BEACON_DELAY: u64 = 4;
+
+/// A beacon chain for `validators`: chain 18's shape on a bridged chain (bounded block time),
+/// `program_state` with the reference-block window, and a `beacon` section whose commitments are
+/// the seed files made here — one data directory per validator, its seed file inside unless
+/// `seedless` names the validator, whose commitment is then one nobody holds the seed of. Each
+/// directory already holds the genesis file: start it with `start_in`.
+fn beacon_cluster(validators: &[Keypair], seedless: Option<usize>) -> (Genesis, Vec<tempfile::TempDir>) {
+    use randprotocol_core::ledger::beacon::{BeaconCommitment, BeaconConfig};
+    use randprotocol_node::beacon::{seed_path, SeedFile};
+    let mut gen = genesis_bridge(validators, &[], Some(bridge_config()));
+    gen.hardening_v6 = Some(true);
+    gen.hc_bundle = word8_to_hex(&ZkExecutor::hc_hidden_bundle_v3());
+    gen.hc_auth = Some(word8_to_hex(&ZkExecutor::hc_auth()));
+    gen.max_proof_bytes = Some(CHAIN18_MAX_PROOF_BYTES);
+    gen.max_block_bytes = Some(CHAIN18_MAX_BLOCK_BYTES);
+    gen.gas = Some(chain18_gas());
+    gen.program_state =
+        Some(randprotocol_core::ledger::program_state::ProgramStateConfig { cell_fee: 10_000_000, refuse_panics: false, reference_block_window: 256 });
+    let dirs: Vec<tempfile::TempDir> = validators.iter().map(|_| tempfile::tempdir().unwrap()).collect();
+    let scratch = tempfile::tempdir().unwrap();
+    let commitments = validators
+        .iter()
+        .enumerate()
+        .map(|(i, k)| {
+            // The seedless validator's seed is made and thrown away with `scratch`.
+            let at = if seedless == Some(i) { seed_path(scratch.path()) } else { seed_path(dirs[i].path()) };
+            let entry = SeedFile::create(&at, CHAIN_ID, &k.address(), 4096).unwrap();
+            BeaconCommitment { validator: k.address().to_base58(), commitment: entry.commitment }
+        })
+        .collect();
+    gen.beacon = Some(BeaconConfig { commit_delay_blocks: BEACON_DELAY, commitments });
+    for d in &dirs {
+        std::fs::write(d.path().join("genesis.json"), gen.to_json()).unwrap();
+    }
+    (gen, dirs)
+}
+
+/// The reveal block `h` opens with, read from `node`'s store.
+fn stored_reveal(node: &TestNode, h: u64) -> [u8; 32] {
+    let block = node.handle.storage.block_by_height(h).unwrap().unwrap_or_else(|| panic!("block {h} is stored"));
+    match block.transactions.first().map(|t| &t.action) {
+        Some(Action::BeaconReveal { reveal }) => *reveal,
+        other => panic!("block {h} does not open with a reveal: {other:?}"),
+    }
+}
+
+/// `rand_getBlockContext([h]).randomness` on `node` (the flag must be set).
+async fn context_randomness(node: &TestNode, h: u64) -> String {
+    let ctx = node.rpc.call("rand_getBlockContext", json!([h])).await.unwrap();
+    assert_eq!(ctx["has_randomness"], json!(true), "block {h}: {ctx}");
+    ctx["randomness"].as_str().unwrap().to_string()
+}
+
+/// The height of the first block above `after` that `validator` proposed, once one is stored.
+async fn wait_block_by(node: &TestNode, validator: Address, after: u64, timeout: Duration) -> u64 {
+    let start = Instant::now();
+    loop {
+        let head = node.handle.storage.head().unwrap().height;
+        if let Some(h) = (after + 1..=head).find(|h| node.handle.storage.block_by_height(*h).unwrap().is_some_and(|b| b.proposer() == validator)) {
+            return h;
+        }
+        assert!(start.elapsed() < timeout, "no block by {validator} above {after} after {timeout:?} (head {head})");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+/// Four validators on a beacon chain over real TCP: blocks propagate (each opens with a reveal
+/// no peer's pool can hold, so each body is fetched by hash), every node serves the same
+/// randomness for every block — the value the stored reveals give from the genesis value — and
+/// a validator stopped and restarted from disk comes back with the same beacon state, finds its
+/// place on its seed chain from the chain's commitment alone, and proposes again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn beacon_validators_agree_on_the_value_across_a_restart() {
+    init_tracing();
+    let ks = keys(4);
+    let (gen, mut dirs) = beacon_cluster(&ks, None);
+    let mut nodes: Vec<TestNode> = Vec::new();
+    for k in &ks {
+        let boot = nodes.first().map(|n| vec![bootstrap_addr(n)]).unwrap_or_default();
+        nodes.push(start_in(dirs.remove(0), k, boot, true).await);
+    }
+    wait_height(&nodes.iter().collect::<Vec<_>>(), 8, Duration::from_secs(90)).await;
+
+    // The value of every block, recomputed from the reveals node 0 stored, is what every node
+    // serves for that block.
+    let executor = node::executor_for_profile(&gen.fri_profile).unwrap();
+    let mut value = gen.build(executor.as_ref()).unwrap().ledger.beacon().unwrap().value;
+    let mut seen = std::collections::BTreeSet::new();
+    for h in 1..=8u64 {
+        value = randprotocol_core::ledger::beacon::mix(&value, &stored_reveal(&nodes[0], h), h);
+        for n in &nodes {
+            assert_eq!(context_randomness(n, h).await, hex::encode(value), "block {h}");
+        }
+        assert!(seen.insert(value), "block {h} repeats a value");
+    }
+    let before = nodes[0].rpc.call("rand_getBeacon", json!([])).await.unwrap();
+    assert_eq!((&before["enabled"], &before["commit_delay_blocks"]), (&json!(true), &json!(BEACON_DELAY)));
+
+    // On the wire a beacon block's proposal is the prefilled compact form (tag 5): the hashes
+    // and the one body no peer can hold, the reveal — never the plain form, never a full block.
+    let mut obs = Observer::start(CHAIN_ID, vec![bootstrap_addr(&nodes[0])]).await;
+    let _ = obs.pump(Duration::from_secs(2)).await;
+    let seen = obs.pump(Duration::from_secs(3)).await;
+    let mut prefilled = 0;
+    for s in seen.iter().filter(|s| s.topic.as_str().ends_with("/consensus")) {
+        match bincode::deserialize::<GossipMessage>(&s.data) {
+            Ok(GossipMessage::CompactProposalPrefilled { compact, prefilled: bodies }) => {
+                assert_eq!(bodies.len(), 1, "one body rides along");
+                assert!(matches!(bodies[0].action, Action::BeaconReveal { .. }));
+                assert_eq!(compact.tx_hashes.first(), Some(&bodies[0].hash()));
+                prefilled += 1;
+            }
+            Ok(GossipMessage::CompactProposal(_)) => panic!("a plain compact proposal on a beacon chain"),
+            Ok(GossipMessage::Consensus(ConsensusMessage::Proposal(_))) => panic!("a full proposal frame"),
+            _ => {}
+        }
+    }
+    assert!(prefilled > 0, "the observer saw no proposal");
+    assert_eq!(before["validators"].as_array().unwrap().len(), 4);
+
+    // Stop the fourth validator; the other three are a quorum and go on (its slots time out).
+    let d = nodes.pop().unwrap();
+    let (dir, left_at) = stop_and_head(d).await;
+    let three: Vec<&TestNode> = nodes.iter().collect();
+    wait_height(&three, left_at + 6, Duration::from_secs(120)).await;
+
+    // Restart it from disk: same beacon state as its peers, and it proposes again — its node
+    // found the reveal for the commitment the chain holds without any stored position.
+    let d = start_in(dir, &ks[3], vec![bootstrap_addr(&nodes[0])], true).await;
+    let rejoined_at = nodes[0].height();
+    let its_block = wait_block_by(&nodes[0], ks[3].address(), rejoined_at, Duration::from_secs(120)).await;
+    nodes.push(d);
+    let all: Vec<&TestNode> = nodes.iter().collect();
+    wait_height(&all, its_block + 2, Duration::from_secs(120)).await;
+    for h in [left_at + 1, rejoined_at, its_block, its_block + 1] {
+        let want = context_randomness(&nodes[0], h).await;
+        for n in &nodes[1..] {
+            assert_eq!(context_randomness(n, h).await, want, "block {h} after the restart");
+        }
+        assert_eq!(
+            nodes[0].handle.storage.block_by_height(h).unwrap().unwrap().hash(),
+            nodes[3].handle.storage.block_by_height(h).unwrap().unwrap().hash(),
+            "block {h}"
+        );
+    }
+    // The restarted node's stored beacon state is the chain's: its own entry is where its
+    // peers have it.
+    let me = ks[3].address().to_base58();
+    let common = nodes[0].height().min(nodes[3].height());
+    wait_height(&all, common, Duration::from_secs(10)).await;
+    let (a, b) = (nodes[0].handle.storage.beacon().unwrap().unwrap(), nodes[3].handle.storage.beacon().unwrap().unwrap());
+    if nodes[0].handle.storage.head().unwrap().height == nodes[3].handle.storage.head().unwrap().height {
+        assert_eq!(a, b, "the same head, the same beacon state");
+    }
+    assert!(a.entries.contains_key(&ks[3].address()), "{me}");
+}
+
+/// A validator whose node has no seed file does not stall the chain: it votes, its own slots
+/// time out, the other three keep committing, and no block is its. It then registers a new
+/// commitment (what `rand-node beacon recommit` does: a fresh seed in its file, a signed
+/// `BeaconCommit`), and after the commit delay its running node picks the seed up and proposes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_validator_without_a_beacon_seed_does_not_stall_the_chain() {
+    use randprotocol_node::beacon::{seed_path, SeedFile};
+    init_tracing();
+    let ks = keys(4);
+    let seedless = 2usize;
+    let (_gen, mut dirs) = beacon_cluster(&ks, Some(seedless));
+    let mut nodes: Vec<TestNode> = Vec::new();
+    for k in &ks {
+        let boot = nodes.first().map(|n| vec![bootstrap_addr(n)]).unwrap_or_default();
+        nodes.push(start_in(dirs.remove(0), k, boot, true).await);
+    }
+    let all: Vec<&TestNode> = nodes.iter().collect();
+    // Twelve blocks: the seedless validator's slot has come round several times.
+    wait_height(&all, 12, Duration::from_secs(180)).await;
+    let me = ks[seedless].address();
+    for h in 1..=12u64 {
+        let block = nodes[0].handle.storage.block_by_height(h).unwrap().unwrap();
+        assert_ne!(block.proposer(), me, "block {h} is by the validator that cannot reveal");
+        assert_eq!(nodes[seedless].handle.storage.block_by_height(h).unwrap().unwrap().hash(), block.hash(), "the seedless node follows: block {h}");
+    }
+    let status = nodes[0].rpc.call("rand_getBeacon", json!([me.to_base58()])).await.unwrap();
+    let original = status["validators"][0]["commitment"].as_str().unwrap().to_string();
+
+    // The recommit: the seed on disk first, then the signed commit, through the node's RPC.
+    let entry = SeedFile::append(&seed_path(nodes[seedless].dir.path()), CHAIN_ID, &me, 64).unwrap();
+    let commitment: [u8; 32] = hex::decode(&entry.commitment).unwrap().try_into().unwrap();
+    let genesis = nodes[seedless].rpc.genesis_hash().await.unwrap();
+    let message = randprotocol_core::types::actions::beacon_commit_message(&genesis, &commitment, 1);
+    let tx = Transaction {
+        chain_id: CHAIN_ID,
+        bundle: None,
+        action: Action::BeaconCommit { validator: me, commitment, nonce: 1, signature: ks[seedless].sign(message.as_bytes()) },
+    };
+    // A reveal is never a transaction anyone can send.
+    let stray = Transaction { chain_id: CHAIN_ID, bundle: None, action: Action::BeaconReveal { reveal: [7; 32] } };
+    let refused = nodes[0].rpc.send_transaction(&stray).await.unwrap_err();
+    assert!(format!("{refused:#}").contains("beacon reveal"), "{refused:#}");
+    let hash = nodes[seedless].rpc.send_transaction(&tx).await.unwrap();
+    let receipt = nodes[seedless].rpc.wait_for_transaction(&hash, Duration::from_secs(120)).await.unwrap();
+    let pending = nodes[0].rpc.call("rand_getBeacon", json!([me.to_base58()])).await.unwrap();
+    let row = &pending["validators"][0];
+    assert_eq!(row["nonce"], json!(1));
+    // Either still pending, or (the chain is fast) already promoted by the validator's block.
+    if !row["pending"].is_null() {
+        assert_eq!(row["pending"], json!({ "activates_at": receipt.height + BEACON_DELAY, "commitment": entry.commitment }));
+        assert_eq!(row["commitment"], json!(original), "the old commitment stays until the new one is promoted");
+    }
+    // After the delay it proposes: its first block opens the new commitment.
+    let its_block = wait_block_by(&nodes[0], me, receipt.height, Duration::from_secs(180)).await;
+    assert!(its_block >= receipt.height + BEACON_DELAY, "block {its_block} before the delay ran (commit at {})", receipt.height);
+    let reveal = stored_reveal(&nodes[0], its_block);
+    assert_eq!(randprotocol_core::ledger::beacon::link(CHAIN_ID, &me, &reveal), commitment);
+    wait_height(&all, its_block + 2, Duration::from_secs(120)).await;
+    for n in &nodes[1..] {
+        assert_eq!(context_randomness(n, its_block).await, context_randomness(&nodes[0], its_block).await);
+    }
 }

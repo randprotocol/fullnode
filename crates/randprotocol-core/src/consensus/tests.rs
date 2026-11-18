@@ -35,6 +35,49 @@ struct Sim {
     safety_violations: Vec<(usize, Hash, Hash)>,
     /// Audit v6, STAKE-1: the equivocation evidence each replica captured.
     equivocations: Vec<(usize, Box<SignedHeader>, Box<SignedHeader>)>,
+    /// The beacon seeds each replica holds ([`with_beacon`]); `None` on a chain without one. A
+    /// restart hands the replica its seeds again, as a node re-reads its seed file.
+    seeds: Vec<Option<std::sync::Arc<TestSeeds>>>,
+}
+
+/// A replica's beacon seed chains, as the node's seed file holds them: the reveal comes from
+/// whichever chain passes through the commitment. A test adds a chain to model a recommit.
+#[derive(Default)]
+struct TestSeeds(std::sync::Mutex<Vec<crate::ledger::beacon::SeedChain>>);
+
+impl RevealSource for TestSeeds {
+    fn reveal(&self, commitment: &[u8; 32]) -> Option<[u8; 32]> {
+        self.0.lock().unwrap().iter().find_map(|s| s.reveal_for(commitment)).map(|(r, _)| r)
+    }
+}
+
+/// The beacon a fixture genesis carries ([`with_beacon`]): for each genesis validator the
+/// length of its seed chain, and whether its replica holds the seed.
+#[derive(Clone)]
+struct BeaconFixture {
+    links: Vec<u64>,
+    held: Vec<bool>,
+}
+
+/// `commit_delay_blocks` of every beacon fixture.
+const BEACON_DELAY: u64 = 2;
+
+thread_local! {
+    static BEACON: std::cell::RefCell<Option<BeaconFixture>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Run `f` with every fixture genesis carrying a `beacon` section (and the sections it stands
+/// on: a reference-block window under `program_state`, on a bridged chain).
+fn with_beacon<R>(links: &[u64], held: &[bool], f: impl FnOnce() -> R) -> R {
+    BEACON.with(|b| *b.borrow_mut() = Some(BeaconFixture { links: links.to_vec(), held: held.to_vec() }));
+    let r = f();
+    BEACON.with(|b| *b.borrow_mut() = None);
+    r
+}
+
+/// Validator `i`'s genesis seed chain in a beacon fixture (the fixture's chain id is 1).
+fn beacon_seed(key: &Keypair, i: usize, links: u64) -> crate::ledger::beacon::SeedChain {
+    crate::ledger::beacon::SeedChain::new(1, key.address(), [0x80 + i as u8; 32], links)
 }
 
 /// A payout address for a test validator: phase S2 makes it a required genesis field, and
@@ -103,7 +146,10 @@ fn with_domain<R>(version: u32, f: impl FnOnce() -> R) -> R {
 
 fn build_with(n: u8, validators: u8, epoch_blocks: u64, all_signers: bool, bridged: bool) -> Sim {
     let keys: Vec<Keypair> = (1..=n).map(|i| Keypair::from_seed([i; 32]).unwrap()).collect();
-    let genesis = Genesis {
+    let beacon = BEACON.with(|b| b.borrow().clone());
+    // A beacon needs the reference-block window, which needs bounded block time (a bridge).
+    let bridged = bridged || beacon.is_some();
+    let mut genesis = Genesis {
         chain_id: 1,
         timestamp_ms: 0,
         validators: keys[..validators as usize]
@@ -166,7 +212,41 @@ fn build_with(n: u8, validators: u8, epoch_blocks: u64, all_signers: bool, bridg
         incremental_nullifier_root: None,
         perps: None,
         hc_auth_multisig: None,
+        beacon: None,
     };
+    if let Some(b) = &beacon {
+        // What `program_state` stands on (`Genesis::validate`), then the window, then the beacon.
+        genesis.max_block_bytes = Some(20 << 20);
+        genesis.gas = Some(crate::gas::GasConfig {
+            gas_price: 100,
+            byte_price: 800,
+            bundle_gas_limit: crate::gas::bundle_gas_limit_pin(),
+            metering: crate::gas::GasMetering::Circuit,
+            dynamic: None,
+        });
+        genesis.hardening_v6 = Some(true);
+        genesis.hc_auth = Some(word8_to_hex(&[21; 8]));
+        genesis.program_state =
+            Some(crate::ledger::program_state::ProgramStateConfig { cell_fee: 10_000_000, refuse_panics: false, reference_block_window: 256 });
+        genesis.beacon = Some(crate::ledger::beacon::BeaconConfig {
+            commit_delay_blocks: BEACON_DELAY,
+            commitments: keys[..validators as usize]
+                .iter()
+                .enumerate()
+                .map(|(i, k)| crate::ledger::beacon::BeaconCommitment {
+                    validator: k.address().to_base58(),
+                    commitment: hex::encode(beacon_seed(k, i, b.links[i]).commitment()),
+                })
+                .collect(),
+        });
+    }
+    let seeds: Vec<Option<std::sync::Arc<TestSeeds>>> = (0..n as usize)
+        .map(|i| {
+            let b = beacon.as_ref()?;
+            let held = i < validators as usize && b.held[i];
+            Some(std::sync::Arc::new(TestSeeds(std::sync::Mutex::new(if held { vec![beacon_seed(&keys[i], i, b.links[i])] } else { Vec::new() }))))
+        })
+        .collect();
     let gs = genesis.build(&StubExecutor).unwrap();
     let mut cfg = ConsensusConfig::new(1, gs.validators.clone(), gs.hash());
     cfg.epoch_blocks = gs.epoch_blocks;
@@ -179,10 +259,15 @@ fn build_with(n: u8, validators: u8, epoch_blocks: u64, all_signers: bool, bridg
         } else {
             None
         };
-        nodes.push(HotStuff::new(cfg.clone(), signer, gs.block.clone(), gs.ledger.clone(), std::sync::Arc::new(StubExecutor)));
+        let mut node = HotStuff::new(cfg.clone(), signer, gs.block.clone(), gs.ledger.clone(), std::sync::Arc::new(StubExecutor));
+        if let Some(s) = &seeds[i] {
+            node.set_reveal_source(s.clone());
+        }
+        nodes.push(node);
         addr_to_idx.insert(k.address(), i);
     }
     let mut sim = Sim {
+        seeds,
         committed: vec![Vec::new(); n as usize],
         recorded: vec![Vec::new(); n as usize],
         pending: vec![Vec::new(); n as usize],
@@ -844,6 +929,9 @@ impl Sim {
         let pending = if durable { self.pending[i].clone() } else { Vec::new() };
         self.nodes[i] =
             HotStuff::resume(cfg, signer, head, qc, ledger, Some(safety), pending, epoch_sets, std::sync::Arc::new(StubExecutor));
+        if let Some(s) = &self.seeds[i] {
+            self.nodes[i].set_reveal_source(s.clone());
+        }
         self.timers[i] = None;
         self.pending_propose[i] = None;
         let acts = self.nodes[i].start();
@@ -1600,6 +1688,7 @@ fn one_node_parts() -> (ConsensusConfig, crate::genesis::GenesisState, Keypair) 
         incremental_nullifier_root: None,
         perps: None,
         hc_auth_multisig: None,
+        beacon: None,
     };
     let gs = genesis.build(&StubExecutor).unwrap();
     let mut cfg = ConsensusConfig::new(1, gs.validators.clone(), gs.hash());
@@ -2229,6 +2318,7 @@ fn aggregation_node_with(
         incremental_nullifier_root: None,
         perps: None,
         hc_auth_multisig: None,
+        beacon: None,
     };
     let mut gs = genesis.build(&StubExecutor).unwrap();
     // Register the aggregator directly on the genesis ledger the node builds on (the register
@@ -4073,4 +4163,137 @@ fn precheck_proposal_refuses_what_on_proposal_refuses_before_the_apply() {
     assert!(matches!(hs.on_proposal(repeated, sim.now), Err(ConsensusError::Execution(_))));
     assert!(!hs.has_block(&block.hash()));
     assert_eq!(hs.precheck_proposal(&block), Ok(()), "the honest block still passes");
+}
+
+// ---- the randomness beacon (genesis `beacon`) ----------------------------------------------
+
+/// The reveal a committed block opens with.
+fn reveal_of(block: &Block) -> [u8; 32] {
+    match block.transactions.first().map(|t| &t.action) {
+        Some(crate::types::Action::BeaconReveal { reveal }) => *reveal,
+        other => panic!("block {} does not open with a reveal: {other:?}", block.height()),
+    }
+}
+
+/// A `BeaconCommit` by `key` on the fixture chain.
+fn beacon_commit(sim: &Sim, key: &Keypair, commitment: [u8; 32], nonce: u64) -> Transaction {
+    let m = crate::types::actions::beacon_commit_message(&sim.gs.hash(), &commitment, nonce);
+    Transaction {
+        chain_id: 1,
+        bundle: None,
+        action: crate::types::Action::BeaconCommit { validator: key.address(), commitment, nonce, signature: key.sign(m.as_bytes()) },
+    }
+}
+
+/// Four validators on a beacon chain: every block opens with its proposer's reveal and nothing
+/// else is one, every replica holds the same beacon value — the one the committed reveals
+/// give, mixed from the genesis value — and each closed block's facts carry the value after it.
+#[test]
+fn a_beacon_chain_commits_and_every_replica_holds_the_same_value() {
+    with_beacon(&[64; 4], &[true; 4], || {
+        let mut sim = setup(4, 4);
+        for _ in 0..14 {
+            sim.step(vec![]);
+        }
+        sim.assert_consistent();
+        let chain = sim.committed[0].clone();
+        assert!(chain.len() >= 8, "only {} blocks", chain.len());
+        let mut value = sim.gs.ledger.beacon().unwrap().value;
+        let mut ledger = sim.gs.ledger.clone();
+        let mut proposers = std::collections::BTreeSet::new();
+        for cb in &chain {
+            assert_eq!(cb.block.transactions.len(), 1, "an empty block carries its reveal and nothing else");
+            let before = value;
+            value = crate::ledger::beacon::mix(&value, &reveal_of(&cb.block), cb.block.height());
+            assert_ne!(value, before);
+            ledger.apply_block(&cb.block, &StubExecutor).expect("a replica replays it");
+            assert_eq!(ledger.beacon().unwrap().value, value);
+            assert_eq!(ledger.block_facts().back().unwrap().randomness, Some(value), "the block's facts carry the value after its reveal");
+            proposers.insert(cb.block.proposer());
+        }
+        assert_eq!(proposers.len(), 4, "every validator proposed");
+        // Every replica's committed ledger is at a prefix of that chain and holds its value.
+        for (i, node) in sim.nodes.iter().enumerate() {
+            let mine = sim.committed[i].len();
+            let mut l = sim.gs.ledger.clone();
+            for cb in &chain[..mine] {
+                l.apply_block(&cb.block, &StubExecutor).unwrap();
+            }
+            assert_eq!(node.committed_ledger().beacon(), l.beacon(), "node {i}");
+            assert_eq!(node.committed_ledger().state_root(), l.state_root(), "node {i}");
+        }
+        // A restart: the replica gets its seed back and the chain goes on.
+        sim.restart_durable(1);
+        let before = sim.committed[0].len();
+        for _ in 0..12 {
+            sim.step(vec![]);
+        }
+        sim.assert_consistent();
+        assert!(sim.committed[0].len() >= before + 4, "the chain stopped after the restart");
+        let after: std::collections::BTreeSet<Address> = sim.committed[0][before..].iter().map(|cb| cb.block.proposer()).collect();
+        assert!(after.contains(&sim.keys[1].address()), "the restarted validator proposes again");
+    });
+}
+
+/// A validator whose node holds no seed cannot open its commitment: it proposes nothing, its
+/// views time out, the other three keep committing — and it keeps voting, so nothing is lost
+/// but its own slots. No block of the chain is its.
+#[test]
+fn a_leader_without_its_seed_misses_its_slot_and_the_chain_advances() {
+    with_beacon(&[64; 4], &[true, true, false, true], || {
+        let mut sim = setup(4, 4);
+        let seedless = sim.keys[2].address();
+        assert!((0..8u64).any(|v| sim.nodes[0].leader(v) == seedless), "it leads some view");
+        for _ in 0..40 {
+            sim.step(vec![]);
+        }
+        sim.assert_consistent();
+        let chain = &sim.committed[0];
+        assert!(chain.len() >= 8, "the chain stalled at {} blocks", chain.len());
+        assert!(chain.iter().all(|cb| cb.block.proposer() != seedless), "a block by the validator that cannot reveal");
+        assert!(sim.nodes[0].view() > chain.len() as u64 + 3, "no view passed without a block");
+        // It votes: its replica follows the chain like the others.
+        assert!(sim.committed[2].len() + 3 >= chain.len(), "the seedless replica fell behind: {} of {}", sim.committed[2].len(), chain.len());
+        let entry = &sim.nodes[0].committed_ledger().beacon().unwrap().entries[&seedless];
+        assert_eq!(entry.commitment, Some(beacon_seed(&sim.keys[2], 2, 64).commitment()), "its commitment never moved");
+    });
+}
+
+/// A validator whose chain is spent misses its slots until it registers a new commitment; the
+/// commit waits out the delay and the validator proposes again from the new chain.
+#[test]
+fn an_exhausted_seed_chain_is_replaced_by_a_recommit_after_the_delay() {
+    with_beacon(&[2, 64, 64, 64], &[true; 4], || {
+        let mut sim = setup(4, 4);
+        let spent = sim.keys[0].address();
+        let blocks_by = |sim: &Sim| sim.committed[1].iter().filter(|cb| cb.block.proposer() == spent).count();
+        for _ in 0..60 {
+            sim.step(vec![]);
+        }
+        sim.assert_consistent();
+        assert_eq!(blocks_by(&sim), 2, "two links, two blocks");
+        let entry = sim.nodes[1].committed_ledger().beacon().unwrap().entries[&spent].clone();
+        assert_eq!(entry.commitment, Some([0x80; 32]), "the last reveal was the seed itself");
+        // The recommit: a new chain, signed by the validator, pooled everywhere.
+        let fresh = crate::ledger::beacon::SeedChain::new(1, spent, [0xee; 32], 64);
+        let commit = beacon_commit(&sim, &sim.keys[0], fresh.commitment(), 1);
+        let tip = fresh.commitment();
+        sim.seeds[0].as_ref().unwrap().0.lock().unwrap().push(fresh);
+        let before = sim.committed[1].len();
+        for _ in 0..60 {
+            sim.step(vec![commit.clone()]);
+        }
+        sim.assert_consistent();
+        let chain = &sim.committed[1];
+        let at = chain.iter().position(|cb| cb.block.transactions.contains(&commit)).expect("the commit was included") as u64 + 1;
+        assert!(at > before as u64);
+        assert_eq!(chain.iter().filter(|cb| cb.block.transactions.contains(&commit)).count(), 1, "included once");
+        let later: Vec<u64> = chain.iter().filter(|cb| cb.block.proposer() == spent).map(|cb| cb.block.height()).skip(2).collect();
+        assert!(!later.is_empty(), "the validator never proposed again");
+        assert!(later.iter().all(|h| *h >= at + BEACON_DELAY), "a block before the delay had run: {later:?}, commit at {at}");
+        let first = chain[later[0] as usize - 1].block.clone();
+        assert_eq!(crate::ledger::beacon::link(1, &spent, &reveal_of(&first)), tip, "its first block opens the new commitment");
+        let entry = sim.nodes[1].committed_ledger().beacon().unwrap().entries[&spent].clone();
+        assert_eq!((entry.nonce, entry.pending), (1, None));
+    });
 }

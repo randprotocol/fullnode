@@ -261,6 +261,25 @@ validator runs `price sign` and hands back its vote file, and whoever collects t
 submit --signature v1.txt --signature v2.txt …`. A vote for update `n` never counts for `n + 1`,
 even at the same price, so a stale round is simply re-signed.
 
+### `rand-node beacon init` / `commitment` / `recommit` / `status`
+
+The randomness beacon (genesis `beacon`; `docs/evm-block-context.md` §11): this validator's seed
+file, `<datadir>/beacon.seed.json`, and its commitment on the chain.
+
+| command | arguments | meaning |
+|---|---|---|
+| `beacon init` | `--datadir <D>`, `--key <validator key>`, `--chain-id <N>`, `--links <N>` (default 1048576) | create the seed file (mode 0600; refuses to overwrite) with one fresh hash chain for this validator on this chain and print its commitment on stdout — the 64 hex characters the genesis `beacon` section lists. Reads no node |
+| `beacon commitment` | `--datadir <D>` | print the newest commitment in the file, after checking every seed in it gives its recorded commitment. Reads no node |
+| `beacon recommit` | `--datadir <D>`, `--key <validator key>`, `--links <N>`, `--rpc`, `--no-wait` | append a fresh chain to the file (older seeds are kept; the file is created if missing), sign a `BeaconCommit` for it at the validator's next commit nonce (`rand_getBeacon`) and submit it. Fee-less. In force `commit_delay_blocks` after its block |
+| `beacon status` | `--datadir <D>`, `--rpc` | the commitment in force and any pending one, whether a seed in the file opens each, and the reveals left; **exits non-zero** when no seed opens the commitment in force (the validator is missing its slots) |
+
+The seed file is secret and bound to one chain id and one validator address: **never copy it
+between hosts**. A validator that recommits before its chain runs out misses no slot; one that
+lost its seed runs `recommit`, misses its own slots for the delay, and keeps voting. `rand-node
+genesis` takes `--beacon-commitment <ADDRESS>=<HEX>` once per validator and
+`--beacon-commit-delay-blocks <BLOCKS>` (default 256); both need
+`--program-state-reference-block-window`.
+
 ### `rand-node vesting status` / `claim` / `revoke` / `bond` / `unbond`
 
 Genesis vesting (`docs/vesting.md`) — a timelocked allocation's holder and revoker side, on a chain

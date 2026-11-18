@@ -265,6 +265,91 @@ async fn register_row(rpc: &RpcClient, me: &randprotocol_core::Address) -> Resul
     Ok((nonce, payout))
 }
 
+/// `rand-node beacon …`: the validator's beacon seed file and its commitment on the chain.
+async fn beacon_cmd(cmd: BeaconCmd) -> Result<()> {
+    use randprotocol_node::beacon::{seed_path, SeedFile};
+    match cmd {
+        BeaconCmd::Init { datadir, key, chain_id, links } => {
+            let kp = load_keypair(&key)?;
+            let path = seed_path(&datadir);
+            let entry = SeedFile::create(&path, chain_id, &kp.address(), links)?;
+            eprintln!(
+                "wrote {} (secret; chain {chain_id}, validator {}, {links} links). Never copy it to another host. Commitment:",
+                path.display(),
+                kp.address()
+            );
+            println!("{}", entry.commitment);
+        }
+        BeaconCmd::Commitment { datadir } => {
+            let file = SeedFile::read(&seed_path(&datadir))?;
+            // Walked from the seed, so a file that is not this validator's is said here.
+            file.chains()?;
+            eprintln!("chain {}, validator {}, {} chain(s); newest commitment:", file.chain_id, file.validator, file.seeds.len());
+            println!("{}", file.newest_commitment().context("the seed file holds no seed")?);
+        }
+        BeaconCmd::Recommit { datadir, links, staking } => {
+            let kp = load_keypair(&staking.key)?;
+            let rpc = RpcClient::new(staking.rpc.clone());
+            let chain_id = rpc.chain_id().await?;
+            let genesis = rpc.genesis_hash().await?;
+            let state = rpc.call("rand_getBeacon", serde_json::json!([kp.address().to_base58()])).await?;
+            anyhow::ensure!(state["enabled"].as_bool() == Some(true), "this chain has no randomness beacon (genesis `beacon`)");
+            let nonce = state["validators"][0]["nonce"].as_u64().map_or(1, |n| n + 1);
+            let delay = state["commit_delay_blocks"].as_u64().unwrap_or(0);
+            // The seed is on disk, flushed, before the commitment leaves this machine.
+            let entry = SeedFile::append(&seed_path(&datadir), chain_id, &kp.address(), links)?;
+            let commitment: [u8; 32] =
+                hex::decode(&entry.commitment).ok().and_then(|b| b.try_into().ok()).context("the new commitment is not 32 bytes")?;
+            let message = randprotocol_core::types::actions::beacon_commit_message(&genesis, &commitment, nonce);
+            let action = randprotocol_core::Action::BeaconCommit {
+                validator: kp.address(),
+                commitment,
+                nonce,
+                signature: kp.sign(message.as_bytes()),
+            };
+            eprintln!(
+                "new seed chain of {links} links written to {}; it is in force {delay} blocks after the commit's block, at this validator's next block",
+                seed_path(&datadir).display()
+            );
+            submit_staking(&staking, chain_id, action, &format!("beacon commit {} at nonce {nonce}", entry.commitment)).await?;
+        }
+        BeaconCmd::Status { datadir, rpc } => {
+            let file = SeedFile::read(&seed_path(&datadir))?;
+            let chains = file.chains()?;
+            let client = RpcClient::new(rpc);
+            let chain_id = client.chain_id().await?;
+            anyhow::ensure!(chain_id == file.chain_id, "the seed file is chain {}'s and the node is on chain {chain_id}", file.chain_id);
+            let state = client.call("rand_getBeacon", serde_json::json!([file.validator])).await?;
+            anyhow::ensure!(state["enabled"].as_bool() == Some(true), "this chain has no randomness beacon (genesis `beacon`)");
+            let row = &state["validators"][0];
+            let word = |v: &serde_json::Value| -> Option<[u8; 32]> { hex::decode(v.as_str()?).ok()?.try_into().ok() };
+            // How many reveals a seed in the file has left for `c` (the newest chain first).
+            let left = |c: &[u8; 32]| chains.iter().rev().find_map(|s| s.reveal_for(c)).map(|(_, n)| n);
+            println!("validator {} on chain {chain_id} at height {}; beacon value {}", file.validator, state["height"], state["value"].as_str().unwrap_or("?"));
+            if let Some(p) = row.get("pending").filter(|p| !p.is_null()) {
+                let opens = word(&p["commitment"]).and_then(|c| left(&c));
+                println!(
+                    "pending commitment {} activates at height {}: {}",
+                    p["commitment"].as_str().unwrap_or("?"),
+                    p["activates_at"],
+                    opens.map_or("NO seed in the file opens it".to_string(), |n| format!("the seed file opens it, {n} reveals"))
+                );
+            }
+            match word(&row["due"]) {
+                None => anyhow::bail!("no commitment in force for this validator: it misses its slots (run `rand-node beacon recommit`, then wait out the commit delay)"),
+                Some(due) => match left(&due) {
+                    Some(n) => println!("commitment in force {}: the seed file opens it; remaining reveals: {n}", hex::encode(due)),
+                    None => anyhow::bail!(
+                        "commitment in force {}: NO seed in the file opens it — this validator misses its slots (run `rand-node beacon recommit`)",
+                        hex::encode(due)
+                    ),
+                },
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Submit a bundle-less validator-signed action and report where it landed.
 ///
 /// There is nothing to prove and nothing to pay: the action is signed by the node's own key and
@@ -692,6 +777,17 @@ enum Cmd {
         /// `bridge` or a `perps` section).
         #[arg(long, value_name = "BLOCKS")]
         program_state_reference_block_window: Option<u64>,
+        /// The randomness beacon (`docs/evm-block-context.md` §11): one validator's hash-chain
+        /// commitment, as `<validator address>=<64 hex>` (what `rand-node beacon init` prints);
+        /// repeat for **every** `--validator`. Given, the file gets a `beacon` section, bound
+        /// into the genesis hash (last); omitted, it has none and hashes byte for byte as
+        /// before. Needs `--program-state-reference-block-window`.
+        #[arg(long = "beacon-commitment", value_name = "ADDRESS=HEX")]
+        beacon_commitments: Vec<String>,
+        /// The beacon's `commit_delay_blocks`: how long a `BeaconCommit` waits before its
+        /// commitment can be opened. Default 256 when `--beacon-commitment` is given.
+        #[arg(long, value_name = "BLOCKS")]
+        beacon_commit_delay_blocks: Option<u64>,
         /// Fee feedback (`docs/fees.md` §1.3): the `fees` section, as a `FeesConfig` JSON file
         /// (`{"burn_base": true, "subsidy_net_of_fees": true, "burn_floor": true,
         /// "proposer_share_bps": 4000, "prove_base": 600000}`, each optional).
@@ -1043,6 +1139,16 @@ enum Cmd {
     Price {
         #[command(subcommand)]
         cmd: PriceCmd,
+    },
+    /// The randomness beacon (genesis `beacon`, `docs/evm-block-context.md` §11): this
+    /// validator's seed file and its commitment on the chain. `init` makes the seed and prints
+    /// the commitment a genesis lists; `commitment` prints it again; `recommit` registers a new
+    /// one on a running chain (a spent chain, a lost seed, a validator that joined after
+    /// genesis); `status` says whether the seed file opens what the chain holds and how many
+    /// reveals are left.
+    Beacon {
+        #[command(subcommand)]
+        cmd: BeaconCmd,
     },
     /// Genesis vesting (`docs/vesting.md`): a timelocked allocation's holder and revoker side —
     /// status, claim, revoke, and bonding locked RAND. The key is made with `keygen` and its
@@ -1502,6 +1608,55 @@ enum AdmitCmd {
 }
 
 /// `rand-node price …` (`fees.usd_subsidy`).
+#[derive(Subcommand)]
+enum BeaconCmd {
+    /// Create `<datadir>/beacon.seed.json` (mode 0600; refuses to overwrite) with one fresh hash
+    /// chain for this validator on this chain, and print its commitment — the 64 hex characters
+    /// the genesis `beacon` section lists for this validator. The file is secret, and bound to
+    /// this chain id and this validator: never copy it to another host.
+    Init {
+        #[arg(long)]
+        datadir: PathBuf,
+        /// The validator's key file (its address is hashed into every link).
+        #[arg(long)]
+        key: PathBuf,
+        #[arg(long)]
+        chain_id: u64,
+        /// Links in the chain: one per block this validator proposes. The default lasts about
+        /// 1.7 years at 26 validators and 2 s blocks. Not consensus.
+        #[arg(long, default_value_t = randprotocol_core::ledger::beacon::DEFAULT_SEED_LINKS)]
+        links: u64,
+    },
+    /// Print the newest commitment in `<datadir>/beacon.seed.json`. Reads no node.
+    Commitment {
+        #[arg(long)]
+        datadir: PathBuf,
+    },
+    /// Add a fresh chain to `<datadir>/beacon.seed.json` (creating the file if there is none;
+    /// older seeds are kept), sign a `BeaconCommit` for its commitment with the validator key
+    /// and submit it. Fee-less: no wallet needed. The new commitment is in force
+    /// `beacon.commit_delay_blocks` after the block that includes it; until then the old chain
+    /// (if the file still holds its seed) keeps opening this validator's blocks.
+    Recommit {
+        #[arg(long)]
+        datadir: PathBuf,
+        #[arg(long, default_value_t = randprotocol_core::ledger::beacon::DEFAULT_SEED_LINKS)]
+        links: u64,
+        #[command(flatten)]
+        staking: StakingArgs,
+    },
+    /// Compare `<datadir>/beacon.seed.json` with the chain (`rand_getBeacon`): the commitment in
+    /// force and any pending one, whether a seed in the file opens each, and how many reveals
+    /// are left. Exits non-zero when no seed opens the commitment this validator's next block
+    /// needs — the validator is missing its slots.
+    Status {
+        #[arg(long)]
+        datadir: PathBuf,
+        #[arg(long, default_value = "http://127.0.0.1:8545")]
+        rpc: String,
+    },
+}
+
 #[derive(Subcommand)]
 enum PriceCmd {
     /// Show the chain's voted price, when it was set, its nonce, and whether it is fresh for the
@@ -2678,9 +2833,17 @@ async fn main() -> Result<()> {
             program_state_cell_fee,
             program_state_refuse_panics,
             program_state_reference_block_window,
+            beacon_commitments,
+            beacon_commit_delay_blocks,
             fees,
             perps,
         } => {
+            if beacon_commit_delay_blocks.is_some() && beacon_commitments.is_empty() {
+                anyhow::bail!("--beacon-commit-delay-blocks needs --beacon-commitment: it is a field of the beacon section");
+            }
+            if !beacon_commitments.is_empty() && program_state_reference_block_window.is_none() {
+                anyhow::bail!("--beacon-commitment needs --program-state-reference-block-window: a program reads the beacon through a reference block");
+            }
             let hc_bundle = match bundle_guest.as_str() {
                 "v3" => ZkExecutor::hc_hidden_bundle_v3(),
                 "v2" => ZkExecutor::hc_hidden_bundle_v2(),
@@ -2929,6 +3092,7 @@ async fn main() -> Result<()> {
                 // this build's digest, never typed; absent otherwise, so a genesis cut without it
                 // hashes byte-for-byte as before.
                 hc_auth_multisig: auth_multisig_guest.then(|| word8_to_hex(&ZkExecutor::hc_auth_multisig())),
+                beacon: None,
             };
             if binding_domain.is_none() && !randprotocol_client::CHAIN_ID_BINDING_CHAIN_IDS.contains(&chain_id) {
                 eprintln!(
@@ -2940,6 +3104,17 @@ async fn main() -> Result<()> {
             }
             for v in &validators {
                 gen.validators.push(parse_genesis_validator(v)?);
+            }
+            if !beacon_commitments.is_empty() {
+                use randprotocol_core::ledger::beacon::{BeaconCommitment, BeaconConfig, DEFAULT_COMMIT_DELAY_BLOCKS};
+                let commitments = beacon_commitments
+                    .iter()
+                    .map(|c| {
+                        let (validator, commitment) = c.split_once('=').context("--beacon-commitment must be <validator address>=<64 hex>")?;
+                        Ok(BeaconCommitment { validator: validator.trim().to_string(), commitment: commitment.trim().to_string() })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                gen.beacon = Some(BeaconConfig { commit_delay_blocks: beacon_commit_delay_blocks.unwrap_or(DEFAULT_COMMIT_DELAY_BLOCKS), commitments });
             }
             // The format every `--alloc` note is sealed in: read off the field just set above, so
             // it is the chain's own declared envelope shape, not this command's default.
@@ -3489,6 +3664,7 @@ async fn main() -> Result<()> {
                 }
             }
         },
+        Cmd::Beacon { cmd } => beacon_cmd(cmd).await?,
         Cmd::BridgeGov { cmd } => bridge_gov(cmd).await?,
         Cmd::Multisig { cmd } => multisig_cmd(cmd).await?,
         Cmd::Vesting { cmd } => match cmd {
@@ -4616,6 +4792,45 @@ fn bundle_gas_limit_or_default(v: Option<u64>) -> u64 {
 mod tests {
     use super::*;
     use randprotocol_core::ledger::staking::MIN_STAKE;
+
+    /// `rand-node beacon` (genesis `beacon`): the four subcommands parse with their defaults;
+    /// `init` writes the seed file for the key's validator and refuses a second time; and
+    /// `commitment` reads it back. `genesis` takes the commitments and the delay (its refusals
+    /// are in `tests/genesis_cli.rs`).
+    #[tokio::test]
+    async fn the_beacon_commands_parse_and_init_writes_the_seed_file_once() {
+        use randprotocol_core::ledger::beacon::DEFAULT_SEED_LINKS;
+        use randprotocol_node::beacon::{seed_path, SeedFile};
+        let dir = tempfile::tempdir().unwrap();
+        let key = dir.path().join("node.key.json");
+        let kp = Keypair::from_seed([3; 32]).unwrap();
+        KeyFile::from_keypair(&kp).write_new(&key).unwrap();
+        let (d, k) = (dir.path().to_str().unwrap(), key.to_str().unwrap());
+        let beacon = |args: &[&str]| match Cli::try_parse_from([&["rand-node", "beacon"], args].concat()).unwrap().cmd {
+            Cmd::Beacon { cmd } => cmd,
+            _ => unreachable!(),
+        };
+        beacon_cmd(beacon(&["init", "--datadir", d, "--key", k, "--chain-id", "22", "--links", "32"])).await.unwrap();
+        let file = SeedFile::read(&seed_path(dir.path())).unwrap();
+        assert_eq!((file.chain_id, file.validator().unwrap(), file.seeds.len(), file.seeds[0].links), (22, kp.address(), 1, 32));
+        let again = beacon_cmd(beacon(&["init", "--datadir", d, "--key", k, "--chain-id", "22"])).await.unwrap_err();
+        assert!(format!("{again:#}").contains("refusing to overwrite"), "{again:#}");
+        assert_eq!(SeedFile::read(&seed_path(dir.path())).unwrap(), file, "the refused init left the file alone");
+        beacon_cmd(beacon(&["commitment", "--datadir", d])).await.unwrap();
+        assert!(beacon_cmd(beacon(&["commitment", "--datadir", dir.path().join("none").to_str().unwrap()])).await.is_err());
+        // Defaults: the tools' chain length, the local RPC, waiting for the commit.
+        assert!(matches!(beacon(&["init", "--datadir", d, "--key", k, "--chain-id", "1"]), BeaconCmd::Init { links: DEFAULT_SEED_LINKS, .. }));
+        let BeaconCmd::Recommit { links, staking, .. } = beacon(&["recommit", "--datadir", d, "--key", k]) else { panic!("recommit") };
+        assert_eq!((links, staking.rpc.as_str(), staking.no_wait), (DEFAULT_SEED_LINKS, "http://127.0.0.1:8545", false));
+        assert!(matches!(beacon(&["status", "--datadir", d]), BeaconCmd::Status { .. }));
+        assert!(Cli::try_parse_from(["rand-node", "beacon", "init", "--datadir", d]).is_err(), "init needs the key and the chain id");
+
+        // `genesis`: the flags.
+        let c = format!("{}={}", kp.address().to_base58(), file.seeds[0].commitment);
+        let parsed = Cli::try_parse_from(["rand-node", "genesis", "--validator", "k,1000,p", "--beacon-commitment", &c, "--beacon-commit-delay-blocks", "300"]).unwrap();
+        let Cmd::Genesis { beacon_commitments, beacon_commit_delay_blocks, .. } = parsed.cmd else { panic!("genesis") };
+        assert_eq!((beacon_commitments, beacon_commit_delay_blocks), (vec![c.clone()], Some(300)));
+    }
 
     /// Issue #60: every subcommand that opens RocksDB raises the open-files limit first — not
     /// only `run`, whose `node::start` did it since #41. `verify --repair` is the one that
@@ -5766,6 +5981,7 @@ mod tests {
             incremental_nullifier_root: None,
             perps: None,
             hc_auth_multisig: None,
+            beacon: None,
         }
     }
 

@@ -79,8 +79,8 @@ the length of `public` and the 8 binding words for the offset in the segment).
 | 13–14 | `timestamp` | block `h`'s header `timestamp_ms / 1000`, **seconds**, rounded down; low, high |
 | 15–16 | `chain_id` | the genesis `chain_id`; low, high |
 | 17–18 | `basefee` | §5; low, high |
-| 19 | `has_randomness` | 1 if words 20–27 hold a beacon value; **always 0 today** |
-| 20–27 | `randomness` | 256 bits as eight words (a `Word8`, as a cell value is); **all zero today** |
+| 19 | `has_randomness` | 1 if words 20–27 hold a beacon value: 1 on a chain with the genesis `beacon` section (§11), 0 on every other |
+| 20–27 | `randomness` | the beacon's value after block `h`'s reveal: 32 bytes as eight little-endian words (a `Word8`, as a cell value is); all zero when word 19 is 0 |
 | 28… | | version 1's words 11…: reads, writes (16 words a cell), then payouts (3 words each) |
 
 A u64 is two words, low first — how the header already encodes `burn_r` and `burn_a`. Constants:
@@ -126,7 +126,7 @@ ordinary `Invoke` or a `Call` every one of them keeps trapping.
 | `CHAINID` | the chain id | words 15–16 (today a constant baked into the image; unchanged outside an `InvokeAt`) |
 | `BASEFEE` | §5 | words 17–18 |
 | `GASPRICE` | `= BASEFEE` (no tips) | words 17–18 |
-| `PREVRANDAO` | **traps while word 19 is 0** (always, today); the beacon value when it is 1 | words 19–27 |
+| `PREVRANDAO` | **traps while word 19 is 0** (a chain without the `beacon` section); the beacon value of block `h` when it is 1 — read §11.4 before using it | words 19–27 |
 | `COINBASE` | 0 | none: fees go to the proposer's register entry, which has no EVM address |
 | `GASLIMIT` | a protocol constant, fixed in the guest by the circuits change | none |
 | `BLOCKHASH` | traps | none: no header hash is in the context |
@@ -136,7 +136,7 @@ ordinary `Invoke` or a `Call` every one of them keeps trapping.
 
 ## 7. The ledger's record and the rules
 
-**The ring.** `Ledger::block_facts`: `(height, timestamp_ms, basefee)` for the last `window` closed
+**The ring.** `Ledger::block_facts`: `(height, timestamp_ms, basefee, randomness)` for the last `window` closed
 blocks, oldest first. Recorded in `close_block` beside the anchor (`record_block_facts`), by the
 proposer and every replica from the same values. Block 0 is never recorded. Like the anchors it
 is derived from the chain, outside the state root, inside `Ledger`'s equality. Each speculative
@@ -186,7 +186,7 @@ CLI: `rand-node genesis --program-state-reference-block-window <BLOCKS>`.
 
 ```json
 { "enabled": true, "height": 4210, "timestamp": 1794960123, "timestamp_ms": 1794960123456,
-  "chain_id": 22, "basefee": "100", "has_randomness": false, "randomness": "00…00",
+  "chain_id": 22, "basefee": "100", "has_randomness": false, "randomness": "00…00",  // true and the value under §11
   "window": 256, "oldest": 3955, "newest": 4210,
   "context_version": 2, "offset": 11, "words": [4210, 0, 1794960123, 0, 22, 0, 100, 0, 0, …] }
 ```
@@ -223,6 +223,188 @@ vendor set 10 before it; `AGENTS.md`, "The constraint-set guard").
 
 Tested here with `StubExecutor` only: no proof was made.
 
-## 11. Randomness (PREVRANDAO) — proposed, not built
+## 11. Randomness (PREVRANDAO): the beacon
 
-> **Randomness (PREVRANDAO).** The chain has no beacon today, and validator signatures cannot serve as one: Dilithium signatures are not unique, so a proposer could grind them. Proposed: a hash-chain commit–reveal beacon ("RANDAO over hash onions"), post-quantum because it uses only the hash. Each validator registers a commitment `c = H^N(seed)`; each block's proposer reveals the preimage of its last commitment in the header; `beacon(h) = H(beacon(h−1) ‖ reveal)`. A reveal is deterministic, so it cannot be ground; the only influence is withholding (skipping one's own block, forfeiting its reward), which is one bit per leader slot — the same trust level as Ethereum's PREVRANDAO, and it must be documented as unsuitable for high-value lotteries without a delay. It needs a header field, validator registration and slashing-free skip handling, so it is its own consensus change at a chain cut; the `randomness`/`has_randomness` words are reserved here so the public layout does not move when it lands.
+Status: **built in the node and gated off; on no chain.** Genesis `beacon`. Chain 21 has no such
+section: its genesis hash, header and block bytes, state root, wire tags 0–45 and store rows are
+unchanged (pinned on the commit before the beacon, `crates/randprotocol-core/tests/
+beacon_gate_off_pin.rs` and `node::tests::chain_21_is_byte_for_byte_what_it_was_before_the_beacon`).
+The guest's `PREVRANDAO` read of words 19–27 is circuits work and waits for the constraint-set-10
+re-vendor (§10); nothing was proved here.
+
+### 11.1 What it is
+
+Validator signatures cannot be a beacon: Dilithium signatures are not unique, so a proposer could
+grind them. The beacon is a hash-chain commit–reveal ("RANDAO over hash onions"), post-quantum
+because it uses only BLAKE3.
+
+- **Link.** `L(x) = blake3("rand-beacon-link-1" ‖ be64(chain_id) ‖ validator address ‖ x)`. The
+  address is inside the link, so a commitment copied from another validator opens to nothing.
+- **Commitment.** A validator picks a secret 32-byte seed and registers `c = L^N(seed)`. `N` is
+  not consensus — the chain checks one link per block and never counts them. The tools default to
+  2^20, about 1.7 years at 26 validators and 2 s blocks.
+- **Reveal.** Block `n`'s proposer reveals `r` with `L(r) = c`, its current commitment. The
+  ledger then sets the proposer's commitment to `r` and
+  `beacon(n) = blake3("rand-beacon-1" ‖ beacon(n−1) ‖ r ‖ be64(n))`.
+- **Genesis value.** `beacon(0) = blake3("rand-beacon-genesis-1" ‖ be64(chain_id) ‖ (address ‖
+  c)*)` over the genesis commitments in address order. (Not the genesis hash: the genesis header
+  carries the state root, which commits to this value.)
+
+A reveal is determined by the commitment, so it cannot be ground.
+
+### 11.2 Carrier, rules and state
+
+The reveal is **not a header field**. The header is embedded positionally in `Block`, in the
+compact proposal and in a `SlashEquivocation`'s signed headers; a gated trailing field could not
+be decoded without context, and any field would move chain 21's header bytes. It is a
+transaction:
+
+| action | tag | shape |
+|---|---|---|
+| `BeaconReveal { reveal: [u8; 32] }` | 46 | bundle-less, fee-less; 45 bytes on the wire |
+| `BeaconCommit { validator, commitment, nonce, signature }` | 47 | bundle-less, fee-less; signed by the validator's key over `blake3("rand-beacon-commit-1" ‖ genesis hash ‖ commitment ‖ be64(nonce))` |
+
+Both are appended after `InvokeAt` (45), so tags 0–45 encode as before. Both sit under the
+transaction root, so the proposer's signature covers the reveal.
+
+**Block rule** (`Ledger::apply_block_reveal`, run by every replica in
+`apply_transactions_for_sync` and by the proposer in `HotStuff::propose` — the same function).
+On a chain with the section, block `n` by proposer `P`:
+
+1. `transactions[0]` is a `BeaconReveal`, bundle-less, on this chain's id — else
+   `BlockError::MissingBeaconReveal` (or `InvalidTx { index: 0, WrongChain | ActionCarriesBundle }`).
+2. `P` has a commitment in force at `n`: its pending commitment if `n ≥` the pending one's
+   activation height, otherwise its current one — else `NoBeaconCommitment`.
+3. `L(reveal) ==` that commitment — else `BadBeaconReveal`. A replayed old reveal fails here: the
+   commitment has moved past it.
+4. A pending commitment that was due is promoted; the commitment becomes `reveal`; the value
+   moves.
+5. No other transaction of the block is a `BeaconReveal` — else
+   `BlockError::MisplacedBeaconReveal { index }`.
+
+Everywhere else — the pool, `rand_sendTransaction`, gossip, a proposer's candidate list — a
+`BeaconReveal` is refused (`RevealOutsideBlockHead`, cached as a permanent verdict), so it is
+never a pooled transaction.
+
+**`BeaconCommit`** (join after genesis, a spent chain, a lost seed): the gate; `validator` is in
+the validator register; `nonce` is the validator's last commit nonce plus one (1 for the first);
+the signature verifies under the register's key. It writes `pending = (height +
+commit_delay_blocks, commitment)` and the nonce; a second commit before promotion replaces the
+pending one and restarts the delay. The pool holds one commit per validator and nonce and orders
+it with governance (it is fee-less).
+
+**The commit delay** is a rule the original proposal did not have. Without it, two colluding
+consecutive leaders — who know `beacon(h−1)` before anyone else — could register a fresh seed
+chosen against it: far more than one bit. With it, a commitment registered at height `h` cannot
+be opened before `h + commit_delay_blocks`. Default 256; bounds 1..=2^20.
+
+**A validator that cannot reveal** — no commitment in force, or a node that holds no seed opening
+it — cannot build a valid block. `propose` returns `NotReady`, the view times out, the next
+leader proposes. The validator stays in the set and keeps voting; **nothing is slashed**. It
+costs the chain one view timeout per missed slot, and the validator its block fees.
+
+**State.** `Ledger::beacon: Option<BeaconState { commit_delay_blocks, value, entries: address →
+{ commitment, nonce, pending } }>`. `None` without the section. With it, consensus state: the
+outermost state-root wrapper, `blake3("rand-state-beacon-1" ‖ root ‖ beacon_root)`; inside
+`Ledger`'s equality; one row, `beacon`, in the `meta` family, written with genesis, at every
+commit and by `truncate_to`, restored by `Storage::restore_beacon` (which `reload_ledger` and the
+replay audit call) and named by the audit. Without the section the row is never written, deleted
+or read, and both actions are refused `UnsupportedAction` before a byte of them is read.
+`BlockFacts.randomness` records `beacon(n)` for each closed block in the reference-block ring.
+
+**Genesis.** `"beacon": { "commit_delay_blocks": 256, "commitments": [{ "validator": "<address,
+base58>", "commitment": "<64 hex>" }, …] }` — `#[serde(default)]`, written only when present; in
+the genesis hash last, as `"beacon" ‖ be64(delay) ‖ (address ‖ commitment)*` in file order, only
+when present. It must list **every** genesis validator exactly once and nobody else, with distinct
+commitments, and it **requires `program_state.reference_block_window`** (a program reads the
+value only through a reference block) — otherwise `BadBeacon`. CLI: `rand-node genesis
+--beacon-commitment <ADDRESS>=<HEX>` (repeatable) and `--beacon-commit-delay-blocks`.
+
+**Gossip.** A beacon block's first transaction is one no peer's pool can hold, so a plain compact
+proposal would cost every validator a body fetch per block. On a beacon chain the leader sends
+`GossipMessage::CompactProposalPrefilled { compact, prefilled: [reveal] }` (appended as the sixth
+gossip variant; never sent on another chain). A receiver keeps the body only after the
+pre-screen, only if it is a reveal and the first hash of the signed list; the fetch-by-hash path
+is unchanged underneath.
+
+### 11.3 Exposure
+
+`BlockFacts::context_words` sets word 19 to 1 and words 20–27 to `beacon(h)`.
+`rand_getBlockContext` renders them (`has_randomness`, `randomness`). `rand_getBeacon` serves the
+value and every validator's commitment (`docs/rpc.md`).
+
+### 11.4 What it is worth — read before using `PREVRANDAO`
+
+The beacon is at **Ethereum's `PREVRANDAO` trust level, not better**, and the reference-block
+design adds one trap of its own.
+
+- **Withholding: one bit per slot.** A proposer cannot choose its reveal, but it can decline to
+  propose. It sees `beacon(n)` before anyone, and if it dislikes it, it skips the block — the
+  next leader's reveal gives another value. The price is that block's fees. A run of `k`
+  colluding consecutive leaders gets `k` bits.
+- **Parent choice: about one more bit.** A leader holding two certified parents the vote rule
+  both allows may choose which to extend; the two give different values.
+- **Foreknowledge.** The proposer knows `beacon(n)` first, and every validator knows it when the
+  proposal arrives, before the block commits. A reveal that leaked in a block that was abandoned
+  is public before the block that finally carries it — and the same reveal is used again.
+- **Window re-rolls.** The *prover* picks the reference block `h`. A contract that simply reads
+  `PREVRANDAO` lets the caller try every block in the window — `window` re-rolls (256 to 4096)
+  — and submit the one it likes. **This breaks naive use completely.**
+
+**The contract-side rule.** The guest enforces nothing beyond trapping when word 19 is 0. A
+contract must pin the block itself:
+
+1. at bet time, store `target = NUMBER + k` with `k ≥ 2` — a block that does not exist yet;
+2. at settlement, `require(NUMBER == target)` and only then read `PREVRANDAO`.
+
+Settlement must then name block `target` as its reference block, which is possible only while
+`target` is inside the window: **within `window` blocks after `target`**. A contract therefore
+needs a refund path for a bet nobody settled in time. And because of withholding, the beacon is
+**unsuitable for a prize worth more than a block's fees to a single proposer** without a further
+delay construction (a VDF, or many blocks' values combined).
+
+### 11.5 Operating a validator
+
+- **The seed file.** `<datadir>/beacon.seed.json`, mode 0600, beside `node.key.json`: the chain
+  id, the validator's address, and the 32-byte seed, length and commitment of each of its
+  chains, newest last. `rand-node beacon init --datadir D --key K --chain-id N` creates it
+  (refusing to overwrite) and prints the commitment the genesis lists.
+- **It is secret, and it is this host's alone.** Whoever holds a seed knows every reveal that
+  validator will make from that chain. The file is bound to one chain id and one address.
+  **Never copy `beacon.seed.json` between hosts**, and do not restore it onto a second machine.
+  Losing it is recoverable (below); leaking it is not, short of a recommit.
+- **Back the seed up; total loss halts the chain.** A validator that loses its seed misses its
+  own slots until a `BeaconCommit` takes effect. If **every** validator loses its seed at once,
+  no block can be produced, so no `BeaconCommit` can land and the chain halts for good: there
+  is no in-protocol recovery. The owner accepted this on 2026-11-18 as an operational risk
+  covered by backups: keep an offline, encrypted copy of each validator's `beacon.seed.json`
+  (a backup for restoring onto the same validator, never a second running copy).
+- **No position is stored.** The node finds its reveal by walking from the seed to the preimage
+  of the commitment the chain holds. Nothing is written before a proposal leaves, so a crash
+  cannot desynchronise it, and after an abandoned block the same reveal is given again.
+- **Recommit.** `rand-node beacon recommit --datadir D --key K [--rpc URL]` appends a fresh
+  chain to the file (flushed before anything is sent), signs a `BeaconCommit` and submits it. It
+  is in force `commit_delay_blocks` after its block, at the validator's next block. The file
+  keeps the old seed, so a validator that recommits **before** its chain runs out misses no
+  slot; one that lost its seed misses its slots for the delay and keeps voting. A running node
+  picks the changed file up by itself.
+- **Starting without a seed.** A validator node on a beacon chain with no file, or one that
+  opens nothing, **starts and votes** and logs at error level that it will miss its slots. (It is
+  not refused: a refused node could not vote, which would cost the chain more than its slots.)
+- **Monitoring.** `rand-node beacon status --datadir D [--rpc URL]` prints the commitment in
+  force, any pending one, whether the file opens each and the reveals left, and **exits non-zero
+  when no seed opens the commitment in force**. Alert on: that exit; remaining reveals under
+  about 20 000 (≈ 12 days at 26 validators and 2 s blocks) — recommit then; `rand_getBeacon`
+  showing a validator with `commitment: null` and no `pending`; and a rising view-timeout rate at
+  one leader's slots, which is what a seedless validator looks like from outside.
+
+### 11.6 Not done
+
+- **Circuits**: the guest's `PREVRANDAO` read of words 19–27 (trap on word 19 = 0), with the rest
+  of §10, at the constraint-set-10 re-vendor; and a real-prover test.
+- **`deploy/cut-chain22-genesis.sh`** does not carry the section: it does not yet carry
+  `reference_block_window` either (§10), which the beacon requires. `deploy/fleet-watch.sh` has
+  no beacon alert; the commands to build one on are above.
+- **Entries are never removed**: a validator that left the register keeps its row in the beacon
+  state (bounded by the register's own growth).
+- **Wallet / explorer**: nothing renders `beacon_reveal` / `beacon_commit` beyond `tx_json`.

@@ -413,6 +413,7 @@ mod tests {
             multisig: None,
             aggregation_tree: None,
             hc_auth_multisig: multisig.then(|| word8_to_hex(&ZkExecutor::hc_auth_multisig())),
+            beacon: None,
         }
     }
 

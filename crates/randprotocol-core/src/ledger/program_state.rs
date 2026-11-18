@@ -65,11 +65,12 @@ pub const CTX_CHAIN_ID: usize = 15;
 /// The gas price in force for the reference block's transactions, in RAND units per unit of
 /// gas ([`BlockFacts::basefee`]): low word, then high.
 pub const CTX_BASEFEE: usize = 17;
-/// 1 when [`CTX_RANDOMNESS`] holds a beacon value, else 0. Always 0 today: the chain has no
-/// beacon, and the words are reserved so the layout does not move when one lands.
+/// 1 when [`CTX_RANDOMNESS`] holds a beacon value, else 0: 1 on a chain whose genesis has a
+/// `beacon` section (`ledger::beacon`), 0 on every other.
 pub const CTX_HAS_RANDOMNESS: usize = 19;
-/// Eight words (a `Word8`, as a cell value is) of beacon output for the reference block. All
-/// zero while [`CTX_HAS_RANDOMNESS`] is 0.
+/// Eight words (a `Word8`, as a cell value is) of beacon output for the reference block: the
+/// beacon's 32 bytes after that block's reveal, as little-endian words (`notes::word8_from_bytes`).
+/// All zero while [`CTX_HAS_RANDOMNESS`] is 0.
 pub const CTX_RANDOMNESS: usize = 20;
 /// The first word after the block context: where a version-2 context's cells start.
 pub const CONTEXT_HEADER_WORDS_BLOCK: usize = CONTEXT_HEADER_WORDS + BLOCK_CONTEXT_WORDS;
@@ -224,6 +225,9 @@ pub struct BlockFacts {
     /// `gas_price` at the block's start, before the block-end controller moves it (the genesis
     /// `gas.gas_price` on a chain without `gas.dynamic`; 0 on a chain without a `gas` section).
     pub basefee: u64,
+    /// The randomness beacon's value after this block's reveal (`ledger::beacon`): `None` on a
+    /// chain without the genesis `beacon` section.
+    pub randomness: Option<[u8; 32]>,
 }
 
 impl BlockFacts {
@@ -233,8 +237,8 @@ impl BlockFacts {
     }
 
     /// The [`BLOCK_CONTEXT_WORDS`] words a version-2 context carries for this block on chain
-    /// `chain_id`, in the order of the `CTX_*` offsets. The randomness flag and its eight words
-    /// are zero: there is no beacon.
+    /// `chain_id`, in the order of the `CTX_*` offsets. The randomness flag is 1 and its eight
+    /// words the beacon's value when the block has one; all nine are zero otherwise.
     pub fn context_words(&self, chain_id: u64) -> [u32; BLOCK_CONTEXT_WORDS] {
         let mut w = [0u32; BLOCK_CONTEXT_WORDS];
         for (at, v) in [
@@ -245,6 +249,11 @@ impl BlockFacts {
         ] {
             w[at - CONTEXT_HEADER_WORDS] = v as u32;
             w[at - CONTEXT_HEADER_WORDS + 1] = (v >> 32) as u32;
+        }
+        if let Some(r) = &self.randomness {
+            w[CTX_HAS_RANDOMNESS - CONTEXT_HEADER_WORDS] = 1;
+            let words = crate::notes::word8_from_bytes(r).expect("32 bytes are a Word8");
+            w[CTX_RANDOMNESS - CONTEXT_HEADER_WORDS..][..8].copy_from_slice(&words);
         }
         w
     }
@@ -1548,10 +1557,18 @@ pub(crate) mod tests {
         assert_eq!((CONTEXT_VERSION, CONTEXT_VERSION_BLOCK), (1, 2));
         assert_eq!((CONTEXT_HEADER_WORDS, BLOCK_CONTEXT_WORDS, CONTEXT_HEADER_WORDS_BLOCK), (11, 17, 28));
         assert_eq!((CTX_REF_HEIGHT, CTX_TIMESTAMP, CTX_CHAIN_ID, CTX_BASEFEE, CTX_HAS_RANDOMNESS, CTX_RANDOMNESS), (11, 13, 15, 17, 19, 20));
-        let facts = BlockFacts { height: (0x11 << 32) | 0x22, timestamp_ms: ((0x33u64 << 32) | 0x44) * 1000 + 999, basefee: (0x55 << 32) | 0x66 };
+        let facts = BlockFacts { height: (0x11 << 32) | 0x22, timestamp_ms: ((0x33u64 << 32) | 0x44) * 1000 + 999, basefee: (0x55 << 32) | 0x66, randomness: None };
         assert_eq!(facts.timestamp_secs(), (0x33 << 32) | 0x44, "seconds, rounded down");
         let block = facts.context_words((0x77 << 32) | 0x88);
         assert_eq!(block, [0x22, 0x11, 0x44, 0x33, 0x88, 0x77, 0x66, 0x55, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        // With a beacon value: the flag, then the 32 bytes as eight little-endian words — the
+        // other eight words unmoved.
+        let bytes: [u8; 32] = std::array::from_fn(|i| i as u8 + 1);
+        let lit = BlockFacts { randomness: Some(bytes), ..facts }.context_words((0x77 << 32) | 0x88);
+        assert_eq!(lit[..8], block[..8]);
+        assert_eq!(lit[8], 1);
+        assert_eq!(lit[9..], [0x0403_0201, 0x0807_0605, 0x0c0b_0a09, 0x100f_0e0d, 0x1413_1211, 0x1817_1615, 0x1c1b_1a19, 0x201f_1e1d]);
+        assert_eq!(crate::notes::word8_to_bytes(&lit[9..].try_into().unwrap()), bytes);
         let t = Transition {
             reads: vec![Cell { key: [1, 2, 3, 4, 5, 6, 7, 8], value: [11, 12, 13, 14, 15, 16, 17, 18] }],
             writes: vec![Cell { key: [21, 22, 23, 24, 25, 26, 27, 28], value: [31, 32, 33, 34, 35, 36, 37, 38] }],
@@ -1592,8 +1609,8 @@ pub(crate) mod tests {
         assert_eq!(
             l.block_facts().iter().copied().collect::<Vec<_>>(),
             vec![
-                BlockFacts { height: 1, timestamp_ms: 1_000_000, basefee: (3 << 32) | 100 },
-                BlockFacts { height: 2, timestamp_ms: secs * 1000 + 999, basefee: (3 << 32) | 100 },
+                BlockFacts { height: 1, timestamp_ms: 1_000_000, basefee: (3 << 32) | 100, randomness: None },
+                BlockFacts { height: 2, timestamp_ms: secs * 1000 + 999, basefee: (3 << 32) | 100, randomness: None },
             ]
         );
         let mut tx = unproved_at(&l, 20, 2, write_one());
@@ -1703,7 +1720,7 @@ pub(crate) mod tests {
         // Switching the window off drops what a ledger held.
         on.set_reference_block_window(0);
         assert!(on.block_facts().is_empty());
-        on.restore_block_facts(vec![BlockFacts { height: 1, timestamp_ms: 1, basefee: 0 }]);
+        on.restore_block_facts(vec![BlockFacts { height: 1, timestamp_ms: 1, basefee: 0, randomness: None }]);
         assert!(on.block_facts().is_empty(), "and a store's rows are not taken up");
     }
 
@@ -1797,11 +1814,11 @@ pub(crate) mod tests {
         // Block 1 uses twice its gas target: the price rises 12.5 % for block 2.
         l.close_block(1, &proposer().address(), 0, 40_000, &StubExecutor);
         assert_eq!(l.gas_prices().gas_price, 112);
-        assert_eq!(l.block_facts().back(), Some(&BlockFacts { height: 1, timestamp_ms: 1_000_000, basefee: 100 }));
+        assert_eq!(l.block_facts().back(), Some(&BlockFacts { height: 1, timestamp_ms: 1_000_000, basefee: 100, randomness: None }));
         l.set_height(2);
         l.set_timestamp_ms(1_004_000);
         l.close_block(2, &proposer().address(), 0, 20_000, &StubExecutor);
-        assert_eq!(l.block_facts().back(), Some(&BlockFacts { height: 2, timestamp_ms: 1_004_000, basefee: 112 }));
+        assert_eq!(l.block_facts().back(), Some(&BlockFacts { height: 2, timestamp_ms: 1_004_000, basefee: 112, randomness: None }));
         // Outside the root, inside equality.
         let mut same_state = l.clone();
         same_state.record_block_facts(2, 113);
@@ -1825,7 +1842,7 @@ pub(crate) mod tests {
         narrow.set_reference_block_window(WINDOW);
         narrow.restore_block_facts(all.clone());
         assert!(narrow == l);
-        let mut wide = (1..6).map(|h| BlockFacts { height: h, timestamp_ms: 0, basefee: 0 }).collect::<Vec<_>>();
+        let mut wide = (1..6).map(|h| BlockFacts { height: h, timestamp_ms: 0, basefee: 0, randomness: None }).collect::<Vec<_>>();
         wide.extend(all);
         narrow.restore_block_facts(wide);
         assert!(narrow == l, "older rows than the window are dropped");

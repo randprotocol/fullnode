@@ -273,6 +273,10 @@ pub fn reload_ledger_from(
     // with the block facts stored for it: a node that came back without them would refuse every
     // `InvokeAt` its peers apply — a fork at the first one after its restart.
     storage.restore_reference_block_window(&mut ledger, gs)?;
+    // And the randomness beacon (genesis `beacon`): its state is in the root and decides which
+    // reveal a block must open with — a node that came back without it would refuse every block
+    // its peers build. Read only under the section; `commit_delay_blocks` is the file's.
+    storage.restore_beacon(&mut ledger, gs)?;
     // And the consensus signing domain (audit v4): `load_ledger` comes back at v0, and a node
     // that kept it on a v1 chain would refuse every peer's proposal at the ledger's own
     // signature check.
@@ -1417,6 +1421,10 @@ struct Node {
     consensus_limiter: admission::PeerLimiter,
     /// The byte policy over every peer's `consensus_byte_bucket` ([`consensus_byte_limiter`], CN-4).
     consensus_byte_limiter: admission::PeerLimiter,
+    /// This validator's beacon seed file (genesis `beacon`): the reveal source the replica
+    /// proposes with, kept so a rebuilt replica (`HotStuff::resume` after a sync) gets it again.
+    /// `None` on an observer and on every chain without the section.
+    beacon_seeds: Option<Arc<crate::beacon::SeedSource>>,
     /// The policy over every peer's `binding_bucket` ([`crate::peer_bindings::on_binding_gossip`]).
     binding_limiter: admission::PeerLimiter,
     /// The policy over every peer's `stem_bucket` (Dandelion++, issue #145).
@@ -2776,6 +2784,31 @@ pub async fn start_with(cfg: NodeConfig, rpc_options: RpcOptions, net_options: N
             profile: core_profile(&gs.fri_profile),
         }));
     }
+    // The randomness beacon (genesis `beacon`): a validator proposes with the reveal its seed
+    // file gives for the commitment the chain holds. A missing or unusable file does not stop
+    // the node — it votes, and misses its own slots until `rand-node beacon recommit` — but it
+    // is said here, once, loudly. Observers and chains without the section never open the file.
+    let beacon_seeds = match (gs.ledger.beacon().is_some(), cfg.validator) {
+        (true, true) => {
+            let me = key.address();
+            let seeds = Arc::new(crate::beacon::SeedSource::open(&cfg.datadir, gs.chain_id, me));
+            let head = hs.committed_ledger();
+            match head.beacon().and_then(|b| b.due_commitment(&me, head.height().saturating_add(1))) {
+                Some(c) => match seeds.reveal_and_remaining(&c) {
+                    Some((_, left)) => tracing::info!("beacon: the seed file opens this validator's commitment; {left} reveals left"),
+                    None => tracing::error!(
+                        "beacon: no seed in {} opens this validator's commitment {}: it will MISS ITS SLOTS until a new commitment is registered (`rand-node beacon recommit`)",
+                        crate::beacon::seed_path(&cfg.datadir).display(),
+                        hex::encode(c)
+                    ),
+                },
+                None => tracing::warn!("beacon: this validator has no commitment in force: it will miss its slots until one is (`rand-node beacon recommit`, then the commit delay)"),
+            }
+            hs.set_reveal_source(seeds.clone());
+            Some(seeds)
+        }
+        _ => None,
+    };
 
     // Network. The sync and gossip byte limits follow the genesis block cap (call limits
     // spec §8), computed once here and handed to the swarm and the serve path.
@@ -3169,6 +3202,7 @@ pub async fn start_with(cfg: NodeConfig, rpc_options: RpcOptions, net_options: N
         status_limiter: admission::PeerLimiter::new(STATUS_GOSSIP_BURST, STATUS_GOSSIP_PER_SEC),
         consensus_limiter: admission::PeerLimiter::new(CONSENSUS_GOSSIP_BURST, CONSENSUS_GOSSIP_PER_SEC),
         consensus_byte_limiter: consensus_byte_limiter(max_block_bytes),
+        beacon_seeds,
         binding_limiter: admission::PeerLimiter::new(
             crate::peer_bindings::BINDING_GOSSIP_BURST,
             crate::peer_bindings::BINDING_GOSSIP_PER_SEC,
@@ -4144,8 +4178,21 @@ impl Node {
                     // hands the hashes back; the compact form is built from that list, so the
                     // wire and the cache never disagree about a body's id (CON-102).
                     let Block { header, transactions, signature } = b;
+                    // The randomness beacon (genesis `beacon`): the block's first transaction is
+                    // the proposer's reveal, which no peer can hold, so it rides with the hashes
+                    // rather than cost every validator a fetch. Only on a chain with the section:
+                    // every other chain's frames are what they were.
+                    let reveal = transactions
+                        .first()
+                        .filter(|t| self.gs.ledger.beacon().is_some() && matches!(t.action, randprotocol_core::Action::BeaconReveal { .. }))
+                        .cloned();
                     let hashes = self.recent_txs.remember_all(transactions);
-                    self.net.broadcast(GossipMessage::CompactProposal(CompactBlock::with_hashes(header, signature, hashes))).await;
+                    let compact = CompactBlock::with_hashes(header, signature, hashes);
+                    let msg = match reveal {
+                        Some(tx) => GossipMessage::CompactProposalPrefilled { compact, prefilled: vec![tx] },
+                        None => GossipMessage::CompactProposal(compact),
+                    };
+                    self.net.broadcast(msg).await;
                 }
                 Action::Broadcast(m) | Action::SendTo(_, m) => {
                     self.net.broadcast(GossipMessage::Consensus(m)).await;
@@ -4567,6 +4614,8 @@ impl Node {
                 GossipMessage::Transaction(tx) => self.on_gossiped_tx(tx, id).await?,
                 // Reported once, on the pre-screen's verdict, inside (spec 2026-10-08 §5).
                 GossipMessage::CompactProposal(c) => self.on_compact_proposal(c, id).await?,
+                // The beacon's form: the same path, with the bodies the leader sent along.
+                GossipMessage::CompactProposalPrefilled { compact, prefilled } => self.on_compact_proposal_prefilled(compact, prefilled, id).await?,
                 GossipMessage::Status(s) => {
                     let ahead = s.height > self.hs.committed_height() + 1;
                     let outcome = on_status_gossip(
@@ -5065,6 +5114,16 @@ impl Node {
     /// cannot be checked against a set this replica lacks, so handing it on would re-open the
     /// amplification. Such a block reaches the replica by sync once the set is known.
     async fn on_compact_proposal(&mut self, c: CompactBlock, id: GossipId) -> Result<()> {
+        self.on_compact_proposal_prefilled(c, Vec::new(), id).await
+    }
+
+    /// [`Node::on_compact_proposal`] with the bodies the leader sent along
+    /// (`GossipMessage::CompactProposalPrefilled`, the randomness beacon). A prefilled body is
+    /// kept only on a beacon chain, only after the header's signature and the hash list passed
+    /// the pre-screen, and only if it is a `BeaconReveal` whose hash is the first of that list —
+    /// the one transaction a beacon block's peers cannot hold. Everything else in the list is
+    /// dropped unread; its bytes are charged to the forwarder's budget with the frame's.
+    async fn on_compact_proposal_prefilled(&mut self, c: CompactBlock, prefilled: Vec<Transaction>, id: GossipId) -> Result<()> {
         use admission::Acceptance;
         use randprotocol_core::consensus::GossipPrecheck;
         let now = Instant::now();
@@ -5073,7 +5132,7 @@ impl Node {
             self.report(id, GossipOutcome::Report(Acceptance::Ignore)).await;
             return Ok(());
         }
-        let bytes = bincode::serialized_size(&c).unwrap_or(u64::MAX) as f64;
+        let bytes = bincode::serialized_size(&c).unwrap_or(u64::MAX).saturating_add(bincode::serialized_size(&prefilled).unwrap_or(u64::MAX)) as f64;
         // Spent in place: `TokenBucket` is `Copy`. The entry exists: `on_consensus_gossip` made it.
         let bucket = &mut self.peers.entry(forwarder).or_default().consensus_byte_bucket;
         if !self.consensus_byte_limiter.allow_n(bucket, bytes, now) {
@@ -5113,6 +5172,16 @@ impl Node {
         }
         self.note_first_compact(key, &c, hash);
         self.report(id, GossipOutcome::Report(Acceptance::Accept)).await;
+        // The leader's reveal, filed where the rebuild below looks (the recent cache). The
+        // pre-screen verified the leader's signature over the header and held the hash list to
+        // the header's root, so a body whose hash is the list's first is the block's own.
+        if self.gs.ledger.beacon().is_some() {
+            if let Some(tx) = prefilled.into_iter().next() {
+                if matches!(tx.action, randprotocol_core::Action::BeaconReveal { .. }) && tx.bundle.is_none() && c.tx_hashes.first() == Some(&tx.hash()) {
+                    self.recent_txs.remember_all([tx]);
+                }
+            }
+        }
         // Every proposal that passed the pre-screen, parked or not, rebuilt or not (final review
         // I2), as the full path counts every proposal it hands on; only these, since an
         // `Ignore`d header's signature was never verified.
@@ -5900,6 +5969,11 @@ impl Node {
                 profile: core_profile(&self.gs.fri_profile),
             }));
         }
+        // Nor does the beacon's reveal source: without it a validator that synced would never
+        // propose again on a beacon chain.
+        if let Some(seeds) = &self.beacon_seeds {
+            self.hs.set_reveal_source(seeds.clone());
+        }
         self.timeout = None;
         self.propose_at = None;
         let acts = self.hs.start();
@@ -6206,6 +6280,59 @@ mod tests {
         assert!(chain[0].contains("startup checkpoint") && chain[0].contains("snapshot"), "{chain:?}");
         assert!(chain.iter().any(|c| c.contains("ledger snapshot") && c.contains("state root")), "{chain:?}");
         assert_eq!(storage.verified_head().unwrap(), Some(row), "the row is not what is wrong; it stays");
+    }
+
+    /// The randomness beacon is genesis-gated, and chain 21 has no `beacon` section: its genesis
+    /// hash, its genesis header's bytes, its genesis state root, the state root after each of
+    /// three empty blocks closed on it (two seconds apart, proposed by the file's first
+    /// validator), and block 1's header bytes and hash are what they were on the commit before the
+    /// beacon existed (`9d9e8473`), where these values were taken. A change here is a consensus
+    /// change for chain 21.
+    #[test]
+    fn chain_21_is_byte_for_byte_what_it_was_before_the_beacon() {
+        use randprotocol_core::types::{Block, BlockHeader, QuorumCertificate};
+        const PINS: [&str; 8] = [
+            "ca76c2766ed6090ac6ba5dad86b724dd5d2b80c0edfaed287cd8b129e663ca9a",
+            "333167abef3a544ed3de9a691ebd4935b1df6b86c7b34ddc1e7f245196b8dcaa",
+            "14923881fad5e24f137a97b41e2a289eac3c801b0d1523786521a64f8b26ef36",
+            "f31b751a1ee75b9457a6172f0e626558b90bbc313d0a3e49796d7b5b70b5ffde",
+            "ea2c7e63f090c584c6a6840d6877a8c404bb30426009e18e210ce0be6a221e89",
+            "da825617704cdb223b70bfbf12e79697c87597e3f2696d39d7305a0a50c3d65a",
+            "0e5f9ea65088814d98e82fdfdf3a81ceb22dc912707bde2b776f9fb3cc4b6088",
+            "689e75b53d55c1e97402126453c16d259b341f6ef50d35b9c63c4fab13738ba3",
+        ];
+        let digest = |bytes: &[u8]| hex::encode(blake3::hash(bytes).as_bytes());
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../deploy/genesis-chain21.json");
+        let file = randprotocol_core::genesis::Genesis::from_json(&std::fs::read_to_string(path).unwrap()).unwrap();
+        let executor = executor_for_profile(&file.fri_profile).unwrap();
+        let gs = file.build(executor.as_ref()).unwrap();
+        let proposer = file.validators[0].public_key.clone();
+        let mut got = vec![gs.hash().to_hex(), digest(&bincode::serialize(&gs.block.header).unwrap()), gs.ledger.state_root().to_hex()];
+        // No beacon on chain 21: no state, and an empty block is a block.
+        assert!(file.beacon.is_none() && gs.ledger.beacon().is_none());
+        let mut ledger = gs.ledger.clone();
+        let mut roots = Vec::new();
+        for h in 1..=3u64 {
+            ledger.set_height(h);
+            ledger.set_timestamp_ms(file.timestamp_ms + 2_000 * h);
+            assert!(ledger.apply_transactions(&[], &proposer.address(), executor.as_ref()).unwrap().is_empty());
+            ledger.close_block(h, &proposer.address(), 0, 0, executor.as_ref());
+            roots.push(ledger.state_root());
+            got.push(ledger.state_root().to_hex());
+        }
+        let header = BlockHeader {
+            height: 1,
+            view: 1,
+            parent: gs.hash(),
+            proposer,
+            timestamp_ms: file.timestamp_ms + 2_000,
+            tx_root: Block::tx_root(&[]),
+            state_root: roots[0],
+            justify: QuorumCertificate { view: 0, block_hash: gs.hash(), votes: Vec::new() },
+        };
+        got.push(digest(&bincode::serialize(&header).unwrap()));
+        got.push(header.hash().to_hex());
+        assert_eq!(got, PINS.iter().map(|s| s.to_string()).collect::<Vec<_>>());
     }
 
     /// Audit v10, CON-102 regression on chain 21's own genesis (`deploy/genesis-chain21.json`:
@@ -8283,6 +8410,7 @@ mod tests {
             status_limiter: admission::PeerLimiter::new(STATUS_GOSSIP_BURST, STATUS_GOSSIP_PER_SEC),
             consensus_limiter: admission::PeerLimiter::new(CONSENSUS_GOSSIP_BURST, CONSENSUS_GOSSIP_PER_SEC),
             consensus_byte_limiter: consensus_byte_limiter(max_block_bytes),
+            beacon_seeds: None,
             binding_limiter: admission::PeerLimiter::new(
                 crate::peer_bindings::BINDING_GOSSIP_BURST,
                 crate::peer_bindings::BINDING_GOSSIP_PER_SEC,
@@ -9363,6 +9491,30 @@ mod tests {
             "the replica voted for the rebuilt block"
         );
         assert_eq!(tx_fetches(&sent), vec![], "nothing fetched");
+        assert_eq!(reports(&sent), vec![libp2p::gossipsub::MessageAcceptance::Accept], "reported once");
+    }
+
+    /// The beacon's prefilled form (`CompactProposalPrefilled`) on a chain **without** the
+    /// beacon: the bodies sent along are dropped unread — nothing is filed in the recent cache —
+    /// and the proposal is handled exactly as the plain compact form: parked, its missing body
+    /// fetched, reported once.
+    #[tokio::test]
+    async fn a_prefilled_body_is_not_kept_on_a_chain_without_the_beacon() {
+        let (_d, storage, gs, hs) = replica_past_a_boundary();
+        assert!(gs.ledger.beacon().is_none());
+        let head = storage.head_block().unwrap();
+        let (mut node, mut seen) = bare_node(storage, gs, hs);
+        let ledger = node.hs.tip_ledger().clone();
+        let tx = next_tx(&ledger, 1);
+        let block = block_on(&head, &ledger, &key(1), node.hs.view(), vec![tx.clone()]);
+        claiming_peer(&mut node, 4);
+
+        node.on_compact_proposal_prefilled(CompactBlock::of(&block), vec![tx.clone()], gossip_id()).await.unwrap();
+        assert!(node.recent_txs.get(&tx.hash()).is_none(), "the body that rode along was not kept");
+        assert!(!node.hs.has_block(&block.hash()), "not rebuilt from it");
+        assert_eq!(node.parked.len(), 1, "parked, as the plain form is");
+        let sent = drain(&mut seen).await;
+        assert!(!tx_fetches(&sent).is_empty(), "the body is fetched by hash");
         assert_eq!(reports(&sent), vec![libp2p::gossipsub::MessageAcceptance::Accept], "reported once");
     }
 

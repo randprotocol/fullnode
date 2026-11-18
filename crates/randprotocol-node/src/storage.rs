@@ -324,6 +324,14 @@ const META_MULTISIG_TOTALS: &str = "multisig_totals";
 /// like the burned bases). Present only while the ledger holds a price: absent on every chain
 /// without the section and on one whose genesis gives no initial price before its first update.
 const META_RAND_PRICE: &str = "rand_price";
+/// `bincode(BeaconState)`: the randomness beacon as of the head (genesis `beacon`,
+/// `ledger::beacon::BeaconState`) — the chain's value and every validator's commitment. Consensus
+/// state under the section — hashed into the state root under `rand-state-beacon-1`, inside
+/// `Ledger`'s equality — written with genesis, at every commit and by `truncate_to`, read back
+/// by [`Storage::restore_beacon`] (which `reload_ledger` and the replay audit both call) and
+/// named in the self-check. **Only under the section**: on a chain without it — chain 21 — the
+/// row is never written, never deleted and never read.
+const META_BEACON: &str = "beacon";
 /// `bincode(BTreeMap<Address, AggregatorEntry>)`: the aggregator register as of the head.
 /// `META_SUPPLY`'s twin in kind — derived, replay-audited — but unlike the bucket this one is
 /// hashed into the state root, so a restarted node that lost it would fork at the next block.
@@ -1388,6 +1396,7 @@ impl Storage {
         self.put_perps(&mut batch, gs.ledger.perps())?;
         let multisig_staged = self.stage_multisig(&mut batch, gs.ledger.multisig())?;
         self.put_rand_price(&mut batch, gs.ledger.rand_price())?;
+        self.put_beacon(&mut batch, gs.ledger.beacon())?;
         batch.put_cf(self.cf(CF_META), META_UNSEALED_FEES, bincode::serialize(gs.ledger.unsealed_fees())?);
         batch.put_cf(self.cf(CF_META), META_AGGREGATORS, bincode::serialize(gs.ledger.aggregators())?);
         batch.put_cf(self.cf(CF_META), META_AGGREGATION, bincode::serialize(&gs.ledger.aggregation().cloned())?);
@@ -2409,6 +2418,39 @@ impl Storage {
             Some(p) => batch.put_cf(self.cf(CF_META), META_RAND_PRICE, bincode::serialize(p)?),
             None => batch.delete_cf(self.cf(CF_META), META_RAND_PRICE),
         }
+        Ok(())
+    }
+
+    /// The randomness beacon's state as of the head (genesis `beacon`, `META_BEACON`): `None` on
+    /// a chain without the section.
+    pub fn beacon(&self) -> Result<Option<randprotocol_core::ledger::beacon::BeaconState>> {
+        self.get_meta_raw(META_BEACON)?
+            .map(|b| bincode::deserialize(&b).map_err(|e| StorageError::Corrupt(format!("beacon: {e}"))))
+            .transpose()
+    }
+
+    /// The beacon beside the rest of the head's state. Without one the batch is left alone —
+    /// not even a delete: a chain without the section never touches the key.
+    fn put_beacon(&self, batch: &mut WriteBatch, b: Option<&randprotocol_core::ledger::beacon::BeaconState>) -> Result<()> {
+        if let Some(b) = b {
+            batch.put_cf(self.cf(CF_META), META_BEACON, bincode::serialize(b)?);
+        }
+        Ok(())
+    }
+
+    /// Give `ledger` (fresh from `load_ledger`, which reads no beacon) the stored beacon state,
+    /// under the genesis `beacon` section — [`Storage::restore_reference_block_window`]'s twin,
+    /// called beside it. A no-op without the section: no row is read, so chain 21 loads exactly
+    /// as before and a row another build left is not taken up. `commit_delay_blocks` is the
+    /// genesis file's, whatever the row says. A chain with the section whose database holds no
+    /// row is a database that is not this chain's.
+    pub fn restore_beacon(&self, ledger: &mut Ledger, gs: &GenesisState) -> Result<()> {
+        let Some(genesis) = gs.ledger.beacon() else { return Ok(()) };
+        let mut state = self
+            .beacon()?
+            .ok_or_else(|| StorageError::Corrupt("the genesis has a beacon section and the database holds no beacon state".into()))?;
+        state.commit_delay_blocks = genesis.commit_delay_blocks;
+        ledger.set_beacon(Some(state));
         Ok(())
     }
 
@@ -3937,6 +3979,7 @@ impl Storage {
         }
         let multisig_staged = self.stage_multisig(&mut batch, ledger_after.multisig())?;
         self.put_rand_price(&mut batch, ledger_after.rand_price())?;
+        self.put_beacon(&mut batch, ledger_after.beacon())?;
         batch.put_cf(self.cf(CF_META), META_UNSEALED_FEES, bincode::serialize(ledger_after.unsealed_fees())?);
         batch.put_cf(self.cf(CF_META), META_AGGREGATORS, bincode::serialize(ledger_after.aggregators())?);
         self.stage_retired_aggregator_nonces(&mut batch, ledger_after)?;
@@ -4504,6 +4547,9 @@ impl Storage {
             // The reference-block ring (issue #168) the same way: inside the equality, and read
             // only under the genesis window.
             self.restore_reference_block_window(&mut stored, gs)?;
+            // And the randomness beacon: inside the equality and the root, read only under the
+            // genesis section.
+            self.restore_beacon(&mut stored, gs)?;
             stored.set_tokens_incremental_root(gs.ledger.tokens().is_some_and(|t| t.incremental_root()));
             // The nullifier range needs no line here: its row loaded it, and the replayed ledger
             // started from `gs.ledger`, which carries the flag, so `stored == ledger` compares ranges.
@@ -4594,6 +4640,11 @@ impl Storage {
                     stored.rand_price(),
                     ledger.rand_price()
                 ))
+            }
+            // The randomness beacon (genesis `beacon`) likewise: inside the equality, hashed
+            // under its section (`rand-state-beacon-1`), named so the repair knows the key.
+            Ok(stored) if stored.beacon() != ledger.beacon() => {
+                check.problem = Some("stored beacon state does not match the replayed chain's".into())
             }
             // The supply counters are outside `Ledger`'s equality (nothing hashes them), so they
             // are audited here explicitly: this is the replay the RPC's numbers are worth.
@@ -4896,6 +4947,7 @@ impl Storage {
         }
         let multisig_staged = self.stage_multisig(&mut batch, ledger.multisig())?;
         self.put_rand_price(&mut batch, ledger.rand_price())?;
+        self.put_beacon(&mut batch, ledger.beacon())?;
         batch.put_cf(self.cf(CF_META), META_UNSEALED_FEES, bincode::serialize(ledger.unsealed_fees())?);
         batch.put_cf(self.cf(CF_META), META_AGGREGATORS, bincode::serialize(ledger.aggregators())?);
         self.stage_retired_aggregator_nonces(&mut batch, ledger)?;
@@ -5065,6 +5117,7 @@ pub(crate) mod fixtures {
             hc_auth: None,
             fees: None,
             hc_auth_multisig: None,
+            beacon: None,
         }
     }
 
@@ -5227,6 +5280,7 @@ pub(crate) mod fixtures {
             hc_auth: None,
             fees: None,
             hc_auth_multisig: None,
+            beacon: None,
         };
         (gs, secrets)
     }
@@ -5904,6 +5958,61 @@ pub(crate) mod fixtures {
         let mut ledger = gs.ledger.clone();
         let b1 = ref_block_next(&s, &ref_block_genesis_parent(&gs), &mut ledger, rpl2_setup_txs(&gs.ledger));
         (dir, s, gs, ledger, b1)
+    }
+
+    // ---- The randomness beacon: the reference-block fixture chain with a `beacon` section ----
+
+    pub(crate) const BEACON_DELAY: u64 = 2;
+
+    /// The fixture validator's beacon seed chain on chain `chain_id`: 16 links from `[0x80; 32]`.
+    pub(crate) fn beacon_seeds(chain_id: u64) -> randprotocol_core::ledger::beacon::SeedChain {
+        randprotocol_core::ledger::beacon::SeedChain::new(chain_id, key(1).address(), [0x80; 32], 16)
+    }
+
+    /// [`ref_block_genesis_file`] with a `beacon` section: its one validator's commitment.
+    pub(crate) fn beacon_genesis_file(chain_id: u64) -> Genesis {
+        let mut g = ref_block_genesis_file(chain_id);
+        g.beacon = Some(randprotocol_core::ledger::beacon::BeaconConfig {
+            commit_delay_blocks: BEACON_DELAY,
+            commitments: vec![randprotocol_core::ledger::beacon::BeaconCommitment {
+                validator: key(1).address().to_base58(),
+                commitment: hex::encode(beacon_seeds(chain_id).commitment()),
+            }],
+        });
+        g
+    }
+
+    /// The beacon fixture chain's next block: the validator's reveal (from `seeds`, for the
+    /// commitment in force at that height) and then `txs`, built and committed by
+    /// [`ref_block_next`].
+    pub(crate) fn beacon_next(
+        s: &Storage,
+        parent: &CommittedBlock,
+        ledger: &mut Ledger,
+        seeds: &randprotocol_core::ledger::beacon::SeedChain,
+        txs: Vec<Transaction>,
+    ) -> CommittedBlock {
+        let height = parent.block.height() + 1;
+        let due = ledger.beacon().expect("a beacon chain").due_commitment(&key(1).address(), height).expect("a commitment in force");
+        let (reveal, _) = seeds.reveal_for(&due).expect("the fixture's seed opens it");
+        let mut all = vec![Transaction { chain_id: ledger.chain_id(), bundle: None, action: Action::BeaconReveal { reveal } }];
+        all.extend(txs);
+        ref_block_next(s, parent, ledger, all)
+    }
+
+    /// An opened store holding the beacon fixture chain one (empty) block in, with the ledger
+    /// after that block, the validator's seed chain and the block.
+    pub(crate) fn beacon_chain(
+        chain_id: u64,
+    ) -> (tempfile::TempDir, Storage, GenesisState, Ledger, randprotocol_core::ledger::beacon::SeedChain, CommittedBlock) {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Storage::open(dir.path()).unwrap();
+        let gs = beacon_genesis_file(chain_id).build(&StubExecutor).unwrap();
+        s.init_genesis(&gs).unwrap();
+        let mut ledger = gs.ledger.clone();
+        let seeds = beacon_seeds(chain_id);
+        let b1 = beacon_next(&s, &ref_block_genesis_parent(&gs), &mut ledger, &seeds, vec![]);
+        (dir, s, gs, ledger, seeds, b1)
     }
 
     /// [`rpl2_invoke_tx`] as an `InvokeAt` naming `ref_height`, proved over the segment
@@ -9961,7 +10070,7 @@ mod tests {
     fn block_facts_are_persisted_restored_truncated_and_audited() {
         use randprotocol_core::ledger::program_state::{BlockFacts, ProgramStateError, Transition};
         let (_dir, s, gs, mut ledger, b1) = ref_block_chain(7);
-        let fact = |h: u64| BlockFacts { height: h, timestamp_ms: REF_T0_MS + h * 4_000, basefee: 100 };
+        let fact = |h: u64| BlockFacts { height: h, timestamp_ms: REF_T0_MS + h * 4_000, basefee: 100, randomness: None };
         let rows = |s: &Storage| s.newest_block_facts(usize::MAX).unwrap();
         assert_eq!(rows(&s), vec![fact(1)], "block 1's facts, written with block 1; none for genesis");
         let b2 = ref_block_next(&s, &b1, &mut ledger, vec![]);
@@ -10027,6 +10136,123 @@ mod tests {
         assert_eq!(crate::node::reload_ledger(&s, &gs, &StubExecutor).unwrap(), ledger);
     }
 
+    /// The randomness beacon is consensus state under the genesis `beacon` section: written with
+    /// genesis, committed with the state after every block's reveal and after a `BeaconCommit`,
+    /// restored at a restart (`reload_ledger`) so the node computes the same root and opens the
+    /// same commitment, rebuilt and compared by the replay audit, named when stale and rewritten
+    /// by the repair; a truncation rewrites it to the head it truncates to. The block facts carry
+    /// each block's value, and a chain with the section whose database lost the row does not load.
+    #[test]
+    fn the_beacon_is_persisted_restored_truncated_and_audited() {
+        use randprotocol_core::ledger::beacon::BeaconState;
+        let (_dir, s, gs, mut ledger, seeds, b1) = beacon_chain(7);
+        let genesis = gs.ledger.beacon().unwrap().clone();
+        assert_eq!(genesis.commit_delay_blocks, BEACON_DELAY);
+        assert_eq!(s.beacon().unwrap().as_ref(), ledger.beacon(), "committed with block 1");
+        assert_ne!(ledger.beacon().unwrap().value, genesis.value, "block 1's reveal moved the value");
+        let after_1 = ledger.beacon().unwrap().clone();
+        // Block 2 carries a recommit by the validator; block 3 is plain.
+        let fresh = randprotocol_core::ledger::beacon::SeedChain::new(7, key(1).address(), [0xee; 32], 16);
+        let message = randprotocol_core::types::actions::beacon_commit_message(&gs.hash(), &fresh.commitment(), 1);
+        let commit = Transaction {
+            chain_id: 7,
+            bundle: None,
+            action: Action::BeaconCommit { validator: key(1).address(), commitment: fresh.commitment(), nonce: 1, signature: key(1).sign(message.as_bytes()) },
+        };
+        let b2 = beacon_next(&s, &b1, &mut ledger, &seeds, vec![commit]);
+        let b3 = beacon_next(&s, &b2, &mut ledger, &seeds, vec![]);
+        let entry = ledger.beacon().unwrap().entries[&key(1).address()].clone();
+        assert_eq!((entry.nonce, entry.pending), (1, Some((2 + BEACON_DELAY, fresh.commitment()))));
+        assert_eq!(s.beacon().unwrap().as_ref(), ledger.beacon());
+        // Every block's facts carry the beacon's value after that block.
+        let facts = s.newest_block_facts(usize::MAX).unwrap();
+        assert_eq!(facts.len(), 3);
+        assert_eq!(facts[0].randomness, Some(after_1.value));
+        assert_eq!(facts[2].randomness, Some(ledger.beacon().unwrap().value));
+        assert!(facts.windows(2).all(|w| w[0].randomness != w[1].randomness));
+
+        // A restart: the plain load knows no genesis and holds no beacon; the reload restores it.
+        assert!(s.load_ledger(&StubExecutor).unwrap().beacon().is_none());
+        let reloaded = crate::node::reload_ledger(&s, &gs, &StubExecutor).unwrap();
+        assert_eq!(reloaded.beacon(), ledger.beacon());
+        assert_eq!(reloaded.state_root(), ledger.state_root());
+        assert_eq!(reloaded, ledger);
+        assert_eq!(reloaded.state_root(), b3.block.header.state_root);
+        // The delay is the genesis file's, whatever the row says.
+        let mut odd = ledger.beacon().unwrap().clone();
+        odd.commit_delay_blocks = 999;
+        s.db.put_cf(s.cf(CF_META), META_BEACON, bincode::serialize(&odd).unwrap()).unwrap();
+        assert_eq!(crate::node::reload_ledger(&s, &gs, &StubExecutor).unwrap().beacon().unwrap().commit_delay_blocks, BEACON_DELAY);
+        s.db.put_cf(s.cf(CF_META), META_BEACON, bincode::serialize(ledger.beacon().unwrap()).unwrap()).unwrap();
+        // The replay audit rebuilds the state from the blocks and finds the stored one equal.
+        assert_eq!(s.verify_chain(&gs, VerifyMode::Quick, &StubExecutor).unwrap().problem, None);
+
+        // A stale row is named by the audit and rewritten by the repair.
+        let stale = BeaconState { value: [0x55; 32], ..ledger.beacon().unwrap().clone() };
+        s.db.put_cf(s.cf(CF_META), META_BEACON, bincode::serialize(&stale).unwrap()).unwrap();
+        let check = s.verify_chain(&gs, VerifyMode::Quick, &StubExecutor).unwrap();
+        let problem = check.problem.clone().expect("a beacon that is not the chain's is a problem");
+        assert!(problem.contains("beacon"), "{problem}");
+        assert_eq!(check.last_good, 3, "the blocks themselves are fine");
+        s.truncate_to(&gs, 3, &check.ledger).unwrap();
+        assert_eq!(s.beacon().unwrap().as_ref(), ledger.beacon());
+        assert_eq!(s.verify_chain(&gs, VerifyMode::Quick, &StubExecutor).unwrap().problem, None);
+
+        // A truncation to block 1 puts the state of block 1 back: the commit is gone.
+        let at_1 = {
+            let mut l = gs.ledger.clone();
+            l.apply_block(&b1.block, &StubExecutor).unwrap();
+            l
+        };
+        s.truncate_to(&gs, 1, &at_1).unwrap();
+        assert_eq!(s.beacon().unwrap(), Some(after_1.clone()));
+        let back = crate::node::reload_ledger(&s, &gs, &StubExecutor).unwrap();
+        assert_eq!(back.beacon(), Some(&after_1));
+        assert_eq!(back.block_facts().back().unwrap().randomness, Some(after_1.value));
+        // And the chain goes on from there, with the same reveal block 2 used.
+        let mut again = at_1.clone();
+        let b2_again = beacon_next(&s, &b1, &mut again, &seeds, vec![]);
+        assert_eq!(b2_again.block.transactions[0], b2.block.transactions[0], "the reveal is determined by the commitment");
+
+        // A lost row on a beacon chain: the database is not this chain's.
+        s.db.delete_cf(s.cf(CF_META), META_BEACON).unwrap();
+        let e = crate::node::reload_ledger(&s, &gs, &StubExecutor).unwrap_err();
+        assert!(format!("{e:#}").contains("beacon"), "{e:#}");
+    }
+
+    /// The other side: on a chain without the `beacon` section — chain 21 — no beacon row is
+    /// ever written, by genesis, a commit or a truncation, the loaded ledger holds no beacon, and
+    /// a row another build left there is not taken up.
+    #[test]
+    fn a_chain_without_the_beacon_stores_no_beacon_row() {
+        for (_dir, s, gs, mut ledger, b1) in [rpl2_chain(7), ref_block_chain(7)] {
+            assert!(gs.ledger.beacon().is_none());
+            let meta_keys = |s: &Storage| -> Vec<Vec<u8>> {
+                s.db.iterator_cf(s.cf(CF_META), IteratorMode::Start).map(|r| r.unwrap().0.to_vec()).collect()
+            };
+            assert!(s.get_meta_raw(META_BEACON).unwrap().is_none(), "none with genesis or block 1");
+            let mut parent = b1;
+            for _ in 0..2 {
+                ledger.set_height(parent.block.height() + 1);
+                ledger.close_block(parent.block.height() + 1, &key(1).address(), 0, 0, &StubExecutor);
+                let b = make_block_unchecked(&parent, &ledger, vec![], &key(1));
+                s.commit(std::slice::from_ref(&b), &ledger, &[], &StubExecutor).unwrap();
+                parent = b;
+            }
+            assert!(ledger.beacon().is_none());
+            assert!(ledger.block_facts().iter().all(|f| f.randomness.is_none()));
+            s.truncate_to(&gs, 3, &ledger).unwrap();
+            assert!(!meta_keys(&s).iter().any(|k| k == META_BEACON.as_bytes()), "no commit and no truncation wrote one");
+            assert_eq!(s.beacon().unwrap(), None);
+            let stray = randprotocol_core::ledger::beacon::BeaconState { commit_delay_blocks: 1, value: [1; 32], entries: Default::default() };
+            s.db.put_cf(s.cf(CF_META), META_BEACON, bincode::serialize(&stray).unwrap()).unwrap();
+            let reloaded = crate::node::reload_ledger(&s, &gs, &StubExecutor).unwrap();
+            assert!(reloaded.beacon().is_none());
+            assert_eq!(reloaded, ledger);
+            assert_eq!(reloaded.state_root(), ledger.state_root());
+        }
+    }
+
     /// Issue #168, the other side: on a chain without the window — chain 21 — no block-facts
     /// row is ever written, by a commit or a truncation, so the store's layout is what it was;
     /// and a row another build left there is not taken up.
@@ -10050,7 +10276,7 @@ mod tests {
         assert!(s.newest_block_facts(usize::MAX).unwrap().is_empty());
         s.truncate_to(&gs, 4, &ledger).unwrap();
         assert_eq!(meta_keys(&s), before, "nor did a truncation");
-        let facts = randprotocol_core::ledger::program_state::BlockFacts { height: 2, timestamp_ms: 2, basefee: 0 };
+        let facts = randprotocol_core::ledger::program_state::BlockFacts { height: 2, timestamp_ms: 2, basefee: 0, randomness: None };
         s.db.put_cf(s.cf(CF_META), Storage::block_facts_key(2), bincode::serialize(&facts).unwrap()).unwrap();
         let reloaded = crate::node::reload_ledger(&s, &gs, &StubExecutor).unwrap();
         assert!(reloaded.block_facts().is_empty() && reloaded.reference_block_window() == 0);

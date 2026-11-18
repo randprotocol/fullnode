@@ -315,6 +315,10 @@ fn claimed_nonce(action: &Action) -> Option<(Address, u64)> {
         // update spends — a register of one, so the zero address under role 10, like the
         // bridge's counters under theirs.
         Action::SetRandPrice { nonce, .. } => Some((Address([0; 32]), *nonce)),
+        // The randomness beacon (genesis `beacon`): a validator's commit nonce, its own counter
+        // in the beacon's state — role 11 keeps it apart from the validator's `Unbond` nonce. A
+        // `BeaconReveal` claims nothing: validation refuses it, so it is never pooled.
+        Action::BeaconCommit { validator, nonce, .. } => Some((*validator, *nonce)),
         _ => None,
     }
 }
@@ -360,6 +364,10 @@ fn is_governance(action: &Action) -> bool {
             | Action::RotatePauseKeyV2 { .. }
             | Action::CancelRotation { .. }
             | Action::SetRandPrice { .. }
+            // The beacon's commit: fee-less, and what a validator needs in a block to get its
+            // slots back. One pooled commit per validator and nonce (role 11), each admitted only
+            // with that registered validator's own signature.
+            | Action::BeaconCommit { .. }
     )
 }
 
@@ -392,6 +400,7 @@ fn claim_key(action: &Action, claim: &(Address, u64)) -> (u8, Address, u64) {
         Action::SlashEquivocation { .. } => 8,
         Action::MultisigPay { .. } | Action::MultisigRotate { .. } => 9,
         Action::SetRandPrice { .. } => 10,
+        Action::BeaconCommit { .. } => 11,
         _ => 0,
     };
     (role, claim.0, claim.1)
@@ -1720,6 +1729,12 @@ impl Mempool {
                 // without the two signature verifications. Once the offender is jailed (by
                 // this pair or another) or the window has passed, it can never apply and leaves.
                 randprotocol_core::ledger::staking::check_slash_open(ledger, &addr, [first.header.height, second.header.height])?;
+            } else if matches!(tx.action, Action::BeaconCommit { .. }) {
+                // The beacon's commit: it stands while the validator is registered and its nonce
+                // is the validator's next commit nonce — the ledger's gate and state checks,
+                // without the signature. Never the validator lookup below: that reads the
+                // register's own nonce, which is another counter.
+                randprotocol_core::ledger::beacon::check_commit_open(ledger, &addr, nonce)?;
             } else if matches!(tx.action, Action::SetRandPrice { .. }) {
                 // The RAND price vote: it stands while its nonce is the next one — the ledger's
                 // gate and nonce check, without the signature work. Once another update has
@@ -1825,6 +1840,9 @@ impl Mempool {
         // longer carry the current voting set — membership and quorum, no signatures — or whose
         // band moved can never apply; it leaves, freeing the price-nonce slot for a replacement.
         randprotocol_core::ledger::rand_price::still_applies(ledger, tx)?;
+        // The beacon's commit, the same rule asked of its own module (the nonce arm above
+        // answers first; this keeps the pool from drifting from the ledger).
+        randprotocol_core::ledger::beacon::still_applies(ledger, tx)?;
         let nullifiers = tx.nullifiers();
         if let Some(nf) = nullifiers.iter().find(|nf| ledger.is_spent(nf)) {
             return Err(TxError::Spent(*nf));

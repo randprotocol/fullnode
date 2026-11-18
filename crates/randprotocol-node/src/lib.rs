@@ -2,6 +2,7 @@
 
 pub mod admission;
 pub mod agg_executor;
+pub mod beacon;
 pub mod bench;
 pub mod bridge_gov_tool;
 pub mod compact;

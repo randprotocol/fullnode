@@ -174,6 +174,20 @@ fn the_genesis_command_writes_the_program_state_section_when_asked() {
     assert!(!unbounded.status.success() && String::from_utf8_lossy(&unbounded.stderr).contains("bounded block time"), "{}", String::from_utf8_lossy(&unbounded.stderr));
     let small = window(&["--program-state-cell-fee", "10000000", "--program-state-reference-block-window", "255"]);
     assert!(!small.status.success() && String::from_utf8_lossy(&small.stderr).contains("reference_block_window 255"), "{}", String::from_utf8_lossy(&small.stderr));
+    // The randomness beacon: the delay is a field of the section, a commitment needs the
+    // reference-block window, and on a chain that cannot have the window (this one) the section
+    // is refused with it — each before any file is written.
+    let commitment = format!("{}={}", randprotocol_core::Keypair::from_seed([1; 32]).unwrap().address().to_base58(), "ab".repeat(32));
+    let lone = window(&["--beacon-commit-delay-blocks", "300"]);
+    assert!(!lone.status.success() && String::from_utf8_lossy(&lone.stderr).contains("needs --beacon-commitment"), "{}", String::from_utf8_lossy(&lone.stderr));
+    let no_window = window(&["--program-state-cell-fee", "10000000", "--beacon-commitment", &commitment]);
+    assert!(
+        !no_window.status.success() && String::from_utf8_lossy(&no_window.stderr).contains("needs --program-state-reference-block-window"),
+        "{}",
+        String::from_utf8_lossy(&no_window.stderr)
+    );
+    let unbounded = window(&["--program-state-cell-fee", "10000000", "--program-state-reference-block-window", "256", "--beacon-commitment", &commitment]);
+    assert!(!unbounded.status.success(), "a beacon on a chain that refuses the window");
     assert!(!dir.path().join("window.json").exists(), "nothing is written for a refused genesis");
 
     // Each flag it stands on, missing one at a time, refused by name; and a fee past the bound.

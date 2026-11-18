@@ -228,6 +228,18 @@ pub fn set_rand_price_message(genesis: &Hash, price_micros_per_rand: u64, nonce:
     Hash::digest_domain(b"rand-set-price-1", &m)
 }
 
+/// What a validator signs to register a new beacon commitment (`Action::BeaconCommit` under the
+/// genesis `beacon`): the genesis hash, the commitment and the commit's nonce, big-endian, under
+/// their own tag. The genesis hash binds it to one chain, the nonce to one commit; the signer is
+/// the validator the action names, so its address needs no place in the message.
+pub fn beacon_commit_message(genesis: &Hash, commitment: &[u8; 32], nonce: u64) -> Hash {
+    let mut m = Vec::with_capacity(72);
+    m.extend_from_slice(genesis.as_bytes());
+    m.extend_from_slice(commitment);
+    m.extend_from_slice(&nonce.to_be_bytes());
+    Hash::digest_domain(b"rand-beacon-commit-1", &m)
+}
+
 /// What a validator signs to move stake into unbonding. The register's `nonce` is the replay
 /// protection: there are no accounts on this chain to carry one.
 pub fn unbond_message(chain_id: u64, validator: &Address, amount: u64, nonce: u64) -> Hash {

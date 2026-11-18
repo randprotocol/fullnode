@@ -730,7 +730,7 @@ pub const PUBLIC_METHODS: &[&str] = &[
     "rand_getAggregate", "rand_getAggregators", "rand_getUnsealed",
     "rand_getVesting", "rand_getVestingSchedule", "rand_getVestingSummary",
     "rand_getPerps", "rand_getPerpAccount", "rand_getPerpAccounts", "rand_getPerpInputs",
-    "rand_getMultisig", "rand_getRandPrice", "rand_getBlockContext",
+    "rand_getMultisig", "rand_getRandPrice", "rand_getBlockContext", "rand_getBeacon",
 ];
 
 /// The public listener's burst and refill, for **every caller together**: there is one address
@@ -998,6 +998,10 @@ pub struct ProgramStateLimits {
     /// 21's object is unchanged.
     #[serde(skip_serializing_if = "is_zero_u64")]
     pub reference_block_window: u64,
+    /// The randomness beacon: genesis `beacon.commit_delay_blocks` (`rand_getBeacon`). Absent on
+    /// a chain without the `beacon` section, so chain 21's object is unchanged.
+    #[serde(skip_serializing_if = "is_zero_u64")]
+    pub beacon_commit_delay_blocks: u64,
 }
 
 fn is_zero_u64(v: &u64) -> bool {
@@ -1053,6 +1057,7 @@ impl ChainLimits {
                     max_writes: MAX_WRITES,
                     max_payouts: MAX_PAYOUTS,
                     reference_block_window: ledger.reference_block_window(),
+                    beacon_commit_delay_blocks: ledger.beacon().map_or(0, |b| b.commit_delay_blocks),
                 }
             }),
             multisig: ledger.multisig().map(|m| {
@@ -2880,6 +2885,15 @@ fn tx_json_with(
             "nonce": nonce,
             "voters": votes.iter().map(|(key, _)| key.address().to_base58()).collect::<Vec<_>>(),
         }),
+        // The randomness beacon (genesis `beacon`): a block's first transaction, the proposer's
+        // reveal; and a validator's new commitment with its nonce.
+        Action::BeaconReveal { reveal } => json!({ "kind": "beacon_reveal", "reveal": hex::encode(reveal) }),
+        Action::BeaconCommit { validator, commitment, nonce, .. } => json!({
+            "kind": "beacon_commit",
+            "validator": validator.to_base58(),
+            "commitment": hex::encode(commitment),
+            "nonce": nonce,
+        }),
     };
     json!({
         "hash": t.hash().to_hex(),
@@ -3308,6 +3322,48 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
         // newest closed block. `{"enabled": false}` on a chain without genesis
         // `program_state.reference_block_window`; a height outside the window is -32602 with
         // the ledger's own wording. Served from the stored ring, as of the committed head.
+        // The randomness beacon (genesis `beacon`; `docs/evm-block-context.md` §11) as of the
+        // committed head: the value, the commit delay, and every validator's commitment, commit
+        // nonce and pending commitment — or one validator's, by address. `{"enabled": false}`
+        // on a chain without the section.
+        "rand_getBeacon" => {
+            use randprotocol_core::Address;
+            let delay = st.limits.program_state.as_ref().map_or(0, |p| p.beacon_commit_delay_blocks);
+            if delay == 0 {
+                return Ok(json!({ "enabled": false }));
+            }
+            let only: Option<Address> = match p.get(0) {
+                None | Some(Value::Null) => None,
+                Some(v) => {
+                    let s = v.as_str().ok_or_else(|| RpcError::invalid_params("validator: an address"))?;
+                    Some(Address::from_base58(s).map_err(|e| RpcError::invalid_params(format!("validator: {e}")))?)
+                }
+            };
+            let storage = st.storage.clone();
+            let (height, state) = blocking(st, move || Ok((storage.head_height()?.unwrap_or(0), storage.beacon()?))).await?;
+            let state = state.ok_or_else(|| RpcError::internal("the chain has a beacon and the store holds no beacon state"))?;
+            let row = |v: &Address, e: &randprotocol_core::ledger::beacon::BeaconEntry| {
+                json!({
+                    "validator": v.to_base58(),
+                    "commitment": e.commitment.map(hex::encode),
+                    "nonce": e.nonce,
+                    "pending": e.pending.map(|(at, c)| json!({ "activates_at": at, "commitment": hex::encode(c) })),
+                    // The commitment the validator's next block (at `height + 1` or later) opens.
+                    "due": e.due_commitment(height.saturating_add(1)).map(hex::encode),
+                })
+            };
+            let validators: Vec<Value> = match only {
+                Some(v) => state.entries.get(&v).map(|e| row(&v, e)).into_iter().collect(),
+                None => state.entries.iter().map(|(v, e)| row(v, e)).collect(),
+            };
+            Ok(json!({
+                "enabled": true,
+                "height": height,
+                "value": hex::encode(state.value),
+                "commit_delay_blocks": delay,
+                "validators": validators,
+            }))
+        }
         "rand_getBlockContext" => {
             use randprotocol_core::ledger::program_state as ps;
             let window = st.limits.program_state.as_ref().map_or(0, |p| p.reference_block_window);
@@ -8286,6 +8342,55 @@ pub(crate) mod tests {
         assert_eq!(ok(&plain, "rand_getBlockContext", json!([])).await, json!({ "enabled": false }));
         assert_eq!(ok(&plain, "rand_getBlockContext", json!([1])).await, json!({ "enabled": false }));
         assert!(ok(&plain, "rand_getLimits", json!([])).await["program_state"].get("reference_block_window").is_none());
+    }
+
+    /// The randomness beacon over RPC: `rand_getBeacon` serves the value and every validator's
+    /// commitment as of the committed head (or one validator's), `rand_getBlockContext` carries
+    /// the block's value in its randomness words, a reveal and a commit render by name, and a
+    /// chain without the section answers `{"enabled": false}` with no new key in its limits.
+    #[tokio::test]
+    async fn get_beacon_serves_the_state_and_the_block_context_carries_the_value() {
+        use fixtures::{beacon_genesis_file, beacon_next, beacon_seeds, BEACON_DELAY};
+        let gs = beacon_genesis_file(7).build(&StubExecutor).unwrap();
+        let (_dir, st) = state_for(&gs);
+        let seeds = beacon_seeds(7);
+        let me = key(1).address().to_base58();
+        let genesis = gs.ledger.beacon().unwrap().clone();
+        assert_eq!(ok(&st, "rand_getLimits", json!([])).await["program_state"]["beacon_commit_delay_blocks"], json!(BEACON_DELAY));
+        let row = |commitment: [u8; 32]| {
+            json!({ "validator": me, "commitment": hex::encode(commitment), "nonce": 0, "pending": null, "due": hex::encode(commitment) })
+        };
+        assert_eq!(
+            ok(&st, "rand_getBeacon", json!([])).await,
+            json!({ "enabled": true, "height": 0, "value": hex::encode(genesis.value), "commit_delay_blocks": BEACON_DELAY, "validators": [row(seeds.commitment())] })
+        );
+        let mut ledger = gs.ledger.clone();
+        let b1 = beacon_next(&st.storage, &fixtures::ref_block_genesis_parent(&gs), &mut ledger, &seeds, vec![]);
+        let value = ledger.beacon().unwrap().value;
+        let (reveal, _) = seeds.reveal_for(&seeds.commitment()).unwrap();
+        let out = ok(&st, "rand_getBeacon", json!([me])).await;
+        assert_eq!(out, json!({ "enabled": true, "height": 1, "value": hex::encode(value), "commit_delay_blocks": BEACON_DELAY, "validators": [row(reveal)] }));
+        assert_ne!(value, genesis.value);
+        // The reference block's context: the flag, and the same 32 bytes.
+        let ctx = ok(&st, "rand_getBlockContext", json!([1])).await;
+        assert_eq!((&ctx["has_randomness"], &ctx["randomness"]), (&json!(true), &json!(hex::encode(value))));
+        assert_eq!(ctx["words"][8], json!(1));
+        // The block's first transaction renders as a reveal.
+        let tx = tx_json(&b1.block.transactions[0], None, &StubExecutor);
+        assert_eq!((&tx["action"]["kind"], &tx["action"]["reveal"]), (&json!("beacon_reveal"), &json!(hex::encode(reveal))));
+        // A validator with no entry: an empty list. A string that is no address: a parameter error.
+        let stranger = key(9).address().to_base58();
+        assert_eq!(ok(&st, "rand_getBeacon", json!([stranger])).await["validators"], json!([]));
+        for bad in [json!(["not an address !"]), json!([7])] {
+            assert_eq!(call(&st, "rand_getBeacon", bad).await.unwrap_err().code, -32602);
+        }
+        assert!(PUBLIC_METHODS.contains(&"rand_getBeacon"));
+
+        // A chain without the section: off, no key in the limits, no randomness in the context.
+        let (_dir, plain, _, _) = rpl2_state();
+        assert_eq!(ok(&plain, "rand_getBeacon", json!([])).await, json!({ "enabled": false }));
+        assert_eq!(ok(&plain, "rand_getBeacon", json!([me])).await, json!({ "enabled": false }));
+        assert!(ok(&plain, "rand_getLimits", json!([])).await["program_state"].get("beacon_commit_delay_blocks").is_none());
     }
 
     /// An invoke's payout and mint notes are public (recipient, amount, asset, blinding, the
