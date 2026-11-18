@@ -92,6 +92,22 @@ pub trait CoveredSource: Send + Sync {
     fn covered(&self, covers: &[Hash]) -> Option<Vec<CoveredBundle>>;
 }
 
+/// What a proposer on a beacon chain (genesis `beacon`, `ledger::beacon`) asks of the node: the
+/// preimage of this validator's beacon commitment — the reveal its next block must open with —
+/// or `None` when the node holds no seed whose chain passes through `commitment` (no seed file,
+/// a spent chain, a commitment registered from another seed). The node answers from its seed
+/// file; consensus holds no secret. Without an answer the validator cannot build a valid block:
+/// `propose` returns `NotReady`, the view times out and the next leader proposes.
+pub trait RevealSource: Send + Sync {
+    fn reveal(&self, commitment: &[u8; 32]) -> Option<[u8; 32]>;
+}
+
+impl RevealSource for crate::ledger::beacon::SeedChain {
+    fn reveal(&self, commitment: &[u8; 32]) -> Option<[u8; 32]> {
+        self.reveal_for(commitment).map(|(r, _)| r)
+    }
+}
+
 /// Certificates this replica has verified, by the hash of their bytes and the set they passed
 /// under (spec 2026-10-05 §7.2), FIFO, oldest first. A QC that arrives as a proposal's justify
 /// and again as a NewView's high QC is verified once; an invalid one is never kept.
@@ -150,6 +166,9 @@ pub struct HotStuff {
     /// sets one (tests, and any chain that never aggregates): an `Aggregate` then takes the T4
     /// signpost error, exactly as before.
     covered: Option<Arc<dyn CoveredSource>>,
+    /// The node's beacon seed (genesis `beacon`): consulted only by `propose`, and only on a
+    /// chain with the section. `None` on an observer and on every chain without it.
+    reveals: Option<Arc<dyn RevealSource>>,
     /// Certificates already verified, keyed by their bytes and the set they passed under, so a QC
     /// seen as a proposal's justify and again as a NewView's high QC is checked once (spec
     /// 2026-10-05 §7.2).
@@ -343,6 +362,7 @@ impl HotStuff {
             signer,
             executor,
             covered: None,
+            reveals: None,
             verified_qcs: VerifiedQcs::new(VERIFIED_QCS_KEPT),
             view,
             high_qc,
@@ -506,6 +526,12 @@ impl HotStuff {
     /// `Aggregate`. Called once at startup; everything before it keeps the T4 behavior.
     pub fn set_covered_source(&mut self, source: Arc<dyn CoveredSource>) {
         self.covered = Some(source);
+    }
+
+    /// Register the node's beacon reveal source (genesis `beacon`). Like the covered source it
+    /// does not ride a `resume`: set it again on the fresh replica.
+    pub fn set_reveal_source(&mut self, source: Arc<dyn RevealSource>) {
+        self.reveals = Some(source);
     }
 
     /// The covered-bundle records a block's `Aggregate` transactions need, keyed by their
@@ -1490,8 +1516,43 @@ impl HotStuff {
         // Select against the time this block will carry, so a validator
         // re-applying it through `apply_block` reaches the same verdict.
         ledger.set_timestamp_ms(timestamp_ms);
-        let mut txs = Vec::with_capacity(candidates.len());
         let me = signer.address();
+        // The randomness beacon (genesis `beacon`): the block opens with this validator's
+        // reveal, applied through the very rule every replica runs on `transactions[0]`. A
+        // validator with no commitment in force, or whose node holds no seed that opens it,
+        // cannot build a valid block: it misses the slot (the view times out) and keeps voting.
+        // The reveal takes one transaction and its bytes out of what the candidates may fill.
+        let mut reveal_tx = None;
+        let mut candidates = candidates;
+        if let Some(beacon) = ledger.beacon() {
+            let reveal = beacon.due_commitment(&me, height).and_then(|c| self.reveals.as_ref().and_then(|s| s.reveal(&c)));
+            let Some(reveal) = reveal else {
+                tracing::warn!("view {view}: no beacon reveal for this validator at height {height} (no commitment in force, or no seed that opens it): missing the slot");
+                return Err(ConsensusError::NotReady);
+            };
+            let tx = Transaction { chain_id: ledger.chain_id(), bundle: None, action: crate::types::Action::BeaconReveal { reveal } };
+            if let Err(e) = ledger.apply_block_reveal(Some(&tx), &me) {
+                tracing::warn!("view {view}: this validator's beacon reveal does not apply at height {height}: {e}");
+                return Err(ConsensusError::NotReady);
+            }
+            let max_bytes = ledger.max_block_bytes().saturating_sub(tx.encoded_len());
+            let mut used = 0usize;
+            let mut kept = Vec::with_capacity(candidates.len());
+            for c in candidates {
+                if kept.len() >= crate::gas::MAX_BLOCK_TXS - 1 {
+                    break;
+                }
+                let len = c.encoded_len();
+                if used.saturating_add(len) > max_bytes {
+                    continue;
+                }
+                used += len;
+                kept.push(c);
+            }
+            candidates = kept;
+            reveal_tx = Some(tx);
+        }
+        let mut txs = Vec::with_capacity(candidates.len());
         // The aggregate selection (spec §3.4): at most one `Aggregate` per block — the largest
         // cover set among the candidates that apply, ties to the lowest proof hash. The rest
         // stay pooled for a later block; a cover set the store cannot cover skips its own
@@ -1574,6 +1635,11 @@ impl HotStuff {
                 txs.push(tx);
                 break;
             }
+        }
+        // The reveal goes first in the list, where the block rule reads it. It was applied
+        // before `base` was taken, so no replay above undoes it and none re-applies it.
+        if let Some(tx) = reveal_tx {
+            txs.insert(0, tx);
         }
         // The same block-end steps `apply_block_for_sync` runs before it recomputes the root.
         let (bytes_used, gas_used) = ledger.block_usage(&txs, call_gas);

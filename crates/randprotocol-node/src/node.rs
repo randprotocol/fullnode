@@ -6196,6 +6196,59 @@ mod tests {
         assert_eq!(storage.verified_head().unwrap(), Some(row), "the row is not what is wrong; it stays");
     }
 
+    /// The randomness beacon is genesis-gated, and chain 21 has no `beacon` section: its genesis
+    /// hash, its genesis header's bytes, its genesis state root, the state root after each of
+    /// three empty blocks closed on it (two seconds apart, proposed by the file's first
+    /// validator), and block 1's header bytes and hash are what they were on the commit before the
+    /// beacon existed (`9d9e8473`), where these values were taken. A change here is a consensus
+    /// change for chain 21.
+    #[test]
+    fn chain_21_is_byte_for_byte_what_it_was_before_the_beacon() {
+        use randprotocol_core::types::{Block, BlockHeader, QuorumCertificate};
+        const PINS: [&str; 8] = [
+            "ca76c2766ed6090ac6ba5dad86b724dd5d2b80c0edfaed287cd8b129e663ca9a",
+            "333167abef3a544ed3de9a691ebd4935b1df6b86c7b34ddc1e7f245196b8dcaa",
+            "14923881fad5e24f137a97b41e2a289eac3c801b0d1523786521a64f8b26ef36",
+            "f31b751a1ee75b9457a6172f0e626558b90bbc313d0a3e49796d7b5b70b5ffde",
+            "ea2c7e63f090c584c6a6840d6877a8c404bb30426009e18e210ce0be6a221e89",
+            "da825617704cdb223b70bfbf12e79697c87597e3f2696d39d7305a0a50c3d65a",
+            "0e5f9ea65088814d98e82fdfdf3a81ceb22dc912707bde2b776f9fb3cc4b6088",
+            "689e75b53d55c1e97402126453c16d259b341f6ef50d35b9c63c4fab13738ba3",
+        ];
+        let digest = |bytes: &[u8]| hex::encode(blake3::hash(bytes).as_bytes());
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../deploy/genesis-chain21.json");
+        let file = randprotocol_core::genesis::Genesis::from_json(&std::fs::read_to_string(path).unwrap()).unwrap();
+        let executor = executor_for_profile(&file.fri_profile).unwrap();
+        let gs = file.build(executor.as_ref()).unwrap();
+        let proposer = file.validators[0].public_key.clone();
+        let mut got = vec![gs.hash().to_hex(), digest(&bincode::serialize(&gs.block.header).unwrap()), gs.ledger.state_root().to_hex()];
+        // No beacon on chain 21: no state, and an empty block is a block.
+        assert!(file.beacon.is_none() && gs.ledger.beacon().is_none());
+        let mut ledger = gs.ledger.clone();
+        let mut roots = Vec::new();
+        for h in 1..=3u64 {
+            ledger.set_height(h);
+            ledger.set_timestamp_ms(file.timestamp_ms + 2_000 * h);
+            assert!(ledger.apply_transactions(&[], &proposer.address(), executor.as_ref()).unwrap().is_empty());
+            ledger.close_block(h, &proposer.address(), 0, 0, executor.as_ref());
+            roots.push(ledger.state_root());
+            got.push(ledger.state_root().to_hex());
+        }
+        let header = BlockHeader {
+            height: 1,
+            view: 1,
+            parent: gs.hash(),
+            proposer,
+            timestamp_ms: file.timestamp_ms + 2_000,
+            tx_root: Block::tx_root(&[]),
+            state_root: roots[0],
+            justify: QuorumCertificate { view: 0, block_hash: gs.hash(), votes: Vec::new() },
+        };
+        got.push(digest(&bincode::serialize(&header).unwrap()));
+        got.push(header.hash().to_hex());
+        assert_eq!(got, PINS.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+    }
+
     /// Audit v10, CON-102 regression on chain 21's own genesis (`deploy/genesis-chain21.json`:
     /// staking with `admission_by_vote`, gas, fees, perps, multisig — genesis parameters that are
     /// in the state root and that the raw `load_ledger` does not carry): the first start walks
