@@ -322,6 +322,105 @@ async fn a_stem_dropped_by_its_successor_is_fluffed_by_the_submitters_embargo() 
     net.stop().await;
 }
 
+/// Audit v12, PRIV-604 (monorepo#30), end to end: a successor that acknowledges a stem and drops
+/// it no longer makes the submitter publish, when the submitter has another successor.
+///
+/// The submitter A first has one stem-capable peer, a black hole (a bare network node that
+/// acknowledges and does nothing else); three more nodes run with Dandelion off.
+///
+/// * Control, transaction 1: with nowhere else to stem, A's embargo fluffs it — A is the only
+///   node that published it, as before.
+/// * Then a fifth node B joins with Dandelion on at q = 1 and becomes A's second successor. A's
+///   own edge stays mapped to the black hole for the epoch, so transaction 2 goes to the hole
+///   again. This time A's first embargo stems it to B, B fluffs it, and every mempool gets it:
+///   A published nothing, and no mempool held it before A's first embargo could run out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_submitter_stems_around_a_black_hole_to_its_other_successor_and_never_publishes() {
+    let b = 1000;
+    let mut configs = vec![cfg(0.0, b, 30)];
+    configs.extend((0..3).map(|_| DandelionConfig::off()));
+    let mut net = Net::start(configs).await;
+    let a = 0;
+    let (hole, mut hole_rx) = network::start_with(
+        NetworkConfig {
+            chain_id: net.gen.chain_id,
+            listen: vec!["/ip4/127.0.0.1/tcp/0".parse().unwrap()],
+            bootstrap: vec![common::cluster::bootstrap_addr(&net.nodes[a])],
+            enable_mdns: false,
+            limits: WireLimits::default(),
+        },
+        [99; 32],
+        EdgeConfig { dandelion: true, ..EdgeConfig::default() },
+    )
+    .await
+    .unwrap();
+    let (dropped_tx, mut dropped) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        while let Some(ev) = hole_rx.recv().await {
+            if let NetworkEvent::StemTx { tx, .. } = ev {
+                let _ = dropped_tx.send(tx.hash());
+            }
+        }
+    });
+    common::cluster::wait_for("the black hole is the submitter's stem peer", Duration::from_secs(20), || {
+        net.nodes[a].handle.dandelion.stem_peers.load(Ordering::Relaxed) == 1
+    })
+    .await;
+
+    // The control: no other successor, so the submitter's embargo publishes it.
+    let tx1 = net.mint();
+    net.submit_and_watch(a, &tx1, 1, Duration::from_secs(30)).await;
+    assert_eq!(dropped.recv().await, Some(tx1.hash()), "transaction 1 went to the black hole");
+    assert_eq!(published_by(&[0; 4], &net.all_fluffs()), vec![a], "with no other successor only the submitter publishes it");
+    assert_eq!(net.stat(a, |d| &d.embargo_restem), 0);
+
+    // B joins: Dandelion on, and it fluffs whatever is stemmed to it.
+    let boot = net.nodes.iter().map(common::cluster::bootstrap_addr).collect();
+    let node_b = start(&net.gen, 6, boot, cfg(1.0, b, 31)).await;
+    net.nodes.push(node_b);
+    let bi = 4;
+    common::cluster::wait_for("B is the submitter's second stem peer", Duration::from_secs(30), || {
+        net.nodes[a].handle.dandelion.stem_peers.load(Ordering::Relaxed) == 2 && net.nodes[bi].handle.status.read().unwrap().connected_peers >= 4
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+
+    let before = net.all_fluffs();
+    let tx2 = net.mint();
+    let h2 = tx2.hash();
+    let start_at = Instant::now();
+    assert_eq!(net.nodes[a].rpc.send_transaction(&tx2).await.expect("accepted"), h2);
+    assert_eq!(dropped.recv().await, Some(h2), "transaction 2 went to the black hole too: the edge keeps its successor");
+    // When each node first shows it pooled.
+    let mut pending_at: Vec<Option<Duration>> = vec![None; net.nodes.len()];
+    while pending_at.iter().any(Option::is_none) {
+        assert!(start_at.elapsed() < Duration::from_secs(30), "not every mempool holds transaction 2: {pending_at:?}");
+        for (i, n) in net.nodes.iter().enumerate() {
+            if pending_at[i].is_none() {
+                let st = n.rpc.call("rand_getTransactionStatus", serde_json::json!([[h2.to_hex()]])).await.unwrap();
+                if st[0]["status"] == "pending" {
+                    pending_at[i] = Some(start_at.elapsed());
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let by = published_by(&before, &net.all_fluffs());
+    eprintln!(
+        "black hole with another successor, embargo {b} ms: published by {by:?}; first mempool at {:?}, all by {:?}; submitter's embargo restems {}",
+        pending_at.iter().flatten().min().unwrap(),
+        pending_at.iter().flatten().max().unwrap(),
+        net.stat(a, |d| &d.embargo_restem)
+    );
+    assert_eq!(by, vec![bi], "B published it; the submitter did not");
+    assert_eq!(net.stat(a, |d| &d.embargo_restem), 1, "the submitter's first embargo stemmed it to B");
+    assert_eq!(net.stat(bi, |d| &d.stem_received), 1);
+    assert_eq!(net.stat(bi, |d| &d.fluff_coin), 1, "B fluffed it on the coin");
+    assert_eq!(net.fluffs(a), before[a], "the submitter published nothing new");
+    hole.shutdown().await;
+    net.stop().await;
+}
+
 /// The added propagation latency, measured and printed, not asserted beyond every mempool
 /// getting each transaction within 30 s: the same five-node network with Dandelion off (publish
 /// at once, as before v0.8.3) and on at the defaults (q = 0.1, 3 s embargo), ten transactions

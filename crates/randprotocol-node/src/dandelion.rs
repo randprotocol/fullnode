@@ -25,7 +25,11 @@
 //!   transaction has not come back to it over gossip by then, it fluffs it itself. That is the
 //!   fail-safe against a successor that drops it (a black hole). A successor that does not
 //!   acknowledge a stem within [`crate::network::STEM_REQUEST_TIMEOUT`] — under the embargo — is
-//!   dropped and the transaction rerouted to the edge's other successor.
+//!   dropped and the transaction rerouted to the edge's other successor. A successor that
+//!   acknowledges and then goes silent is rerouted around once as well
+//!   ([`Dandelion::on_embargo`]): the first time a holder's timer runs out it stems the
+//!   transaction to a successor it has not tried, under a fresh timer, and only fluffs it itself
+//!   when that timer runs out too or it has no such successor (audit v12, PRIV-604).
 //! - **Loops.** A stem that comes back to a node already holding it is treated as a fresh
 //!   arrival on that edge — the q coin, then the edge's successor — without a second verification
 //!   ([`Dandelion::on_loop`]). In a fleet of 25 the walk revisits a node within a handful of hops;
@@ -105,11 +109,15 @@ pub struct DandelionConfig {
     /// Seed the RNG instead of drawing it from the OS. Tests only: a predictable RNG is a
     /// predictable route.
     pub seed: Option<u64>,
+    /// Reroute once around a successor that acknowledged a stem and then went silent
+    /// ([`Dandelion::on_embargo`]). On by default; off, a holder fluffs at its first embargo, as
+    /// through v0.8.6. Configurable for tests only.
+    pub silent_reroute: bool,
 }
 
 impl Default for DandelionConfig {
     fn default() -> DandelionConfig {
-        DandelionConfig { enabled: true, fluff_prob: DEFAULT_FLUFF_PROB, embargo: DEFAULT_EMBARGO, epoch: EPOCH, seed: None }
+        DandelionConfig { enabled: true, fluff_prob: DEFAULT_FLUFF_PROB, embargo: DEFAULT_EMBARGO, epoch: EPOCH, seed: None, silent_reroute: true }
     }
 }
 
@@ -278,6 +286,21 @@ impl Router {
         Some(pick)
     }
 
+    /// A successor for a transaction from `from` that already went to `sent` and was not heard
+    /// of again: one of this epoch's successors that is neither in `sent` nor the predecessor,
+    /// at random. Does not touch the edge's mapping — the next transaction on the edge still takes
+    /// its usual successor, since one silence does not say which node downstream dropped it.
+    /// `None`: every successor was tried.
+    pub fn alternate(&mut self, from: Edge, sent: &[PeerId], now: Instant, rng: &mut StdRng) -> Option<PeerId> {
+        self.maybe_rotate(now, rng);
+        let back = match from {
+            Edge::Peer(p) => Some(p),
+            Edge::Local => None,
+        };
+        let candidates: Vec<PeerId> = self.successors.iter().copied().filter(|s| Some(*s) != back && !sent.contains(s)).collect();
+        candidates.choose(rng).copied()
+    }
+
     pub fn successors(&self) -> &[PeerId] {
         &self.successors
     }
@@ -299,6 +322,9 @@ struct StemEntry {
     deadline: Instant,
     /// The successors it was sent to, in order.
     sent_to: Vec<PeerId>,
+    /// Its embargo already ran out once and it was stemmed around the silence
+    /// ([`Dandelion::on_embargo`]); the next time it is fluffed.
+    rerouted: bool,
     /// Its place in the order of holding ([`Stempool::evict_relayed_for`]'s "oldest").
     seq: u64,
 }
@@ -360,7 +386,7 @@ impl Stempool {
         self.bytes += bytes;
         let seq = self.next_seq;
         self.next_seq += 1;
-        self.entries.insert(hash, StemEntry { tx, bytes, origin, deadline, sent_to: Vec::new(), seq });
+        self.entries.insert(hash, StemEntry { tx, bytes, origin, deadline, sent_to: Vec::new(), rerouted: false, seq });
         true
     }
 
@@ -397,6 +423,28 @@ impl Stempool {
         due.into_iter().filter_map(|h| self.take(&h).map(|tx| (h, tx))).collect()
     }
 
+    /// The transactions whose embargo has run out by `now`, still held.
+    fn due(&self, now: Instant) -> Vec<Hash> {
+        let mut due: Vec<(u64, Hash)> = self.entries.iter().filter(|(_, e)| e.deadline <= now).map(|(h, e)| (e.seq, *h)).collect();
+        due.sort_unstable_by_key(|(seq, _)| *seq);
+        due.into_iter().map(|(_, h)| h).collect()
+    }
+
+    /// Whether `hash` was already stemmed around a silence once.
+    pub fn rerouted(&self, hash: &Hash) -> bool {
+        self.entries.get(hash).is_some_and(|e| e.rerouted)
+    }
+
+    /// `hash` goes to `peer` around a silent successor: recorded as sent, marked, and held until
+    /// the new `deadline`.
+    fn reroute(&mut self, hash: &Hash, peer: PeerId, deadline: Instant) {
+        if let Some(e) = self.entries.get_mut(hash) {
+            e.sent_to.push(peer);
+            e.rerouted = true;
+            e.deadline = deadline;
+        }
+    }
+
     /// The earliest embargo, for the node loop's timer.
     pub fn next_deadline(&self) -> Option<Instant> {
         self.entries.values().map(|e| e.deadline).min()
@@ -426,6 +474,9 @@ pub struct DandelionStats {
     pub fluff_no_route: AtomicU64,
     pub fluff_full: AtomicU64,
     pub fluff_embargo: AtomicU64,
+    /// A stem transaction whose embargo ran out and that was stemmed to another successor
+    /// instead of fluffed ([`Dandelion::on_embargo`]).
+    pub embargo_restem: AtomicU64,
     /// A stem transaction that came back to a node holding it and was sent on.
     pub loop_restem: AtomicU64,
     /// One that came back past [`MAX_STEM_FORWARDS`] and was left to the embargo.
@@ -461,6 +512,15 @@ pub enum LoopAction {
     Fluff(FluffReason),
     /// Nothing: its embargo will fluff it.
     Absorb,
+}
+
+/// What to do with a held stem transaction whose embargo ran out ([`Dandelion::on_embargo`]).
+#[derive(Clone, Debug)]
+pub enum EmbargoAction {
+    /// Stem it to this successor; it stays held, under a fresh embargo.
+    Restem { hash: Hash, peer: PeerId, tx: Transaction },
+    /// It is out of the stempool: pool it and publish it.
+    Fluff { hash: Hash, tx: Transaction },
 }
 
 /// The node's Dandelion++ state: configuration, router, stempool and RNG.
@@ -527,6 +587,51 @@ impl Dandelion {
     pub fn hold(&mut self, hash: Hash, tx: Transaction, origin: Edge, now: Instant) -> bool {
         let wait = self.embargo_for(origin);
         self.stempool.hold(hash, tx, origin, now + wait)
+    }
+
+    /// Every held transaction whose embargo has run out by `now`, and what to do with each
+    /// (audit v12, PRIV-604).
+    ///
+    /// The transaction was sent down the stem and has not come back over gossip, so some node
+    /// after this one is holding it or dropped it — a successor that acknowledged and went
+    /// silent, which the acknowledgement timeout cannot see. Through v0.8.6 the holder then
+    /// published it itself; when the submitter's own successor was the silent one, the submitter
+    /// was the only holder and so the node that published. Now the first expiry stems it to a
+    /// successor of this epoch that has not had it ([`Router::alternate`]), under a fresh embargo
+    /// drawn as before, and the walk from there ends at a fluff by some other node. Only the
+    /// second expiry — or a first one with no untried successor, or past [`MAX_STEM_FORWARDS`]
+    /// sends — fluffs it here, so the fail-safe still holds: a transaction is published at most
+    /// two embargoes (`4b`) after it was held.
+    ///
+    /// Every holder does this, the submitter and relays alike, so a stem that arrives late says
+    /// nothing about where it began. What is left: a submitter all of whose successors drop the
+    /// stem still publishes it itself, and the time to the fluff still shortens with the number
+    /// of holders.
+    pub fn on_embargo(&mut self, now: Instant) -> Vec<EmbargoAction> {
+        let mut out = Vec::new();
+        for hash in self.stempool.due(now) {
+            let Some((origin, sent)) = self.stempool.route_of(&hash).map(|(o, s)| (o, s.to_vec())) else { continue };
+            let untried = if self.cfg.silent_reroute && !self.stempool.rerouted(&hash) && sent.len() < MAX_STEM_FORWARDS {
+                self.router.alternate(origin, &sent, now, &mut self.rng)
+            } else {
+                None
+            };
+            match untried {
+                Some(peer) => {
+                    let wait = self.embargo_for(origin);
+                    self.stempool.reroute(&hash, peer, now + wait);
+                    if let Some(tx) = self.stempool.tx(&hash).cloned() {
+                        out.push(EmbargoAction::Restem { hash, peer, tx });
+                    }
+                }
+                None => {
+                    if let Some(tx) = self.stempool.take(&hash) {
+                        out.push(EmbargoAction::Fluff { hash, tx });
+                    }
+                }
+            }
+        }
+        out
     }
 
     /// A stem copy of `hash`, which this node already holds, arrived from `from`: the stem came
@@ -840,6 +945,129 @@ mod tests {
             crate::network::STEM_REQUEST_TIMEOUT,
             DEFAULT_EMBARGO
         );
+    }
+
+    /// A Dandelion with `n` stem-capable peers and a fixed RNG, and those peers.
+    fn dandelion_with(n: usize, seed: u64, silent_reroute: bool) -> (Dandelion, Vec<PeerId>) {
+        let mut d = Dandelion::new(DandelionConfig { seed: Some(seed), silent_reroute, ..DandelionConfig::default() });
+        let ps = peers(n);
+        for p in &ps {
+            d.router.add_peer(*p, false, None, &mut d.rng);
+        }
+        (d, ps)
+    }
+
+    /// Hold `tx` from `origin` as the node loop does: decide, hold, record the send.
+    fn stem(d: &mut Dandelion, tx: &Transaction, origin: Edge, now: Instant) -> PeerId {
+        let Decision::Stem(first) = d.decide(origin, now) else { panic!("a route") };
+        assert!(d.hold(tx.hash(), tx.clone(), origin, now));
+        d.stempool.sent(&tx.hash(), first);
+        first
+    }
+
+    /// Audit v12, PRIV-604, the acknowledge-then-drop successor: a holder whose embargo runs out
+    /// does not publish the transaction; it stems it to its other successor under a fresh
+    /// embargo and keeps holding it. Only when that embargo runs out too does it fluff. The
+    /// submitter and a relay do the same, the edge's usual successor is unchanged for the next
+    /// transaction, and with the reroute off (v0.8.6's behaviour, the control) the first expiry
+    /// fluffs.
+    #[test]
+    fn a_holder_stems_around_a_silent_successor_once_before_it_fluffs() {
+        let b = DEFAULT_EMBARGO;
+        let relay_edge = Edge::Peer(PeerId::random());
+        for origin in [Edge::Local, relay_edge] {
+            let (mut d, _) = dandelion_with(4, 11, true);
+            // q = 0 so the relay edge stems too; the rule under test is the embargo's.
+            d.cfg.fluff_prob = 0.0;
+            let t0 = Instant::now();
+            let tx = tx(1);
+            let h = tx.hash();
+            let first = stem(&mut d, &tx, origin, t0);
+            assert!(d.on_embargo(t0 + b - Duration::from_millis(1)).is_empty(), "{origin:?}: nothing before b");
+
+            let t1 = t0 + 2 * b;
+            let acts = d.on_embargo(t1);
+            let [EmbargoAction::Restem { hash, peer, tx: sent }] = acts.as_slice() else { panic!("{origin:?}: one restem, got {acts:?}") };
+            assert_eq!((*hash, sent.hash()), (h, h));
+            assert_ne!(*peer, first, "{origin:?}: around the silent successor, not back to it");
+            assert!(d.router.successors().contains(peer), "{origin:?}: to a successor of this epoch");
+            assert!(d.stempool.contains(&h) && d.stempool.rerouted(&h), "{origin:?}: still held");
+            assert_eq!(d.stempool.route_of(&h).unwrap().1, [first, *peer]);
+            let again = d.stempool.next_deadline().unwrap();
+            assert!(again >= t1 + b && again <= t1 + 2 * b, "{origin:?}: a fresh embargo in [b, 2b]");
+            assert_eq!(d.router.route(origin, t1, &mut rng(0)), Some(first), "{origin:?}: the edge keeps its successor");
+
+            assert!(d.on_embargo(t1 + b - Duration::from_millis(1)).is_empty(), "{origin:?}: nothing before the second runs out");
+            let acts = d.on_embargo(t1 + 2 * b);
+            assert!(matches!(acts.as_slice(), [EmbargoAction::Fluff { hash, .. }] if *hash == h), "{origin:?}: the second expiry fluffs: {acts:?}");
+            assert!(d.stempool.is_empty() && d.stempool.next_deadline().is_none());
+        }
+
+        // The control: without the reroute the first expiry fluffs.
+        let (mut d, _) = dandelion_with(4, 11, false);
+        let t0 = Instant::now();
+        let tx = tx(2);
+        stem(&mut d, &tx, Edge::Local, t0);
+        let acts = d.on_embargo(t0 + 2 * b);
+        assert!(matches!(acts.as_slice(), [EmbargoAction::Fluff { .. }]), "{acts:?}");
+    }
+
+    /// The fail-safe is intact where there is nowhere else to stem: one stem-capable peer, a
+    /// relay whose only other successor is its predecessor, a transaction that already went to
+    /// every successor, and one past [`MAX_STEM_FORWARDS`] sends all fluff at the first expiry.
+    #[test]
+    fn a_holder_with_no_untried_successor_fluffs_at_its_first_embargo() {
+        let b = DEFAULT_EMBARGO;
+        let t0 = Instant::now();
+        let fluffs = |acts: &[EmbargoAction]| matches!(acts, [EmbargoAction::Fluff { .. }]);
+
+        // One capable peer: the black hole is the only successor.
+        let (mut d, _) = dandelion_with(1, 3, true);
+        let tx1 = tx(1);
+        stem(&mut d, &tx1, Edge::Local, t0);
+        assert!(fluffs(&d.on_embargo(t0 + 2 * b)), "no other successor");
+
+        // Two capable peers, and the predecessor is the other one.
+        let (mut d, ps) = dandelion_with(2, 3, true);
+        d.cfg.fluff_prob = 0.0;
+        let tx2 = tx(2);
+        let first = stem(&mut d, &tx2, Edge::Peer(ps[0]), t0);
+        assert_eq!(first, ps[1], "never back to the predecessor");
+        assert!(fluffs(&d.on_embargo(t0 + 2 * b)), "the only untried successor is the predecessor");
+
+        // Already sent to both successors (the stem looped through here).
+        let (mut d, _) = dandelion_with(4, 3, true);
+        let tx3 = tx(3);
+        let first = stem(&mut d, &tx3, Edge::Local, t0);
+        let other = *d.router.successors().iter().find(|p| **p != first).unwrap();
+        d.stempool.sent(&tx3.hash(), other);
+        assert!(fluffs(&d.on_embargo(t0 + 2 * b)), "both successors had it");
+
+        // Past the forward cap.
+        let (mut d, _) = dandelion_with(4, 3, true);
+        let tx4 = tx(4);
+        let first = stem(&mut d, &tx4, Edge::Local, t0);
+        for _ in 1..MAX_STEM_FORWARDS {
+            d.stempool.sent(&tx4.hash(), first);
+        }
+        assert!(fluffs(&d.on_embargo(t0 + 2 * b)), "sent MAX_STEM_FORWARDS times");
+    }
+
+    /// A transaction that came back over gossip while it waited (taken out of the stempool) is
+    /// neither restemmed nor fluffed by an embargo, before or after a reroute.
+    #[test]
+    fn a_transaction_seen_on_gossip_is_left_alone_by_the_embargo() {
+        let b = DEFAULT_EMBARGO;
+        let (mut d, _) = dandelion_with(4, 5, true);
+        let t0 = Instant::now();
+        let (a, c) = (tx(1), tx(2));
+        stem(&mut d, &a, Edge::Local, t0);
+        stem(&mut d, &c, Edge::Local, t0);
+        assert!(d.stempool.take(&a.hash()).is_some(), "a was fluffed by another node");
+        let acts = d.on_embargo(t0 + 2 * b);
+        assert!(matches!(acts.as_slice(), [EmbargoAction::Restem { hash, .. }] if *hash == c.hash()), "{acts:?}");
+        assert!(d.stempool.take(&c.hash()).is_some(), "c came back after its reroute");
+        assert!(d.on_embargo(t0 + 10 * b).is_empty());
     }
 
     /// The embargo fail-safe in the stempool: a held transaction comes out exactly when its timer
