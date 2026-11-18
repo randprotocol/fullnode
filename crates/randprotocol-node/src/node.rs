@@ -87,6 +87,9 @@ pub struct NodeConfig {
     /// ([`crate::mempool::state_proof_tier_cap_for`]: the memory left for a key build, audit v13
     /// CON-701).
     pub state_proof_tier_cap: Option<u8>,
+    /// MSA-4: the multisig register size at which this node stops pooling `CreateMultisig`
+    /// (`--max-multisig-accounts`); `None`, the default, is no cap. Node policy only.
+    pub multisig_account_cap: Option<u64>,
     /// Apply incoming proposals on the consensus loop, as before (`--apply-proposals-inline`,
     /// spec 2026-10-11 off-loop apply §4.5); `false`, the default, applies them on a blocking
     /// worker ([`OFFLOOP_APPLIES`]).
@@ -3145,6 +3148,7 @@ pub async fn start_with(cfg: NodeConfig, rpc_options: RpcOptions, net_options: N
     mempool.set_faucet_minters(admission::faucet_minters(&gs));
     mempool.set_state_proof_tier_cap(state_proof_tier_cap);
     let pool_tier_cap = mempool.state_proof_tier_cap();
+    mempool.set_multisig_account_cap(cfg.multisig_account_cap);
     if let Some(p) = cfg.gas_policy {
         mempool.set_gas_policy(p);
     }
@@ -8352,6 +8356,7 @@ mod tests {
             verify_workers: None,
             apply_inline: false,
             state_proof_tier_cap: None,
+            multisig_account_cap: None,
             prune_history: None,
             gas_policy: None,
             msauth: Default::default(),

@@ -46,6 +46,7 @@ async fn the_check_passes_on_the_public_listener_and_fails_on_the_operator_one()
             verify_workers: None,
             apply_inline: false,
             state_proof_tier_cap: None,
+            multisig_account_cap: None,
             prune_history: None,
             gas_policy: None,
             msauth: Default::default(),

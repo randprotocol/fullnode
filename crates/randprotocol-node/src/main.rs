@@ -1003,6 +1003,13 @@ enum Cmd {
         /// (CON-701; 16 from ~1.43 GB left, 18 from ~5.73 GB, 20 from ~22.9 GB).
         #[arg(long, value_name = "TIER", value_parser = parse_state_proof_tier)]
         max_state_proof_tier: Option<u8>,
+        /// MSA-4: stop pooling `CreateMultisig` once the chain's multisig register holds this
+        /// many accounts (the genesis-seeded ones included): such a create is not verified,
+        /// pooled, relayed or proposed here. Node policy only, for a chain whose genesis sets no
+        /// `multisig.max_accounts` (chain 21): a block carrying a create still applies, so the
+        /// cap holds only as far as the proposers run it. Default: no cap.
+        #[arg(long, value_name = "COUNT")]
+        max_multisig_accounts: Option<u64>,
         /// Admission memory budget in MiB (issue #157): one byte budget over RPC request bodies
         /// and transactions waiting for verification, gossiped or submitted. Past it,
         /// `rand_sendTransaction` answers -32005 (busy, retry) and gossiped transactions are shed
@@ -3301,6 +3308,7 @@ async fn main() -> Result<()> {
             prover_threads,
             verify_workers,
             max_state_proof_tier,
+            max_multisig_accounts,
             admission_budget_mb,
             disable_scan_leaves,
             apply_proposals_inline,
@@ -3374,6 +3382,7 @@ async fn main() -> Result<()> {
                 min_free_disk_bytes: min_free_disk_mb << 20,
                 verify_workers,
                 state_proof_tier_cap: max_state_proof_tier,
+                multisig_account_cap: max_multisig_accounts,
                 apply_inline: apply_proposals_inline,
                 prune_history,
                 gas_policy: randprotocol_core::gas::GasPolicy::from_prices(gas_price, byte_price),
@@ -4851,6 +4860,22 @@ mod tests {
         for args in [&["status"][..], &["keygen", "--out", "k.json"], &["address", "--key", "k.json"]] {
             assert!(!opens_storage(&cmd(args)), "`rand-node {}` opens no database", args.join(" "));
         }
+    }
+
+    /// MSA-4: `--max-multisig-accounts` is unset by default (no cap) and takes a count.
+    #[test]
+    fn msa4_the_multisig_accounts_flag_takes_a_count_and_defaults_to_none() {
+        let run = |extra: &[&str]| {
+            let args = ["rand-node", "run", "--datadir", "d", "--key", "k.json"].into_iter().chain(extra.iter().copied());
+            match Cli::try_parse_from(args).map(|c| c.cmd) {
+                Ok(Cmd::Run { max_multisig_accounts, .. }) => Ok(max_multisig_accounts),
+                Ok(_) => unreachable!("a run"),
+                Err(e) => Err(e.to_string()),
+            }
+        };
+        assert_eq!(run(&[]).unwrap(), None, "default: no cap");
+        assert_eq!(run(&["--max-multisig-accounts", "64"]).unwrap(), Some(64));
+        assert!(run(&["--max-multisig-accounts", "many"]).is_err());
     }
 
     /// CON-601: `--max-state-proof-tier` is unset by default (the node sizes the cap from its

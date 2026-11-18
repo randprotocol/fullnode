@@ -1402,6 +1402,8 @@ pub fn acceptance_for_pool(e: &MempoolError, hash: Hash, refused: &mut RefusedCa
         // PERP-6: this node's pool policy; the proof is valid on a chain without `bound_payouts`,
         // and a peer on an older build relays it honestly.
         | MempoolError::StateProofOverpays { .. }
+        // MSA-4: this node's `--max-multisig-accounts`; the create is valid on the chain.
+        | MempoolError::MultisigAtNodeCap { .. }
         | MempoolError::AdmissionBusy(_) => Acceptance::Ignore,
     }
 }
