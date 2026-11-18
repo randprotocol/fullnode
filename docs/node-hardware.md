@@ -84,12 +84,15 @@ Rules that follow from these numbers:
 - **4 GB of RAM is the validator minimum** (issue #157). A 2 GB droplet runs a validator at rest
   (~1.4 GB resident), but the 2026-10-27 overnight run OOM-killed the 2 GB validators 24 times in
   8 h, each after a burst of eight ~2.9 MB transactions; the one 4 GB node in a burst survived
-  it. v0.8.3 bounds admission memory (`--admission-budget-mb`, 1/16 of RAM by default, ~117 MiB
-  on a 2 GB host), and every setup and roll (`deploy/vps-setup.sh`, `deploy/update-droplet.sh`,
+  it. v0.8.3 bounds admission memory (`--admission-budget-mb`, 1/16 of RAM by default and never
+  under one largest submission: ~129 MiB on a 2 GB host on chain 21; a request body counts three
+  times its length, the heap it is measured to hold — OPS-602, `tests/burst_memory.rs`), and every setup and roll (`deploy/vps-setup.sh`, `deploy/update-droplet.sh`,
   `deploy/roll-all.sh`) writes the drop-in `rand-node.service.d/50-limits.conf` from
   `deploy/lib/unit-limits.sh` (PROC-601) with `MemoryHigh=85%`, so the kernel reclaims and
   throttles before it kills. A 2 GB host that has
-  to stay on needs both, plus swap (the fleet's have 1 GB).
+  to stay on needs both, plus swap (the fleet's have 1 GB). `deploy/probe-memory.sh` records each
+  host's RAM, swap, `MemoryHigh`, resident memory and budget, and names the hosts under the
+  minimum, without swap, or without `MemoryHigh`.
 - **A perps state-proof key build is the largest single allocation a node makes** (CON-601):
   ~1 GiB at tier 16, ~4 GiB at tier 18 (3.56 GB resident measured), ~16 GiB at tier 20. Chain 21
   allows tier 18, which neither a 2 GB nor a 4 GB host can build. The node caps the tier it

@@ -1211,8 +1211,9 @@ pub async fn serve(addr: SocketAddr, state: RpcState) -> anyhow::Result<(SocketA
 /// Issue #157: charge a POST's body against the admission budget before axum reads it, and hold
 /// the charge until the response is built — for `rand_sendTransaction`, until the verdict, so a
 /// burst of large submissions is bounded while it waits rather than buffered without limit. The
-/// declared `Content-Length` is what is charged (capped at the body limit, which refuses anything
-/// longer); a body without one is charged the whole limit. A charge that does not fit is answered
+/// declared `Content-Length` (capped at the body limit, which refuses anything longer; the whole
+/// limit for a body without one) is charged at [`crate::admission::body_charge`] — three times
+/// over, the heap a body is measured to hold while it is handled (audit v12, OPS-602). A charge that does not fit is answered
 /// at once with `-32005` and HTTP 503 + `Retry-After: 1`. A GET (the WebSocket upgrade) has no
 /// body and is not charged.
 async fn charge_body(
@@ -1230,7 +1231,8 @@ async fn charge_body(
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse::<usize>().ok())
         .map_or(st.max_body_bytes, |n| n.min(st.max_body_bytes));
-    match st.admission.try_charge(declared) {
+    // Charged at what the body is held as, not its length once (OPS-602).
+    match st.admission.try_charge(crate::admission::body_charge(declared)) {
         Ok(charge) => {
             let response = next.run(req).await;
             drop(charge);
@@ -9265,7 +9267,9 @@ pub(crate) mod tests {
         let body = |i: u32| serde_json::to_vec(&json!({ "jsonrpc": "2.0", "id": i, "method": "rand_sendTransaction", "params": [hex::encode(tx(i).encode())] })).unwrap();
         let len = body(0).len();
         assert!(len > 1_500_000 && (0..N as u32).all(|i| body(i).len() == len), "equal, large bodies: {len} B");
-        let budget = crate::admission::AdmissionBudget::new(HELD * len + len / 2);
+        // Each body is charged at `body_charge` (OPS-602): room for three, not for a fourth.
+        let charged = crate::admission::body_charge(len);
+        let budget = crate::admission::AdmissionBudget::new(HELD * charged + charged / 2);
         // A stand-in node loop that answers nothing until the test says so.
         let (node_tx, mut node_rx) = mpsc::channel(N);
         let st = RpcState { admission: budget.clone(), node: node_tx, ..st };
@@ -9302,7 +9306,7 @@ pub(crate) mod tests {
             assert!(v["error"]["message"].as_str().unwrap().starts_with("busy:"), "{v}");
             assert_eq!(v["error"]["data"]["limit"], json!(budget.limit()));
         }
-        assert_eq!(budget.in_use(), HELD * len, "three bodies charged, never more than the budget");
+        assert_eq!(budget.in_use(), HELD * charged, "three bodies charged, never more than the budget");
         assert!(node_rx.try_recv().is_err(), "no fourth submission reached the node");
 
         for (hash, reply) in held.drain(..) {
@@ -9333,10 +9337,12 @@ pub(crate) mod tests {
     ///
     /// Asserted: the bytes in flight never exceed the budget (sampled throughout); every
     /// submission is answered either with its hash or with `-32005`, never reset or lost; and every
-    /// hash acknowledged is one the node pooled — nothing is acknowledged and then dropped. The
-    /// 27 Oct burst of eight fits the 2 GB default outright (~8.7 MB counted each, ~70 MB of
-    /// ~117 MiB): the budget bounds counted bytes, not RSS, which is why MemoryHigh (PROC-601) and
-    /// the 4 GB validator minimum stand beside it. A burst twice that size is cut at the budget.
+    /// hash acknowledged is one the node pooled — nothing is acknowledged and then dropped. Each
+    /// such submission counts ~20 MB (its 5.8 MB body at `body_charge`, three times over, plus the
+    /// decoded transaction), so six fit the 2 GB default (~117 MiB) and the rest of the 27 Oct
+    /// burst of eight is told `-32005`; before monorepo#26 the body counted once, all eight fit,
+    /// and the heap they held was about three times what the budget named
+    /// (`tests/burst_memory.rs` measures it). A burst twice that size is cut the same way.
     #[tokio::test]
     async fn the_27_oct_burst_shape_stays_inside_the_2gb_default_budget() {
         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -9357,7 +9363,7 @@ pub(crate) mod tests {
             HOST_RAM,
             crate::admission::AdmissionBudget::floor_for(st.max_body_bytes, st.limits.max_block_bytes),
         );
-        let per_submission = body(0).len() + crate::admission::charge_of(&tx(0));
+        let per_submission = crate::admission::body_charge(body(0).len()) + crate::admission::charge_of(&tx(0));
 
         for burst in [8usize, 16] {
             let budget = crate::admission::AdmissionBudget::new(limit);
@@ -9437,7 +9443,7 @@ pub(crate) mod tests {
             assert_eq!(budget.in_use(), 0, "every charge is back");
             let fits = limit / per_submission;
             if burst <= fits {
-                assert_eq!(busy, 0, "the 27 Oct burst of {burst} fits a 2 GB host's default budget ({fits} would)");
+                assert_eq!(busy, 0, "a burst of {burst} fits a 2 GB host's default budget ({fits} would)");
             } else {
                 assert!(busy >= burst - fits, "burst {burst}: at most {fits} admitted, {busy} told to retry");
                 assert!(acked.len() <= fits);

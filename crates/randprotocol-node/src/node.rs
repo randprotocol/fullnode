@@ -2893,7 +2893,7 @@ pub async fn start_with(cfg: NodeConfig, rpc_options: RpcOptions, net_options: N
         let floor = AdmissionBudget::floor_for(rpc_limits.rpc_max_body_bytes(), rpc_limits.max_block_bytes);
         let bytes = match rpc_options.admission_budget {
             Some(b) if b < floor => anyhow::bail!(
-                "--admission-budget-mb {} is under one largest transaction on this chain ({} MiB: the {}-byte request-body cap plus the {}-byte block cap)",
+                "--admission-budget-mb {} is under one largest transaction on this chain ({} MiB: three times the {}-byte request-body cap, what a body is held as, plus the {}-byte block cap)",
                 b >> 20,
                 floor.div_ceil(1 << 20),
                 rpc_limits.rpc_max_body_bytes(),
