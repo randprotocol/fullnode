@@ -132,6 +132,7 @@ jobs:
           SELFTEST=1 bash deploy/lib/unit-limits.sh
           SELFTEST=1 bash deploy/lib/fleet-env.sh
           SELFTEST=1 bash deploy/roll-fleet.sh
+          SELFTEST=1 bash deploy/enable-public-rpc.sh
       # VK-10: the prover pool router's tests (stdlib only).
       - name: The prover pool router
         working-directory: fullnode/deploy/prover
@@ -143,7 +144,7 @@ jobs:
         # reads as a sync test), and a pattern that looks right silently lets 90 minutes of proving
         # into the fast job. A new cheap test has to be added here on purpose — that is the trade.
         run: |
-          cargo test -p randprotocol-node --release --test submit --test ws
+          cargo test -p randprotocol-node --release --test submit --test ws --test public_rpc_check
           # Coverage push 2026-10-11: suites the nightly already ran, cheap and proof-free, that the
           # fast job and the coverage measurement did not name. The prover service and its HTTP
           # surface run on a stub prove function; the `rand`/`rand-node` binaries are driven as an

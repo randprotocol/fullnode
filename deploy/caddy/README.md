@@ -77,25 +77,46 @@ It serves a fixed method set (`rpc::PUBLIC_METHODS`: no viewing-key methods, no 
 caller as loopback — so the method gate and the meter are the node's, not only the sale proxy's
 `RPC_ALLOWED` in another repository.
 
-**State (2026-10-28): not recorded.** The last recorded state of this hop is the 2026-09-27 tunnel
-above, to obs1's operator port `:8545`. obs1 was rebuilt on another host in the 2026-10-22
-DigitalOcean migration, and nothing in this repository records whether its new unit carries
-`--public-rpc`. To find out, from the web droplet: `rand_getPeers` through `127.0.0.1:18545`
-answers "not served on this node's public listener" once the hop ends at `:8546`, and answers a
-peer list while it still ends at `:8545`; on obs1, `systemctl cat rand-node | grep -- --public-rpc`.
-Write the answer here. If it is not done, the steps, by the operator, one host at a time:
+**State: the operator's statement, no stored check.** The operator reports (monorepo#17) that on
+2026-10-28 the hop was moved to the node's public listener: `deploy/enable-public-rpc.sh` with
+`RESTART=1` on the node that serves it, the `rpctunnel` key's `permitopen` and the web droplet's
+tunnel unit both changed to `:8546`, and `rand_getPeers` and `rand_importViewingKey` then answered
+"not served on this node's public listener" through the tunnel. No check output is stored in any
+repository, so audit v12 counted VK-2 as not running. What closes that is a stored run of
+`deploy/check-public-rpc.sh` (below), not this paragraph.
 
-1. obs1's unit: add `--public-rpc 127.0.0.1:8546` to `ExecStart` — `deploy/enable-public-rpc.sh root@<host>`
-   (edits the unit, idempotent; `RESTART=1` restarts it and checks the listener refuses
-   `rand_getPeers`; a new host gets it from `PUBLIC_RPC=1 deploy/vps-setup.sh …`).
-2. obs1's `rpctunnel` key: `permitopen="127.0.0.1:8546"` in place of `:8545`.
-3. The web droplet's `rpc-tunnel-obs1.service`: `-L 127.0.0.1:18545:127.0.0.1:8546`.
-4. Check from the web droplet: `rand_chainId` answers through `127.0.0.1:18545`;
-   `rand_getPeers` answers "not served on this node's public listener".
-5. E, if randscan's `/rpc` route is ever used again: the same flag, and the route's upstream to
+**The committed unit** (monorepo#17). `deploy/systemd/rand-node.service.d/60-public-rpc.conf` is
+the drop-in that turns the listener on: one line, `Environment=RAND_NODE_PUBLIC_RPC=127.0.0.1:8546`,
+which a node of v0.8.7 or later reads as `--public-rpc`. It leaves `ExecStart` alone, so it fits
+every host's unit. A host whose `ExecStart` already carries `--public-rpc` needs nothing more.
+
+The steps, by the operator, one host at a time:
+
+1. The node's unit: `DROPIN=1 deploy/enable-public-rpc.sh root@<host>` installs the drop-in
+   (v0.8.7+; idempotent; a unit that already has the flag is left alone). On an older binary,
+   without `DROPIN=1`, it appends `--public-rpc 127.0.0.1:8546` to `ExecStart`. `RESTART=1`
+   restarts the node and runs the check on the host. A new host gets the flag from
+   `PUBLIC_RPC=1 deploy/vps-setup.sh …`.
+2. The node's `rpctunnel` key: `permitopen="127.0.0.1:8546"` in place of `:8545`.
+3. The web droplet's tunnel unit: `-L 127.0.0.1:18545:127.0.0.1:8546`.
+4. **Check, and keep the output.** On the node:
+   `ssh root@<host> 'bash -s -- --local' < deploy/check-public-rpc.sh` (the unit turns the listener
+   on; `rand_chainId` answers; `rand_getPeers`, `rand_mint` and the three viewing-key methods are
+   each refused in the node's own words; a batch is refused). On the web droplet, against the
+   tunnel's local end: `bash -s -- --url http://127.0.0.1:18545 < deploy/check-public-rpc.sh` —
+   this is the one that shows where the public hop ends: it fails, naming the method, while the
+   tunnel still ends at `:8545`. Through the public name the proxy answers first, so
+   `--behind-proxy --url https://…` shows only the proxy's list. Each run ends `public-rpc: ok`
+   or `public-rpc: FAIL` with its reasons; put the two outputs in the roll record
+   (`deploy/roll-records/`), with the date and no host addresses.
+5. E, if randscan's `/rpc` route is ever used again: the same drop-in, and the route's upstream to
    `127.0.0.1:8546`. randscan's own explorer keeps `127.0.0.1:8545` — it needs the viewing methods.
 
-Until then the section below describes the running chain.
+The check is tested against a real node's two listeners
+(`crates/randprotocol-node/tests/public_rpc_check.rs`): it passes on the public one and fails on
+the operator one.
+
+Until a check is stored, read the section below as describing either state.
 
 ## Which layer gates which method
 
