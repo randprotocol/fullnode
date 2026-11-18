@@ -39,7 +39,10 @@
 #                                                    # (base_fees_burned "0" — BASE_FEES_BURNED_ANY=1
 #                                                    # after the first bundle — and perps proved_height
 #                                                    # 0, no accounts, collateral counters "0": run it
-#                                                    # before the first deposit and state proof)
+#                                                    # before the first deposit and state proof);
+#                                                    # and that THIS TREE's CHAIN_CONSTRAINT_SETS has
+#                                                    # chain 22's row (issue #166, below) — it exits
+#                                                    # non-zero until the row the cut printed is added
 #   SELFTEST=1 deploy/cut-chain22-genesis.sh         # no network, no binaries: the assembly on fixtures
 #   DRY_RUN=1 NODE=… WALLET=… PERP_PROVER=… RAND_MSAUTH_VK=<msauth-vk-production.bin> \
 #     MULTISIG_NOT_CARRIED_OK=1 deploy/cut-chain22-genesis.sh
@@ -172,6 +175,26 @@
 #     `carries:`). No deploy/cutover-fleet-chain22.sh exists yet: derive it from chain 21's.
 #   * NODE must report rand-node $EXPECT_NODE_VERSION (no default, OPEN 7), v0.8.5 or later. `balances` runs with
 #     chain 21's own build, v0.8.2 (WALLET).
+#   * THE CONSTRAINT-SET ROW (issue #166, ZKVM-201). A genesis records no constraint set; the node
+#     binds one to a chain by genesis hash in `constraint_set::CHAIN_CONSTRAINT_SETS`
+#     (crates/randprotocol-node/src/constraint_set.rs), and every cut adds its row. The hash does not
+#     exist before the cut, so the row cannot be in the build that cuts (that build runs chain 22 by
+#     the `constraint-set` marker its `init` writes into each datadir). So:
+#       - the cut PRINTS the row — `(22, "<genesis hash>", <N>),`, N this tree's
+#         BUILD_CONSTRAINT_SET, from deploy/check-constraint-set.sh --print-row — and APPENDS it to
+#         the cut record as `constraint-set-row:` under an OPEN comment. Where NODE's `init` wrote
+#         a marker (a build with the guard), the marker must say N too, or the cut refuses: the
+#         binary was not built from this checkout and the row would name the wrong set;
+#       - `check-limits` — the one mode run on the FINISHED genesis after the cut, and the last
+#         step before chain 22 takes traffic — runs deploy/check-constraint-set.sh --chain 22
+#         --genesis-hash <the hash NODE re-derives> and exits non-zero until this tree holds
+#         exactly that row at this tree's set. It is there and not in the cut because a check at
+#         the cut could only ever refuse (no tree can hold a hash that does not exist yet), and
+#         not in `push` because deploy/cutover-fleet-chain22.sh does not exist yet: when it is
+#         derived, its `verify` should make the same call. What it cannot check: that a given
+#         release BINARY carries the row (no command prints the table); it checks the tree the
+#         next release is built from, and the node's own tests fail a tree whose committed
+#         deploy/genesis-chain22.json has no row.
 #
 # The inputs outside the repository (chain 21's, re-pointed at ~/.rand-chain22 where the cut writes):
 #   PERP_IMAGE / EXPECT_ENGINE_HC / PERP_PROVER   as chain 21's (f286a611…; durian.market's perp-prover,
@@ -1712,15 +1735,43 @@ if m:
   "$NODE" multisig id "${a[@]}"
 }
 
+# The constraint set a rand-node binary says it is: the `constraint-set` marker its `init` wrote
+# into <datadir> (issue #166). Empty for a build before the guard, which writes none.
+binary_constraint_set() {   # <datadir an init just wrote>
+  [ -f "$1/constraint-set" ] || return 0
+  tr -d '[:space:]' < "$1/constraint-set"
+}
+
+# Append the row the cut printed to the cut record, as an open item (once: the same row twice is
+# one line).
+record_constraint_set_row() {   # <cut record> <row>
+  ! grep -qxF "constraint-set-row: $2" "$1" || return 0
+  [ -z "$(tail -c1 "$1")" ] || echo >> "$1"
+  cat >> "$1" <<EOF
+# OPEN — printed by the cut (issue #166): add this row to CHAIN_CONSTRAINT_SETS in
+# crates/randprotocol-node/src/constraint_set.rs (raise the array's length) and commit it;
+# \`deploy/cut-chain$CHAIN_ID-genesis.sh check-limits\` refuses until the tree has it.
+constraint-set-row: $2
+EOF
+}
+
 check_limits() {   # <rpc url> <genesis file>
-  local h d tid
+  local h d tid bset rc=0
   [ -f "$2" ] || { echo "check-limits: $2 is not a file" >&2; exit 1; }
   [ -x "$NODE" ] || { echo "check-limits: NODE=$NODE is not executable (it re-derives the genesis hash)" >&2; exit 1; }
-  d=$(mktemp -d); h=$("$NODE" init --datadir "$d/p" --genesis "$2" | sed -n 's/.*genesis \([0-9a-f]\{64\}\).*/\1/p' || true); rm -rf "$d"
+  d=$(mktemp -d); h=$("$NODE" init --datadir "$d/p" --genesis "$2" | sed -n 's/.*genesis \([0-9a-f]\{64\}\).*/\1/p' || true)
+  bset=$(binary_constraint_set "$d/p"); rm -rf "$d"
   [ -n "$h" ] || { echo "check-limits: $NODE derived no genesis hash from $2" >&2; exit 1; }
   tid=$(treasury_id_of "$2")
   echo "check-limits: treasury id ${tid:-none (no multisig section)}"
-  CHECK_RPC=$1 CHECK_GENESIS=$2 EXPECT_GENESIS_HASH=$h TREASURY_ID=$tid py_check_limits
+  CHECK_RPC=$1 CHECK_GENESIS=$2 EXPECT_GENESIS_HASH=$h TREASURY_ID=$tid py_check_limits || rc=1
+  # Issue #166: this tree's CHAIN_CONSTRAINT_SETS holds the chain's row, at the set this tree —
+  # and, where its init writes the marker, this binary — is built for. Both checks always run.
+  echo "check-limits: the constraint-set row (issue #166), chain $CHAIN_ID, genesis $h:"
+  [ -n "$bset" ] || echo "check-limits:   ⚠ $NODE's init wrote no constraint-set marker (a build before the guard): the binary's own set is NOT checked against the row"
+  deploy/check-constraint-set.sh --chain "$CHAIN_ID" --genesis-hash "$h" ${bset:+--binary-set "$bset"} || rc=1
+  [ "$rc" = 0 ] || echo "check-limits: REFUSED — see above" >&2
+  return "$rc"
 }
 
 if [ "${1:-}" = check-limits ]; then
@@ -2384,6 +2435,77 @@ PY
   fi
   if check "$ST/good.json" EXPECT_GENESIS_HASH="$(printf 'cd%.0s' $(seq 32))"; then bad "check-limits accepted another genesis hash"
   else ok "check-limits refuses a node serving another genesis hash"; fi
+
+  # ── issue #166: the constraint-set row — printed, recorded, and required by check-limits ──
+  write_answers "$ST/good.json" "$ST/answers.json"   # the correct node again, whatever the cases above left
+  AB=$(printf 'ab%.0s' $(seq 32)); N=$(sed -n 's/^pub const BUILD_CONSTRAINT_SET: u32 = \([0-9][0-9]*\);.*$/\1/p' crates/randprotocol-node/src/node.rs)
+  CS=crates/randprotocol-node/src/constraint_set.rs; WANT_ROW="($CHAIN_ID, \"$AB\", $N),"
+  cs_with() {  # <out file> <row…>: the committed table without chain $CHAIN_ID, the rows put after chain 21's
+    local out=$1; shift
+    grep -v "^    ($CHAIN_ID, " "$CS" | ROWS=$(printf '    %s\n' "$@") awk '{ print } /^    \(21, / && ENVIRON["ROWS"] != "    " { print ENVIRON["ROWS"] }' > "$out"
+  }
+  cs_with "$ST/cs-none.rs" ""
+  cs_with "$ST/cs-row.rs" "$WANT_ROW"
+  cs_with "$ST/cs-wrongset.rs" "($CHAIN_ID, \"$AB\", $((N - 1))),"
+  cs_with "$ST/cs-otherhash.rs" "($CHAIN_ID, \"$(printf 'cd%.0s' $(seq 32))\", $N),"
+  cs_with "$ST/cs-twice.rs" "$WANT_ROW" "($CHAIN_ID, \"$(printf 'cd%.0s' $(seq 32))\", $N),"
+  cs_with "$ST/cs-otherchain.rs" "($((CHAIN_ID + 1)), \"$AB\", $N),"
+  row_check() {  # <table> [extra args…]: check-constraint-set.sh for chain $CHAIN_ID at the fixture hash
+    local t=$1; shift
+    CONSTRAINT_SET_RS=$t deploy/check-constraint-set.sh --chain "$CHAIN_ID" --genesis-hash "$AB" "$@" >"$ST/log" 2>&1
+  }
+  if [ "$(deploy/check-constraint-set.sh --chain "$CHAIN_ID" --genesis-hash "$AB" --print-row 2>/dev/null)" = "$WANT_ROW" ] && [[ "$N" =~ ^[0-9]+$ ]]; then
+    ok "check-constraint-set.sh --print-row prints the row alone: $WANT_ROW"
+  else bad "--print-row printed '$(deploy/check-constraint-set.sh --chain "$CHAIN_ID" --genesis-hash "$AB" --print-row 2>&1 | tail -1)', not '$WANT_ROW'"; fi
+  if deploy/check-constraint-set.sh --chain 21 --genesis-hash "$CHAIN21_HASH" --binary-set "$N" >"$ST/log" 2>&1 && grep -q 'chain 21, .* — the row is there' "$ST/log"; then
+    ok "the committed table holds chain 21's row at this tree's constraint set $N"
+  else bad "chain 21's row in the committed table: $(tail -1 "$ST/log")"; fi
+  if row_check "$ST/cs-row.rs" --binary-set "$N"; then ok "a table with chain $CHAIN_ID's row at set $N is accepted"; else bad "a table with the row: $(tail -2 "$ST/log")"; fi
+  for c in "none:a table without chain $CHAIN_ID's row" "wrongset:the row under another constraint set ($((N - 1)))" "otherhash:a chain-$CHAIN_ID row with another genesis hash" \
+           "twice:two rows for chain $CHAIN_ID" "otherchain:the hash listed under another chain id"; do
+    if row_check "$ST/cs-${c%%:*}.rs"; then bad "${c#*:} — accepted"
+    elif grep -qF "does not hold chain $CHAIN_ID's row" "$ST/log" && grep -qF "wanted, exactly:   $WANT_ROW" "$ST/log"; then ok "${c#*:} is refused, naming the row to add"
+    else bad "${c#*:} — wrong refusal: $(tail -1 "$ST/log")"; fi
+  done
+  if row_check "$ST/cs-row.rs" --binary-set "$((N + 1))"; then bad "a binary of constraint set $((N + 1)) — accepted"
+  elif grep -q "binary is constraint set $((N + 1))" "$ST/log"; then ok "a rand-node of another constraint set ($((N + 1))) than the tree's is refused, row or no row"
+  else bad "--binary-set $((N + 1)): $(tail -1 "$ST/log")"; fi
+  if row_check "$ST/cs-row.rs" --binary-set "$((N + 1))" --print-row; then bad "--print-row for a binary of another set — printed a row"
+  elif ! grep -qF "$WANT_ROW" "$ST/log"; then ok "--print-row prints no row for a rand-node of another constraint set"
+  else bad "--print-row --binary-set $((N + 1)) printed the row"; fi
+  # the record: the row lands once, as a field the policy's reader finds
+  printf 'reason: fixture\nrollback: fixture' > "$ST/record-row.txt"   # no trailing newline
+  record_constraint_set_row "$ST/record-row.txt" "$WANT_ROW"; record_constraint_set_row "$ST/record-row.txt" "$WANT_ROW"
+  if [ "$(_cut_record_value "$ST/record-row.txt" constraint-set-row)" = "$WANT_ROW" ] && [ "$(grep -c '^constraint-set-row:' "$ST/record-row.txt")" = 1 ] \
+     && grep -q '^# OPEN — printed by the cut (issue #166)' "$ST/record-row.txt" && [ "$(_cut_record_value "$ST/record-row.txt" rollback)" = fixture ]; then
+    ok "the cut record gets the row once, as constraint-set-row: under an OPEN comment"
+  else bad "record_constraint_set_row: $(tail -2 "$ST/record-row.txt")"; fi
+  # check-limits end to end (the mode itself, a fake rand-node whose init prints the fixture hash
+  # and writes FAKE_MARKER as the constraint-set marker), against the fake RPC above
+  # shellcheck disable=SC2016  # the fake's own source
+  printf '#!/usr/bin/env bash\ncase "$1 $2" in\n  "init --datadir") mkdir -p "$3"; [ -z "${FAKE_MARKER:-}" ] || echo "$FAKE_MARKER" > "$3/constraint-set"; echo "initialized $3: genesis %s (chain id 22)";;\n  "multisig id") echo %s;;\nesac\n' "$AB" "$(printf 'ef%.0s' $(seq 32))" > "$ST/fake-node-cl"; chmod +x "$ST/fake-node-cl"
+  cl() {  # <table> [env…]: `check-limits` on the assembled file
+    local t=$1; shift
+    env SELFTEST=0 NODE="$ST/fake-node-cl" CONSTRAINT_SET_RS="$t" "$@" bash "$0" check-limits "$RPC" "$ST/good.json" >"$ST/log" 2>&1
+  }
+  if cl "$ST/cs-row.rs" FAKE_MARKER="$N" && grep -q 'serves chain 22 as cut' "$ST/log" && grep -q "chain $CHAIN_ID, genesis $AB, constraint set $N — the row is there" "$ST/log"; then
+    ok "check-limits passes when the node serves chain 22 as cut and the tree holds the row at the binary's set"
+  else bad "check-limits with the row: $(tail -3 "$ST/log")"; fi
+  if cl "$ST/cs-none.rs" FAKE_MARKER="$N"; then bad "check-limits passed on a tree without chain $CHAIN_ID's row"
+  elif grep -q 'serves chain 22 as cut' "$ST/log" && grep -qF "wanted, exactly:   $WANT_ROW" "$ST/log" && grep -q 'check-limits: REFUSED' "$ST/log"; then
+    ok "check-limits REFUSES a tree without the row although the node serves chain 22 as cut (a release from it is not signed off)"
+  else bad "check-limits without the row — wrong refusal: $(tail -3 "$ST/log")"; fi
+  if cl "$ST/cs-wrongset.rs" FAKE_MARKER="$N"; then bad "check-limits passed with the row under another set"
+  else ok "check-limits refuses the row under another constraint set"; fi
+  if cl "$ST/cs-row.rs" FAKE_MARKER="$((N + 1))"; then bad "check-limits passed for a rand-node of constraint set $((N + 1))"
+  elif grep -q "binary is constraint set $((N + 1))" "$ST/log"; then ok "check-limits refuses a rand-node whose marker names another constraint set than the tree's"
+  else bad "check-limits, marker $((N + 1)): $(tail -2 "$ST/log")"; fi
+  if cl "$ST/cs-row.rs" && grep -q 'wrote no constraint-set marker' "$ST/log"; then ok "check-limits on a rand-node before the guard (no marker) passes on the row, saying the binary's set is unchecked"
+  else bad "check-limits, no marker: $(tail -2 "$ST/log")"; fi
+  python3 -c "import json,sys; p=sys.argv[1]; a=json.load(open(p)); a['rand_getLimits']['testnet'] = False; json.dump(a, open(p,'w'))" "$ST/answers.json"
+  if cl "$ST/cs-row.rs" FAKE_MARKER="$N"; then bad "check-limits passed on a node not serving chain 22 as cut because the row was there"
+  elif grep -q 'does NOT serve chain 22 as cut: testnet' "$ST/log" && grep -q 'the row is there' "$ST/log"; then ok "check-limits still refuses a node that does not serve chain 22 as cut, row or no row (both checks run)"
+  else bad "check-limits, wrong limits with the row: $(tail -2 "$ST/log")"; fi
   kill "$FAKE_RPC_PID" 2>/dev/null || true; FAKE_RPC_PID=
 
   # the bash-level guards, each refusing before anything runs
@@ -2847,6 +2969,13 @@ HASH2=$("$NODE" init --datadir "$TMP/probe2" --genesis "$OUT" | sed -n 's/.*gene
 # from a running node (rand_getPerps, rand_getLimits.multisig, rand_getTokens; refuse_panics
 # through the hash alone).
 probe_fields "$OUT" "$HASH"
+# Issue #166: the row chain $CHAIN_ID needs in CHAIN_CONSTRAINT_SETS, at this tree's
+# BUILD_CONSTRAINT_SET (the vendored zkVM's, or check-constraint-set.sh refuses) — and at this
+# binary's, where its init wrote the marker: a NODE of another set was not built from this
+# checkout, and the cut refuses before the file lands rather than print a row with the wrong set.
+BIN_SET=$(binary_constraint_set "$TMP/probe")
+CS_ROW=$(deploy/check-constraint-set.sh --chain "$CHAIN_ID" --genesis-hash "$HASH" ${BIN_SET:+--binary-set "$BIN_SET"} --print-row)
+[ -n "$BIN_SET" ] || echo "cut-chain22: ⚠ $NODE's init wrote no constraint-set marker (a build before the guard): the row's set is this tree's BUILD_CONSTRAINT_SET, not checked against the binary" >&2
 
 if [ "${DRY_RUN:-}" = 1 ] && [ "${DRY_RUN_NO_PROBE:-}" != 1 ]; then
   # A loopback probe node: 127.0.0.1 only, no bootstrap, no mDNS, a throwaway key, a temp datadir.
@@ -2869,6 +2998,8 @@ fi
 
 [ ! -e "$FINAL_OUT" ] || { echo "cut-chain22: $FINAL_OUT appeared during the cut — refusing to overwrite it" >&2; exit 1; }
 cp "$OUT" "$FINAL_OUT"; OUT=$FINAL_OUT
+CS_RECORDED="appended to $CUT_RECORD as constraint-set-row:, an OPEN item"
+record_constraint_set_row "$CUT_RECORD" "$CS_ROW" || CS_RECORDED="⚠ NOT written to $CUT_RECORD (append failed) — copy it there by hand"
 TS=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['timestamp_ms'])" "$OUT")
 AGE=$(( ( $(date +%s) * 1000 - TS ) / 1000 ))
 
@@ -2897,6 +3028,8 @@ cut-chain22: bridge: $(python3 -c "import json,sys;b=json.load(open(sys.argv[1])
 cut-chain22: NOT carried: shielded notes of wallets the operator does not hold, any unwithdrawn validator rewards, chain 21's multisig register (the treasury's vault), perps exchange and program vaults — the cut record's drops: line.
 cut-chain22: next: the second operator rebuilds the hash from this file on another machine and writes \`second-hash: $HASH\` into $CUT_RECORD — deploy/cutover-fleet-chain22.sh (to be derived from chain 21's) push refuses without it.
 cut-chain22: record in $CUT_RECORD: the genesis hash, the TREASURY ID and the PERPS GENESIS ROOT above (treasury-id: / perps-genesis-root: lines).
+cut-chain22: CONSTRAINT-SET ROW — OPEN (issue #166): add this line to CHAIN_CONSTRAINT_SETS in crates/randprotocol-node/src/constraint_set.rs (raise the array's length), run \`cargo test -p randprotocol-node --lib constraint_set\`, commit; $CS_RECORDED; check-limits (next line) refuses until the tree has it:
+    $CS_ROW
 cut-chain22: after launch: NODE=… $0 check-limits <first node's RPC> $OUT   (before the first bundle, deposit and state proof)
 cut-chain22: operations: msauth-vk-production.bin (sha256 68facb06…cd30) beside rand-node on every chain-22 node; NTP on every validator (perps block time is consensus input); a perp-view service and a prover host (~22 GB a proof) whose perp-prover builds sparse jobs (durian 28cebfb+); token collateral is outside the supply audit (M6).
 

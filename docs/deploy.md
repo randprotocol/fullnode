@@ -1950,6 +1950,31 @@ before the first deposit and state proof. **No RPC serves `program_state.refuse_
 genesis hash the node serves, which the field probe showed moves without it. Serving it is a node
 follow-up.
 
+**The constraint-set row (issue #166).** A genesis records no constraint set; the node binds one
+to a chain by genesis hash in `constraint_set::CHAIN_CONSTRAINT_SETS`
+(`crates/randprotocol-node/src/constraint_set.rs`), and every cut adds its row. The hash does not
+exist before the cut, so the build that cuts and launches chain 22 cannot hold the row: it runs
+the chain by the `constraint-set` marker `init` writes into each datadir. The steps:
+
+1. **The cut prints the row** — `(22, "<genesis hash>", <N>),`, N the tree's
+   `BUILD_CONSTRAINT_SET` (`deploy/check-constraint-set.sh --chain 22 --genesis-hash <hash>
+   --print-row`) — and appends it to the cut record as `constraint-set-row:` under an `OPEN`
+   comment. Where `NODE`'s `init` wrote a marker, the marker must name N too, or the cut refuses
+   before the file lands (the binary was not built from the checkout the script runs in).
+2. **Add the row** to `CHAIN_CONSTRAINT_SETS` (raise the array's length), commit it with
+   `deploy/genesis-chain22.json`, and run `cargo test -p randprotocol-node --lib constraint_set`:
+   the table's tests fail a tree whose committed `deploy/genesis-chain<N>.json` has no row, or a
+   row with another hash.
+3. **`check-limits` refuses until the tree has it.** After its RPC read-back it runs
+   `deploy/check-constraint-set.sh --chain 22 --genesis-hash <the hash NODE re-derives>
+   [--binary-set <NODE's marker>]` and exits non-zero unless the table holds exactly that row, at
+   the node's `BUILD_CONSTRAINT_SET`, and no other row for chain 22 or that hash. A release for
+   chain 22 is tagged only from a tree on which `check-limits` passes. What this does not check:
+   that a given release binary carries the row — no command prints a binary's table.
+
+When `deploy/cutover-fleet-chain22.sh` is derived from chain 21's, its `verify` step should make
+the same call.
+
 ## The next cut: the proposer/aggregator split (`fees.proposer_share_bps`, `fees.prove_base`; unreleased)
 
 **What it is.** Two optional numbers in the same `fees` section (`docs/fees.md` §1.3,

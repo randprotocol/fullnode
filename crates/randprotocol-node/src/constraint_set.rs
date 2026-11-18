@@ -34,6 +34,33 @@ pub const MARKER_FILE: &str = "constraint-set";
 /// under (`node::CHAINS_THIS_BUILD_CANNOT_RUN` holds the same hashes for 14-20, each with its
 /// reason). **A chain cut adds its row here**, and a constraint-set bump needs no other edit to
 /// refuse the chains before it: every row whose set is not [`BUILD_CONSTRAINT_SET`] is refused.
+///
+/// **Adding a row.** A genesis hash does not exist before its cut, so the row follows the cut: the
+/// cut script prints it and appends it to the cut record (`constraint-set-row:`), and its
+/// `check-limits` — `deploy/check-constraint-set.sh --chain N --genesis-hash <hash>` — exits
+/// non-zero until this table holds exactly that row at [`BUILD_CONSTRAINT_SET`]. The tests below
+/// hold the table to the committed `deploy/genesis-chain<N>.json` files in both directions, so a
+/// tree that commits a new chain's genesis without its row does not pass them.
+///
+/// **Where the sets come from** (checked against this repository's records, 2026-11-18; every row
+/// confirmed, none contradicted, none without evidence). `machine::CONSTRAINT_SET` exists as a
+/// constant only since 2026-10-12 (4219d5f5, at 9), so for 14-20 the evidence is the written
+/// record and the vendored zkVM's own text at the commit that added each genesis file — the
+/// highest "constraint set N" it names there is the row's set every time:
+///
+/// | chain | set | record |
+/// |---|---|---|
+/// | 14 | 6 | cut 2026-09-20 (ed882418), between set 6 (2026-09-14, `docs/confidential.md` "Constraint set 6") and set 7 (2026-09-28); `main.rs` `this_build_refuses_chains_14_to_17`, written at v0.6.1: "chains 14 and 15 (constraint set 6)" |
+/// | 15 | 6 | cut 2026-09-26 (5b351300), the same window and the same test |
+/// | 16 | 7 | `AGENTS.md` "v0.6.1 — constraint set 7 (2026-09-28; … chain 16's build)"; `docs/confidential.md` "Constraint set 7 (… fullnode v0.6.1, chain 16 only)" |
+/// | 17 | 7 | `docs/confidential.md` "Chain 17 (constraint set 7, v0.6.3 …)"; the vendored zkVM at b388540c names nothing above 7 |
+/// | 18 | 8 | `AGENTS.md` "Chain 18 — LIVE … the first gas-metered chain, constraint set 8"; `deploy/chain18-bridge-steps.md` |
+/// | 19 | 8 | `AGENTS.md` "A pure re-genesis of chain 18 on the same build (v0.6.7, constraint set 8)"; `deploy/chain19-bridge-steps.md` |
+/// | 20 | 8 | cut 2026-10-01 on v0.6.8 (74cfaca0: the vendored zkVM names nothing above 8; set 9 arrived 2026-10-12); `CHANGELOG.md` v0.8.0 "Chain 21 onward; not for chain 20. Constraint set 9 …" |
+/// | 21 | 9 | `deploy/cut-records/chain21.record` `reason:` "constraint set 9 … changes every verifier key"; the genesis file re-derived in the tests below |
+///
+/// No record states chain 20's set in one sentence the way chains 16-19 have one; its row rests on
+/// the build it was cut with and on v0.8.0's refusal of it.
 pub const CHAIN_CONSTRAINT_SETS: [(u64, &str, u32); 8] = [
     (14, "1cff3b7da248d93ab547aef5c05bb7d0d22da510b592dab9cf7374807de7c7ff", 6),
     (15, "cc30e0854fb25b3abcee96bb7bc206dcd6e37862f6dfe80a05b3e474c2d1b6b8", 6),
@@ -210,20 +237,98 @@ mod tests {
         refuse_listed_under(CHAIN_21, BUILD_CONSTRAINT_SET).unwrap();
     }
 
-    /// The table agrees with the refuse-list: every chain `CHAINS_THIS_BUILD_CANNOT_RUN` names
-    /// for its constraint set is listed here under another set than this build's, so neither
-    /// list can let through what the other refuses.
+    /// The table and the refuse-list cannot drift: every chain `CHAINS_THIS_BUILD_CANNOT_RUN`
+    /// names since 14 is listed here, by the same hash and chain id, under a set below this
+    /// build's — and every row here below this build's set has its row and reason there. Neither
+    /// list lets through what the other refuses.
     #[test]
-    fn every_chain_the_build_cannot_run_is_listed_under_another_set() {
-        for (chain, hash, _) in crate::node::CHAINS_THIS_BUILD_CANNOT_RUN {
+    fn every_chain_the_build_cannot_run_is_listed_under_an_earlier_set() {
+        let refused = crate::node::CHAINS_THIS_BUILD_CANNOT_RUN;
+        for (chain, hash, _) in refused {
+            assert!(chain >= 14, "chain {chain}: this table starts at 14 — widen it before listing an earlier chain");
             let (listed_chain, set) = listed(hash).unwrap_or_else(|| panic!("chain {chain} is not in CHAIN_CONSTRAINT_SETS"));
-            assert_eq!(listed_chain, chain);
-            assert_ne!(set, BUILD_CONSTRAINT_SET, "chain {chain}");
+            assert_eq!(listed_chain, chain, "{hash}");
+            assert!(set < BUILD_CONSTRAINT_SET, "chain {chain} is refused by hash but listed under set {set}");
         }
-        let mut hashes: Vec<_> = CHAIN_CONSTRAINT_SETS.iter().map(|(_, h, _)| *h).collect();
-        hashes.sort();
-        hashes.dedup();
-        assert_eq!(hashes.len(), CHAIN_CONSTRAINT_SETS.len(), "one row a genesis");
+        for (chain, hash, set) in CHAIN_CONSTRAINT_SETS {
+            if set < BUILD_CONSTRAINT_SET {
+                assert!(
+                    refused.iter().any(|(c, h, _)| *c == chain && *h == hash),
+                    "chain {chain} (set {set}) is refused by its set and has no row in CHAINS_THIS_BUILD_CANNOT_RUN: \
+                     give it one, for its reason"
+                );
+            }
+        }
+    }
+
+    /// The table's shape: chain ids strictly ascending (so unique), each hash 64 lowercase hex
+    /// and in one row, no set above this build's (a chain cannot have been cut under a set that
+    /// did not exist yet) and none going down as the chains go up.
+    #[test]
+    fn the_table_is_ascending_unique_and_no_row_is_ahead_of_this_build() {
+        for pair in CHAIN_CONSTRAINT_SETS.windows(2) {
+            assert!(pair[0].0 < pair[1].0, "chain ids ascend: {} then {}", pair[0].0, pair[1].0);
+            assert!(pair[0].2 <= pair[1].2, "chain {} is set {}, the chain before it set {}", pair[1].0, pair[1].2, pair[0].2);
+        }
+        let mut hashes = std::collections::BTreeSet::new();
+        for (chain, hash, set) in CHAIN_CONSTRAINT_SETS {
+            assert!(chain >= 14, "chain {chain}");
+            assert_eq!(hash.len(), 64, "chain {chain}");
+            assert!(hash.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)), "chain {chain}: {hash}");
+            assert!(hashes.insert(hash), "chain {chain}: {hash} is in two rows");
+            assert!((1..=BUILD_CONSTRAINT_SET).contains(&set), "chain {chain} is listed under set {set}; this build is {BUILD_CONSTRAINT_SET}");
+        }
+    }
+
+    /// `deploy/genesis-chain<N>.json`, N ≥ 14, built by the loader `run` uses (`Genesis::from_json`,
+    /// the file's own executor, `build`): chain id and genesis hash.
+    fn committed_genesis_files() -> Vec<(u64, String)> {
+        let deploy = concat!(env!("CARGO_MANIFEST_DIR"), "/../../deploy");
+        let mut out = Vec::new();
+        for e in std::fs::read_dir(deploy).unwrap() {
+            let path = e.unwrap().path();
+            let name = path.file_name().unwrap().to_str().unwrap().to_string();
+            let Some(n) = name.strip_prefix("genesis-chain").and_then(|r| r.strip_suffix(".json")) else { continue };
+            let Ok(n) = n.parse::<u64>() else { continue };
+            if n < 14 {
+                continue;
+            }
+            let file = randprotocol_core::genesis::Genesis::from_json(&std::fs::read_to_string(&path).unwrap())
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
+            let executor = crate::node::executor_for_profile(&file.fri_profile).unwrap();
+            let gs = file.build(executor.as_ref()).unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert_eq!(gs.chain_id, n, "{name}");
+            out.push((n, gs.hash().to_hex()));
+        }
+        out.sort();
+        out
+    }
+
+    /// The table is the committed genesis files, both ways: every `deploy/genesis-chain<N>.json`
+    /// since 14 hashes to its chain's row, and every row has its file. A cut that commits the
+    /// new chain's genesis without its row fails here (issue #166's open item (a)); so does a row
+    /// with a mistyped hash. Chain 21's — the running chain — is this build's set.
+    #[test]
+    fn the_table_is_the_committed_genesis_files() {
+        let files = committed_genesis_files();
+        for (chain, hash) in &files {
+            let row = listed(hash).unwrap_or_else(|| {
+                panic!(
+                    "deploy/genesis-chain{chain}.json hashes to {hash}, which CHAIN_CONSTRAINT_SETS does not list: add \
+                     ({chain}, \"{hash}\", {BUILD_CONSTRAINT_SET}), — the row its cut printed"
+                )
+            });
+            assert_eq!(row.0, *chain, "{hash} is listed as chain {}, and is deploy/genesis-chain{chain}.json", row.0);
+        }
+        for (chain, hash, _) in CHAIN_CONSTRAINT_SETS {
+            assert!(
+                files.iter().any(|(c, h)| *c == chain && h == hash),
+                "chain {chain}'s row ({hash}) is no committed deploy/genesis-chain{chain}.json"
+            );
+        }
+        let chain_21 = files.iter().find(|(c, _)| *c == 21).expect("deploy/genesis-chain21.json");
+        assert_eq!(chain_21.1, CHAIN_21);
+        assert_eq!(listed(&chain_21.1), Some((21, BUILD_CONSTRAINT_SET)), "the running chain is this build's set");
     }
 
     /// The accident the issue describes: a re-vendored build (constraint set 10) on a chain-21
