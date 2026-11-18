@@ -12,15 +12,6 @@ stopped at v0.4 until 2026-09-30, when the entries v0.5 to v0.6.7 were written f
 
 ## Unreleased
 
-- **A state proof that pays more than the exchange can hold is not pooled** (PERP-6, node policy
-  on every chain; consensus unchanged): the pool's pre-screen and its direct insert refuse a
-  `PerpStateProof` whose payouts total more than `Mempool::payout_ceiling` — the chain's count
-  under genesis `perps.bound_payouts`; otherwise `initial_collateral + rand_in − rand_out` for
-  RAND collateral and the token's total supply for a token — so it is not verified, pooled,
-  relayed or proposed by this node (`StateProofOverpays`: not cached, no peer penalised). On chain
-  21 a block that carries one still applies; the validity rule is `bound_payouts`, at the
-  chain-22 cut.
-
 Core and node (issue #168, ZKVM-203; **genesis-gated, on no chain** — chain 21's genesis hash,
 wire, storage and behaviour are unchanged):
 
