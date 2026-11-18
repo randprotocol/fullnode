@@ -1370,6 +1370,9 @@ pub fn acceptance_for_pool(e: &MempoolError, hash: Hash, refused: &mut RefusedCa
         | MempoolError::StateProofBusy
         // CON-601: this node's memory, never the proof's fault.
         | MempoolError::StateProofAboveNodeTier { .. }
+        // PERP-6: this node's pool policy; the proof is valid on a chain without `bound_payouts`,
+        // and a peer on an older build relays it honestly.
+        | MempoolError::StateProofOverpays { .. }
         | MempoolError::AdmissionBusy(_) => Acceptance::Ignore,
     }
 }

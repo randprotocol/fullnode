@@ -669,6 +669,18 @@ not the chain's `proved_root`, which is how the prover learns to roll back.
   `bound_payouts`, refuse a proof that pays more than was deposited; on a chain without the flag
   (chain 21) the counters are reported but bind nothing, and a payout is bounded by its request
   alone.
+- **Over-paying state proofs are not pooled (PERP-6, node policy on every chain).** Whatever the
+  genesis says, a node does not pool, relay or propose a state proof whose payouts total more
+  than the exchange can hold on its tip: under `bound_payouts` the chain's own count; without it,
+  `initial_collateral + rand_in − rand_out` for RAND collateral (the audit pair, counted from
+  genesis on every node) and the collateral token's total supply for a token (a deposit moves no
+  supply, so the exchange never holds more than exists). Refused at the pool's pre-screen, before
+  the segment, a verifier key or the verify queue: `the state proof pays N collateral units, more
+  than the M the exchange can hold; this node does not pool it` (`StateProofOverpays`; not cached,
+  no peer penalised, since the proof is valid on a chain without the flag). **This is policy, not
+  validity:** on chain 21 a block from a proposer that carries such a proof still applies, and the
+  token ceiling is the whole supply, not the exchange's share of it. The consensus rule is
+  `bound_payouts`, from the chain-22 cut.
 - **Engine capacities.** The ledger pins `MAX_MARKETS` = 2, the pinned engine's capacity, and
   nothing else of the engine's: `MAX_ACCOUNTS` (15) and `MAX_PERP_PAYOUTS` (8) are ledger rules
   chosen to fit it, not engine constants read from it.

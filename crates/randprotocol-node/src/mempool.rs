@@ -100,6 +100,14 @@ pub enum MempoolError {
     /// penalised; a node with more memory admits it, and a block carrying it applies as always.
     #[error("this node admits no state proof above tier {cap} to its pool (a tier-{tier} verifier-key build exceeds its memory); submit it to a node with more memory")]
     StateProofAboveNodeTier { tier: u8, cap: u8 },
+    /// PERP-6, node policy on every chain: a state proof whose payouts total more collateral
+    /// than the exchange can hold on this tip ([`Mempool::payout_ceiling`]). The ledger refuses
+    /// such a proof itself only under genesis `perps.bound_payouts` (`PayoutExceedsCollateral`);
+    /// on a chain without it (chain 21) the proof is valid, so this is a statement about what
+    /// this node pools, relays and proposes, never about the message: not cached, no peer
+    /// penalised, and a block carrying one still applies.
+    #[error("the state proof pays {want} collateral units, more than the {ceiling} the exchange can hold; this node does not pool it")]
+    StateProofOverpays { want: u128, ceiling: u128 },
     /// Issue #157: the admission byte budget ([`crate::admission::AdmissionBudget`]) cannot take
     /// this transaction now. Retryable, never cached, no peer penalised; `rand_sendTransaction`
     /// answers it as `-32005`.
@@ -755,6 +763,48 @@ impl Mempool {
         Ok(())
     }
 
+    /// PERP-6: the most collateral the exchange can hold on `ledger`, from consensus state alone
+    /// — an upper bound on what an honest engine could pay out, on every chain:
+    ///
+    /// - under genesis `bound_payouts`, the chain's own count ([`Perps::collateral_held`]:
+    ///   `initial_collateral + collateral_in − collateral_out`), the ledger's rule;
+    /// - RAND collateral without it: `initial_collateral + rand_in − rand_out`, the pair the
+    ///   supply audit reads, counted from genesis on every node;
+    /// - a token without it: the token's total supply. A deposit moves no supply, so whatever the
+    ///   exchange holds is part of it. (The `collateral_in`/`collateral_out` counters are not
+    ///   used here: off `bound_payouts` they start at a node's v0.8.2 roll, not at genesis, and
+    ///   would refuse honest payouts of earlier deposits.)
+    ///
+    /// `None` without a perps section, or for a collateral token the registry does not list (the
+    /// ledger's own rules decide then).
+    ///
+    /// [`Perps::collateral_held`]: randprotocol_core::ledger::perps::Perps::collateral_held
+    pub fn payout_ceiling(ledger: &Ledger) -> Option<u128> {
+        let p = ledger.perps()?;
+        if p.config.bound_payouts {
+            return Some(p.collateral_held());
+        }
+        match p.config.collateral_asset {
+            0 => Some((p.config.initial_collateral as u128 + p.rand_in as u128).saturating_sub(p.rand_out as u128)),
+            asset => ledger.tokens()?.get(asset).map(|t| t.total_supply as u128),
+        }
+    }
+
+    /// PERP-6: `Err` for a state proof whose payouts total more than [`Self::payout_ceiling`] —
+    /// sums and one lookup, before the ledger's segment, any key or the verify queue. On a chain
+    /// with `bound_payouts` the ledger's `PayoutExceedsCollateral` says the same; elsewhere this
+    /// keeps a proof that mints collateral nobody deposited out of this node's pool, gossip and
+    /// proposals. Node policy, never a validity rule.
+    fn state_proof_payout_gate(tx: &Transaction, ledger: &Ledger) -> Result<(), MempoolError> {
+        let Action::PerpStateProof { payouts, .. } = &tx.action else { return Ok(()) };
+        let Some(ceiling) = Self::payout_ceiling(ledger) else { return Ok(()) };
+        let want: u128 = payouts.iter().map(|po| po.amount as u128).sum();
+        if want > ceiling {
+            return Err(MempoolError::StateProofOverpays { want, ceiling });
+        }
+        Ok(())
+    }
+
     /// CON-60 (b): what verifying `tx` would cost this node in verifier keys ([`ProofCost`]).
     /// Cold only when the shape has no key built *and* the proof passes every rule the ledger and
     /// the executor apply before a key is touched — the ledger's cheap state-proof rules (which
@@ -1087,6 +1137,8 @@ impl Mempool {
     ) -> Result<Hash, MempoolError> {
         let c = self.pool_conflicts(&tx, ledger, executor)?;
         ledger.validate(&tx, executor).map_err(MempoolError::Invalid)?;
+        // PERP-6: after the ledger's own verdict, so a `bound_payouts` chain answers by its rule.
+        Self::state_proof_payout_gate(&tx, ledger)?;
         // The pool's policies (the faucet minter rule, COV-2's call screen) after the ledger's own
         // verdict: this path runs no `precheck`, and it is the one a local `rand_mint` takes.
         self.pool_policy(&tx, ledger).map_err(MempoolError::Invalid)?;
@@ -1233,6 +1285,7 @@ impl Mempool {
         executor: &dyn ConfidentialExecutor,
     ) -> Result<Claims, MempoolError> {
         self.state_proof_tier_gate(tx, executor)?;
+        Self::state_proof_payout_gate(tx, ledger)?;
         let c = self.pool_conflicts(tx, ledger, executor)?;
         Self::applies(tx, &c.commitments, c.claim, ledger).map_err(MempoolError::Invalid)?;
         self.pool_policy(tx, ledger).map_err(MempoolError::Invalid)?;
@@ -4944,6 +4997,84 @@ mod tests {
         // the order still passes — back-pressure is a sparse-chain policy (I-3).
         let (_, dense) = run(false);
         assert!(m.precheck(&order, &dense, &StubExecutor).is_ok());
+    }
+
+    /// PERP-6, node policy on a chain without `bound_payouts` (chain 21's rule): a request is
+    /// bounded by the note bound alone, so a state proof paying 2^62 against a 5·10^6 deposit is
+    /// valid to the ledger — and this node still does not pool it, at the pre-screen (before the
+    /// segment, a key or the verify queue) or on the direct insert: it pays more than the
+    /// exchange was ever given. The refusal is this node's policy, never the transaction's
+    /// fault: `Ignore` to gossip, not cached, not retryable. A proof paying exactly what the
+    /// exchange holds is pooled, and with `bound_payouts` set the ledger's own rule answers.
+    #[test]
+    fn perp6_a_state_proof_paying_more_than_the_exchange_can_hold_is_not_pooled() {
+        use fixtures::{key, make_perps_block, perp_deposit_tx, perp_state_proof_tx, perp_withdraw_tx};
+        use randprotocol_core::ledger::perps::{PerpError, PerpPayout};
+        const DEPOSIT: u64 = 5_000_000;
+        let chain = |amount: u64, bound: bool| {
+            let mut g = fixtures::perps_genesis_file(7);
+            g.perps.as_mut().unwrap().bound_payouts = bound;
+            let gs = g.build(&StubExecutor).unwrap();
+            let mut l = gs.ledger.clone();
+            let trader = key(50);
+            let deposit = perp_deposit_tx(&l, &trader, 300, DEPOSIT);
+            let b1 = make_perps_block(&gs.block, &mut l, vec![deposit], &key(1));
+            let withdraw = perp_withdraw_tx(7, &trader, 1, amount, 1);
+            let request = randprotocol_core::notes::word8_from_bytes(withdraw.hash().as_bytes()).unwrap();
+            make_perps_block(&b1, &mut l, vec![withdraw], &key(1));
+            (l, request)
+        };
+        let huge = 1u64 << 62;
+        let (l, request) = chain(huge, false);
+        assert!(!l.perps().unwrap().config.bound_payouts, "the fixture chain is chain 21's shape");
+        assert_eq!(Mempool::payout_ceiling(&l), Some(DEPOSIT as u128), "RAND collateral: what was deposited");
+        let over = perp_state_proof_tx(&l, 2, [7; 8], vec![PerpPayout { request, amount: huge }], 0);
+        let ex = &StubExecutor;
+        assert_eq!(l.validate(&over, ex), Ok(()), "the ledger's v0 rule admits it");
+        let mut m = Mempool::new(100);
+        let refusal = MempoolError::StateProofOverpays { want: huge as u128, ceiling: DEPOSIT as u128 };
+        assert_eq!(m.precheck(&over, &l, ex).unwrap_err(), refusal);
+        assert!(m.last_cost.lock().unwrap().is_none(), "refused before the cold-build gate");
+        assert_eq!(m.insert(over.clone(), &l, ex).unwrap_err(), refusal);
+        assert_eq!(m.insert_verified(over.clone(), &l, ex).unwrap_err(), refusal);
+        assert!(m.is_empty() && !refusal.is_retryable());
+        let mut refused = crate::admission::RefusedCache::new(8);
+        assert_eq!(crate::admission::acceptance_for_pool(&refusal, over.hash(), &mut refused), crate::admission::Acceptance::Ignore);
+        assert!(refused.get(&over.hash()).is_none(), "not cached: the proof is valid on this chain");
+        // The engine can pay what it holds: pooled.
+        let (l, request) = chain(DEPOSIT, false);
+        let exact = perp_state_proof_tx(&l, 2, [7; 8], vec![PerpPayout { request, amount: DEPOSIT }], 0);
+        assert!(m.precheck(&exact, &l, ex).is_ok());
+        assert!(m.insert(exact, &l, ex).is_ok());
+        // Under `bound_payouts` the ceiling is the chain's own count and the ledger answers.
+        let (l, request) = chain(huge, true);
+        assert_eq!(Mempool::payout_ceiling(&l), Some(l.perps().unwrap().collateral_held()));
+        let over = perp_state_proof_tx(&l, 2, [7; 8], vec![PerpPayout { request, amount: huge }], 0);
+        let ledgers = MempoolError::Invalid(PerpError::PayoutExceedsCollateral { want: huge as u128, have: DEPOSIT as u128 }.into());
+        assert_eq!(m.insert(over.clone(), &l, ex).unwrap_err(), ledgers, "the direct insert hears the ledger's rule");
+        assert!(matches!(m.precheck(&over, &l, ex), Err(MempoolError::StateProofOverpays { .. })), "the pre-screen is cheaper and says the same");
+        // A token as collateral (chain 21's zUSD): the ceiling is the token's total supply — a
+        // deposit moves no supply, so the exchange never holds more. Nothing minted yet: 0, and
+        // a proof paying one unit is not pooled.
+        let mut g = fixtures::perps_genesis_file(7);
+        g.tokens.as_mut().unwrap().tokens = vec![randprotocol_core::genesis::GenesisToken {
+            name: "Rand USD".into(),
+            symbol: "zUSD".into(),
+            salt: [0x5a; 32],
+            backings: vec![randprotocol_core::genesis::GenesisBacking { chain: 2, token: [0x77; 32], decimals: 8, locked: None }],
+        }];
+        g.bridge = Some(fixtures::bridge_config().0);
+        g.faucet = false;
+        g.perps.as_mut().unwrap().collateral_asset = 1;
+        let gs = g.build(&StubExecutor).unwrap();
+        let mut l = gs.ledger.clone();
+        make_perps_block(&gs.block, &mut l, vec![], &key(1));
+        assert_eq!(Mempool::payout_ceiling(&l), Some(0));
+        let minted = perp_state_proof_tx(&l, 1, [7; 8], vec![PerpPayout { request: [9; 8], amount: 1 }], 0);
+        assert_eq!(m.precheck(&minted, &l, ex).unwrap_err(), MempoolError::StateProofOverpays { want: 1, ceiling: 0 });
+        assert!(m.precheck(&perp_state_proof_tx(&l, 1, [7; 8], vec![], 0), &l, ex).is_ok(), "a proof paying nothing passes");
+        // No perps section: no ceiling, nothing to gate.
+        assert_eq!(Mempool::payout_ceiling(&fixtures::genesis_with(1, vec![]).ledger), None);
     }
 
     /// CON-601: a node's state-proof tier cap refuses a cold proof above it at the pool's
