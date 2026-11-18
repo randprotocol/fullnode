@@ -685,6 +685,13 @@ enum Cmd {
         /// into the genesis hash (last) only when given. Needs `--program-state-cell-fee`.
         #[arg(long)]
         program_state_refuse_panics: bool,
+        /// Issue #168 (`docs/evm-block-context.md`): write
+        /// `program_state.reference_block_window` — how many closed blocks an `InvokeAt` may
+        /// name as its reference block, 256..=4096. Bound into the genesis hash (last) only when
+        /// given. Needs `--program-state-cell-fee` and a chain that bounds its block time (a
+        /// `bridge` or a `perps` section).
+        #[arg(long, value_name = "BLOCKS")]
+        program_state_reference_block_window: Option<u64>,
         /// Fee feedback (`docs/fees.md` §1.3): the `fees` section, as a `FeesConfig` JSON file
         /// (`{"burn_base": true, "subsidy_net_of_fees": true, "burn_floor": true,
         /// "proposer_share_bps": 4000, "prove_base": 600000}`, each optional).
@@ -2660,6 +2667,7 @@ async fn main() -> Result<()> {
             proof_window_blocks,
             program_state_cell_fee,
             program_state_refuse_panics,
+            program_state_reference_block_window,
             fees,
             perps,
         } => {
@@ -2695,6 +2703,12 @@ async fn main() -> Result<()> {
             // here, by flag name, before a file is written).
             if program_state_refuse_panics && program_state_cell_fee.is_none() {
                 anyhow::bail!("--program-state-refuse-panics needs --program-state-cell-fee: it is a field of the program_state section");
+            }
+            if program_state_reference_block_window.is_some() && program_state_cell_fee.is_none() {
+                anyhow::bail!("--program-state-reference-block-window needs --program-state-cell-fee: it is a field of the program_state section");
+            }
+            if program_state_reference_block_window == Some(0) {
+                anyhow::bail!("--program-state-reference-block-window 0 is the default (off): leave the flag out");
             }
             if program_state_cell_fee.is_some() {
                 for (on, flag) in [
@@ -2863,7 +2877,7 @@ async fn main() -> Result<()> {
                 // RPL-2: absent unless `--program-state-cell-fee` is given, so a genesis cut
                 // without it hashes byte-for-byte as before.
                 program_state: program_state_cell_fee
-                    .map(|cell_fee| randprotocol_core::ledger::program_state::ProgramStateConfig { cell_fee, refuse_panics: program_state_refuse_panics, reference_block_window: 0 }),
+                    .map(|cell_fee| randprotocol_core::ledger::program_state::ProgramStateConfig { cell_fee, refuse_panics: program_state_refuse_panics, reference_block_window: program_state_reference_block_window.unwrap_or(0) }),
                 // Fee feedback (`docs/fees.md` §1.3): read from a `FeesConfig` JSON file when
                 // `--fees` is given, so `Genesis::build` validates it (`burn_floor` without
                 // `burn_base`, `subsidy_net_of_fees` without aggregation); omitted entirely
@@ -5237,6 +5251,7 @@ mod tests {
             "max_pending_digests",
             "refuse_panics",
             "max_accounts",
+            "reference_block_window",
         ] {
             assert!(!rewrite.contains(f), "a rewrite of chain 21's file adds `{f}`");
         }
