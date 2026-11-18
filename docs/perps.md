@@ -337,6 +337,24 @@ and a tier-18 proof takes minutes), so withdrawals would wait without bound. Und
   recorded heights. Back-pressure on new orders counts both recorded digests (four
   `max_window_blocks`) and heights (four `max_window_heights` between the head and the proved
   height).
+- **What `max_window_heights` costs and buys** (the owner's input at the cut; arithmetic from the
+  rules above, no recommendation). With nobody trading, the chain records one heartbeat every
+  `max_window_heights` heights and a window spans at most that many, so an idle chain needs
+  `heights / max_window_heights` state proofs to stay proved, each over one digest; a dense chain
+  needs `heights / max_window_blocks`, each over a full window. At 75 000 blocks a day (1.15 s
+  blocks):
+
+  | `max_window_heights` | heartbeat (funding, marks, liquidations run at least every) | proofs a day, idle | back-pressure holds new orders past |
+  |---|---|---|---|
+  | 64 (the lower bound) | 74 s | 1 172 (the dense chain's count; each proof is smaller) | 256 heights, about 5 min |
+  | 256 | 4.9 min | 293 | 1 024 heights, about 20 min |
+  | 1 024 | 20 min | 74 | 4 096 heights, about 78 min |
+  | 4 096 (the upper bound) | 78 min | 19 | 16 384 heights, about 5.2 h |
+
+  A larger value means fewer proofs when idle and a longer wait before a liquidation is run on a
+  quiet market. A busy exchange is bound by `max_window_blocks` recorded blocks a proof whatever
+  the value. (`perp101_catching_up_an_idle_sparse_chain_takes_one_small_proof_per_heartbeat`
+  pins the proof counts.)
 
 **Building a sparse job (a prover).** From `rand_getPerps`: take `pending_heights` greater than
 `proved_height`, ascending, while each is within `max_window_heights` of `proved_height` and at most

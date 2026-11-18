@@ -12,6 +12,11 @@ stopped at v0.4 until 2026-09-30, when the entries v0.5 to v0.6.7 were written f
 
 ## Unreleased
 
+- **PERP-101, the `max_window_heights` decision** (docs and a test; no behaviour change):
+  `docs/perps.md` tabulates what the chain-22 input costs — heartbeat interval, state proofs a day
+  on an idle chain (`heights / max_window_heights`, so the lower bound 64 needs as many proofs as
+  chain 21's dense rule), back-pressure distance — and a ledger test pins the proof counts.
+
 Core and node (issue #168, ZKVM-203; **genesis-gated, on no chain** — chain 21's genesis hash,
 wire, storage and behaviour are unchanged):
 

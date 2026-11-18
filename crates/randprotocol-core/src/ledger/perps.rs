@@ -3868,6 +3868,66 @@ pub(crate) mod tests {
         assert_eq!(p.last_recorded_height(), 5);
     }
 
+    /// PERP-101, what `max_window_heights` buys (the owner's input at the chain-22 cut): on a
+    /// chain nobody trades on, a sparse chain records one heartbeat per `max_window_heights`
+    /// heights and a window spans at most that many, so a prover catching up over `n` idle
+    /// heights needs `n / max_window_heights` state proofs, each over one digest — where the
+    /// dense chain (chain 21) needs `n / max_window_blocks` proofs, each over a full window of
+    /// digests. A withdrawal requested after the idle stretch is paid by the proof that reaches
+    /// its height. At the lower bound (`max_window_heights == max_window_blocks`) the proof
+    /// count is the dense chain's; only the work in each proof is smaller.
+    #[test]
+    fn perp101_catching_up_an_idle_sparse_chain_takes_one_small_proof_per_heartbeat() {
+        const IDLE: u64 = 512;
+        // The proofs a prover needs to bring `l` to its last recorded height, and the most
+        // digests any of them ran: each the longest window the rules admit.
+        let catch_up = |l: &mut Ledger| {
+            let (mut proofs, mut widest) = (0u64, 0usize);
+            loop {
+                let p = l.perps().unwrap();
+                let (from, c) = (p.proved_height, p.config.clone());
+                let reach = if c.sparse_windows { c.max_window_heights } else { c.max_window_blocks };
+                let pending = p.pending_heights();
+                let Some(&to) = pending.iter().filter(|h| **h - from <= reach).take(c.max_window_blocks as usize).last() else { break };
+                let tx = if c.sparse_windows {
+                    widest = widest.max(p.window_heights(from, to).count());
+                    sparse_state_proof(l, from, to, vec![])
+                } else {
+                    widest = widest.max((to - from) as usize);
+                    state_proof(l, from, to, [7; 8], vec![], 0)
+                };
+                apply(l, &tx).unwrap_or_else(|e| panic!("window {from}..={to}: {e:?}"));
+                proofs += 1;
+            }
+            (proofs, widest)
+        };
+        let idle = |mut l: Ledger| {
+            for h in 1..=IDLE {
+                close(&mut l, h);
+            }
+            l.set_height(IDLE + 1);
+            l
+        };
+        let blocks = sample_config().max_window_blocks;
+        // Dense (chain 21's rule): a digest per block, a full window per proof.
+        let mut dense = idle(ledger_with(true));
+        assert_eq!(dense.perps().unwrap().pending_digests() as u64, IDLE);
+        assert_eq!(catch_up(&mut dense), (IDLE / blocks, blocks as usize));
+        // Sparse at 16 heights (the fixture's), then at 128: one heartbeat digest per proof.
+        for heights in [16u64, 128] {
+            let mut l = sparse_ledger();
+            l.perps_mut().unwrap().config.max_window_heights = heights;
+            let mut l = idle(l);
+            assert_eq!(l.perps().unwrap().pending_digests() as u64, IDLE / heights, "one heartbeat per {heights} heights");
+            assert_eq!(catch_up(&mut l), (IDLE / heights, 1), "max_window_heights {heights}");
+            assert_eq!(l.perps().unwrap().proved_height, IDLE);
+        }
+        // At the lower bound the count is the dense chain's.
+        let mut l = sparse_ledger();
+        l.perps_mut().unwrap().config.max_window_heights = blocks;
+        assert_eq!(catch_up(&mut idle(l)).0, IDLE / blocks);
+    }
+
     /// PERP-101: more than `max_window_blocks` recorded digests inside one span is refused by
     /// name; the shorter window over the first eight passes.
     #[test]
