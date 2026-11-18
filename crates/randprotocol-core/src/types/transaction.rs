@@ -583,6 +583,22 @@ pub enum Action {
         transition: Transition,
         ref_height: u64,
     },
+    /// The randomness beacon's reveal (46; genesis `beacon`, `docs/evm-block-context.md` §11):
+    /// the preimage of the proposer's current beacon commitment. On a beacon chain it is every
+    /// block's **first transaction**, placed by the block's proposer, and valid nowhere else —
+    /// not in the pool, not over RPC, not at a later index (`ledger::beacon`). Bundle-less and
+    /// fee-less. It sits under the transaction root, so the proposer's signature covers it.
+    /// Refused `UnsupportedAction` on a chain without the section. Appended last: bincode is
+    /// positional.
+    BeaconReveal { reveal: [u8; 32] },
+    /// A validator's new beacon commitment (47; genesis `beacon`): `commitment = L^N(seed)`,
+    /// signed by the validator's key over
+    /// [`crate::types::actions::beacon_commit_message`]`(genesis hash, commitment, nonce)`, with
+    /// `nonce` the validator's last commit nonce plus one. It takes effect
+    /// `beacon.commit_delay_blocks` later, at the validator's next block. Bundle-less and
+    /// fee-less: a registered validator's own signature and one nonce per commit. Refused
+    /// `UnsupportedAction` on a chain without the section. Appended last: bincode is positional.
+    BeaconCommit { validator: Address, commitment: [u8; 32], nonce: u64, signature: Signature },
 }
 
 /// The fields of an [`Action::Invoke`] or an [`Action::InvokeAt`], borrowed: what every rule
@@ -654,6 +670,8 @@ impl Action {
             Action::MultisigPay { .. } => Some("multisig_pay"),
             Action::MultisigRotate { .. } => Some("multisig_rotate"),
             Action::SetRandPrice { .. } => Some("set_rand_price"),
+            Action::BeaconReveal { .. } => Some("beacon_reveal"),
+            Action::BeaconCommit { .. } => Some("beacon_commit"),
             _ => None,
         }
     }
@@ -735,6 +753,11 @@ impl Action {
             // The price vote: no proof field; every field is kept so the binding moves with each.
             Action::SetRandPrice { price_micros_per_rand, nonce, votes } => {
                 Action::SetRandPrice { price_micros_per_rand: *price_micros_per_rand, nonce: *nonce, votes: votes.clone() }
+            }
+            // The beacon's two: no proof field; every field is kept.
+            Action::BeaconReveal { reveal } => Action::BeaconReveal { reveal: *reveal },
+            Action::BeaconCommit { validator, commitment, nonce, signature } => {
+                Action::BeaconCommit { validator: *validator, commitment: *commitment, nonce: *nonce, signature: signature.clone() }
             }
             Action::Bond { validator, amount, registration } => {
                 Action::Bond { validator: *validator, amount: *amount, registration: registration.clone() }
@@ -999,7 +1022,9 @@ impl Action {
             | Action::MultisigDeposit { .. }
             | Action::MultisigPay { .. }
             | Action::MultisigRotate { .. }
-            | Action::SetRandPrice { .. } => {}
+            | Action::SetRandPrice { .. }
+            | Action::BeaconReveal { .. }
+            | Action::BeaconCommit { .. } => {}
         }
         a
     }
@@ -1129,7 +1154,9 @@ impl Transaction {
             | Action::MultisigDeposit { .. }
             | Action::MultisigPay { .. }
             | Action::MultisigRotate { .. }
-            | Action::SetRandPrice { .. } => return None,
+            | Action::SetRandPrice { .. }
+            | Action::BeaconReveal { .. }
+            | Action::BeaconCommit { .. } => return None,
         };
         let body = (chain_id, tag, action.perp_unsigned());
         Some(match domain {
@@ -1608,6 +1635,40 @@ mod tests {
         assert_eq!(got, (SET_RAND_PRICE_PIN.0.to_string(), SET_RAND_PRICE_PIN.1.to_string()));
     }
 
+    /// `(blake3(encoding), txid)` of the two beacon actions in
+    /// `the_beacon_actions_encodings_and_txids_are_pinned`, tags 46 and 47.
+    const BEACON_PINS: [(&str, &str); 2] = [
+        ("c251fba77471a4bfe2b15daf9ee6bda7784b6cce033eb537c65aa36a5b0d6ade", "31d6bf167283402f705e41ddc5999c62d67ecf9ff7fdc4c572187116ef2cc0a8"),
+        ("e336fa3a0ba8b336e6679afed9e7ebed7350740bdda336c64d4e0f294b436f0a", "81bd4a5faf12e719448a808074d438bd1f7e1096a8289d491739625907a9e390"),
+    ];
+
+    /// The randomness beacon on the wire (genesis `beacon`): `BeaconReveal` is tag 46 and
+    /// `BeaconCommit` tag 47, appended after `InvokeAt` (45), both bundle-less. A reveal is 45
+    /// bytes: chain id, the bundle's `Option` tag, the variant, the 32 bytes. A commit is the
+    /// validator's address, the commitment, the nonce (little-endian) and the signature.
+    #[test]
+    fn the_beacon_actions_encodings_and_txids_are_pinned() {
+        let fixed = Signature::from_bytes(&[7u8; crate::crypto::SIGNATURE_LEN]).unwrap();
+        let reveal = Transaction { chain_id: 13, bundle: None, action: Action::BeaconReveal { reveal: [0x5a; 32] } };
+        let commit = Transaction {
+            chain_id: 13,
+            bundle: None,
+            action: Action::BeaconCommit { validator: Address([0x11; 32]), commitment: [0x6b; 32], nonce: 0x0102, signature: fixed.clone() },
+        };
+        let head = |tag: u32| [&13u64.to_le_bytes()[..], &[0u8][..], &tag.to_le_bytes()[..]].concat();
+        assert_eq!(reveal.encode(), [&head(46)[..], &[0x5a; 32][..]].concat());
+        let sig = bincode::serialize(&fixed).unwrap();
+        assert_eq!(commit.encode(), [&head(47)[..], &[0x11; 32][..], &[0x6b; 32][..], &0x0102u64.to_le_bytes()[..], &sig[..]].concat());
+        for (tx, tag) in [(&reveal, 46usize), (&commit, 47)] {
+            assert_eq!(variant_index(&tx.action), tag, "the enum position is the tag");
+            assert_eq!(&Transaction::decode(&tx.encode()).unwrap(), tx);
+            assert!(tx.action.bundle_less().is_some());
+        }
+        let got: Vec<(String, String)> =
+            [&reveal, &commit].iter().map(|tx| (hex::encode(blake3::hash(&tx.encode()).as_bytes()), hex::encode(tx.hash().0))).collect();
+        assert_eq!(got, BEACON_PINS.iter().map(|(d, i)| (d.to_string(), i.to_string())).collect::<Vec<_>>());
+    }
+
     #[test]
     fn the_consensus_encoding_and_txid_are_pinned() {
         let call = Transaction::shielded(
@@ -1813,6 +1874,8 @@ mod tests {
             ),
             (Action::AdmitValidator { candidate: minter.clone(), signatures: Vec::new() }, "admit_validator"),
             (Action::SetRandPrice { price_micros_per_rand: 1, nonce: 1, votes: Vec::new() }, "set_rand_price"),
+            (Action::BeaconReveal { reveal: [0; 32] }, "beacon_reveal"),
+            (Action::BeaconCommit { validator: Address([0; 32]), commitment: [0; 32], nonce: 1, signature: Signature::empty() }, "beacon_commit"),
             (
                 {
                     let h = SignedHeader {
@@ -2137,6 +2200,8 @@ mod tests {
             Action::MultisigRotate { .. } => 43,
             Action::SetRandPrice { .. } => 44,
             Action::InvokeAt { .. } => 45,
+            Action::BeaconReveal { .. } => 46,
+            Action::BeaconCommit { .. } => 47,
         }
     }
 
@@ -2463,6 +2528,8 @@ mod tests {
                 let Action::Invoke { program, proof, input_envelope, transition } = sample(33, proof) else { unreachable!() };
                 Action::InvokeAt { program, proof, input_envelope, transition, ref_height: 77 }
             }
+            46 => Action::BeaconReveal { reveal: [0x5a; 32] },
+            47 => Action::BeaconCommit { validator: pk().address(), commitment: [0x6b; 32], nonce: 1, signature: sig() },
             _ => panic!("no variant {i}"),
         }
     }

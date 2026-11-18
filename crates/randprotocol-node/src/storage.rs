@@ -5065,6 +5065,7 @@ pub(crate) mod fixtures {
             hc_auth: None,
             fees: None,
             hc_auth_multisig: None,
+            beacon: None,
         }
     }
 
@@ -5227,6 +5228,7 @@ pub(crate) mod fixtures {
             hc_auth: None,
             fees: None,
             hc_auth_multisig: None,
+            beacon: None,
         };
         (gs, secrets)
     }
@@ -9961,7 +9963,7 @@ mod tests {
     fn block_facts_are_persisted_restored_truncated_and_audited() {
         use randprotocol_core::ledger::program_state::{BlockFacts, ProgramStateError, Transition};
         let (_dir, s, gs, mut ledger, b1) = ref_block_chain(7);
-        let fact = |h: u64| BlockFacts { height: h, timestamp_ms: REF_T0_MS + h * 4_000, basefee: 100 };
+        let fact = |h: u64| BlockFacts { height: h, timestamp_ms: REF_T0_MS + h * 4_000, basefee: 100, randomness: None };
         let rows = |s: &Storage| s.newest_block_facts(usize::MAX).unwrap();
         assert_eq!(rows(&s), vec![fact(1)], "block 1's facts, written with block 1; none for genesis");
         let b2 = ref_block_next(&s, &b1, &mut ledger, vec![]);
@@ -10050,7 +10052,7 @@ mod tests {
         assert!(s.newest_block_facts(usize::MAX).unwrap().is_empty());
         s.truncate_to(&gs, 4, &ledger).unwrap();
         assert_eq!(meta_keys(&s), before, "nor did a truncation");
-        let facts = randprotocol_core::ledger::program_state::BlockFacts { height: 2, timestamp_ms: 2, basefee: 0 };
+        let facts = randprotocol_core::ledger::program_state::BlockFacts { height: 2, timestamp_ms: 2, basefee: 0, randomness: None };
         s.db.put_cf(s.cf(CF_META), Storage::block_facts_key(2), bincode::serialize(&facts).unwrap()).unwrap();
         let reloaded = crate::node::reload_ledger(&s, &gs, &StubExecutor).unwrap();
         assert!(reloaded.block_facts().is_empty() && reloaded.reference_block_window() == 0);

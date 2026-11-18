@@ -120,6 +120,7 @@ fn genesis_full(
         hc_auth: None,
         fees: None,
         hc_auth_multisig: None,
+        beacon: None,
     }
 }
 
@@ -1265,6 +1266,7 @@ fn genesis_private_multisig(validator: &Keypair, public_signers: &[Keypair]) -> 
     use randprotocol_core::ledger::multisig::{MultisigAccountConfig, MultisigConfig};
     Genesis {
         hc_auth_multisig: Some(word8_to_hex(&ZkExecutor::hc_auth_multisig())),
+        beacon: None,
         max_proof_bytes: Some(4 << 20),
         max_block_bytes: Some(20 << 20),
         // 3 s blocks × 256 would leave 12.8 minutes for two signatures, a tier-18 Test prove and a bundle prove.

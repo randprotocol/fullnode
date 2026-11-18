@@ -2919,6 +2919,7 @@ async fn main() -> Result<()> {
                 // this build's digest, never typed; absent otherwise, so a genesis cut without it
                 // hashes byte-for-byte as before.
                 hc_auth_multisig: auth_multisig_guest.then(|| word8_to_hex(&ZkExecutor::hc_auth_multisig())),
+                beacon: None,
             };
             if binding_domain.is_none() && !randprotocol_client::CHAIN_ID_BINDING_CHAIN_IDS.contains(&chain_id) {
                 eprintln!(
@@ -5720,6 +5721,7 @@ mod tests {
             incremental_nullifier_root: None,
             perps: None,
             hc_auth_multisig: None,
+            beacon: None,
         }
     }
 

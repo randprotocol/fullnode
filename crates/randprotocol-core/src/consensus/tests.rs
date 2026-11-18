@@ -166,6 +166,7 @@ fn build_with(n: u8, validators: u8, epoch_blocks: u64, all_signers: bool, bridg
         incremental_nullifier_root: None,
         perps: None,
         hc_auth_multisig: None,
+        beacon: None,
     };
     let gs = genesis.build(&StubExecutor).unwrap();
     let mut cfg = ConsensusConfig::new(1, gs.validators.clone(), gs.hash());
@@ -1600,6 +1601,7 @@ fn one_node_parts() -> (ConsensusConfig, crate::genesis::GenesisState, Keypair) 
         incremental_nullifier_root: None,
         perps: None,
         hc_auth_multisig: None,
+        beacon: None,
     };
     let gs = genesis.build(&StubExecutor).unwrap();
     let mut cfg = ConsensusConfig::new(1, gs.validators.clone(), gs.hash());
@@ -2229,6 +2231,7 @@ fn aggregation_node_with(
         incremental_nullifier_root: None,
         perps: None,
         hc_auth_multisig: None,
+        beacon: None,
     };
     let mut gs = genesis.build(&StubExecutor).unwrap();
     // Register the aggregator directly on the genesis ledger the node builds on (the register

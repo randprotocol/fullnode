@@ -1582,6 +1582,7 @@ mod tests {
             hc_auth: None,
             fees: None,
             hc_auth_multisig: None,
+            beacon: None,
         }
     }
 

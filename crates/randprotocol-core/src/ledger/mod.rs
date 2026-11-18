@@ -9,6 +9,7 @@
 //! parallel: each phase owns its own file.
 
 pub mod aggregation;
+pub mod beacon;
 mod shared_set;
 pub use shared_set::SharedSet;
 #[cfg(test)]
@@ -367,6 +368,10 @@ pub enum TxError {
     /// [`rand_price::PriceError`]).
     #[error("rand price: {0}")]
     Price(#[from] rand_price::PriceError),
+    /// The randomness beacon (genesis `beacon`): a reveal or a commit the module refused (see
+    /// [`beacon::BeaconError`]).
+    #[error("beacon: {0}")]
+    Beacon(#[from] beacon::BeaconError),
     /// Block aggregation: a register action or aggregate the aggregation module refused (see
     /// [`aggregation::AggregationError`]).
     #[error("aggregation: {0}")]
@@ -433,6 +438,13 @@ pub enum BlockError {
     InvalidTx { index: usize, error: TxError },
     #[error("tx root mismatch")]
     TxRootMismatch,
+    /// On a beacon chain (genesis `beacon`) a block's first transaction is its proposer's
+    /// `BeaconReveal`. This block has no transaction, or opens with something else.
+    #[error("the block does not open with its proposer's beacon reveal")]
+    MissingBeaconReveal,
+    /// A `BeaconReveal` anywhere but index 0: a block carries exactly one.
+    #[error("tx {index} is a beacon reveal; a block carries one, as its first transaction")]
+    MisplacedBeaconReveal { index: usize },
     /// The block names one transaction twice (audit v6, GOSSIP-2). The transaction root
     /// duplicates the last leaf of an odd level, so such a list can carry the root — and the
     /// header, hash and signature — of the honest list it was made from. Reported by the orphan
@@ -693,6 +705,11 @@ pub struct Ledger {
     /// section — the `rand-state-price-1` wrapper, inside equality, `META_RAND_PRICE` — and `None`
     /// (outside the root) without it.
     rand_price: Option<rand_price::RandPrice>,
+    /// The randomness beacon (`beacon.rs`; genesis `beacon`): the chain's value and every
+    /// validator's commitment. Consensus state under the section — the `rand-state-beacon-1`
+    /// wrapper, inside equality, one `meta` row — and `None` (outside the root, nothing stored,
+    /// both beacon actions refused) without it.
+    beacon: Option<beacon::BeaconState>,
     /// Σ of every registration fee burned under `tokens.burn_registration_fee` (audit v5,
     /// TOK-2). A supply counter in kind — derived, outside the state root and this ledger's
     /// equality, persisted beside `META_SUPPLY` and replay-audited — kept off [`Supply`] so
@@ -917,6 +934,9 @@ impl PartialEq for Ledger {
             // The voted RAND price (`fees.usd_subsidy`): consensus state under the section,
             // `None` on both sides without it.
             && self.rand_price == o.rand_price
+            // The randomness beacon: consensus state under the section, `None` on both sides
+            // without it.
+            && self.beacon == o.beacon
             // The live gas prices (Phase 2): consensus state under `gas.dynamic`, compared by
             // effective value so a restored `Some(section prices)` equals an unmoved `None`.
             && self.gas_prices() == o.gas_prices()
@@ -969,6 +989,7 @@ impl Ledger {
             base_fees_burned: 0,
             fees: fees::FeesConfig::default(),
             rand_price: None,
+            beacon: None,
             max_program_words: gas::MAX_PROGRAM_WORDS,
             max_proof_bytes: gas::MAX_PROOF_BYTES,
             max_block_bytes: gas::MAX_BLOCK_BYTES,
@@ -1045,6 +1066,7 @@ impl Ledger {
             base_fees_burned: 0,
             fees: fees::FeesConfig::default(),
             rand_price: None,
+            beacon: None,
             max_program_words: gas::MAX_PROGRAM_WORDS,
             max_proof_bytes: gas::MAX_PROOF_BYTES,
             max_block_bytes: gas::MAX_BLOCK_BYTES,
@@ -1454,6 +1476,18 @@ impl Ledger {
     /// genesis price — `set_admitted`'s twin: hashed into the root under the section.
     pub fn set_rand_price(&mut self, price: Option<rand_price::RandPrice>) {
         self.rand_price = price;
+    }
+
+    /// The randomness beacon's state (genesis `beacon`), `None` on every chain without the
+    /// section.
+    pub fn beacon(&self) -> Option<&beacon::BeaconState> {
+        self.beacon.as_ref()
+    }
+
+    /// Seed the beacon at genesis, or restore the state a node persisted beside the rest
+    /// (`META_BEACON`) — `set_rand_price`'s twin: hashed into the root when present.
+    pub fn set_beacon(&mut self, state: Option<beacon::BeaconState>) {
+        self.beacon = state;
     }
 
     /// The price, when it is usable at this ledger's height: the section is set, a price exists,
@@ -1953,7 +1987,9 @@ impl Ledger {
         if self.reference_block_window == 0 {
             return;
         }
-        let facts = program_state::BlockFacts { height, timestamp_ms: self.timestamp_ms, basefee };
+        // The beacon's value after this block's reveal (`None` without the genesis `beacon`).
+        let randomness = self.beacon.as_ref().map(|b| b.value);
+        let facts = program_state::BlockFacts { height, timestamp_ms: self.timestamp_ms, basefee, randomness };
         if let Some(entry) = self.block_facts.iter_mut().find(|f| f.height == height) {
             *entry = facts;
             return;
@@ -2932,6 +2968,14 @@ impl Ledger {
             Action::SetRandPrice { price_micros_per_rand, nonce, votes } => {
                 rand_price::check_set_price(self, *price_micros_per_rand, *nonce, votes)?
             }
+            // The randomness beacon, gated on the genesis `beacon` section, which the module
+            // checks first. A reveal is never valid here: the block rule
+            // (`apply_transactions_for_sync`) applies the one at a block's head itself, so the
+            // pool, RPC and every later index refuse it.
+            Action::BeaconReveal { .. } => beacon::refuse_reveal(self)?,
+            Action::BeaconCommit { validator, commitment, nonce, signature } => {
+                beacon::check_commit(self, validator, commitment, *nonce, signature)?
+            }
             // `AdmitValidator` (audit v6, STAKE-2) is the register's too: gated on
             // `staking.admission_by_vote`, which `staking::validate` checks before anything else.
             a @ (Action::Bond { .. }
@@ -3308,6 +3352,12 @@ impl Ledger {
             Action::SetRandPrice { price_micros_per_rand, nonce, votes } => {
                 rand_price::apply_set_price(self, *price_micros_per_rand, *nonce, votes)?
             }
+            // Unreachable past `validate_inner`, which refuses every reveal; kept as a refusal
+            // so no path can apply one outside the block rule.
+            Action::BeaconReveal { .. } => beacon::refuse_reveal(self)?,
+            Action::BeaconCommit { validator, commitment, nonce, signature } => {
+                beacon::apply_commit(self, validator, commitment, *nonce, signature)?
+            }
             Action::Call { program, input_envelope, .. } | Action::Invoke { program, input_envelope, .. } | Action::InvokeAt { program, input_envelope, .. } => {
                 // RPL-2: the transition first — vault, supplies, cells, payout notes — then the
                 // receipt, which is a call's. Every refusal was decided by `validate_inner`.
@@ -3463,7 +3513,17 @@ impl Ledger {
         scratch.pruned_side = side;
         let mut receipts = Vec::new();
         let mut aggregate_seen = false;
-        for (index, tx) in txs.iter().enumerate() {
+        // The randomness beacon (genesis `beacon`): the block opens with its proposer's reveal,
+        // applied here and nowhere else. Without the section nothing is asked, and a reveal met
+        // below is refused by name like any action of a module that is off.
+        let beacon_on = scratch.beacon.is_some();
+        if beacon_on {
+            scratch.apply_block_reveal(txs.first(), proposer)?;
+        }
+        for (index, tx) in txs.iter().enumerate().skip(usize::from(beacon_on)) {
+            if beacon_on && matches!(tx.action, Action::BeaconReveal { .. }) {
+                return Err(BlockError::MisplacedBeaconReveal { index });
+            }
             if matches!(tx.action, Action::Aggregate { .. }) {
                 // Spec §3.4's "at most one" as a block rule: the second is refused by index,
                 // before its records are even looked up.
@@ -3484,6 +3544,23 @@ impl Ledger {
         scratch.pruned_side.clear();
         *self = scratch;
         Ok(receipts)
+    }
+
+    /// The beacon's block rule for `first`, a block's transaction 0, on a chain with the
+    /// section: it is a bundle-less `BeaconReveal` on this chain's id that opens `proposer`'s
+    /// commitment ([`beacon::apply_reveal`]). The proposer builds its block through this same
+    /// function (`HotStuff::propose`).
+    pub fn apply_block_reveal(&mut self, first: Option<&Transaction>, proposer: &Address) -> Result<(), BlockError> {
+        let Some(tx) = first else { return Err(BlockError::MissingBeaconReveal) };
+        let Action::BeaconReveal { reveal } = &tx.action else { return Err(BlockError::MissingBeaconReveal) };
+        let refused = |error: TxError| BlockError::InvalidTx { index: 0, error };
+        if tx.chain_id != self.chain_id {
+            return Err(refused(TxError::WrongChain { expected: self.chain_id, actual: tx.chain_id }));
+        }
+        if tx.bundle.is_some() {
+            return Err(refused(TxError::ActionCarriesBundle("beacon_reveal")));
+        }
+        beacon::apply_reveal(self, proposer, reveal).map_err(refused)
     }
 
     /// Full block application: proposer signature, tx root, every tx, the block-end anchor, and
@@ -3794,6 +3871,13 @@ impl Ledger {
                 if self.fees.usd_subsidy().is_some() { format!("{:?}", self.rand_price) } else { "off".into() }
             )
             + &format!(
+                " beacon {}",
+                match &self.beacon {
+                    Some(b) => format!("{:?}", b.root()),
+                    None => "off".into(),
+                }
+            )
+            + &format!(
                 " nullifier range {}",
                 match &self.nullifier_mmr {
                     Some(m) => format!("{} leaves", m.count()),
@@ -3906,6 +3990,14 @@ impl Ledger {
             buf.extend_from_slice(root.as_bytes());
             buf.extend_from_slice(rand_price::price_root(self.rand_price.as_ref()).as_bytes());
             root = Hash::digest_domain(b"rand-state-price-1", &buf);
+        }
+        // The randomness beacon (genesis `beacon`), outermost: only under the section, so every
+        // chain without it keeps its root byte for byte.
+        if let Some(b) = &self.beacon {
+            let mut buf = Vec::with_capacity(64);
+            buf.extend_from_slice(root.as_bytes());
+            buf.extend_from_slice(b.root().as_bytes());
+            root = Hash::digest_domain(b"rand-state-beacon-1", &buf);
         }
         root
     }

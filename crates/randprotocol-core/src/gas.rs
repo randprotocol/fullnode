@@ -393,6 +393,10 @@ pub fn fee_floor(action: &Action) -> u64 {
         // The RAND price vote (`fees.usd_subsidy`): `AdmitValidator`'s shape and reason — a
         // quorum of the voting set's signatures over the next nonce, which it spends.
         Action::SetRandPrice { .. } => 0,
+        // The randomness beacon (genesis `beacon`). A reveal is placed by the block's proposer and
+        // refused everywhere else, so it is never a pooled transaction; a commit needs a
+        // registered validator's own signature and spends that validator's next commit nonce.
+        Action::BeaconReveal { .. } | Action::BeaconCommit { .. } => 0,
         // Audit v6, STAKE-1: equivocation evidence. Bundle-less and fee-less — anyone may carry
         // it, and it needs no wallet — and unspammable: it is admissible only with two of a
         // registered validator's own signatures over one view, and once per offender per jail.
