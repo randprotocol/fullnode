@@ -5881,6 +5881,19 @@ pub(crate) mod fixtures {
         b
     }
 
+    /// The genesis block as the parent [`ref_block_next`] builds block 1 on.
+    pub(crate) fn ref_block_genesis_parent(gs: &GenesisState) -> CommittedBlock {
+        CommittedBlock {
+            block: gs.block.clone(),
+            pruned: Vec::new(),
+            qc: QuorumCertificate::genesis(gs.block.hash()),
+            receipts: Vec::new(),
+            deposits: Vec::new(),
+            aggregates: Vec::new(),
+            perp_words: None,
+        }
+    }
+
     /// An opened store holding the reference-block fixture chain one block in
     /// ([`rpl2_setup_txs`]), with the ledger after that block and the block itself.
     pub(crate) fn ref_block_chain(chain_id: u64) -> (tempfile::TempDir, Storage, GenesisState, Ledger, CommittedBlock) {
@@ -5889,16 +5902,7 @@ pub(crate) mod fixtures {
         let gs = ref_block_genesis_file(chain_id).build(&StubExecutor).unwrap();
         s.init_genesis(&gs).unwrap();
         let mut ledger = gs.ledger.clone();
-        let genesis_block = CommittedBlock {
-            block: gs.block.clone(),
-            pruned: Vec::new(),
-            qc: QuorumCertificate::genesis(gs.block.hash()),
-            receipts: Vec::new(),
-            deposits: Vec::new(),
-            aggregates: Vec::new(),
-            perp_words: None,
-        };
-        let b1 = ref_block_next(&s, &genesis_block, &mut ledger, rpl2_setup_txs(&gs.ledger));
+        let b1 = ref_block_next(&s, &ref_block_genesis_parent(&gs), &mut ledger, rpl2_setup_txs(&gs.ledger));
         (dir, s, gs, ledger, b1)
     }
 

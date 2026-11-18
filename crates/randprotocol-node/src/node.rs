@@ -6208,6 +6208,9 @@ mod tests {
         let executor = executor_for_profile(&file.fri_profile).unwrap();
         let gs = file.build(executor.as_ref()).unwrap();
         assert_eq!(gs.hash().to_hex(), "ca76c2766ed6090ac6ba5dad86b724dd5d2b80c0edfaed287cd8b129e663ca9a");
+        // Issue #168: chain 21 has no reference-block window — no ring, and no `InvokeAt`.
+        assert_eq!(gs.ledger.reference_block_window(), 0);
+        assert!(gs.ledger.block_facts().is_empty());
         let dir = tempfile::tempdir().unwrap();
         let storage = Storage::open(dir.path()).unwrap();
         storage.init_genesis(&gs).unwrap();
