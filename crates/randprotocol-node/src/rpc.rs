@@ -1802,6 +1802,11 @@ fn parse_limit(params: &Value, idx: usize) -> Result<usize, RpcError> {
     }
 }
 
+/// RPC-201: `rand_getScanLeaves` calls this process has served (not the refused ones). Logged at
+/// powers of two, so an operator can tell from the journal whether any wallet before v0.8.3
+/// still scans through the node before turning the method off.
+pub(crate) static SCAN_LEAVES_SERVED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// An envelope's scan head as `rand_getScanLeaves` serves it: `kem_ct ‖ to_receiver ‖ to_sender`,
 /// standard base64 with padding. Whatever lengths the parts have — a wallet reads a head of any
 /// other length than 1 208 bytes in full rather than guessing at its split.
@@ -3006,6 +3011,16 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
                         .into(),
                     data: None,
                 });
+            }
+            // RPC-201: who still calls it decides when it can go. No caller is recorded, only
+            // the count, at 1, 2, 4, 8, … served calls since the node started.
+            let served = SCAN_LEAVES_SERVED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            if served.is_power_of_two() {
+                tracing::warn!(
+                    served,
+                    "rand_getScanLeaves served {served} time(s) since start: a wallet before v0.8.3 is scanning through this node, \
+                     which shows it the leaves that wallet owns (RPC-201; --disable-scan-leaves refuses the method)"
+                );
             }
             let from: u64 = param(p, 0, "from_index")?;
             let limit = parse_limit(p, 1)?;
@@ -5465,6 +5480,11 @@ pub(crate) mod tests {
         let (_d, st, _gs) = chain();
         assert!(st.scan_leaves, "served by default for now (wallets before v0.8.3 use it)");
         let off = RpcState { scan_leaves: false, ..st.clone() };
+        // Only served calls are counted (the counter is the process's, so other tests move it
+        // too: it never goes down, and a refusal alone does not move it past a served call).
+        let before = SCAN_LEAVES_SERVED.load(std::sync::atomic::Ordering::Relaxed);
+        ok(&st, "rand_getScanLeaves", json!([0, 1])).await;
+        assert!(SCAN_LEAVES_SERVED.load(std::sync::atomic::Ordering::Relaxed) > before, "a served call is counted");
         for state in [off.clone(), off.for_public_listener()] {
             let e = call(&state, "rand_getScanLeaves", json!([0, 100])).await.unwrap_err();
             assert_eq!(e.code, -32601, "{}", e.message);
