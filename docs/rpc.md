@@ -313,12 +313,15 @@ its own choice.
 **Turning it off (audit v12, RPC-201).** Wallets before v0.8.3 still scan with this method, so
 every node that serves it still learns those wallets' leaves. `rand-node run --disable-scan-leaves`
 refuses it on both listeners (`-32601`, the message names the flag and asks for rand v0.8.3+);
-`rand_getCommitments` is unaffected. **The plan:** served by default in v0.8.x so a wallet
-before v0.8.3 keeps scanning; at the next minor (v0.9.0) the default flips to off, with
-`--enable-scan-leaves` for an operator who wants it, once the wallet download page has carried
-v0.8.3+ for a release cycle. The public RPC deploy template (`deploy/enable-public-rpc.sh`) does
-not pass the flag yet: nothing in these docs says the public RPC should break old wallets before
-the flip, so that is the operator's call per host until v0.9.0.
+`rand_getCommitments` is unaffected. **The default follows the release** (owner's decision of
+2026-11-05): a v0.8.x node serves the method unless `--disable-scan-leaves` is passed, so a wallet
+before v0.8.3 keeps scanning; a node of v0.9.0 or later refuses it unless `--enable-scan-leaves`
+is passed. The node reads its own version for this, so the flip happens with the version bump and
+needs no other change. The two flags together are refused. While it serves the method a node
+logs a warning at its 1st, 2nd, 4th, 8th, … served call since start (the count only, no caller),
+so an operator can see in the journal whether any wallet before v0.8.3 still scans through it
+before turning it off. The public RPC deploy template (`deploy/enable-public-rpc.sh`) does not
+pass `--disable-scan-leaves`: that is the operator's call per host until v0.9.0.
 
 ### `rand_getNullifiers`
 Params: `[from_height]` or `[from_height, limit]`. Result: every nullifier published from that
