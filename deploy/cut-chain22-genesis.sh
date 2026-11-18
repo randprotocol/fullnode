@@ -115,6 +115,18 @@
 #      with input blocks and heartbeats; the cap bounds the input part when no prover runs (inputs
 #      are refused `DigestLogFull` until a proof drains it). Range max_window_blocks..=1048576.
 #
+#   9. Validator memory for the state-proof key build (CON-601, monorepo#23; CON-60, #6). The cut
+#      keeps max_tier 18 (the production sizing) and pins the engine's program height, which
+#      bounds the shapes a proof may declare to the chain's canonical ones. It does not bound the
+#      build: the first tier-18 state proof in a block makes every validator build a key at
+#      ~3.6 GB resident (the pool's per-node tier cap, --max-state-proof-tier, cannot apply to a
+#      block). A 2 GB or 4 GB validator can be killed applying it. The owner decides before the
+#      cut — resize every validator to ≥ 8 GB, or accept and name another plan — and the cut
+#      record's reason:, carries: or clients: line must say so (it must match
+#      CON-601 | validator memory | key build); the cut refuses a record that is silent.
+#      Precomputed, hash-pinned state-proof keys (loaded, as the msauth key is) would remove the
+#      build; they are not built yet.
+#
 # Known gap (not a decision): no RPC serves `program_state.refuse_panics` (rand_getLimits'
 # program_state object is cell_fee/max_reads/max_writes/max_payouts). `check-limits` therefore
 # reads it back through the genesis hash alone — the node must serve the hash `init` derives from
@@ -1857,7 +1869,7 @@ holder = payouts[len(rand_notes)] if dry else "rand1SELFTESTz"
 open(f"{st}/zusd-carry.txt", "w").write("".join(f"holder {holder} {fmt(n['amount'], 8)}\n" for n in zusd_notes))
 # A filled cut record (the fixture's — the real one is the operator's, published before the cut).
 open(f"{st}/cut-record.txt", "w").write(
-    "chain-id: 22\nreason: audit v11 gated fields — PST-1 refuse_panics, PERP-6 bound_payouts, PERP-101 sparse windows, CON-60, MSA-4 max_accounts\n"
+    "chain-id: 22\nreason: audit v11 gated fields — PST-1 refuse_panics, PERP-6 bound_payouts, PERP-101 sparse windows, CON-60, CON-601 validator memory for the tier-18 key build (fixture), MSA-4 max_accounts\n"
     "carries: fixture register, bridge state, balances and the treasury signers (new issuance)\n"
     "drops: fixture: chain 21's multisig register (the treasury vault)\nclients: fixture: none\n"
     "second-operator: fixture\nrollback: fixture: keep chain 21 dirs and *.pre-c22 binaries a day\n")
@@ -2577,7 +2589,8 @@ PY
   for x in "treasury:the genesis fees section is a genesis-gated validity rule (PST-1, PERP-6, PERP-101)" \
            "pst1:audit v11 — PERP-6 bound_payouts, PERP-101 sparse windows; the treasury re-seeded" \
            "perp6:audit v11 — PST-1 refuse_panics, PERP-101 sparse windows; the treasury re-seeded" \
-           "perp101:audit v11 — PST-1 refuse_panics, PERP-6 bound_payouts; the treasury re-seeded"; do
+           "perp101:audit v11 — PST-1 refuse_panics, PERP-6 bound_payouts; the treasury re-seeded" \
+           "con601:audit v11 — PST-1 refuse_panics, PERP-6 bound_payouts, PERP-101 sparse windows, CON-60; the treasury re-seeded"; do
     sed "s/^reason:.*/reason: ${x#*:}/; s/^carries:.*/carries: fixture register, bridge state and balances/" "$ST/cut-record.txt" > "$ST/cut-record-no-${x%%:*}.txt"
   done
   sed 's/^drops:.*/drops: nothing/' "$ST/cut-record.txt" > "$ST/cut-record-drops-nothing.txt"
@@ -2614,6 +2627,7 @@ PY
   bash_refuses "a cut record that does not name PST-1" "names no PST-1" "${real_cut[@]}" CUT_RECORD="$ST/cut-record-no-pst1.txt" --
   bash_refuses "a cut record that does not name PERP-6" "names no PERP-6" "${real_cut[@]}" CUT_RECORD="$ST/cut-record-no-perp6.txt" --
   bash_refuses "a cut record that does not name PERP-101" "names no PERP-101" "${real_cut[@]}" CUT_RECORD="$ST/cut-record-no-perp101.txt" --
+  bash_refuses "a cut record that does not say how validators hold the tier-18 key build (CON-601)" "names no CON-601" "${real_cut[@]}" CUT_RECORD="$ST/cut-record-no-con601.txt" --
   bash_refuses "MULTISIG_NOT_CARRIED_OK=1, the record's drops: silent" "names no dropped multisig register" "${real_cut[@]}" MULTISIG_NOT_CARRIED_OK=1 CUT_RECORD="$ST/cut-record-drops-nothing.txt" --
   bash_refuses "PERPS_STATE_NOT_CARRIED_OK=1, the record's drops: silent" "names no dropped perps exchange state" "${real_cut[@]}" PERPS_STATE_NOT_CARRIED_OK=1 --
   bash_refuses "PROGRAM_VAULTS_DROPPED_OK=1, the record's drops: silent" "names no dropped program vaults" "${real_cut[@]}" PROGRAM_VAULTS_DROPPED_OK=1 --
@@ -2729,6 +2743,12 @@ require_cut_record_mentions "$CUT_RECORD" 'treasury|multisig' "treasury (the mul
 require_cut_record_mentions "$CUT_RECORD" 'PST-1|refuse_panics' "PST-1 (program_state.refuse_panics, monorepo#15)" reason carries
 require_cut_record_mentions "$CUT_RECORD" 'PERP-6|bound_payouts' "PERP-6 (perps.bound_payouts, monorepo#13)" reason carries
 require_cut_record_mentions "$CUT_RECORD" 'PERP-101|sparse.windows|max_window_heights' "PERP-101 (perps.sparse_windows + max_window_heights, monorepo#12)" reason carries
+# CON-601 (monorepo#23, with CON-60 #6): the engine pin bounds which keys a state proof can ask
+# for, not what one costs to build — a block carrying a max_tier-18 proof still makes EVERY
+# validator build that key (3.56 GB resident measured; docs/perps.md "the node's tier cap"), and
+# no node policy can refuse a valid block. So the record must say how chain 22's validators hold
+# it (OPEN 9): every validator given the memory (≥ 8 GB), or another decision the owner names.
+require_cut_record_mentions "$CUT_RECORD" 'CON-601|validator.memory|key.build' "CON-601 (how every validator holds a max_tier-18 state-proof key build, about 3.6 GB: monorepo#23)" reason carries clients
 # Chain 21's state the cut drops on the operator's word (OPEN 3–5): the record's drops: line names it.
 [ "${MULTISIG_NOT_CARRIED_OK:-}" != 1 ] || require_cut_record_mentions "$CUT_RECORD" 'treasury|multisig' "dropped multisig register (MULTISIG_NOT_CARRIED_OK=1)" drops
 [ "${PERPS_STATE_NOT_CARRIED_OK:-}" != 1 ] || require_cut_record_mentions "$CUT_RECORD" 'perp' "dropped perps exchange state (PERPS_STATE_NOT_CARRIED_OK=1)" drops

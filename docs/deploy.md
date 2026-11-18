@@ -2017,7 +2017,11 @@ need it), each of which must hash differently. The real cut refuses a build with
 `engine_program_log_height` (anything before v0.8.2); `DRY_RUN=1` skips them all on such a build,
 loudly (`AUDIT_V10 SKIPPED`), and puts in each operator input's lower bound (64; 1), loudly, as a
 placeholder. The cut record's `reason:` or `carries:` must name PST-1, PERP-6 and PERP-101 and the
-treasury. Every node — validators, archives, the RPC nodes the sites read — runs v0.8.5 or later
+treasury. It must also say (in `reason:`, `carries:` or `clients:`, matching `CON-601`, `validator
+memory` or `key build`) how every validator holds a `max_tier`-18 state-proof key build, about
+3.6 GB resident: the engine pin bounds the shapes a proof may declare, not the build, and a block
+carrying a tier-18 proof makes every validator build the key (CON-601). Give every validator at
+least 8 GB before the cut, or name the plan the owner chose. Every node — validators, archives, the RPC nodes the sites read — runs v0.8.5 or later
 from chain 22's first block: an older one refuses the file (`deny_unknown_fields` on the perps,
 multisig and program-state sections). durian.market's perp-prover must build sparse jobs
 (durian 28cebfb, PERP-101) before the first perps window on chain 22, and the prover host must fit
