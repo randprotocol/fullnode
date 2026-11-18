@@ -560,9 +560,62 @@ pub enum Action {
     /// fee-less. Refused `UnsupportedAction` on a chain without the section, before anything
     /// else is read. Appended last: bincode is positional.
     SetRandPrice { price_micros_per_rand: u64, nonce: u64, votes: Vec<(PublicKey, Signature)> },
+    /// Issue #168 (45) (`docs/evm-block-context.md`; genesis
+    /// `program_state.reference_block_window`): an [`Action::Invoke`] that asks for **block
+    /// context**. `ref_height` names a recent closed block, the *reference block*; the proof is
+    /// made over `public ‖ call_binding ‖ transition.context_at(..)`, the version-2 context,
+    /// whose block words (that block's height and time, the chain id, its gas price) the ledger
+    /// fills from its own record of block `ref_height` — the transaction supplies the height and
+    /// nothing else, so a proof made against other facts does not verify. Admitted only while
+    /// `ref_height` is a closed block inside the window; in every other respect an `Invoke`
+    /// (same gate, same fee, same transition rules, same receipt).
+    ///
+    /// A variant of its own, not a field on `Invoke`: bincode is positional, so a field there
+    /// would change every invoke's bytes, binding and hash on a live chain. An ordinary invoke
+    /// is byte for byte what it was and reveals no reference block. Refused
+    /// `ReferenceBlockDisabled` on a chain without the window. Appended last: bincode is
+    /// positional.
+    InvokeAt {
+        program: ProgramId,
+        #[serde(with = "crate::crypto::wire_bytes")]
+        proof: Vec<u8>,
+        input_envelope: Option<CallEnvelope>,
+        transition: Transition,
+        ref_height: u64,
+    },
+}
+
+/// The fields of an [`Action::Invoke`] or an [`Action::InvokeAt`], borrowed: what every rule
+/// that treats the two alike reads ([`Action::invoke`]). `ref_height` is `None` for a plain
+/// `Invoke`.
+#[derive(Clone, Copy, Debug)]
+pub struct InvokeParts<'a> {
+    pub program: &'a ProgramId,
+    pub proof: &'a Vec<u8>,
+    pub input_envelope: Option<&'a CallEnvelope>,
+    pub transition: &'a Transition,
+    pub ref_height: Option<u64>,
 }
 
 impl Action {
+    /// This action's fields if it is an invoke of either form (`Invoke`, or issue #168's
+    /// `InvokeAt`), `None` otherwise.
+    pub fn invoke(&self) -> Option<InvokeParts<'_>> {
+        match self {
+            Action::Invoke { program, proof, input_envelope, transition } => {
+                Some(InvokeParts { program, proof, input_envelope: input_envelope.as_ref(), transition, ref_height: None })
+            }
+            Action::InvokeAt { program, proof, input_envelope, transition, ref_height } => Some(InvokeParts {
+                program,
+                proof,
+                input_envelope: input_envelope.as_ref(),
+                transition,
+                ref_height: Some(*ref_height),
+            }),
+            _ => None,
+        }
+    }
+
     /// The name of this action if it rides *without* a bundle, `None` if it must carry one.
     ///
     /// The faucet `Mint` and the validator-signed staking actions started the list; block
@@ -650,6 +703,15 @@ impl Action {
                 proof: proof.clone(),
                 input_envelope: input_envelope.clone(),
                 transition: transition.clone(),
+            },
+            // Issue #168: an `Invoke`'s rule, and `ref_height` is kept — the proof is about that
+            // block's facts, so a copy naming another block must not keep the bundle's proof.
+            Action::InvokeAt { program, proof, input_envelope, transition, ref_height } => Action::InvokeAt {
+                program: *program,
+                proof: proof.clone(),
+                input_envelope: input_envelope.clone(),
+                transition: transition.clone(),
+                ref_height: *ref_height,
             },
             // Multisig: no proof field; every field is kept so the binding moves with each.
             Action::CreateMultisig { salt, signers, threshold } => {
@@ -930,6 +992,7 @@ impl Action {
             | Action::RotatePauseKeyV2 { .. }
             | Action::CancelRotation { .. }
             | Action::Invoke { .. }
+            | Action::InvokeAt { .. }
             | Action::PerpDeposit { .. }
             | Action::PerpStateProof { .. }
             | Action::CreateMultisig { .. }
@@ -1059,6 +1122,7 @@ impl Transaction {
             | Action::RotatePauseKeyV2 { .. }
             | Action::CancelRotation { .. }
             | Action::Invoke { .. }
+            | Action::InvokeAt { .. }
             | Action::PerpDeposit { .. }
             | Action::PerpStateProof { .. }
             | Action::CreateMultisig { .. }
@@ -1271,6 +1335,11 @@ impl Transaction {
             // change, the payouts and the recipients the transaction declares.
             Action::Invoke { program, input_envelope, transition, .. } => {
                 Action::Invoke { program, proof: Vec::new(), input_envelope, transition }
+            }
+            // Issue #168: likewise, with the reference height — the proof commits to the block
+            // it was made against through this binding as well as through the context words.
+            Action::InvokeAt { program, input_envelope, transition, ref_height, .. } => {
+                Action::InvokeAt { program, proof: Vec::new(), input_envelope, transition, ref_height }
             }
             other => other,
         };
@@ -2019,7 +2088,7 @@ mod tests {
     /// The number of `Action` variants, and each one's position — an exhaustive match with no
     /// wildcard, so a new variant fails to compile here until [`sample`] has a row for it (and
     /// [`Action::blanked`] has an arm).
-    const VARIANTS: usize = 45;
+    const VARIANTS: usize = 46;
     fn variant_index(a: &Action) -> usize {
         match a {
             Action::None => 0,
@@ -2067,6 +2136,7 @@ mod tests {
             Action::MultisigPay { .. } => 42,
             Action::MultisigRotate { .. } => 43,
             Action::SetRandPrice { .. } => 44,
+            Action::InvokeAt { .. } => 45,
         }
     }
 
@@ -2388,6 +2458,11 @@ mod tests {
                 signatures: vec![crate::types::actions::SignerSignature { index: 0, signature: sig() }],
             },
             44 => Action::SetRandPrice { price_micros_per_rand: 150_000, nonce: 1, votes: vec![(pk(), sig())] },
+            // Issue #168: row 33's invoke, naming a reference block.
+            45 => {
+                let Action::Invoke { program, proof, input_envelope, transition } = sample(33, proof) else { unreachable!() };
+                Action::InvokeAt { program, proof, input_envelope, transition, ref_height: 77 }
+            }
             _ => panic!("no variant {i}"),
         }
     }
@@ -2405,8 +2480,9 @@ mod tests {
         // Since the hidden-asset bundle (spec §3.7) only an `Aggregate` carries a proof that is
         // blanked: `BridgeBurn` (8) and `TokenBurn` (17) no longer carry a bundle of their own.
         let blanked_proof = [13usize];
-        // A `Call` (3), an RPL-2 `Invoke` (33) and an RPL-3 `PerpStateProof` (39) carry a proof that is kept.
-        let kept_proof = [3usize, 33, 39];
+        // A `Call` (3), an RPL-2 `Invoke` (33), an RPL-3 `PerpStateProof` (39) and issue #168's
+        // `InvokeAt` (45) carry a proof that is kept.
+        let kept_proof = [3usize, 33, 39, 45];
         let mut seen = [false; VARIANTS];
         for (i, seen) in seen.iter_mut().enumerate() {
             let with = sample(i, vec![0x99; 7]);

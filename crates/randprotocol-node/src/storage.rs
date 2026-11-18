@@ -5617,7 +5617,7 @@ pub(crate) mod fixtures {
         });
         g.hardening_v6 = Some(true);
         g.hc_auth = Some(word8_to_hex(&HCA));
-        g.program_state = Some(randprotocol_core::ledger::program_state::ProgramStateConfig { cell_fee: CELL_FEE, refuse_panics: false });
+        g.program_state = Some(randprotocol_core::ledger::program_state::ProgramStateConfig { cell_fee: CELL_FEE, refuse_panics: false, reference_block_window: 0 });
         g
     }
 
@@ -5726,7 +5726,7 @@ pub(crate) mod fixtures {
             Action::Invoke { program, proof: Vec::new(), input_envelope: None, transition },
         );
         let record = ledger.program(&program).expect("the fixture program is deployed");
-        let segment = ledger.invoke_segment(record, &tx).expect("an invoke with a bundle");
+        let segment = ledger.invoke_segment(record, &tx).expect("a segment").expect("an invoke with a bundle");
         let call = StubExecutor::make_proof_with_public(&program, 10, [9, 8, 7, 6, 5, 4, 3, 2], &segment);
         let Action::Invoke { proof, .. } = &mut tx.action else { unreachable!() };
         *proof = call;

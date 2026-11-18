@@ -142,7 +142,7 @@ fn the_genesis_command_writes_the_program_state_section_when_asked() {
     let run = genesis(&with, &[all.as_slice(), &["--program-state-cell-fee", "10000000"]].concat());
     assert!(run.status.success(), "{}", String::from_utf8_lossy(&run.stderr));
     let w = read(&with);
-    assert_eq!(w.program_state, Some(ProgramStateConfig { cell_fee: 10_000_000, refuse_panics: false }));
+    assert_eq!(w.program_state, Some(ProgramStateConfig { cell_fee: 10_000_000, refuse_panics: false, reference_block_window: 0 }));
     let executor = randprotocol_node::node::executor_for_profile(&w.fri_profile).unwrap();
     let state = w.build(executor.as_ref()).unwrap();
     assert_eq!(state.ledger.program_state().map(|s| s.cell_fee), Some(10_000_000));
@@ -157,7 +157,7 @@ fn the_genesis_command_writes_the_program_state_section_when_asked() {
     let run = genesis(&strict, &[all.as_slice(), &["--program-state-cell-fee", "10000000", "--program-state-refuse-panics"]].concat());
     assert!(run.status.success(), "{}", String::from_utf8_lossy(&run.stderr));
     let s = read(&strict);
-    assert_eq!(s.program_state, Some(ProgramStateConfig { cell_fee: 10_000_000, refuse_panics: true }));
+    assert_eq!(s.program_state, Some(ProgramStateConfig { cell_fee: 10_000_000, refuse_panics: true, reference_block_window: 0 }));
     let strict_state = s.build(executor.as_ref()).unwrap();
     assert!(strict_state.ledger.refuse_panicked_invokes());
     assert_ne!(strict_state.hash(), state.hash(), "the rule is bound by the genesis hash");
