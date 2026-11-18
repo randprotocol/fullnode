@@ -34,16 +34,20 @@ Python 3 standard library only. Configuration, all environment:
   SUBMIT_BURST      submits one address may make at once (default 2)
   SUBMIT_SHARE      one address's refill as a fraction of the pool's measured capacity
                     (default 0.3; VK-10, audit v12): with the burst, one address gets under a
-                    third of what the pool clears in an hour, however many members are up
+                    third of what the pool clears in an hour, however many members are up.
+                    With more than 1/SUBMIT_SHARE addresses active in the last ten minutes the
+                    refill is an equal split of the capacity between them instead (audit v13)
   MEMBER_JOBS_PER_MIN  one member's throughput (default 0.6: ~70 s a bundle on a c-8); the
                     capacity is this times the members the two-second poll finds up
   SUBMIT_PER_MIN    optional ceiling on the per-address refill per minute (unset: none); it
                     caps the share, it never raises it
   ROUTER_LISTEN     ip:port to listen on (default 127.0.0.1:8650)
 
-The client address is nginx's X-Real-IP (the router listens on loopback only).
+The client address is nginx's X-Real-IP (the router listens on loopback only); an IPv6 address
+is metered as its /64.
 """
 
+import ipaddress
 import json
 import os
 import random
@@ -118,13 +122,34 @@ class SubmitMeter:
     what the pool clears however many members are up; a fixed `per_min` (SUBMIT_PER_MIN) is a
     ceiling on it, never an override. Without a capacity, `per_min` alone is the refill (tests).
     Bounded: past MAX_CLIENTS addresses the stalest half is dropped, which can only ever be
-    generous."""
+    generous.
+
+    Audit v13 added two things. An address is a client KEY ([`client_key`]): an IPv6 address
+    counts as its /64, since one host holds the whole /64. And the refill is the smaller of SHARE
+    and an equal split of the capacity between the keys admitted in the last ACTIVE_SECS, so the
+    keys together are admitted about what the pool clears rather than SHARE each."""
 
     MAX_CLIENTS = 100_000
     DEFAULT_BURST = 2
     # Audit v12, VK-10: the old fixed 1 a minute let one address take ~85% of a two-member pool.
     # 0.3 of capacity plus the burst of 2 keeps one address to under a third of an hour's jobs.
     DEFAULT_SHARE = 0.3
+    # A key counts as active for this long after its last admitted submit.
+    ACTIVE_SECS = 600.0
+
+    @staticmethod
+    def client_key(address):
+        """What one client is: an IPv4 address; an IPv6 address's /64 (an IPv4-mapped one is its
+        IPv4 address); anything that does not parse, as given."""
+        try:
+            ip = ipaddress.ip_address(address.strip())
+        except (ValueError, AttributeError):
+            return address
+        if ip.version == 6:
+            if ip.ipv4_mapped is not None:
+                return str(ip.ipv4_mapped)
+            return str(ipaddress.ip_network((int(ip) >> 64 << 64, 64)))
+        return str(ip)
 
     def __init__(self, burst, per_min=None, share=DEFAULT_SHARE, capacity=None):
         if not 0 < share <= 1:
@@ -136,28 +161,53 @@ class SubmitMeter:
         self.share = float(share)
         self.capacity = capacity
         self.lock = threading.Lock()
-        self.buckets = {}  # address -> (tokens, last)
+        self.buckets = {}  # client key -> (tokens, last)
+        self.admitted = {}  # client key -> the time of its last admitted submit
+        self._active = (None, 0)  # (the second it was counted in, the count)
 
-    def rate_per_min(self):
-        """One address's refill now: SHARE of the measured capacity, capped by SUBMIT_PER_MIN."""
+    def _count_active(self, now):
+        # Under the lock. Counted at most once a second: the scan is over every admitted key.
+        second = int(now)
+        if self._active[0] != second:
+            horizon = now - self.ACTIVE_SECS
+            for key in [k for k, t in self.admitted.items() if t < horizon]:
+                del self.admitted[key]
+            self._active = (second, len(self.admitted))
+        return self._active[1]
+
+    def active(self, now=None):
+        """The client keys admitted a submit in the last ACTIVE_SECS."""
+        now = time.monotonic() if now is None else now
+        with self.lock:
+            return self._count_active(now)
+
+    def rate_per_min(self, active=1):
+        """One key's refill now: SHARE of the measured capacity or, when more than 1/SHARE keys
+        are active, an equal split of it between them; capped by SUBMIT_PER_MIN."""
         if self.capacity is None:
             return self.per_min
-        rate = self.share * self.capacity.jobs_per_min()
+        capacity = self.capacity.jobs_per_min()
+        rate = min(self.share * capacity, capacity / max(1, active))
         return rate if self.per_min is None else min(rate, self.per_min)
 
     def allow(self, address, now=None):
         now = time.monotonic() if now is None else now
-        rate = self.rate_per_min() / 60.0
+        key = self.client_key(address)
         with self.lock:
-            tokens, last = self.buckets.get(address, (self.burst, now))
+            # This key counts among the active ones while it is asking.
+            active = self._count_active(now) + (0 if key in self.admitted else 1)
+            rate = self.rate_per_min(active) / 60.0
+            tokens, last = self.buckets.get(key, (self.burst, now))
             tokens = min(self.burst, tokens + (now - last) * rate)
             if tokens < 1.0:
-                self.buckets[address] = (tokens, now)
+                self.buckets[key] = (tokens, now)
                 return False
-            self.buckets[address] = (tokens - 1.0, now)
+            self.buckets[key] = (tokens - 1.0, now)
+            self.admitted[key] = now
             if len(self.buckets) > self.MAX_CLIENTS:
                 for addr, _ in sorted(self.buckets.items(), key=lambda kv: kv[1][1])[: self.MAX_CLIENTS // 2]:
                     del self.buckets[addr]
+                    self.admitted.pop(addr, None)
             return True
 
 

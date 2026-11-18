@@ -421,6 +421,63 @@ class MemberRouteTest(unittest.TestCase):
         self.assertEqual(cap.live(), 1)
         self.assertAlmostEqual(cap.jobs_per_min(), router.PoolCapacity.DEFAULT_MEMBER_JOBS_PER_MIN)
 
+    def test_an_ipv6_slash_64_is_one_address(self):
+        # VK-10 (audit v13): a host holds a whole IPv6 /64, so metering each of its 2^64
+        # addresses apart metered nothing. One /64 is one client; another /64, an IPv4 address
+        # and an IPv4-mapped IPv6 address are their own.
+        key = router.SubmitMeter.client_key
+        self.assertEqual(key("2001:db8:1:2::1"), key("2001:db8:1:2:ffff:ffff:ffff:ffff"))
+        self.assertNotEqual(key("2001:db8:1:2::1"), key("2001:db8:1:3::1"))
+        self.assertEqual(key("::ffff:198.51.100.7"), key("198.51.100.7"))
+        self.assertNotEqual(key("198.51.100.7"), key("198.51.100.8"))
+        self.assertEqual(key("not an address"), "not an address")
+        m = router.SubmitMeter(burst=2, per_min=0)
+        self.assertTrue(m.allow("2001:db8:1:2::1", now=0.0))
+        self.assertTrue(m.allow("2001:db8:1:2::2", now=0.0))
+        for host in range(3, 200):
+            self.assertFalse(m.allow(f"2001:db8:1:2::{host:x}", now=0.0), "the /64's burst is spent")
+        self.assertTrue(m.allow("2001:db8:1:3::1", now=0.0), "another /64 has its own")
+        self.assertEqual(len(m.buckets), 2)
+
+    def test_many_active_addresses_share_the_capacity_between_them(self):
+        # VK-10 (audit v13): at a fixed 0.3 of capacity each, three addresses were admitted ~90%
+        # of what a two-member pool clears and six addresses 180%. The refill is now the smaller
+        # of SUBMIT_SHARE and an equal split between the addresses active in the last
+        # ACTIVE_SECS, so together they are admitted about what the pool clears, and any three of
+        # six get about half.
+        cap = router.PoolCapacity(lambda: 2)
+        m = router.SubmitMeter(router.SubmitMeter.DEFAULT_BURST, capacity=cap)
+        per_hour = cap.jobs_per_min() * 60
+        got = {a: 0 for a in ("a", "b", "c", "d", "e", "f")}
+        hours = 6
+        for t in range(0, 3600 * hours):
+            for a in got:
+                got[a] += m.allow(a, now=float(t))
+        total = sum(got.values())
+        bursts = len(got) * router.SubmitMeter.DEFAULT_BURST
+        self.assertLessEqual(total, per_hour * hours + bursts, "all six together: what the pool clears, plus their bursts")
+        self.assertGreaterEqual(total, 0.9 * per_hour * hours, "and the pool is not left idle")
+        three = got["a"] + got["b"] + got["c"]
+        self.assertLessEqual(three, 0.5 * per_hour * hours + 3 * router.SubmitMeter.DEFAULT_BURST)
+        # One address alone still gets SUBMIT_SHARE: the split only ever lowers the rate.
+        self.assertAlmostEqual(m.rate_per_min(active=1), router.SubmitMeter.DEFAULT_SHARE * cap.jobs_per_min())
+        self.assertAlmostEqual(m.rate_per_min(active=3), router.SubmitMeter.DEFAULT_SHARE * cap.jobs_per_min())
+        self.assertAlmostEqual(m.rate_per_min(active=6), cap.jobs_per_min() / 6)
+
+    def test_an_address_that_stops_submitting_stops_counting(self):
+        cap = router.PoolCapacity(lambda: 2)
+        m = router.SubmitMeter(router.SubmitMeter.DEFAULT_BURST, capacity=cap)
+        for a in range(10):
+            self.assertTrue(m.allow(f"198.51.100.{a}", now=0.0))
+        self.assertEqual(m.active(now=1.0), 10)
+        self.assertEqual(m.active(now=router.SubmitMeter.ACTIVE_SECS + 2.0), 0)
+        # A refused submit does not keep an address counted: only admissions do.
+        m2 = router.SubmitMeter(burst=1, per_min=0)
+        self.assertTrue(m2.allow("x", now=0.0))
+        for t in range(1, 2000, 50):
+            self.assertFalse(m2.allow("x", now=float(t)))
+        self.assertEqual(m2.active(now=router.SubmitMeter.ACTIVE_SECS + 2.0), 0)
+
     def test_the_meter_refills(self):
         m = router.SubmitMeter(burst=1, per_min=60)
         self.assertTrue(m.allow("x", now=0.0))

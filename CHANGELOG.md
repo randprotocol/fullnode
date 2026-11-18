@@ -12,6 +12,12 @@ stopped at v0.4 until 2026-09-30, when the entries v0.5 to v0.6.7 were written f
 
 ## Unreleased
 
+- **Prover pool router: an IPv6 /64 is one address, and active addresses split the capacity**
+  (VK-10, audit v13; `deploy/prover/router.py`, deploy only): the submit meter keys an IPv6
+  client on its /64, and when more than 1/`SUBMIT_SHARE` addresses were admitted a submit in the
+  last ten minutes each one's refill is an equal split of the pool's capacity instead of
+  `SUBMIT_SHARE` each. Three addresses alone still take about 90% (README). Needs a router roll.
+
 Core and node (issue #168, ZKVM-203; **genesis-gated, on no chain** — chain 21's genesis hash,
 wire, storage and behaviour are unchanged):
 
