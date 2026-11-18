@@ -500,6 +500,27 @@ own units. A row at zero does not exist, so an empty vault — and a program nob
 (`burn_r`, and `burn_a` of `burn_asset` when the transition's `inflow` is `deposit`) and leaves
 it as the notes the transition's `pays` name.
 
+### `rand_getBlockContext`
+Issue #168 (genesis-gated, on no chain; `docs/evm-block-context.md`). Params: `[height?]` — omitted
+or `null` is the newest closed block. Result:
+
+```json
+{ "enabled": true, "height": 4210, "timestamp": 1794960123, "timestamp_ms": 1794960123456,
+  "chain_id": 22, "basefee": "100", "has_randomness": false, "randomness": "00…00",
+  "window": 256, "oldest": 3955, "newest": 4210,
+  "context_version": 2, "offset": 11, "words": [4210, 0, 1794960123, 0, 22, 0, 100, 0, 0, …] }
+```
+
+What the chain defines about closed block `height` for an `invoke_at` that names it as its
+reference block: its time in seconds (and the header's milliseconds), the chain id, `basefee`
+(RAND units per gas the block's calls paid, a decimal string), and `words` — the 17 block words
+exactly as the ledger places them at words 11..28 of a version-2 invoke context, which a prover
+feeds its guest. `oldest`..`newest` are the heights served; `window` is genesis
+`program_state.reference_block_window`. `has_randomness` is always `false` today. A height
+outside `oldest..=newest` is `-32602` with the ledger's wording; before any block has closed,
+`-32001`. `{"enabled": false}` on a chain without the window (chain 21). Served from storage, as
+of the committed head. Public.
+
 ### `rand_getPerps`
 RPL-3 (perps; genesis-gated, `docs/perps.md`). Params: `[]`. Result, the exchange's public state as
 of the head — the genesis section, the proved root and height, the heights a next proof must
@@ -2076,6 +2097,20 @@ the proof's published digest against the one it computed before it submits anyth
 ## Changelog
 
 What changed for clients, in one place. Newest first.
+
+### Unreleased — block context: `rand_getBlockContext`, `InvokeAt` (tag 45) (genesis-gated; on no chain, chain 21 does not carry it)
+
+Additive (issue #168, `docs/evm-block-context.md`). A genesis
+`program_state.reference_block_window` lets an invoke name a recent closed block and read its
+time, the chain id and its gas price. New: `rand_getBlockContext` (public; `{"enabled": false}`
+without the window); `rand_getLimits.program_state.reference_block_window`, present only when set
+(chain 21's object is unchanged); the action `InvokeAt`, wire tag 45, an `Invoke`'s fields then
+`ref_height` (u64) — `tx_json` renders it as `"kind": "invoke_at"` with an `invoke`'s fields and
+`ref_height`. An `invoke` is unchanged on the wire and in `tx_json`. Refusals:
+`ReferenceBlockDisabled` (no window), `StaleReferenceBlock`, `FutureReferenceBlock` — none
+cached as permanent; a pooled `invoke_at` whose reference block left the window is evicted at the
+next tip. A wallet's public-note scan that keys on `"invoke"` does not see an `invoke_at`'s payout
+notes until it learns the kind.
 
 ### v0.8.3 — `faucet` means "this node can mint here" (node-only; issue #153)
 

@@ -322,4 +322,6 @@ lets the multisig auth guest verify up to three signatures inside tier 18 (85 83
 `research/docs/01-isa.md` (encodings, selectors, loader), `02-tables-and-buses.md` (every column
 and bus), `03-privacy.md` (what a proof leaks, the FRI profile), `04-guests.md` (the M4 plan),
 `05-roadmap.md` (milestones and deviations), `06-viewing-keys.md` (the note layer and the
-`bundle` relation); this repository's `docs/confidential.md` and `docs/shielded.md`.
+`bundle` relation); this repository's `docs/confidential.md` and `docs/shielded.md`. Block context for programs (the
+reference block an invoke may name, the public words a guest reads for `TIMESTAMP` / `NUMBER` /
+`BASEFEE`, and what is still to build in the guests): `docs/evm-block-context.md`.

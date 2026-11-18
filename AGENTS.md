@@ -6,6 +6,44 @@ invariants, and known traps.
 
 ## Project memory (state as of 2026-11-08)
 
+### Block context: the reference block (issue #168, ZKVM-203; 2026-11-18, branch `feat/i168-reference-block`, NOT pushed; genesis-gated, on no chain)
+
+The node half of #168; the guest half (the EVM opcodes reading the words) is circuits on
+constraint set 10 and waits for the chain-22 cut. Spec: `docs/evm-block-context.md`.
+
+- **Gate**: genesis `program_state.reference_block_window` (u64; 0 = off, serde-skipped; hash
+  `"program_state_reference_block_window"` ‖ be64, last, only when nonzero; 256..=4096; refused
+  without `bridge` or `perps`, i.e. unless `bounds_block_time()`). Ledger parameter
+  `reference_block_window`, restored by `reload_ledger` via
+  `Storage::restore_reference_block_window`.
+- **Carrier**: `Action::InvokeAt` — **tag 45, appended last**, an `Invoke`'s fields then
+  `ref_height`. Never add a field to `Invoke`/`Transition`: `tests/invoke_wire_pin.rs` pins an
+  `Invoke`'s bytes, txid, both bindings and v1 context at pre-change values. `Action::invoke()`
+  (`InvokeParts`) is what code that treats both forms alike reads; **a new `Action::Invoke { .. }`
+  match with a wildcard arm silently misses `InvokeAt`** — every such site was widened by hand
+  (core, node admission/mempool/rpc/storage/viewing, client lib/wallet).
+- **Context version 2** (`Transition::context_at`): v1's words 0..11 (word 0 = 2), then 17 block
+  words at 11..28 (`CTX_REF_HEIGHT` 11, `CTX_TIMESTAMP` 13 in seconds, `CTX_CHAIN_ID` 15,
+  `CTX_BASEFEE` 17, `CTX_HAS_RANDOMNESS` 19, `CTX_RANDOMNESS` 20..28, both zero), then v1's cells
+  and payouts. `basefee` = the live `gas_price` at the block's **start** (read in `close_block`
+  before the controller moves it).
+- **Ring**: `Ledger::block_facts` (`BlockFacts { height, timestamp_ms, basefee }`), recorded in
+  `close_block` only (**not** in `record_anchor` — a test fixture that ends a block with
+  `record_anchor` alone records no facts), inside `Ledger` equality, outside the state root.
+  Stored as `block-facts/` ‖ be64 rows in `CF_META` (no new column family), written at commit,
+  rewritten by `truncate_to`, compared by the replay audit. Nothing is written with the window off.
+- **`Ledger::invoke_segment` returns `Result<Option<_>>`**: `Err` when an `InvokeAt`'s block is
+  not held — callers must `?`, never fall back to a call segment. It is the one segment that
+  reads ledger state; the verify cache is keyed on the segment words, so it stays sound.
+- **Rules**: `Ledger::block_facts_at(h)` in `program_state::{validate, apply, still_applies}`.
+  Head: `h ≤ tip ∧ tip − h < window`; block `n`: `h < n ∧ n − h ≤ window`. Errors
+  `ReferenceBlockDisabled` / `StaleReferenceBlock` / `FutureReferenceBlock`, none `is_permanent`.
+- **RPC**: `rand_getBlockContext` (public; `{"enabled": false}` when off);
+  `rand_getLimits.program_state.reference_block_window` only when set; `tx_json` kind `invoke_at`.
+- **Not done**: circuits (READ_PUBLIC in evm-core/evm-rt/evm2rv, re-pin), wallet/CLI building an
+  `InvokeAt` (and its note scan learning `invoke_at`), a real-prover test,
+  `deploy/cut-chain22-genesis.sh` (see the branch's report). Stub executor only: no proof made.
+
 ### Aggregation's memory docs re-anchored (issue #119, AGG-E2E-2; 2026-11-18, branch `docs/i119-aggregation-memory`, docs only)
 
 `docs/node-hardware.md` §4 and `docs/aggregation.md` ("What is still open") now lead with the

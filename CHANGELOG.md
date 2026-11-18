@@ -12,6 +12,25 @@ stopped at v0.4 until 2026-09-30, when the entries v0.5 to v0.6.7 were written f
 
 ## Unreleased
 
+Core and node (issue #168, ZKVM-203; **genesis-gated, on no chain** — chain 21's genesis hash,
+wire, storage and behaviour are unchanged):
+
+- **Block context for invokes: the reference block.** Genesis
+  `program_state.reference_block_window` (0 or absent = off; 256..=4096; needs a `bridge` or
+  `perps` section, which bound block time; hashed last and only when nonzero). Under it a new
+  action, `InvokeAt` (wire tag 45: an `Invoke`'s fields, then `ref_height`), names a recent closed
+  block; its proof is made over context **version 2** — version 1 with 17 block words at fixed
+  offsets 11..28 (`ref_height`, time in seconds, chain id, the gas price the block's calls paid,
+  and a reserved randomness flag and value, zero) — which the ledger fills from its own ring of
+  the last `window` blocks' facts, recorded at each block's end beside the anchor and stored,
+  restored, audited and truncated with it. A reference block outside the window is refused by
+  name (`StaleReferenceBlock`, `FutureReferenceBlock`), and a pooled one is evicted when it
+  expires. RPC `rand_getBlockContext`; `rand-node genesis
+  --program-state-reference-block-window`. An ordinary `Invoke` is byte for byte what it was
+  (pinned in `crates/randprotocol-core/tests/invoke_wire_pin.rs`). The EVM guests still trap on
+  the block opcodes: reading these words is circuits work on constraint set 10, at the chain-22
+  cut. Spec: `docs/evm-block-context.md`.
+
 Node (issue #166, ZKVM-201; node-only, no wire, genesis or consensus change):
 
 - **A build of one constraint set no longer starts on, or truncates, a datadir of another.** A

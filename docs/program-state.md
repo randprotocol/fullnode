@@ -137,6 +137,11 @@ Rewriting or deleting a cell is free. `rand_estimateFee {"kind":"invoke", …}` 
 call proof publishes the panic sentinel in output 7 invalid (`ProgramPanicked`). Absent — chain
 21 and every chain before it — the old rule stands and the hash is unchanged.
 
+`"reference_block_window": 256` (optional, `--program-state-reference-block-window`; issue #168)
+lets an invoke of the form `InvokeAt` name a recent closed block and read its time, the chain id
+and its gas price through a version-2 context: `docs/evm-block-context.md`. Absent — chain 21 —
+no such invoke is admitted and the hash is unchanged.
+
 `rand-node genesis --program-state-cell-fee 10000000`. The section requires `tokens`, `gas`,
 `hardening_v6`, `hc_auth` and `confidential`; `cell_fee` is at most 1 000 RAND. It is bound into
 the genesis hash last (after issue #118's `proof_window_blocks` tag), and adds the program-state root
