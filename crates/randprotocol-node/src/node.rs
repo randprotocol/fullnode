@@ -9443,6 +9443,30 @@ mod tests {
         assert_eq!(reports(&sent), vec![libp2p::gossipsub::MessageAcceptance::Accept], "reported once");
     }
 
+    /// The beacon's prefilled form (`CompactProposalPrefilled`) on a chain **without** the
+    /// beacon: the bodies sent along are dropped unread — nothing is filed in the recent cache —
+    /// and the proposal is handled exactly as the plain compact form: parked, its missing body
+    /// fetched, reported once.
+    #[tokio::test]
+    async fn a_prefilled_body_is_not_kept_on_a_chain_without_the_beacon() {
+        let (_d, storage, gs, hs) = replica_past_a_boundary();
+        assert!(gs.ledger.beacon().is_none());
+        let head = storage.head_block().unwrap();
+        let (mut node, mut seen) = bare_node(storage, gs, hs);
+        let ledger = node.hs.tip_ledger().clone();
+        let tx = next_tx(&ledger, 1);
+        let block = block_on(&head, &ledger, &key(1), node.hs.view(), vec![tx.clone()]);
+        claiming_peer(&mut node, 4);
+
+        node.on_compact_proposal_prefilled(CompactBlock::of(&block), vec![tx.clone()], gossip_id()).await.unwrap();
+        assert!(node.recent_txs.get(&tx.hash()).is_none(), "the body that rode along was not kept");
+        assert!(!node.hs.has_block(&block.hash()), "not rebuilt from it");
+        assert_eq!(node.parked.len(), 1, "parked, as the plain form is");
+        let sent = drain(&mut seen).await;
+        assert!(!tx_fetches(&sent).is_empty(), "the body is fetched by hash");
+        assert_eq!(reports(&sent), vec![libp2p::gossipsub::MessageAcceptance::Accept], "reported once");
+    }
+
     /// Final review I6 (c): a compact proposal naming a body only the recent cache holds — not
     /// the pool — rebuilds from the cache alone and is handled with no fetch (spec 2026-10-08
     /// §5.2, §5.4).
