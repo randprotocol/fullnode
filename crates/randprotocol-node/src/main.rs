@@ -843,7 +843,9 @@ enum Cmd {
         /// `rand_sendTransaction` — no viewing-key methods, no `rand_mint`, no `rand_getPeers` —
         /// takes no batch and no WebSocket, and meters every caller together (behind a proxy
         /// they all arrive from one address, and that address is loopback, which `--rpc` trusts).
-        #[arg(long)]
+        /// Also read from `RAND_NODE_PUBLIC_RPC`, so a systemd drop-in can turn it on without
+        /// rewriting `ExecStart` (`deploy/systemd/rand-node.service.d/60-public-rpc.conf`).
+        #[arg(long, env = "RAND_NODE_PUBLIC_RPC")]
         public_rpc: Option<SocketAddr>,
         /// Require a bearer token on the viewing-key methods of `--rpc`: the first line of this
         /// file, at least 32 characters, sent by the explorer as `Authorization: Bearer <token>`.
@@ -4657,6 +4659,39 @@ mod tests {
         }
         assert_eq!(parse_state_proof_tier("18"), Ok(18));
         assert!(parse_state_proof_tier("17").unwrap_err().contains("10, 12, 14, 16, 18, 20"));
+    }
+
+    /// VK-2 (monorepo#17): the public listener can be turned on from the environment, which is
+    /// what the committed drop-in does — the same variable, the same loopback address, and no
+    /// other setting — so it works on any unit without rewriting `ExecStart`. The flag still
+    /// works and nothing is listened on without one of them.
+    #[test]
+    fn the_committed_drop_in_turns_the_public_listener_on_through_the_environment() {
+        use clap::CommandFactory;
+        let cmd = Cli::command();
+        let run = cmd.find_subcommand("run").expect("run");
+        let arg = run.get_arguments().find(|a| a.get_id() == "public_rpc").expect("--public-rpc");
+        assert_eq!(arg.get_env().and_then(|v| v.to_str()), Some("RAND_NODE_PUBLIC_RPC"));
+        assert_eq!(arg.get_long(), Some("public-rpc"));
+
+        let dropin = include_str!("../../../deploy/systemd/rand-node.service.d/60-public-rpc.conf");
+        let set: Vec<&str> = dropin.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')).collect();
+        assert_eq!(set, ["[Service]", "Environment=RAND_NODE_PUBLIC_RPC=127.0.0.1:8546"], "the drop-in sets the one variable and nothing else");
+        let addr = set[1].rsplit('=').next().unwrap();
+        assert!(addr.parse::<SocketAddr>().expect("an address the flag parses").ip().is_loopback(), "loopback only: the proxy or tunnel is what faces the Internet");
+
+        // The flag itself, as before; without it (and without the variable) no public listener.
+        let parsed = |extra: &[&str]| {
+            let args = ["rand-node", "run", "--datadir", "d", "--key", "k.json"].into_iter().chain(extra.iter().copied());
+            match Cli::try_parse_from(args).map(|c| c.cmd) {
+                Ok(Cmd::Run { public_rpc, .. }) => public_rpc,
+                _ => unreachable!("a run"),
+            }
+        };
+        assert_eq!(parsed(&["--public-rpc", "127.0.0.1:8546"]), Some("127.0.0.1:8546".parse().unwrap()));
+        if std::env::var_os("RAND_NODE_PUBLIC_RPC").is_none() {
+            assert_eq!(parsed(&[]), None);
+        }
     }
 
     /// Audit v12, PRIV-601: a node publishes its transactions on the anonymous lane only unless
