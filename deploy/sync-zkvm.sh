@@ -247,6 +247,9 @@
 set -euo pipefail
 SRC=${1:-../circuits/research}
 DST=crates/randprotocol-zkvm
+# Issue #166: the vendored zkVM's constraint set before anything is copied; the script's last
+# step prints it beside the one after and fails if the node's BUILD_CONSTRAINT_SET was left behind.
+CS_BEFORE=$(sed -n 's/^pub const CONSTRAINT_SET: u32 = \([0-9][0-9]*\);.*$/\1/p' "$DST/src/machine.rs" 2>/dev/null || true)
 mkdir -p "$DST/src" "$DST/tests"
 rsync -a --delete --exclude target --exclude .git --exclude Cargo.lock --exclude rust-toolchain.toml \
       --exclude executor.rs --exclude codec.rs --exclude guests.rs --exclude asm.rs \
@@ -753,3 +756,8 @@ PY
 sed -i '' 's|crates/shrugg-zkvm/tests/backend.rs|crates/randprotocol-zkvm/tests/backend.rs|' "$RVM_DST/tests/backend.rs"
 RVM_REV=$(git -C "$RVM_SRC" rev-parse --short HEAD 2>/dev/null || echo unknown)
 echo "synced recursion VM from $RVM_SRC at $RVM_REV (pin $RVM_REV) into $RVM_DST"
+# Issue #166 (ZKVM-201), last so that everything above is in place when it speaks: the constraint
+# set before and after, and a non-zero exit when the vendored zkVM's number is no longer the
+# node's BUILD_CONSTRAINT_SET. A sync that moved the constraint set is a chain cut, not a
+# re-vendor: `deploy/check-constraint-set.sh` says what has to change with it.
+deploy/check-constraint-set.sh --before "${CS_BEFORE:-unknown}"

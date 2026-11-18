@@ -12,6 +12,26 @@ stopped at v0.4 until 2026-09-30, when the entries v0.5 to v0.6.7 were written f
 
 ## Unreleased
 
+Node (issue #166, ZKVM-201; node-only, no wire, genesis or consensus change):
+
+- **A build of one constraint set no longer starts on, or truncates, a datadir of another.** A
+  genesis records no constraint set, so a re-vendored binary that still carried the chain's guests
+  passed `check_build_runs_genesis`, read every proof in the chain's history as a corrupt block
+  at its startup walk, and truncated the chain (`run` did this itself; `verify --repair` too).
+  Now: `BUILD_CONSTRAINT_SET` is held to the vendored zkVM's `CONSTRAINT_SET` at compile time;
+  `constraint_set::CHAIN_CONSTRAINT_SETS` lists chains 14-21 by genesis hash with the set each
+  was cut under, and a listed chain of another set is refused by name with both numbers; and
+  `init` and `run` write `<datadir>/constraint-set` (one number), which `run`, `verify`,
+  `verify --repair` and `init` read before the database is opened — a datadir of another set is
+  refused and left byte-identical. A datadir with a database, no marker and an unlisted genesis
+  (a devnet from before this release) still starts, but a walk that finds a problem there is an
+  error instead of a truncation until the marker exists; a clean walk writes it. Chain-21 hosts
+  need nothing: the table covers them and the first start writes the marker.
+  **Operators: `constraint-set` is part of the datadir** — copy it with `genesis.json` and `db/`.
+- **`deploy/sync-zkvm.sh` ends on `deploy/check-constraint-set.sh`**: it prints the vendored
+  `CONSTRAINT_SET` before and after the sync and exits non-zero when the node's number was left
+  behind. CI's `guest-provenance` job runs the same script against circuits at `CIRCUITS_PIN`.
+
 Node, wallet and viewing (audit v14 addendum rows; node-local policy and client-side reading only: no wire, storage-format or consensus change):
 
 - **CON-701, the first minute** (Medium, was Partial): without `--max-state-proof-tier` a node

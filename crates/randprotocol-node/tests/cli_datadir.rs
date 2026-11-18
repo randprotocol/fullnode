@@ -436,3 +436,138 @@ fn verify_refuses_a_genesis_naming_another_builds_multisig_guest() {
         assert!(!v.out.contains("CORRUPT") && !v.out.contains("repaired"), "{}", v.out);
     }
 }
+
+// --- Issue #166 (ZKVM-201): the datadir's constraint-set marker ---
+
+/// This build's constraint set, as the marker file holds it.
+fn build_set() -> u32 {
+    randprotocol_node::node::BUILD_CONSTRAINT_SET
+}
+
+/// Every path and byte under `dir`, so "nothing was written" is an equality.
+fn tree(dir: &Path) -> Vec<(std::path::PathBuf, Vec<u8>)> {
+    let mut out = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        for e in std::fs::read_dir(&d).unwrap() {
+            let p = e.unwrap().path();
+            if p.is_dir() {
+                out.push((p.clone(), Vec::new()));
+                stack.push(p);
+            } else {
+                out.push((p.clone(), std::fs::read(&p).unwrap()));
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+fn run_args<'a>(d: &'a str, key: &'a str) -> [&'a str; 12] {
+    ["run", "--datadir", d, "--key", key, "--listen", "/ip4/127.0.0.1/tcp/0", "--rpc", "127.0.0.1:0", "--no-mdns", "--min-free-disk-mb", "0"]
+}
+
+fn keyfile(dir: &Path) -> std::path::PathBuf {
+    let key = dir.join("node-key.json");
+    let r = node(&["keygen", "--out", key.to_str().unwrap()]);
+    assert!(r.ok, "{}", r.err);
+    key
+}
+
+/// Start `rand-node run` and wait for `<datadir>/constraint-set` to hold this build's set, then
+/// stop the node. Panics with the node's output if it exits or the marker never appears.
+fn run_until_marked(d: &Path, key: &Path) {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_rand-node"))
+        .args(run_args(d.to_str().unwrap(), key.to_str().unwrap()))
+        .env("RAND_ALLOW_TEST_FRI_PROFILE", "1")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("rand-node runs");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    let marker = d.join("constraint-set");
+    let marked = loop {
+        if std::fs::read_to_string(&marker).ok().as_deref() == Some(format!("{}\n", build_set()).as_str()) {
+            break true;
+        }
+        if child.try_wait().unwrap().is_some() || std::time::Instant::now() > deadline {
+            break false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    };
+    let _ = child.kill();
+    let out = child.wait_with_output().unwrap();
+    assert!(marked, "no marker at {}: {}", marker.display(), String::from_utf8_lossy(&out.stderr));
+}
+
+/// `init` writes the marker beside the genesis and the database: one line, this build's set.
+#[test]
+fn init_marks_the_datadir_with_this_builds_constraint_set() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = init(dir.path());
+    assert_eq!(std::fs::read_to_string(data.join("constraint-set")).unwrap(), format!("{}\n", build_set()));
+    let r = node(&["verify", "--datadir", data.to_str().unwrap()]);
+    assert!(r.ok, "{}{}", r.out, r.err);
+}
+
+/// The issue's acceptance test: this build (constraint set N) on a datadir made under N−1.
+/// `run`, `verify`, `verify --repair` and a second `init` each refuse, name both numbers, report
+/// neither CORRUPT nor repaired — and leave every byte of the datadir as it was.
+#[test]
+fn a_datadir_of_another_constraint_set_is_refused_by_run_verify_repair_and_init_untouched() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = init(dir.path());
+    let d = data.to_str().unwrap();
+    let key = keyfile(dir.path());
+    let other = build_set() - 1;
+    std::fs::write(data.join("constraint-set"), format!("{other}\n")).unwrap();
+    let before = tree(&data);
+    let genesis = dir.path().join("genesis.json");
+    let commands: [(&str, Vec<&str>); 4] = [
+        ("run", run_args(d, key.to_str().unwrap()).to_vec()),
+        ("verify", vec!["verify", "--datadir", d]),
+        ("verify --repair", vec!["verify", "--datadir", d, "--repair"]),
+        ("init", vec!["init", "--datadir", d, "--genesis", genesis.to_str().unwrap()]),
+    ];
+    for (name, args) in commands {
+        let r = node(&args);
+        assert!(!r.ok, "{name} must refuse: {}{}", r.out, r.err);
+        assert!(
+            r.err.contains(&format!("written under constraint set {other}"))
+                && r.err.contains(&format!("this build is constraint set {}", build_set()))
+                && r.err.contains("Nothing was written"),
+            "{name}: {}",
+            r.err
+        );
+        assert!(!r.out.contains("CORRUPT") && !r.out.contains("repaired"), "{name}: {}", r.out);
+        assert_eq!(tree(&data), before, "{name} left the datadir byte-identical");
+    }
+    // A marker that is not a number is refused too, and not rewritten.
+    std::fs::write(data.join("constraint-set"), "nine\n").unwrap();
+    let r = node(&["verify", "--datadir", d, "--repair"]);
+    assert!(!r.ok && r.err.contains("is not a constraint-set number"), "{}", r.err);
+    assert_eq!(std::fs::read_to_string(data.join("constraint-set")).unwrap(), "nine\n");
+}
+
+/// `run` on a datadir that has only a genesis file (no `init`, no database) writes the marker;
+/// and on a datadir with a database, no marker and an unlisted genesis — a devnet from before the
+/// marker — it writes it once its startup walk has verified the chain. `verify` never writes it.
+#[test]
+fn run_marks_a_new_datadir_and_an_unmarked_one_it_has_verified() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = keyfile(dir.path());
+    let genesis = make_genesis(dir.path());
+    let fresh = dir.path().join("fresh");
+    std::fs::create_dir_all(&fresh).unwrap();
+    std::fs::copy(&genesis, fresh.join("genesis.json")).unwrap();
+    run_until_marked(&fresh, &key);
+
+    let old = dir.path().join("data");
+    let r = node(&["init", "--datadir", old.to_str().unwrap(), "--genesis", genesis.to_str().unwrap()]);
+    assert!(r.ok, "{}", r.err);
+    std::fs::remove_file(old.join("constraint-set")).unwrap();
+    let v = node(&["verify", "--datadir", old.to_str().unwrap()]);
+    assert!(v.ok, "an unmarked datadir of an unlisted chain still verifies: {}{}", v.out, v.err);
+    assert!(!old.join("constraint-set").exists(), "verify never writes the marker");
+    run_until_marked(&old, &key);
+}

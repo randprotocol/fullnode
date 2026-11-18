@@ -374,6 +374,18 @@ Creates `<datadir>/db` (RocksDB) with block 0, the deposit notes as the tree's f
 the validator register. Re-running with the same genesis is a no-op; a different genesis is
 refused.
 
+It also writes `<datadir>/constraint-set`: one line, the constraint set this build proves and
+verifies under (issue #166). `run`, `verify` and `init` read it before they open the database
+and refuse a datadir written under another set, naming both numbers and writing nothing — a
+build of another constraint set verifies none of the chain's proofs and would otherwise truncate
+its history as corrupt. `run` writes the file itself on a datadir that has none when the genesis
+is a chain the build lists under its own set (every chain-21 datadir) or the datadir has no
+database yet. A datadir with a database, no file and an unlisted genesis starts, but is never
+truncated — at startup or by `verify --repair` — until the file exists: a clean startup walk
+writes it, or the operator does (`echo <n> > <datadir>/constraint-set`) when they know which
+release wrote the datadir. The node never rewrites a file that is there. Copy it with
+`genesis.json` and `db/` when a datadir is moved or restored.
+
 **A v0.4 genesis needs a v0.4 binary on every node before `init`.** A build older than the
 `max_program_words` field does not refuse a file that sets it: the genesis parser ignores fields
 it does not know, so it silently drops the cap, builds the no-cap chain's genesis hash and ledger,
