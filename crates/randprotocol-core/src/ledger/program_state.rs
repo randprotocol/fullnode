@@ -252,9 +252,8 @@ impl BlockFacts {
         }
         if let Some(r) = &self.randomness {
             w[CTX_HAS_RANDOMNESS - CONTEXT_HEADER_WORDS] = 1;
-            for (i, chunk) in r.chunks_exact(4).enumerate() {
-                w[CTX_RANDOMNESS - CONTEXT_HEADER_WORDS + i] = u32::from_le_bytes(chunk.try_into().expect("four bytes"));
-            }
+            let words = crate::notes::word8_from_bytes(r).expect("32 bytes are a Word8");
+            w[CTX_RANDOMNESS - CONTEXT_HEADER_WORDS..][..8].copy_from_slice(&words);
         }
         w
     }

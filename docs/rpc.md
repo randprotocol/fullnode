@@ -516,10 +516,33 @@ reference block: its time in seconds (and the header's milliseconds), the chain 
 (RAND units per gas the block's calls paid, a decimal string), and `words` — the 17 block words
 exactly as the ledger places them at words 11..28 of a version-2 invoke context, which a prover
 feeds its guest. `oldest`..`newest` are the heights served; `window` is genesis
-`program_state.reference_block_window`. `has_randomness` is always `false` today. A height
+`program_state.reference_block_window`. `has_randomness` is `true`, and `randomness` the beacon's
+32 bytes after that block's reveal, on a chain with the genesis `beacon` section
+(`rand_getBeacon`); `false` and zeros on every other. A height
 outside `oldest..=newest` is `-32602` with the ledger's wording; before any block has closed,
 `-32001`. `{"enabled": false}` on a chain without the window (chain 21). Served from storage, as
 of the committed head. Public.
+
+### `rand_getBeacon`
+The randomness beacon (genesis-gated, on no chain; `docs/evm-block-context.md` §11). Params:
+`[validator?]` — an address (base58) for that validator's row alone; omitted or `null` for all.
+Result, as of the committed head:
+
+```json
+{ "enabled": true, "height": 4210, "value": "<64 hex>", "commit_delay_blocks": 256,
+  "validators": [{ "validator": "<address>", "commitment": "<64 hex>" , "nonce": 0,
+                   "pending": null, "due": "<64 hex>" }] }
+```
+
+`value` is the beacon after block `height`'s reveal (the genesis value at height 0). Per
+validator: `commitment`, the one its next reveal must open (`null` for a validator that joined
+after genesis and whose first commit is still pending); `nonce`, its last `BeaconCommit`'s (the
+next carries `nonce + 1`); `pending`, `null` or `{ "activates_at": <height>, "commitment": "<64
+hex>" }`; `due`, the commitment a block by this validator at `height + 1` must open (the pending
+one once it is due), `null` if it has none in force — that validator misses its slots. A
+validator with no row is absent (`"validators": []` when one was asked for). A string that is no
+address is `-32602`. `{"enabled": false}` on a chain without the section (chain 21). Public.
+Consumers: `rand-node beacon status` / `recommit`.
 
 ### `rand_getPerps`
 RPL-3 (perps; genesis-gated, `docs/perps.md`). Params: `[]`. Result, the exchange's public state as
@@ -2097,6 +2120,19 @@ the proof's published digest against the one it computed before it submits anyth
 ## Changelog
 
 What changed for clients, in one place. Newest first.
+
+### Unreleased — the randomness beacon: `rand_getBeacon`, `BeaconReveal` (46), `BeaconCommit` (47) (genesis-gated; on no chain, chain 21 does not carry it)
+
+Additive (`docs/evm-block-context.md` §11). Under a genesis `beacon` section every block's first
+transaction is its proposer's `BeaconReveal` — an indexer on such a chain sees one more
+transaction per block, bundle-less, `"kind": "beacon_reveal"` with `reveal` (64 hex) — and a
+validator registers a new commitment with `BeaconCommit`, `"kind": "beacon_commit"` with
+`validator`, `commitment`, `nonce`. New: `rand_getBeacon` (public; `{"enabled": false}` without
+the section); `rand_getLimits.program_state.beacon_commit_delay_blocks`, present only on a
+beacon chain (chain 21's object is unchanged); `rand_getBlockContext`'s `has_randomness` /
+`randomness` and its words 8..17 carry the block's value there. A `BeaconReveal` sent as a
+transaction is always refused. On the gossip wire a beacon chain's proposals are
+`CompactProposalPrefilled` (variant 5); other chains' frames are unchanged.
 
 ### Unreleased — block context: `rand_getBlockContext`, `InvokeAt` (tag 45) (genesis-gated; on no chain, chain 21 does not carry it)
 

@@ -6,6 +6,59 @@ invariants, and known traps.
 
 ## Project memory (state as of 2026-11-08)
 
+### The randomness beacon (2026-11-18, branch `feat/randomness-beacon` stacked on `feat/i168-reference-block`, NOT pushed; genesis-gated, on no chain)
+
+Spec and operator notes: `docs/evm-block-context.md` §11. Stub executor only: nothing proved.
+
+- **Gate**: genesis `beacon { commit_delay_blocks, commitments[] }` (`Option`, serde-skipped,
+  **last field**; hash `"beacon"` ‖ be64(delay) ‖ (address ‖ c)* in file order, last, only when
+  present). Must list every genesis validator once and nobody else; **refused without
+  `program_state.reference_block_window`**. `Ledger::beacon: Option<BeaconState>` is the gate
+  everywhere (`ledger/beacon.rs`).
+- **Chain 21 is pinned at pre-change values** (taken on `9d9e8473`):
+  `tests/beacon_gate_off_pin.rs` (a header's bytes and hash, tags 44/45) and
+  `node::tests::chain_21_is_byte_for_byte_what_it_was_before_the_beacon` (genesis header, state
+  roots after three empty blocks, block 1's header). If either moves, the change is a fork of
+  chain 21. The core test cannot build chain 21's genesis: the stub executor hashes notes
+  differently (`NoteCommitmentMismatch`) — that is why the chain-21 half lives in the node.
+- **Carrier**: `Action::BeaconReveal { reveal }` **tag 46**, `Action::BeaconCommit { validator,
+  commitment, nonce, signature }` **tag 47**, appended after `InvokeAt`. Not a header field (the
+  header is embedded positionally in `Block`, `CompactBlock`, `SignedHeader`).
+- **A reveal is applied in exactly one place**: `Ledger::apply_block_reveal`, called by
+  `apply_transactions_for_sync` for `txs[0]` (which then **skips index 0** in its loop) and by
+  `HotStuff::propose`. The generic `validate_inner` / `apply_validated` arms **always refuse** a
+  reveal (`beacon::refuse_reveal`), which is what keeps it out of the pool, RPC and later
+  indexes. Do not "fix" that arm to apply it. `apply_transactions(&[])` on a beacon ledger is
+  `MissingBeaconReveal` — a test fixture that closes blocks by hand must put a reveal first
+  (`storage::fixtures::beacon_next`, the Sim's `with_beacon`).
+- **`propose`**: the reveal is applied before `base` is cloned and inserted at `txs[0]` after the
+  candidate loop — the half-apply replay iterates `txs` through `apply_tx`, which would refuse a
+  reveal. Candidates are cut to `MAX_BLOCK_TXS − 1` and `max_block_bytes − 45` (the pool offers
+  the full caps). No commitment in force or no seed → `NotReady` (a `warn!`), the view times out.
+- **Promotion happens at the validator's own block**, not at the activation height: `pending`
+  stays set until that validator next proposes. `BeaconEntry::due_commitment(height)` is the one
+  reader that accounts for it — use it, not `commitment`.
+- **Root / store**: outermost wrapper `rand-state-beacon-1` after the price wrapper;
+  `META_BEACON = "beacon"` in `CF_META`, `put_beacon` is a **no-op (not a delete) on `None`**;
+  `load_ledger` reads no beacon — `Storage::restore_beacon` does, under the genesis section, from
+  `reload_ledger` and `verify_chain`, and overrides `commit_delay_blocks` from the file. A beacon
+  chain whose row is missing does not load. `BlockFacts` gained `randomness: Option<[u8; 32]>`
+  (its bincode row changed; it was on no chain).
+- **Node**: `src/beacon.rs` — `beacon.seed.json` (0600, chain id + address + seeds, newest
+  last) and `SeedSource` (`RevealSource`), which re-reads the file when its mtime/length changes
+  and remembers the last commitment it could not open. `HotStuff::set_reveal_source` does **not**
+  ride a `resume` — it is set again beside `set_covered_source` (`Node::beacon_seeds`). A missing
+  seed is an error log, **not** a refusal to start (design §5 said refuse; a refused validator
+  cannot vote).
+- **Gossip**: `GossipMessage::CompactProposalPrefilled` (variant 5, appended), sent only when
+  `gs.ledger.beacon().is_some()`; the receiver files the body in `recent_txs` only after the
+  pre-screen, only a reveal, only if it is `tx_hashes[0]`.
+- **Pool**: `BeaconCommit` claims `(validator, nonce)` under role 11 and ranks with governance;
+  `admission::is_permanent` caches `RevealOutsideBlockHead` and `BadSignature`.
+- **Not done**: circuits (`PREVRANDAO` reading words 19–27), a real-prover test,
+  `deploy/cut-chain22-genesis.sh` (it carries neither the window nor the beacon),
+  `deploy/fleet-watch.sh` alerts, entry removal for validators that left the register.
+
 ### Block context: the reference block (issue #168, ZKVM-203; 2026-11-18, branch `feat/i168-reference-block`, NOT pushed; genesis-gated, on no chain)
 
 The node half of #168; the guest half (the EVM opcodes reading the words) is circuits on

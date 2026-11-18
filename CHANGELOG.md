@@ -12,6 +12,28 @@ stopped at v0.4 until 2026-09-30, when the entries v0.5 to v0.6.7 were written f
 
 ## Unreleased
 
+Core and node (**genesis-gated, on no chain** — chain 21's genesis hash, header and block bytes,
+state root, wire tags 0–45 and store rows are unchanged, pinned at values taken before the
+change):
+
+- **The randomness beacon (PREVRANDAO).** Genesis `beacon` (a commit delay and one hash-chain
+  commitment per genesis validator; hashed last, only when present; needs
+  `program_state.reference_block_window`). Each validator commits to `L^N(seed)`; every block
+  opens with its proposer's `BeaconReveal` (wire tag 46), the preimage of its commitment, and
+  `beacon(n) = H(beacon(n−1) ‖ reveal ‖ n)`. A validator registers a new commitment with
+  `BeaconCommit` (tag 47), in force `commit_delay_blocks` later — a delay the proposal did not
+  have, without which two colluding consecutive leaders could grind a fresh seed. A validator
+  that cannot reveal misses its slots and keeps voting; nothing is slashed. The state is under a
+  new outermost root wrapper (`rand-state-beacon-1`) and in one store row, both only under the
+  section. A reference block's context words 19–27 carry the value. Node: the seed file
+  `<datadir>/beacon.seed.json` (0600; **never copy it between hosts**), `rand-node beacon
+  init|commitment|recommit|status`, `rand-node genesis --beacon-commitment`, RPC
+  `rand_getBeacon`, and a prefilled compact proposal so the reveal costs no fetch. Same trust
+  level as Ethereum's `PREVRANDAO` — one bit of withholding per slot — and a contract must pin
+  `target = NUMBER + k` at bet time or the prover re-rolls across the window: `docs/
+  evm-block-context.md` §11.4. The guest's `PREVRANDAO` read waits for the constraint-set-10
+  re-vendor; `deploy/cut-chain22-genesis.sh` does not carry the section yet.
+
 Core and node (issue #168, ZKVM-203; **genesis-gated, on no chain** — chain 21's genesis hash,
 wire, storage and behaviour are unchanged):
 
