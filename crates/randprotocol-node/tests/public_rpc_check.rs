@@ -58,9 +58,8 @@ async fn the_check_passes_on_the_public_listener_and_fails_on_the_operator_one()
     let public = format!("http://{}", handle.public_rpc_addr.expect("the public listener is up"));
     let operator = format!("http://{}", handle.rpc_addr);
 
-    let (public_url, operator_url) = (public.clone(), operator.clone());
     let (on_public, on_operator, through_proxy_flag) = tokio::task::spawn_blocking(move || {
-        (check(&["--url", &public_url]), check(&["--url", &operator_url]), check(&["--behind-proxy", "--url", &operator_url]))
+        (check(&["--url", &public]), check(&["--url", &operator]), check(&["--behind-proxy", "--url", &operator]))
     })
     .await
     .unwrap();
