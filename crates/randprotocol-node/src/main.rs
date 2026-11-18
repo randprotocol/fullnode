@@ -4782,6 +4782,45 @@ mod tests {
     use super::*;
     use randprotocol_core::ledger::staking::MIN_STAKE;
 
+    /// `rand-node beacon` (genesis `beacon`): the four subcommands parse with their defaults;
+    /// `init` writes the seed file for the key's validator and refuses a second time; and
+    /// `commitment` reads it back. `genesis` takes the commitments and the delay (its refusals
+    /// are in `tests/genesis_cli.rs`).
+    #[tokio::test]
+    async fn the_beacon_commands_parse_and_init_writes_the_seed_file_once() {
+        use randprotocol_core::ledger::beacon::DEFAULT_SEED_LINKS;
+        use randprotocol_node::beacon::{seed_path, SeedFile};
+        let dir = tempfile::tempdir().unwrap();
+        let key = dir.path().join("node.key.json");
+        let kp = Keypair::from_seed([3; 32]).unwrap();
+        KeyFile::from_keypair(&kp).write_new(&key).unwrap();
+        let (d, k) = (dir.path().to_str().unwrap(), key.to_str().unwrap());
+        let beacon = |args: &[&str]| match Cli::try_parse_from([&["rand-node", "beacon"], args].concat()).unwrap().cmd {
+            Cmd::Beacon { cmd } => cmd,
+            _ => unreachable!(),
+        };
+        beacon_cmd(beacon(&["init", "--datadir", d, "--key", k, "--chain-id", "22", "--links", "32"])).await.unwrap();
+        let file = SeedFile::read(&seed_path(dir.path())).unwrap();
+        assert_eq!((file.chain_id, file.validator().unwrap(), file.seeds.len(), file.seeds[0].links), (22, kp.address(), 1, 32));
+        let again = beacon_cmd(beacon(&["init", "--datadir", d, "--key", k, "--chain-id", "22"])).await.unwrap_err();
+        assert!(format!("{again:#}").contains("refusing to overwrite"), "{again:#}");
+        assert_eq!(SeedFile::read(&seed_path(dir.path())).unwrap(), file, "the refused init left the file alone");
+        beacon_cmd(beacon(&["commitment", "--datadir", d])).await.unwrap();
+        assert!(beacon_cmd(beacon(&["commitment", "--datadir", dir.path().join("none").to_str().unwrap()])).await.is_err());
+        // Defaults: the tools' chain length, the local RPC, waiting for the commit.
+        assert!(matches!(beacon(&["init", "--datadir", d, "--key", k, "--chain-id", "1"]), BeaconCmd::Init { links: DEFAULT_SEED_LINKS, .. }));
+        let BeaconCmd::Recommit { links, staking, .. } = beacon(&["recommit", "--datadir", d, "--key", k]) else { panic!("recommit") };
+        assert_eq!((links, staking.rpc.as_str(), staking.no_wait), (DEFAULT_SEED_LINKS, "http://127.0.0.1:8545", false));
+        assert!(matches!(beacon(&["status", "--datadir", d]), BeaconCmd::Status { .. }));
+        assert!(Cli::try_parse_from(["rand-node", "beacon", "init", "--datadir", d]).is_err(), "init needs the key and the chain id");
+
+        // `genesis`: the flags.
+        let c = format!("{}={}", kp.address().to_base58(), file.seeds[0].commitment);
+        let parsed = Cli::try_parse_from(["rand-node", "genesis", "--validator", "k,1000,p", "--beacon-commitment", &c, "--beacon-commit-delay-blocks", "300"]).unwrap();
+        let Cmd::Genesis { beacon_commitments, beacon_commit_delay_blocks, .. } = parsed.cmd else { panic!("genesis") };
+        assert_eq!((beacon_commitments, beacon_commit_delay_blocks), (vec![c.clone()], Some(300)));
+    }
+
     /// Issue #60: every subcommand that opens RocksDB raises the open-files limit first — not
     /// only `run`, whose `node::start` did it since #41. `verify --repair` is the one that
     /// matters most: it runs by hand, under a login shell's limit, on a node already in trouble.
