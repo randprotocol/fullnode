@@ -130,10 +130,10 @@ jobs:
         working-directory: fullnode
         run: |
           SELFTEST=1 bash deploy/lib/unit-limits.sh
-          SELFTEST=1 bash deploy/lib/fleet-env.sh
-          SELFTEST=1 bash deploy/roll-fleet.sh
           SELFTEST=1 bash deploy/lib/verify-release.sh
           SELFTEST=1 bash deploy/sign-release.sh
+          SELFTEST=1 bash deploy/lib/fleet-env.sh
+          SELFTEST=1 bash deploy/roll-fleet.sh
       # VK-10: the prover pool router's tests (stdlib only).
       - name: The prover pool router
         working-directory: fullnode/deploy/prover
