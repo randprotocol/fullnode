@@ -330,9 +330,10 @@ endpoint and the registered aggregator key.
 | `--layout <flat\|tree>` | `flat` | `tree` (tree aggregation, `docs/aggregation.md` §3.8): read the chain's `aggregation_tree` section from `rand_status.aggregation.tree` once at start, refuse to run unless this build reproduces every pin (`check_tree_pins`), then each pass takes `L·2^d` covers for the largest `d ≤ max_depth` the unsealed list fills (nothing below `2L`), proves the whole tree on this host (`2^(d+1) − 1` rVM proofs, tier 21 at production) and signs under the tree domain. Refused at start on a chain without the section |
 
 One pass polls `rand_getUnsealed`, fetches up to `max_covers` raw bundles with
-`rand_getRawTransaction`, proves one rVM aggregate over them (CPU; the test profile lands at
-tier 18, production at 20 since the phase-2 row cuts — minutes and tens to hundreds of GB on
-this tree, `docs/node-hardware.md` §4 — so run it on the proof batch machine), seals the payment note (subsidy at the current schedule index plus the covered
+`rand_getRawTransaction`, proves one rVM aggregate over them (CPU; on the build vendored today the test profile lands at rVM
+tier 18 and production N = 1 at tier 18 too, N = 2 at 19 — minutes, and a peak that is
+projected, not measured, at production: ≈ 32–75 GB for N = 1, `docs/node-hardware.md` §4 — so
+run it on the proof batch machine), seals the payment note (subsidy at the current schedule index plus the covered
 bundles' proving shares) to the register's payout address, signs and submits. `rand_status`'s
 `aggregation` section carries the chain parameters the payment is computed from. Under the
 genesis `fees.usd_subsidy` the schedule is read from the node, not derived here: while

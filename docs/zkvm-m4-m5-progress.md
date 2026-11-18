@@ -118,5 +118,10 @@ daemon, and the chain-9 genesis cut. Chain 8 is unaffected (a chain without
 | 9–10 | PTX first build + bring-up; production N re-measurement | the fleet GPU node |
 | 11 | self-verifier end-to-end | est. tier 22 / ≥ 128 GB |
 
+The classes in rows 3–8 are September's estimates, from the 48.6 GB oracle; the constraint-set-8
+runs of 2026-09-30 disproved them (94.5–221 GB for the test twins, 376.9 GB for production
+N = 1), and those in turn are superseded by the rVM's later phases without a new production
+measurement. The current state is `docs/node-hardware.md` §4.
+
 Exact commands and per-run estimates: `circuits/recursion/docs/03-gpu-and-self-recursion.md`
 Appendix A. The consolidated ops checklist: `docs/deploy.md`.
