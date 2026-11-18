@@ -1949,7 +1949,7 @@ it here and in the script together. Every chain-21 node needs the msauth verifie
 the `DRY_RUN` loopback node needs it
 too (`RAND_MSAUTH_VK=<the committed blob>`).
 
-## The next cut: chain 22 (audit v11 gated fields)
+## The next cut: chain 22 (audit v11 gated fields, block context, the beacon)
 
 **What it is.** v0.8.2 (299378d0; the audit/v10-node and audit/v10-perps merges d7358e90 and
 81b9a2c0) ships five genesis-gated rules that chain 21 cannot switch on in place (`CHANGELOG.md`
@@ -1967,6 +1967,8 @@ issues at the cut: randprotocol/monorepo#15 (PST-1), #13 (PERP-6) and #12 (PERP-
 | `perps.max_pending_digests` | `65536` (owner's decision, 2026-11-05) | caps the recorded digests no state proof has covered: at the cap, deposits, orders, cancels and withdrawal requests are refused `DigestLogFull` until a proof drains the log; about 18 h of input-bearing blocks with no prover, ~2.6 MB of log (PERP-5, v0.8.5+; the stored perps row then uses trailer `rand-perps-ext-2`) | `docs/perps.md` field table |
 | `multisig.max_accounts` | **the owner's value** (≥ 1) | the most accounts the register ever holds, the seeded treasury counted; a `CreateMultisig` past it is refused (MSA-4) | `docs/multisig.md` (`max_accounts`) |
 | `tokens.incremental_root` | `true` | "Recommended: on, for the next cut" (above, audit v6 TOK-1); chain 21 did not carry it | this page, "The next cut: `tokens.incremental_root`" |
+| `program_state.reference_block_window` | `256` (**owner value to confirm**, OPEN 9) | EVM block context: how many closed blocks an `InvokeAt` may name as its reference block (TIMESTAMP, NUMBER, CHAINID, BASEFEE, PREVRANDAO for programs); 256..=4096; needs bounded block time (chain 22 has `bridge` and `perps`). Carried by the owner's decision of 2026-11-18 | `docs/evm-block-context.md` §7 (issue #168, PR #184) |
+| `beacon` | `commit_delay_blocks` `256` (**owner value to confirm**, OPEN 10) + one commitment per validator (the operators') | the randomness beacon: every block opens with its proposer's hash-chain reveal; refused by the node without the window. Carried by the owner's decision of 2026-11-18 | `docs/evm-block-context.md` §11 (PR #189) |
 
 Everything else is chain 21's, asserted equal: `fees` {burn_base, burn_floor}, `perps` (BTC-PERP on
 zUSD, the pinned engine, tier 18, 24 inputs — and its `genesis_root`, re-derived by perp-prover,
@@ -1997,7 +1999,14 @@ takes no default for any of them:
    and the aggregation-only fields — each refused, as chain 21 refused them.
 7. `EXPECT_NODE_VERSION` — v0.8.5 is the first release with every field (`max_pending_digests`;
    the rest since v0.8.2). The cut refuses a `rand-node --version`, or an `EXPECT_NODE_VERSION`,
-   below 0.8.5, `DRY_RUN` and `NODE_VERSION_OK=1` included.
+   below 0.8.5, `DRY_RUN` and `NODE_VERSION_OK=1` included. The window and the beacon are in no
+   release yet: the cut gates them on the build's `genesis --help` instead (below).
+9. `program_state.reference_block_window` — carried (owner, 2026-11-18); the value is to confirm.
+   `REFERENCE_BLOCK_WINDOW`, default 256, 256..=4096. Larger is friendlier to slow provers and
+   worse for naive `PREVRANDAO` use (every block in the window is a re-roll, §11.4 of
+   `docs/evm-block-context.md`).
+10. `beacon.commit_delay_blocks` — carried (owner, 2026-11-18); the value is to confirm.
+   `BEACON_COMMIT_DELAY_BLOCKS`, default 256, 1..=1048576.
 
 RPL-2 program vaults are refused the same way (`rand_getSupply.program_rand_held`;
 `PROGRAM_VAULTS_DROPPED_OK=1`, the record's `drops:` naming them): chain 21's record dropped the
@@ -2036,6 +2045,67 @@ before the first deposit and state proof. **No RPC serves `program_state.refuse_
 (`rand_getLimits.program_state` is the cell fee and three bounds): it is read back only through the
 genesis hash the node serves, which the field probe showed moves without it. Serving it is a node
 follow-up.
+
+**Block context and the beacon at the cut (#168 / PR #184, PR #189).** The inputs:
+
+| input | default | what |
+|---|---|---|
+| `REFERENCE_BLOCK_WINDOW` | `256` | `program_state.reference_block_window`, 256..=4096 (OPEN 9, to confirm); explicitly empty is refused |
+| `BEACON_COMMIT_DELAY_BLOCKS` | `256` | `beacon.commit_delay_blocks`, 1..=1048576 (OPEN 10, to confirm) |
+| `BEACON_TSV` | `~/.rand-chain22/beacon-commitments.tsv` | `<validator name> <64 hex>` per line, one per chain-22 validator (the names of `GENESIS_NAMES` and `BONDED`) |
+
+`BEACON_TSV` is joined by name with the validators, as the script joins every other validator
+datum. The cut refuses a line that is not `<name> <64 lowercase hex>`, a name twice, a name that
+is no chain-22 validator, a validator with no line, one commitment for two validators, and an
+all-zero commitment. The section lists each validator at the address **its public key derives**
+(`rand-node admit sign --candidate <public key>` under a throwaway key prints it; nothing is
+submitted) and the cut refuses a `VALIDATORS_TSV` or registration address that differs. Both
+fields are **spliced** by the script, like `perps`: `rand-node genesis
+--program-state-reference-block-window` (and `--beacon-commitment`, which needs it) is refused
+on the base file, which has no `bridge` or `perps` yet. The real cut refuses a build whose
+`genesis --help` lacks either flag; `DRY_RUN` skips both, loudly (`BLOCK CONTEXT SKIPPED`), and
+without a `BEACON_TSV` uses 26 random placeholder commitments. Asserted on the finished file
+(`program_state` in `ProgramStateConfig`'s order, the beacon the file's last field, the
+commitments in validator order); **field-probed** — 30 variants beside the audit-v10 eight, each
+of which must hash differently: without the window and the beacon together, the window at
+another value, without the beacon, the delay at another value, and each one of the 26
+commitments changed; and written to the cut record as `reference-block-window:`,
+`beacon-commit-delay-blocks:` (both under an "owner values to confirm" comment), one
+`beacon-commitment: <name> <address> <hex>` per validator, and the operator procedure below. The
+record's `reason:` or `carries:` must name both (#168 / block context, #189 / beacon).
+
+**The operator seed procedure (each validator, before the cut).** The seed is secret and is this
+host's alone (`docs/evm-block-context.md` §11.5):
+
+1. On **its own host**, the validator's operator runs `rand-node beacon init --datadir <datadir>
+   --key <node key> --chain-id 22` and sends **only the printed commitment** to whoever assembles
+   `BEACON_TSV`. Nobody else ever holds a seed; `beacon.seed.json` is never copied between hosts.
+2. The operator keeps an **offline, encrypted backup** of `beacon.seed.json`, for restoring onto the
+   same validator only. A validator that loses its seed misses its slots until a `BeaconCommit`
+   takes effect; if every validator lost its seed at once the chain would halt for good — the
+   owner accepted that on 2026-11-18 as an operational risk covered by these backups.
+3. **Before its node starts on chain 22**, on the host: `deploy/check-beacon-seed.sh --genesis
+   <genesis-chain22.json> --datadir <datadir> --key <node key>`. It refuses unless the key's
+   address has a genesis commitment, `rand-node beacon commitment` re-derives the file and names
+   that address and chain 22 (a file copied from another host names that host's validator), a
+   chain in the file has the genesis commitment, and the file is mode 0600. After the start, the
+   same with `--rpc 127.0.0.1:8545` also needs `rand-node beacon status` to exit 0 (the commitment
+   in force is opened by the file) and, at height 0, that commitment to be the genesis one.
+
+This check runs **on each validator host**, not in `check-limits`: only the host sees its seed
+file, and `check-limits` reads one RPC from the operator's machine. When
+`deploy/cutover-fleet-chain22.sh` is derived from chain 21's, its `start` must run it on every host
+before any node starts and again in the same ssh call as each host's `systemctl start` — exactly
+where chain 21's script gates on the msauth key — and its `wait` should run it with `--rpc`.
+
+**After launch**, `check-limits` also reads `rand_getLimits.program_state.reference_block_window`
+and `.beacon_commit_delay_blocks`; `rand_getBlockContext` (`enabled`, `window`, `chain_id`,
+`context_version` 2, `has_randomness` true — before block 1 it answers `-32001` and the window is
+read from the limits alone); and `rand_getBeacon` (`enabled`, the delay, the genesis validator
+set, and per validator nonce 0, nothing pending, `due` = `commitment`). At height 0 every
+commitment must be the genesis one exactly; above it a validator that has proposed holds its last
+reveal instead, accepted for at most `height` validators (the script has no BLAKE3 to walk the
+link; the node's reveal rule checked it).
 
 **The constraint-set row (issue #166).** A genesis records no constraint set; the node binds one
 to a chain by genesis hash in `constraint_set::CHAIN_CONSTRAINT_SETS`
