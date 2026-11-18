@@ -5125,6 +5125,8 @@ mod tests {
         assert!(m.precheck(&perp_state_proof_tx(&l, 1, [7; 8], vec![], 0), &l, ex).is_ok(), "a proof paying nothing passes");
         // No perps section: no ceiling, nothing to gate.
         assert_eq!(Mempool::payout_ceiling(&fixtures::genesis_with(1, vec![]).ledger), None);
+    }
+
     /// MSA-4, node policy for a chain without genesis `multisig.max_accounts` (chain 21): with
     /// `--max-multisig-accounts` set, a `CreateMultisig` is not pooled once the register holds
     /// that many accounts — at the pre-screen and on the direct insert — while the ledger still
