@@ -269,6 +269,10 @@ pub fn reload_ledger_from(
     // anchor or `time` is older than that and inside the genesis window — applied by its peers,
     // so a fork at the first one after its restart.
     storage.restore_proof_window(&mut ledger, gs)?;
+    // And the reference-block window (issue #168; genesis `program_state.reference_block_window`)
+    // with the block facts stored for it: a node that came back without them would refuse every
+    // `InvokeAt` its peers apply — a fork at the first one after its restart.
+    storage.restore_reference_block_window(&mut ledger, gs)?;
     // And the consensus signing domain (audit v4): `load_ledger` comes back at v0, and a node
     // that kept it on a v1 chain would refuse every peer's proposal at the ledger's own
     // signature check.
