@@ -1,0 +1,10 @@
+# RandProtocol prover keys that were retired (VK-9): one per line, `<fingerprint> <retired on> <what it was>`.
+# A key here is never sent a witness and never stored as a pairing, by this build and every later
+# one, whatever a pairing file or a link says. A retired key cannot be revoked in a wallet that was
+# released before it was retired: that wallet has to be updated. This list is how every release
+# after the retirement refuses it. Add a line when a pool key is retired; never remove one.
+RGTF-7HKJ-XZFV-GQ1J 2026-10-01 the key every pool machine shared until wallet 0.6.9
+ZEXQ-1JHV-ZT60-KFB5 2026-10-22 pool member a until wallet 0.8.0
+D2XV-WXVT-PZRC-D7G8 2026-10-22 pool member archive2 until wallet 0.8.0
+SR28-MYT0-GR6A-03DE 2026-10-22 pool member nyc3 until wallet 0.8.0
+GMNX-Q1QD-FEXG-JHJM 2026-10-22 pool member sfo3 until wallet 0.8.0

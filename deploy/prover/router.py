@@ -39,6 +39,11 @@ Python 3 standard library only. Configuration, all environment:
                     capacity is this times the members the two-second poll finds up
   SUBMIT_PER_MIN    optional ceiling on the per-address refill per minute (unset: none); it
                     caps the share, it never raises it
+  PROVER_RETIRED    member names that were retired, comma-separated (default: archive2,nyc3,sfo3,
+                    the members wallets 0.6.9 to 0.8.0 pinned besides `a`; VK-9). `/m/<name>` for
+                    one of them answers 410 and a JSON-RPC error that says the member was retired
+                    and to update, instead of an empty 404; a name that is also in PROVER_MEMBERS
+                    is refused at startup, so a retired name is never routed to a prover again
   ROUTER_LISTEN     ip:port to listen on (default 127.0.0.1:8650)
 
 The client address is nginx's X-Real-IP (the router listens on loopback only).
@@ -57,6 +62,12 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 # `http.rs`'s MAX_BODY_BYTES: twice MAX_SEALED_JOB_BYTES (64 KiB) for the hex, plus 4 KiB.
 MAX_BODY_BYTES = 2 * 65536 + 4096
 BUSY = -32005
+# VK-9 (monorepo#18): the members that were retired on 2026-10-22 and never came back under their
+# name. Wallets 0.6.9 to 0.8.0 still pin a key for each (and for the old `a`); nothing served here
+# can change what those wallets pin, so the most this can do is say so plainly and never route
+# the name again.
+DEFAULT_RETIRED = ("archive2", "nyc3", "sfo3")
+RETIRED_CODE = -32010
 UNKNOWN_JOB = -32001
 # A finished job is forgotten by its prover 20 minutes after it ends and a wallet waits at most
 # 50 (30 queued + 20 proving); an hour covers both.
@@ -369,8 +380,30 @@ def error_code(reply):
     return None
 
 
-def make_handler(pool, members=None, meter=None):
+def retired_reply(req_id, name):
+    """The JSON-RPC error a request for a retired member gets. A final refusal, on purpose: a
+    client that treats a JSON-RPC error as the prover's last word stops asking."""
+    return {
+        "jsonrpc": "2.0",
+        "id": req_id,
+        "error": {
+            "code": RETIRED_CODE,
+            "message": f"the RandProtocol prover {name!r} was retired and its key is no longer used: update Rand Wallet "
+            "(or rand) to the current release, which pins the current provers, or pair your own prover",
+            "data": {"retired": name},
+        },
+    }
+
+
+def check_retired(members, retired):
+    """A retired name must not be a member: a wallet that pins the old key under that name would
+    be sent to a prover again. Returns the names in both."""
+    return sorted(set(members) & set(retired))
+
+
+def make_handler(pool, members=None, meter=None, retired=()):
     members = members or {}
+    retired = frozenset(retired) - frozenset(members)
 
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
@@ -421,6 +454,11 @@ def make_handler(pool, members=None, meter=None):
                 return members[path[3:]]
             return False
 
+        def retired_member(self):
+            """The retired member this path names, or None."""
+            path = self.path.split("?", 1)[0]
+            return path[3:] if path.startswith("/m/") and path[3:] in retired else None
+
         def do_OPTIONS(self):
             m = self.member()
             if m is False:
@@ -446,6 +484,10 @@ def make_handler(pool, members=None, meter=None):
             body = self.rfile.read(length)
             m = self.member()
             if m is False:
+                gone = self.retired_member()
+                if gone is not None:
+                    req = parse(body)
+                    return self.plain(410, retired_reply(req.get("id") if isinstance(req, dict) else None, gone))
                 return self.not_found()
             req = parse(body)
             if meter is not None and isinstance(req, dict) and req.get("method") == "prover_submit":
@@ -472,6 +514,11 @@ def main():
             members[name.strip()] = Backend(url.strip())
     if not urls and not members:
         sys.exit("PROVER_BACKENDS and PROVER_MEMBERS are empty: name at least one prover")
+    retired = os.environ.get("PROVER_RETIRED")
+    retired = DEFAULT_RETIRED if retired is None else tuple(n.strip() for n in retired.split(",") if n.strip())
+    both = check_retired(members, retired)
+    if both:
+        sys.exit(f"PROVER_MEMBERS names retired member(s) {', '.join(both)}: a retired name is never routed again (give the member a new name)")
     host, _, port = os.environ.get("ROUTER_LISTEN", "127.0.0.1:8650").rpartition(":")
     pool = Pool(urls)
     pool.poll_once()
@@ -491,7 +538,7 @@ def main():
         share=float(os.environ.get("SUBMIT_SHARE", SubmitMeter.DEFAULT_SHARE)),
         capacity=capacity,
     )
-    server = ThreadingHTTPServer((host, int(port)), make_handler(pool, members, meter))
+    server = ThreadingHTTPServer((host, int(port)), make_handler(pool, members, meter, retired))
     server.daemon_threads = True
     print(f"routing {len(urls)} shared-key prover(s) and {len(members)} member(s) on {host}:{port}", file=sys.stderr, flush=True)
     server.serve_forever()

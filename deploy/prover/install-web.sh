@@ -80,11 +80,33 @@ for arg in "$@"; do
         grep -q '^$ip ' /etc/rand-prover-pool/known_hosts || echo '$ip $key' >> /etc/rand-prover-pool/known_hosts
         printf 'REMOTE=provertunnel@$ip\\nREMOTE_PORT=$remote\\n' > /etc/rand-prover-pool/$port.env"
 done
+# VK-9 (monorepo#18): the retired members' paths reach the router too, which answers them 410
+# "was retired … update" (router.py, PROVER_RETIRED) instead of nginx's bare 404. A name that is a
+# member in this run is skipped: a live member is never treated as retired.
+RETIRED=${RETIRED-archive2 nyc3 sfo3}
+RETIRED_ENV=""
+for name in $RETIRED; do
+    case ",$MEMBERS_ENV" in *",$name="*) continue ;; esac
+    RETIRED_ENV="${RETIRED_ENV:+$RETIRED_ENV,}$name"
+    MEMBER_LOCATIONS="$MEMBER_LOCATIONS
+    location = /m/$name {
+        limit_req zone=prover burst=60 nodelay;
+        limit_req_status 429;
+        client_max_body_size 140k;
+        proxy_pass http://127.0.0.1:8650/m/$name;
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header Connection \"\";
+        proxy_read_timeout 30s;
+    }"
+done
 printf '%s\n' "$MEMBER_LOCATIONS" | "${SSH[@]}" 'cat > /etc/nginx/snippets/prover-members.conf'
 
 "${SSH[@]}" "set -e
     echo 'PROVER_BACKENDS=$BACKENDS' > /etc/rand-prover-pool/router.env
     echo 'PROVER_MEMBERS=$MEMBERS_ENV' >> /etc/rand-prover-pool/router.env
+    echo 'PROVER_RETIRED=$RETIRED_ENV' >> /etc/rand-prover-pool/router.env
     echo 'ROUTER_LISTEN=127.0.0.1:8650' >> /etc/rand-prover-pool/router.env
     chmod 0644 /etc/rand-prover-pool/router.env
     systemctl daemon-reload

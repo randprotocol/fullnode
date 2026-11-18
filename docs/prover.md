@@ -632,6 +632,16 @@ rand --prover send rand1… 1.5
   each member's answer against its pinned fingerprint, so a served copy cannot substitute a key.
   The one key the pool first shared (`RGTF-7HKJ-XZFV-GQ1J`, pinned by wallet 0.6.8) was retired
   on 2026-10-01, when wallet 0.6.9 shipped.
+- **Retired keys** (VK-9, monorepo#18). A key that was pinned and is no longer the pool's is
+  listed in `randprotocol_client::prover::RETIRED_PROVERS` (`retired-provers.txt`: the shared key
+  and the four members wallets 0.6.9 to 0.8.0 pinned). `rand` never stores a pairing with a
+  listed key and never sends one anything, whatever a link or a pairing file says: a
+  `<key>.prover.json` written by an older `rand prover pair --trusted` stops working at the
+  update with "the prover key … was retired on … Run `rand prover pair --trusted`", and
+  `rand prover show` marks it `RETIRED`. That is the only revocation there is: **a wallet released
+  before a key was retired still pins it and cannot be told otherwise** — it has to be updated
+  (wallet 0.8.1 or later, `rand` 0.8.2 or later). The pool answers a retired member's URL with
+  HTTP 410 and a JSON-RPC error saying so (`deploy/prover/README.md`, "Retired keys").
 - **A short line, and no fee.** A bundle must land within `ledger::TIME_WINDOW` = 256 blocks of
   the height it names, so each member proves one bundle at a time and lets one job wait. A wallet
   tries the members in turn and skips one that is busy or unreachable; when every member is, it
