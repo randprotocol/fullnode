@@ -808,7 +808,7 @@ fn created_notes(
         // envelope to record), so they never arrive through `cb.deposits` and are rebuilt here:
         // one per payout, pays then mints, each with the payout's own envelope and the
         // commitment `program_state::apply` computed — stamped with the *bundle's* `time`.
-        Action::Invoke { transition, .. } => {
+        Action::Invoke { transition, .. } | Action::InvokeAt { transition, .. } => {
             let time = tx
                 .bundle
                 .as_ref()
@@ -898,7 +898,7 @@ pub fn derived_note_count(tx: &randprotocol_core::Transaction) -> usize {
         Action::RegisterToken { initial, .. } => usize::from(initial.is_some()),
         // RPL-2: one note per payout, which `created_notes` rebuilds above — the one action that
         // derives more than one. A count of the transition's own lists, nothing decoded.
-        Action::Invoke { transition, .. } => transition.pays.len() + transition.mints.len(),
+        Action::Invoke { transition, .. } | Action::InvokeAt { transition, .. } => transition.pays.len() + transition.mints.len(),
         // RPL-3: one note per payout of a positive amount, which the ledger appends as a
         // `Deposit` right after the (bundle-less) proof — every payout's request is pending on
         // a committed proof, so each such payout is a note. A list over the cap derives nothing
@@ -2709,7 +2709,7 @@ impl Storage {
                 Some(r) => receipts.push(r),
                 None => {
                     // An RPL-2 `Invoke` leaves a call's receipt too.
-                    if matches!(tx.action, Action::Call { .. } | Action::Invoke { .. }) {
+                    if matches!(tx.action, Action::Call { .. } | Action::Invoke { .. } | Action::InvokeAt { .. }) {
                         return Err(StorageError::Corrupt(format!(
                             "receipt for call {} in block {h} missing",
                             tx.hash()

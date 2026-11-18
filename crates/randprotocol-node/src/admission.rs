@@ -1038,7 +1038,7 @@ pub fn oversized_note(tx: &Transaction) -> Option<TxError> {
         // (`program_state::check_shape` refuses it on every chain that admits an invoke, whatever
         // `tokens.bound_note_value` says). The count is capped first, as the ledger caps it: an
         // unvalidated transition must not buy a walk of any length.
-        Action::Invoke { transition, .. } => {
+        Action::Invoke { transition, .. } | Action::InvokeAt { transition, .. } => {
             use randprotocol_core::ledger::program_state::{ProgramStateError, MAX_PAYOUTS};
             if transition.pays.len() + transition.mints.len() > MAX_PAYOUTS {
                 return None;
@@ -1129,7 +1129,7 @@ pub fn non_canonical_proofs(tx: &Transaction) -> Option<TxError> {
 /// it is an Ignore and is never cached.
 pub fn call_reveals_private_inputs(tx: &Transaction) -> Option<TxError> {
     // An RPL-2 `Invoke`'s call proof is a call proof: the same private tables, the same floor.
-    let (randprotocol_core::Action::Call { proof, .. } | randprotocol_core::Action::Invoke { proof, .. }) = &tx.action
+    let (randprotocol_core::Action::Call { proof, .. } | randprotocol_core::Action::Invoke { proof, .. } | randprotocol_core::Action::InvokeAt { proof, .. }) = &tx.action
     else {
         return None;
     };
@@ -1152,7 +1152,7 @@ pub fn call_reveals_private_inputs(tx: &Transaction) -> Option<TxError> {
 /// only on a chain whose genesis sets `program_state.refuse_panics`; on chain 21 a block from a
 /// proposer that carries one still applies.
 pub fn invoke_panicked(tx: &Transaction) -> Option<TxError> {
-    let randprotocol_core::Action::Invoke { proof, .. } = &tx.action else {
+    let (randprotocol_core::Action::Invoke { proof, .. } | randprotocol_core::Action::InvokeAt { proof, .. }) = &tx.action else {
         return None;
     };
     let outputs = randprotocol_zkvm::executor::call_proof_outputs(proof)?;
@@ -1249,7 +1249,7 @@ pub fn call_pricing(
     use randprotocol_core::gas;
     use randprotocol_core::ledger::program_state;
     use randprotocol_core::Action;
-    let (Action::Call { program, proof, input_envelope } | Action::Invoke { program, proof, input_envelope, .. }) =
+    let (Action::Call { program, proof, input_envelope } | Action::Invoke { program, proof, input_envelope, .. } | Action::InvokeAt { program, proof, input_envelope, .. }) =
         &tx.action
     else {
         return Ok(CallPricing { floor: gas::fee_floor(&tx.action).saturating_add(ledger.prove_base_for(tx)), gas_limit: None });
@@ -1270,7 +1270,7 @@ pub fn call_pricing(
     // ledger's caps, so an unvalidated transition cannot make this build a segment of any
     // length (the context is 16 words a cell).
     let outcome = match &tx.action {
-        Action::Invoke { transition, .. } => {
+        Action::Invoke { transition, .. } | Action::InvokeAt { transition, .. } => {
             if transition.reads.len() > program_state::MAX_READS {
                 return Err(program_state::ProgramStateError::TooManyReads(transition.reads.len()).into());
             }
@@ -1281,7 +1281,9 @@ pub fn call_pricing(
             if payouts > program_state::MAX_PAYOUTS {
                 return Err(program_state::ProgramStateError::TooManyPayouts(payouts).into());
             }
-            let segment = ledger.invoke_segment(record, tx).ok_or(TxError::MissingBundle)?;
+            // Issue #168: `?` first — an `InvokeAt` whose reference block this ledger does not
+            // hold has no segment, and is refused by that name before any decode.
+            let segment = ledger.invoke_segment(record, tx)?.ok_or(TxError::MissingBundle)?;
             executor.decode_invoke(record, proof, &segment)
         }
         _ if ledger.hardening_v6() => {

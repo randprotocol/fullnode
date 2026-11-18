@@ -2097,7 +2097,7 @@ fn derived_note_cms_with(
             vec![mint_commitment(&m.recipient, m.amount, *index, m.time, &m.r, executor)]
         }
         // Stamped with the bundle's `time`, as the ledger stamps them.
-        (Action::Invoke { transition, .. }, Some(b)) => {
+        (Action::Invoke { transition, .. } | Action::InvokeAt { transition, .. }, Some(b)) => {
             transition.payouts().map(|p| payout_commitment(p, b.time, executor)).collect()
         }
         // Multisig: a pay's notes, stamped with the action's own `time` (it rides no bundle).
@@ -2245,7 +2245,7 @@ fn header_json(b: &randprotocol_core::Block, sealed: bool, fees: Option<&randpro
             // in the action, stamped with its own `time`.
             matches!(
                 t.action,
-                Action::BridgeAttest { .. } | Action::TokenMint { .. } | Action::RegisterToken { .. } | Action::Invoke { .. } | Action::MultisigPay { .. }
+                Action::BridgeAttest { .. } | Action::TokenMint { .. } | Action::RegisterToken { .. } | Action::Invoke { .. } | Action::InvokeAt { .. } | Action::MultisigPay { .. }
             )
                 || (fees.is_some() && matches!(t.action, Action::BridgeBurn { .. }))
         })
@@ -2277,7 +2277,7 @@ fn public_rebuild_copy(t: &Transaction) -> Transaction {
         bundle.auth_proof = Vec::new();
     }
     match &mut s.action {
-        Action::Invoke { proof, .. } => *proof = Vec::new(),
+        Action::Invoke { proof, .. } | Action::InvokeAt { proof, .. } => *proof = Vec::new(),
         Action::BridgeAttest { pq_signatures, .. } => *pq_signatures = Vec::new(),
         // A multisig pay carries no proof and no bundle: the copy is the transaction itself
         // (its hash is its real id), signatures and all.
@@ -2800,16 +2800,21 @@ fn tx_json_with(
         // the bundle's burn fields were to the program (`inflow`; the amounts are the bundle's
         // `burn_r` / `burn_a` / `burn_asset` above), and every note paid out or minted. The
         // wallet's public-note scan keys on the kind string `invoke`: do not rename it.
-        Action::Invoke { program, proof, input_envelope, transition } => {
+        //
+        // Issue #168: an `InvokeAt` is rendered the same way under the kind `invoke_at`, with
+        // the reference block it names (`ref_height`); an `invoke`'s object is unchanged.
+        Action::Invoke { program, proof, input_envelope, transition }
+        | Action::InvokeAt { program, proof, input_envelope, transition, .. } => {
             use randprotocol_core::ledger::program_state::Inflow;
+            let ref_height = t.action.invoke().and_then(|i| i.ref_height);
             // A payout note's `time` is the bundle's. An invoke always rides one; without it
             // (no committed transaction is) the notes are not computable and 0 is rendered.
             let time = t.bundle.as_ref().map_or(0, |b| b.time);
             let payouts = |ps: &[randprotocol_core::ledger::program_state::Payout]| {
                 ps.iter().map(|p| payout_json(p, time, executor)).collect::<Vec<_>>()
             };
-            json!({
-                "kind": "invoke", "program": program.to_hex(), "proof_len": proof.len(),
+            let mut v = json!({
+                "kind": if ref_height.is_some() { "invoke_at" } else { "invoke" }, "program": program.to_hex(), "proof_len": proof.len(),
                 "input_envelope_len": input_envelope.as_ref().map(|e| e.len() as u64),
                 "transition": {
                     "reads": transition.reads.iter().map(cell_json).collect::<Vec<_>>(),
@@ -2822,7 +2827,11 @@ fn tx_json_with(
                     "pays": payouts(&transition.pays),
                     "mints": payouts(&transition.mints),
                 },
-            })
+            });
+            if let Some(h) = ref_height {
+                v["ref_height"] = json!(h);
+            }
+            v
         }
         // Multisig accounts. A create names its salt, threshold and how many signers (the keys
         // are on the raw transaction, and `rand_getMultisig` lists them once the account exists);

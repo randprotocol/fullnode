@@ -382,7 +382,7 @@ pub fn disclosed(tx: &Transaction, derived: &[Word8], key: &TxKey) -> Vec<Openin
         // RPL-2: one envelope per payout, each against its own derived commitment — the i-th
         // payout (pays, then mints) against the i-th. The caller sealed them, so a `TxKey` for
         // each can exist. A short list opens only as far as it goes.
-        Action::Invoke { transition, .. } => {
+        Action::Invoke { transition, .. } | Action::InvokeAt { transition, .. } => {
             for (i, (p, cm)) in transition.payouts().zip(derived).enumerate() {
                 try_env("payout", i as u8, *cm, &p.envelope);
             }

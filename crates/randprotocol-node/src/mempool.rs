@@ -1034,7 +1034,7 @@ impl Mempool {
                 .gas_call_floor(limit, randprotocol_core::gas::call_bytes(proof, input_envelope.as_ref()))
                 .map(|f| f.saturating_add(prove_base))
                 .unwrap_or(p.floor),
-            (a @ Action::Invoke { proof, input_envelope, .. }, Some(limit)) => ledger
+            (a @ (Action::Invoke { proof, input_envelope, .. } | Action::InvokeAt { proof, input_envelope, .. }), Some(limit)) => ledger
                 .gas_call_floor(limit, randprotocol_core::gas::call_bytes(proof, input_envelope.as_ref()))
                 .map(|f| f.saturating_add(randprotocol_core::ledger::program_state::cell_fee_of(ledger, a)).saturating_add(prove_base))
                 .unwrap_or(p.floor),
@@ -1475,7 +1475,7 @@ impl Mempool {
         // the Calls have been placed is filled with the transfers held back, in their order, so
         // the reservation costs no block space. With no Call ready the cap is the block's.
         // An RPL-2 `Invoke` is a call that pays the byte price too, so it counts as one here.
-        let call_ready = ready.iter().any(|(_, p, _)| matches!(p.tx.action, Action::Call { .. } | Action::Invoke { .. }));
+        let call_ready = ready.iter().any(|(_, p, _)| matches!(p.tx.action, Action::Call { .. } | Action::Invoke { .. } | Action::InvokeAt { .. }));
         let flat_cap = if call_ready { max_bytes / 4 * 3 } else { max_bytes };
         let mut out = Vec::new();
         let mut held_back = Vec::new();
@@ -1492,7 +1492,7 @@ impl Mempool {
                 // still travel.
                 continue;
             }
-            let flat = !matches!(p.tx.action, Action::Call { .. } | Action::Invoke { .. }) && !is_governance(&p.tx.action);
+            let flat = !matches!(p.tx.action, Action::Call { .. } | Action::Invoke { .. } | Action::InvokeAt { .. }) && !is_governance(&p.tx.action);
             if flat && flat_bytes + len > flat_cap {
                 held_back.push(p);
                 continue;

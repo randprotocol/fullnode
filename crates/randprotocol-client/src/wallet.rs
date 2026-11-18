@@ -926,7 +926,7 @@ pub fn rebuilt_notes_with(w: &Wallet, tx: &Transaction, tx_hash: Option<&Hash>, 
         // RPL-2: every note an invoke pays out or mints is public the same way — recipient,
         // amount, asset, blinding — with the chain's `PROGRAM_FROM` word and the *bundle's*
         // time (`program_state::payout_commitment`). Pays then mints, each to whoever it names.
-        Action::Invoke { transition, .. } => {
+        Action::Invoke { transition, .. } | Action::InvokeAt { transition, .. } => {
             let Some(b) = &tx.bundle else { return Vec::new() };
             transition
                 .payouts()
@@ -2644,7 +2644,7 @@ fn bind_call(tx: &mut Transaction, domain: &BindingDomain, prove: &BoundProver<'
     let binding = tx.call_binding(domain);
     let proof = prove(tx, domain)?;
     match &mut tx.action {
-        Action::Call { proof: p, .. } | Action::Invoke { proof: p, .. } => *p = proof,
+        Action::Call { proof: p, .. } | Action::Invoke { proof: p, .. } | Action::InvokeAt { proof: p, .. } => *p = proof,
         _ => return Err(anyhow!("a call binding for an action that is not a call (wallet bug)")),
     }
     debug_assert_eq!(tx.call_binding(domain), binding, "filling the call proof in never moves the call binding");
@@ -5819,7 +5819,7 @@ pub(crate) mod tests {
             b.auth_proof = Vec::new();
         }
         match &mut s.action {
-            Action::Invoke { proof, .. } => *proof = Vec::new(),
+            Action::Invoke { proof, .. } | Action::InvokeAt { proof, .. } => *proof = Vec::new(),
             Action::BridgeAttest { pq_signatures, .. } => *pq_signatures = Vec::new(),
             _ => {}
         }
