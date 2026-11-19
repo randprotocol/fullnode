@@ -1962,36 +1962,56 @@ issues at the cut: randprotocol/monorepo#15 (PST-1), #13 (PERP-6) and #12 (PERP-
 | `program_state.refuse_panics` | `true` | an `Invoke` whose call proof publishes guest-sdk's panic sentinel (`0xdeadbeef` in output 7) is invalid (PST-1; pool policy refuses it now) | `docs/program-state.md` (`refuse_panics`), `rand-node genesis --program-state-refuse-panics` |
 | `perps.bound_payouts` | `true` | a state proof may pay out no more collateral than `initial_collateral + collateral_in − collateral_out` (PERP-6) | `docs/perps.md` field table |
 | `perps.initial_collateral` | absent (0) | the collateral a seeded engine starts with; chain 22's engine starts from `perp-prover genesis-state`, which holds none | `docs/perps.md` field table |
-| `perps.sparse_windows` + `perps.max_window_heights` | `true` + **the owner's value** | input-less blocks record no digest; one window spans at most `max_window_heights` heights, `max_window_blocks` (64) ..= 4096; it is also the heartbeat interval, and back-pressure holds new orders at 4 × it past the proved height (PERP-101) | `docs/perps.md` "Sparse windows" |
+| `perps.sparse_windows` + `perps.max_window_heights` | `true` + `256` (the owner's choice, 2026-11-19; still the operator input `PERPS_MAX_WINDOW_HEIGHTS`) | input-less blocks record no digest; one window spans at most `max_window_heights` heights, `max_window_blocks` (64) ..= 4096; it is also the heartbeat interval, and back-pressure holds new orders at 4 × it past the proved height (PERP-101) | `docs/perps.md` "Sparse windows" |
 | `perps.engine_program_log_height` | `14` | pins the engine's program height so an invalid proof is not re-proved at another shape (CON-60); `rand perp image-hc` prints it on stderr for the pinned image `f286a611…` | `docs/perps.md` field table |
 | `perps.max_pending_digests` | `65536` (owner's decision, 2026-11-05) | caps the recorded digests no state proof has covered: at the cap, deposits, orders, cancels and withdrawal requests are refused `DigestLogFull` until a proof drains the log; about 18 h of input-bearing blocks with no prover, ~2.6 MB of log (PERP-5, v0.8.5+; the stored perps row then uses trailer `rand-perps-ext-2`) | `docs/perps.md` field table |
-| `multisig.max_accounts` | **the owner's value** (≥ 1) | the most accounts the register ever holds, the seeded treasury counted; a `CreateMultisig` past it is refused (MSA-4) | `docs/multisig.md` (`max_accounts`) |
+| `multisig.max_accounts` | `65536` (the owner's choice, 2026-11-19; still the operator input `MULTISIG_MAX_ACCOUNTS`, ≥ 1) | the most accounts the register ever holds, the seeded treasury counted; a `CreateMultisig` past it is refused (MSA-4) | `docs/multisig.md` (`max_accounts`) |
 | `tokens.incremental_root` | `true` | "Recommended: on, for the next cut" (above, audit v6 TOK-1); chain 21 did not carry it | this page, "The next cut: `tokens.incremental_root`" |
 | `program_state.reference_block_window` | `256` (**owner value to confirm**, OPEN 9) | EVM block context: how many closed blocks an `InvokeAt` may name as its reference block (TIMESTAMP, NUMBER, CHAINID, BASEFEE, PREVRANDAO for programs); 256..=4096; needs bounded block time (chain 22 has `bridge` and `perps`). Carried by the owner's decision of 2026-11-18 | `docs/evm-block-context.md` §7 (issue #168, PR #184) |
 | `beacon` | `commit_delay_blocks` `256` (**owner value to confirm**, OPEN 10) + one commitment per validator (the operators') | the randomness beacon: every block opens with its proposer's hash-chain reveal; refused by the node without the window. Carried by the owner's decision of 2026-11-18 | `docs/evm-block-context.md` §11 (PR #189) |
 
 Everything else is chain 21's, asserted equal: `fees` {burn_base, burn_floor}, `perps` (BTC-PERP on
 zUSD, the pinned engine, tier 18, 24 inputs — and its `genesis_root`, re-derived by perp-prover,
-must equal chain 21's `da0e3a53…`), `multisig` create fee 1 RAND with one treasury 2 of 3,
-`hc_auth_multisig` 9705f8e2…, 6 MiB proofs and 19 MiB blocks, and chain 20's shape before them.
+must equal chain 21's `da0e3a53…`), `multisig` create fee 1 RAND with one treasury (now 5 of 6,
+item 3 below), `hc_auth_multisig` 9705f8e2…, 6 MiB proofs and 19 MiB blocks, and chain 20's shape
+before them.
 
-**Open — the owner's, before the cut** (`deploy/cut-chain22-genesis.sh`'s header, OPEN 1–7; OPEN 8,
-`perps.max_pending_digests`, was decided 2026-11-05: 65536, in the table above). The real cut
-takes no default for any of them:
+**The owner's decisions** (`deploy/cut-chain22-genesis.sh`'s header, OPEN 1–10; OPEN 8,
+`perps.max_pending_digests`, was decided 2026-11-05: 65536, in the table above; OPEN 1–4 on
+2026-11-19). The real cut takes no default for items 1, 2 and 7:
 
 1. `perps.max_window_heights` — no documented value (the documented default, 0, is refused beside
-   `sparse_windows`). `PERPS_MAX_WINDOW_HEIGHTS`, 64..=4096.
-2. `multisig.max_accounts` — no documented value; absent is unbounded, which would not close MSA-4.
-   `MULTISIG_MAX_ACCOUNTS`, ≥ 1.
-3. The treasury. No document says how a multisig account crosses a cut: chain 21's treasury
-   (`d5fd1883…1958`, 100 000 RAND new issuance at its cut) is register state, not a note, so the
-   carry-over scan never sees it. The script seeds one treasury as chain 21's did — new issuance
-   from `TREASURY`, signers asserted equal to chain 21's — and refuses while chain 21's register
-   holds RAND (`rand_getSupply.multisig_rand_held`) unless `MULTISIG_NOT_CARRIED_OK=1` and the
-   record's `drops:` line names it. The chain-22 balance is `TREASURY`'s `balance` line.
-4. Chain 21's perps exchange. No carry is designed (engine state is proved off chain); the cut
-   refuses while `rand_getPerps` shows accounts, pending withdrawals or collateral unless
-   `PERPS_STATE_NOT_CARRIED_OK=1` and the record's `drops:` names it.
+   `sparse_windows`). The owner chose **256** on 2026-11-19. It stays an operator input,
+   `PERPS_MAX_WINDOW_HEIGHTS` (64..=4096), with no default: the real cut refuses without it.
+2. `multisig.max_accounts` — absent is unbounded, which would not close MSA-4. The owner chose
+   **65 536** on 2026-11-19. It stays an operator input, `MULTISIG_MAX_ACCOUNTS` (≥ 1), with no
+   default.
+3. **The treasury: 5 of 6, six new signers, its balance carried** (decided 2026-11-19). Chain 21's
+   treasury (`d5fd1883…1958`) is 2 of 3; the owner's standing rule is that a multisig is always 5
+   of 6. Chain 22 seeds one treasury from `TREASURY` (`~/.rand-chain22/treasury.txt`: `signer
+   <name> <pk hex>` × 6, `threshold 5`, `balance <RAND>`). The cut refuses any other count or
+   threshold, a key listed twice, and any key that is one of chain 21's treasury signers (its
+   genesis three, or the live ones `snapshot` read after a rotation): chain 22's is a fresh key
+   set, with a fresh salt and so a new id. Chain 21's account itself (id, signers, nonce) is
+   replaced, not carried. Its **RAND is carried**: the `balance` must equal chain 21's
+   `rand_getSupply.multisig_rand_held` at the snapshot (100 000 RAND, `100000000000000` units, on
+   2026-11-19), and the cut refuses any other amount. The vault is register state, not a note, so
+   no wallet scan sees it and the note carry cannot count it a second time; the cut also refuses
+   a genesis that would seed more RAND (notes + stakes + treasury) than chain 21's `total_supply`
+   at the snapshot. `MULTISIG_NOT_CARRIED_OK=1` is needed only for what the treasury carry cannot
+   carry: a token in chain 21's treasury vault (only RAND is seeded at genesis), or RAND in
+   register accounts other than the treasury (not re-created; their RAND is inside
+   `multisig_rand_held`, so it lands in chain 22's treasury). The record's `drops:` must then name
+   it; set with nothing to drop, it is refused. The record's `carries:` line must name the
+   treasury.
+4. **Chain 21's perps exchange: carried (empty)** (decided 2026-11-19). It holds 0 collateral and 0
+   RAND (`rand_getSupply.perps_collateral_held` and `perps_rand_held` `"0"`), and chain 22's engine
+   starts from `perp-prover genesis-state` over the same markets on the same engine, so the same
+   root, `da0e3a53…`, asserted equal. When the snapshot shows the exchange empty (`rand_getPerps`
+   accounts, pending withdrawals and collateral; `rand_getPerpAccounts`; the two supply counters)
+   the cut needs no override, and the record's `carries:` line must name perps. A non-empty
+   exchange is still refused unless `PERPS_STATE_NOT_CARRIED_OK=1` and the record's `drops:`
+   names it; set on an empty exchange, the override is refused.
 5. zUSD held by the exchange: chain 21's zUSD supply does not move on a deposit, so the carry rule
    (Σ `ZUSD_CARRY` == Σ locked == custody) still holds and the operator names, line by line, whose
    note re-issues it.
@@ -2008,9 +2028,37 @@ takes no default for any of them:
 10. `beacon.commit_delay_blocks` — carried (owner, 2026-11-18); the value is to confirm.
    `BEACON_COMMIT_DELAY_BLOCKS`, default 256, 1..=1048576.
 
-RPL-2 program vaults are refused the same way (`rand_getSupply.program_rand_held`;
+RPL-2 program vaults stay **dropped** (`rand_getSupply.program_rand_held`;
 `PROGRAM_VAULTS_DROPPED_OK=1`, the record's `drops:` naming them): chain 21's record dropped the
-programs' state, but its script never counted their RAND.
+programs' state, but its script never counted their RAND. durian.market's AMM is redeployed on
+chain 22, and the 200 RAND in its chain-21 pool is dropped.
+
+**Chain 21's history on record** (decision 7, 2026-11-19). rand-archive-2 (`ARCHIVE2`) is
+abandoned. Chain 21's history on record starts at height **187 556**, on hosts e and obs1, and
+both report `rand_status.prune_floor` 187556: no unpruned chain-21 node exists. State the floor on
+the cut record's `rollback:` line too (the template asks what is kept): the record does not reach
+chain 21's genesis.
+
+**The carry scan from a pruned node** (owner, 2026-11-19). `snapshot` and `balances` refuse a
+`CHAIN21_RPC` whose `prune_floor` is above 0 unless `PRUNED_SCAN_OK=1`; with it they print the
+floor loudly, `balances.json` and the snapshot record it, and the cut then needs
+`PRUNED_SCAN_OK=1` as well and a cut record whose `scan-floor:` line names the floor as a plain
+number (`scan-floor: 187556`); it refuses a record that does not, and the override when nothing
+was pruned. What a pruned scan loses (`crates/randprotocol-client/src/wallet.rs`, `warn_pruned`;
+RS-1): **shielded notes and spends are complete**, because the node never prunes its commitments
+or nullifiers. Only a bridge deposit (`bridge_attest`), token mint, registration's initial mint
+or program payout committed below the floor **whose envelope does not open** is missed; an
+honestly sealed one is still found. A wallet missing from the scan is still refused by the
+uncovered-genesis-allocs check.
+
+**archive2 is not a chain-22 validator** (owner, 2026-11-19; offline since about 9 November).
+`BONDED` defaults to `obs1 g1 g2 g3 g4 g5 g6`, and the cut refuses any other list (chain 21's
+bonded validators without archive2, in order). Chain 22 starts with **25 validators** (18 genesis +
+7 bonded; quorum 17), and the beacon takes 25 commitments. Nothing reads archive2's registration
+file or key. **archive2's chain-21 stake (1 000 RAND) and any unwithdrawn rewards are not recreated
+on chain 22**: the cut checks that the one chain-21 register entry outside the 25 pays out where
+chain 21's genesis archive2 does, prints the dropped stake, and refuses a record whose `drops:`
+line does not name archive2.
 
 **Rolling it out.** `deploy/cut-chain22-genesis.sh`, derived from chain 21's script with chain 21
 as the source (`snapshot` also reads `rand_getPerps`, `rand_getPerpAccounts` and the treasury's
@@ -2025,12 +2073,28 @@ need it), each of which must hash differently. The real cut refuses a build with
 `--program-state-refuse-panics` or whose `rand perp image-hc` prints no
 `engine_program_log_height` (anything before v0.8.2); `DRY_RUN=1` skips them all on such a build,
 loudly (`AUDIT_V10 SKIPPED`), and puts in each operator input's lower bound (64; 1), loudly, as a
-placeholder. The cut record's `reason:` or `carries:` must name PST-1, PERP-6 and PERP-101 and the
-treasury. It must also say (in `reason:`, `carries:` or `clients:`, matching `CON-601`, `validator
-memory` or `key build`) how every validator holds a `max_tier`-18 state-proof key build, about
-3.6 GB resident: the engine pin bounds the shapes a proof may declare, not the build, and a block
-carrying a tier-18 proof makes every validator build the key (CON-601). Give every validator at
-least 8 GB before the cut, or name the plan the owner chose. Every node — validators, archives, the RPC nodes the sites read — runs v0.8.5 or later
+placeholder. The cut record's `reason:` or `carries:` must name PST-1, PERP-6 and PERP-101; its
+`carries:` must name the treasury (carried, 5 of 6) and, unless `PERPS_STATE_NOT_CARRIED_OK=1`,
+perps (carried, empty). It must also name CON-601 (in `reason:`, `carries:` or `clients:`, e.g.
+"CON-601: validators load the pinned tier-18 state-proof key (genesis pin), never build it").
+
+**CON-601: tier 18 stays, with a pinned state-proof key** (owner, 2026-11-19). The engine pin
+bounds the shapes a proof may declare, not the cost of building their key: a block carrying a
+tier-18 state proof makes every validator build a ~3.6 GB key (3.56 GB resident measured), more
+than a 2 GB or 4 GB validator holds, and node policy cannot refuse a valid block. Chain 22 keeps
+perps at `max_tier` 18 with `max_block_inputs` 24, as on chain 21. The tier-18 state-proof
+verifier key(s) are built once, their hash pinned in chain 22's genesis, and validators load them
+instead of building them, as the msauth key is shipped and loaded. That key, its genesis field
+and the node's loader are a separate PR, not written yet. The script carries a TODO where it will
+assert the field. **Tier 16 was rejected.** Its budget is 65 535 cycles, and a close that
+liquidates more than about 3 accounts exceeds it. Measured on the pinned engine f286a611… (durian.market
+`artifacts/perp-engine.tier`, README "Perps"): 7 liquidations 76 493 cycles, 14 liquidations
+153 845 with no inputs before the close (212 018 with 24 inputs: tier 18, 19 % left); within
+tier 16 only a fill (18 086), four fill blocks (24 576) and a close with no liquidation (43 854)
+were measured. No `max_block_inputs` value helps, since the cost is the liquidations. Nothing in
+the genesis bounds those: the 15-account limit is a ledger constant and a per-close liquidation
+cap is a later engine milestone. A mass liquidation would leave a tier-16 exchange unprovable,
+and with no forced exit its collateral would wait for ever. Every node — validators, archives, the RPC nodes the sites read — runs v0.8.5 or later
 from chain 22's first block: an older one refuses the file (`deny_unknown_fields` on the perps,
 multisig and program-state sections). durian.market's perp-prover must build sparse jobs
 (durian 28cebfb, PERP-101) before the first perps window on chain 22, and the prover host must fit
@@ -2064,11 +2128,11 @@ fields are **spliced** by the script, like `perps`: `rand-node genesis
 --program-state-reference-block-window` (and `--beacon-commitment`, which needs it) is refused
 on the base file, which has no `bridge` or `perps` yet. The real cut refuses a build whose
 `genesis --help` lacks either flag; `DRY_RUN` skips both, loudly (`BLOCK CONTEXT SKIPPED`), and
-without a `BEACON_TSV` uses 26 random placeholder commitments. Asserted on the finished file
+without a `BEACON_TSV` uses 25 random placeholder commitments (one per chain-22 validator). Asserted on the finished file
 (`program_state` in `ProgramStateConfig`'s order, the beacon the file's last field, the
-commitments in validator order); **field-probed** — 30 variants beside the audit-v10 eight, each
+commitments in validator order); **field-probed** — 29 variants beside the audit-v10 eight, each
 of which must hash differently: without the window and the beacon together, the window at
-another value, without the beacon, the delay at another value, and each one of the 26
+another value, without the beacon, the delay at another value, and each one of the 25
 commitments changed; and written to the cut record as `reference-block-window:`,
 `beacon-commit-delay-blocks:` (both under an "owner values to confirm" comment), one
 `beacon-commitment: <name> <address> <hex>` per validator, and the operator procedure below. The

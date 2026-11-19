@@ -14,18 +14,32 @@ chain-id: <N>
 
 # Why a rolling update cannot do this: name the validity rule, the wire format or the verifier key
 # that changes. "A new feature" is not a reason; a node-only change rolls onto the live chain.
+# Chain 22 also names CON-601 here (or on carries: / clients:): "CON-601: validators load the
+# pinned tier-18 state-proof key (genesis pin), never build it" — perps stays at max_tier 18
+# (owner, 2026-11-19); the cut refuses a record silent on it.
 reason: <the validity rule, wire format or verifier key that forces a new genesis>
 
 # What the new genesis carries over from the old chain: the validator register, each bridged
 # token's per-backing `locked`, the vesting register, and every balance re-issued as a genesis
-# note, by holder.
+# note, by holder. Register state carried into a new shape is named here too (chain 22: the
+# treasury, 5 of 6 with six new signers, its balance carried from chain 21's multisig register,
+# multisig_rand_held; and perps carried (empty), its genesis root chain 21's).
 carries: <the register, the bridge state, the balances carried, by holder>
 
 # What it does not carry: EVERY balance on the old chain that is not re-issued, operator's or not,
 # with the amount — in particular every non-operator balance (a shielded note cannot be re-created
-# without its owner's address). Validator rewards not withdrawn. Write `nothing` only if a scan
-# showed nothing.
+# without its owner's address). Validator rewards not withdrawn. Program vaults (chain 22: the
+# 200 RAND in durian's chain-21 AMM pool, redeployed). Write `nothing` only if a scan showed
+# nothing.
 drops: <every balance not carried, with amounts; every non-operator balance>
+
+# The height the carry scan started at: `0` when `snapshot` and `balances` read an unpruned node,
+# else that node's `rand_status.prune_floor`, as a plain number (chain 22: 187556 — e and obs1
+# prune below it and rand-archive-2 is abandoned; the cut needs PRUNED_SCAN_OK=1 and refuses a
+# record whose scan-floor: does not name the floor). A pruned scan is complete for shielded notes
+# and spends; it misses only a bridge deposit, token mint, registration mint or program payout
+# below the floor whose envelope does not open (RS-1).
+scan-floor: <0, or the scanned node's prune_floor>
 
 # The client rebuild checklist, each item with the version or commit that was built against the
 # new chain and checked before the cut: the wallet CLI (`rand`), the clients repository's apps
@@ -43,5 +57,7 @@ second-operator: <name, and the machine they rebuilt on>
 second-hash:
 
 # How to go back: what is kept on every host (old data dirs, old binaries), for how long, and the
-# command sequence that returns the fleet to the old chain.
+# command sequence that returns the fleet to the old chain. Say where the old chain's history is
+# kept and from which height (chain 22: chain 21's from height 187 556, on hosts e and obs1;
+# rand-archive-2 is abandoned).
 rollback: <what is kept, for how long, and the steps back>

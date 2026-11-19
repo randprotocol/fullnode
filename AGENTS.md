@@ -6,6 +6,37 @@ invariants, and known traps.
 
 ## Project memory (state as of 2026-11-08)
 
+### The chain-22 treasury is 5 of 6 with its RAND carried; perps carried empty (2026-11-19, branch `feat/chain22-treasury-carry`; deploy only)
+
+Owner's decisions of 2026-11-19 in `deploy/cut-chain22-genesis.sh` (OPEN 1–4 of its header;
+`docs/deploy.md` "The next cut: chain 22").
+
+- **Treasury**: `TREASURY_SIGNERS=6`, `TREASURY_THRESHOLD=5` (fixed; a multisig is always 5 of 6).
+  Six distinct keys, none of chain 21's treasury signers (genesis or the snapshot's live set),
+  validators', guardians' or the pause key. `balance` must equal the snapshot's
+  `rand_getSupply.multisig_rand_held` (py_treasury and py_splice); it is a carry, not issuance —
+  and the genesis must not seed more RAND than chain 21's `total_supply` (the no-double-count bound).
+- **Overrides**: `MULTISIG_NOT_CARRIED_OK` only for a vault token or RAND in other register
+  accounts; `PERPS_STATE_NOT_CARRIED_OK` only for a non-empty exchange (now also the supply's
+  `perps_collateral_held` / `perps_rand_held`). Each is **refused when set with nothing to drop**.
+  `PROGRAM_VAULTS_DROPPED_OK` unchanged (durian's AMM is redeployed).
+- **Record**: `carries:` must name the treasury (not `reason:` alone) and, without the perps
+  override, perps.
+- Fixture signers are SHAKE-256 of fixed labels, 2624 hex. SELFTEST 404 → 426. DRY_RUN and the
+  real cut not exercised (no rand-node binary on the machine that made the change).
+- The owner chose `PERPS_MAX_WINDOW_HEIGHTS` 256 and `MULTISIG_MAX_ACCOUNTS` 65 536: still inputs
+  with no default. rand-archive-2 is abandoned; chain 21's history on record starts at 187 556
+  (e, obs1).
+- **archive2 dropped**: `CHAIN21_BONDED` (8) minus `DROPPED_VALIDATORS` (archive2) must equal
+  `BONDED`; `VALIDATOR_COUNT` (25) and `VALIDATOR_QUORUM` (17) are derived and exported, and every
+  count (beacon, field probe, check-limits, fixtures) reads them. The chain-21 register must hold
+  26 and the one entry left out must pay out where chain 21's genesis archive2 does; `validators`
+  is excused from the whole-file compare and checked per entry instead. Record `drops:` names it.
+- **Pruned scan**: `pruned_gate` in py_snapshot / py_balances (`PRUNED_SCAN_OK=1`), `prune_floor`
+  written into both files; the bash gate before py_splice requires the override and a
+  digit-bounded `scan-floor:` match; py_splice refuses the override on an unpruned scan. SELFTEST
+  426 → 444 (fake chain-21 RPC with `prune_floor` 187556 and a fake `rand` exercise both commands).
+
 ### The chain-22 cut script carries block context and the beacon (2026-11-18, branch `feat/chain22-beacon-cut` stacked on `feat/randomness-beacon`, NOT pushed; deploy only)
 
 The owner decided on 2026-11-18 that chain 22 launches with `program_state.reference_block_window`

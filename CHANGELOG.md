@@ -61,6 +61,30 @@ Deploy (no node change):
   name, one distinct 64-hex commitment each; field-probed, read back by check-limits
   (`rand_getBeacon`, `rand_getBlockContext`), written to the cut record with the operator seed
   procedure. New `deploy/check-beacon-seed.sh`, run on each validator host before its node starts.
+- **The chain-22 treasury is 5 of 6 with its balance carried; perps is carried empty** (owner's
+  decisions of 2026-11-19, `deploy/cut-chain22-genesis.sh`). `TREASURY` must list exactly six
+  distinct signers, `threshold 5`, none of them chain 21's (genesis or rotated); its `balance`
+  must equal chain 21's `rand_getSupply.multisig_rand_held` at the snapshot (100 000 RAND) —
+  carried from the register, not new issuance — and the genesis may not seed more RAND than chain
+  21's `total_supply`. `TREASURY_SIGNERS_CHANGED` / `TREASURY_ROTATED` are gone;
+  `MULTISIG_NOT_CARRIED_OK` covers only a vault token or another account's RAND, and
+  `PERPS_STATE_NOT_CARRIED_OK` only a non-empty exchange (each refused when there is nothing to
+  drop). An empty exchange is carried with its genesis root asserted equal; program vaults stay
+  dropped (`PROGRAM_VAULTS_DROPPED_OK`). The cut record's `carries:` names the treasury and perps.
+  `docs/multisig.md` now advises 5 of 6; `docs/deploy.md` records the owner's 256 / 65 536 for
+  `PERPS_MAX_WINDOW_HEIGHTS` / `MULTISIG_MAX_ACCOUNTS` (still inputs) and that rand-archive-2 is
+  abandoned, chain 21's history on record starting at height 187 556 (e, obs1). SELFTEST 404 →
+  426.
+- **Chain 22 drops archive2 and accepts a pruned carry scan on the record** (owner's decisions of
+  2026-11-19). `BONDED` defaults to `obs1 g1 g2 g3 g4 g5 g6` and no other list is accepted:
+  chain 22 starts with 25 validators (quorum 17), the beacon takes 25 commitments, nothing reads
+  archive2's registration or key, and archive2's chain-21 stake is not recreated — the cut prints
+  it and the record's `drops:` must name archive2. `PRUNED_SCAN_OK=1` lets `snapshot` and
+  `balances` read a node with `prune_floor` above 0 (none other exists: e and obs1 prune below
+  187 556), prints the floor loudly and records it; the cut then needs the override and a
+  `scan-floor:` record line naming the floor, and refuses the override when nothing was pruned.
+  A pruned scan is complete for shielded notes and spends and misses only an envelope below the
+  floor that does not open (RS-1). SELFTEST 426 → 444.
 
 Node (issue #166, ZKVM-201; node-only, no wire, genesis or consensus change):
 
