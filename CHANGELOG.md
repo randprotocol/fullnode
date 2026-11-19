@@ -61,6 +61,20 @@ Deploy (no node change):
   name, one distinct 64-hex commitment each; field-probed, read back by check-limits
   (`rand_getBeacon`, `rand_getBlockContext`), written to the cut record with the operator seed
   procedure. New `deploy/check-beacon-seed.sh`, run on each validator host before its node starts.
+- **The chain-22 treasury is 5 of 6 with its balance carried; perps is carried empty** (owner's
+  decisions of 2026-11-19, `deploy/cut-chain22-genesis.sh`). `TREASURY` must list exactly six
+  distinct signers, `threshold 5`, none of them chain 21's (genesis or rotated); its `balance`
+  must equal chain 21's `rand_getSupply.multisig_rand_held` at the snapshot (100 000 RAND) —
+  carried from the register, not new issuance — and the genesis may not seed more RAND than chain
+  21's `total_supply`. `TREASURY_SIGNERS_CHANGED` / `TREASURY_ROTATED` are gone;
+  `MULTISIG_NOT_CARRIED_OK` covers only a vault token or another account's RAND, and
+  `PERPS_STATE_NOT_CARRIED_OK` only a non-empty exchange (each refused when there is nothing to
+  drop). An empty exchange is carried with its genesis root asserted equal; program vaults stay
+  dropped (`PROGRAM_VAULTS_DROPPED_OK`). The cut record's `carries:` names the treasury and perps.
+  `docs/multisig.md` now advises 5 of 6; `docs/deploy.md` records the owner's 256 / 65 536 for
+  `PERPS_MAX_WINDOW_HEIGHTS` / `MULTISIG_MAX_ACCOUNTS` (still inputs) and that rand-archive-2 is
+  abandoned, chain 21's history on record starting at height 187 556 (e, obs1). SELFTEST 404 →
+  426.
 
 Node (issue #166, ZKVM-201; node-only, no wire, genesis or consensus change):
 
