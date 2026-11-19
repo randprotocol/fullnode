@@ -48,16 +48,22 @@
 #     VALIDATOR HOST before its node starts, proves the host's seed file opens its genesis
 #     commitment.
 #
-#   deploy/cut-chain22-genesis.sh snapshot <dir>     # chain 21 still up, bridge daemons stopped
-#   WALLET=<chain 21's rand, v0.8.2> deploy/cut-chain22-genesis.sh balances <dir>
-#                                                    # read-only toward the chain: the RAND carry list
+#   [PRUNED_SCAN_OK=1] deploy/cut-chain22-genesis.sh snapshot <dir>
+#                                                    # chain 21 still up, bridge daemons stopped
+#   [PRUNED_SCAN_OK=1] WALLET=<chain 21's rand, v0.8.2> deploy/cut-chain22-genesis.sh balances <dir>
+#                                                    # read-only toward the chain: the RAND carry list.
+#                                                    # PRUNED_SCAN_OK=1 (owner, 2026-11-19): accept a
+#                                                    # pruned CHAIN21_RPC — none other exists (e, obs1:
+#                                                    # prune_floor 187556; rand-archive-2 abandoned);
+#                                                    # the cut then needs it too and the record's
+#                                                    # `scan-floor: <floor>` (what it loses: py_snapshot)
 #   CUT_RECORD=<record> CHAIN21_SNAPSHOT=<dir> NODE=<the cut build's rand-node> WALLET=<its rand> \
 #     EXPECT_NODE_VERSION=<that release> PERP_PROVER=<durian's perp-prover> \
 #     PERPS_MAX_WINDOW_HEIGHTS=<64..4096> MULTISIG_MAX_ACCOUNTS=<n ≥ 1> \
 #     [BEACON_TSV=<name ↔ commitment>] [REFERENCE_BLOCK_WINDOW=<256..4096, 256>] \
 #     [BEACON_COMMIT_DELAY_BLOCKS=<1..1048576, 256>] \
 #     [PERP_IMAGE=<perp-engine.image.bin>] [TREASURY=<treasury.txt>] \
-#     [PROGRAM_VAULTS_DROPPED_OK=1] [MULTISIG_NOT_CARRIED_OK=1] [PERPS_STATE_NOT_CARRIED_OK=1] \
+#     [PROGRAM_VAULTS_DROPPED_OK=1] [PRUNED_SCAN_OK=1] [MULTISIG_NOT_CARRIED_OK=1] [PERPS_STATE_NOT_CARRIED_OK=1] \
 #     deploy/cut-chain22-genesis.sh                  # the cut (the last two only for what the
 #                                                    # treasury carry / an empty exchange cannot carry)
 #   NODE=<the cut build's rand-node> deploy/cut-chain22-genesis.sh check-limits <rpc url> <genesis file>
@@ -287,7 +293,7 @@
 #   FEE_RECIPIENT_FILE  default ~/.rand-chain20/fee-recipient-address.txt — chain 20's and chain
 #                     21's recipient, fingerprint 89DS-4Q4X-HXSX-MBYW (it never moved).
 #   BEACON_TSV        default ~/.rand-chain22/beacon-commitments.tsv: "<validator name> <64 hex>",
-#                     one line per chain-22 validator (the 26 names of GENESIS_NAMES and BONDED), each
+#                     one line per chain-22 validator (the 25 names of GENESIS_NAMES and BONDED), each
 #                     commitment what that validator's own `rand-node beacon init --chain-id 22`
 #                     printed on its own host. Public: commitments only, never a seed.
 #
@@ -358,8 +364,25 @@ CHAIN21_SNAPSHOT=${CHAIN21_SNAPSHOT:-}                       # the cut: the snap
 # ── public inputs, all outside the repository ─────────────────────────────────────────────────
 VALIDATORS_TSV=${VALIDATORS_TSV:-$HOME/.rand-chain14/public/validators.tsv}   # name addr pk peer payout (18)
 REGISTRATIONS=${REGISTRATIONS:-$HOME/.rand-chain15/registrations}              # <name>.txt, one per bonded validator (8)
-BONDED=${BONDED:-obs1 archive2 g1 g2 g3 g4 g5 g6}
+# Chain 21's bonded validators in its register order (its genesis). Chain 22 DROPS archive2 (the
+# owner, 2026-11-19: offline since about 9 Nov): it is not a chain-22 validator, its registration
+# file and key are never read, and its chain-21 stake (and any unwithdrawn rewards) is NOT
+# recreated on chain 22 — the cut record's drops: line must name it. Chain 22 starts with 25
+# validators (18 genesis + 7 bonded), quorum 17. Not overridable: another set edits this script
+# and docs/deploy.md together.
+CHAIN21_BONDED="obs1 archive2 g1 g2 g3 g4 g5 g6"
+DROPPED_VALIDATORS=archive2
+BONDED=${BONDED:-obs1 g1 g2 g3 g4 g5 g6}
 GENESIS_NAMES=${GENESIS_NAMES:-a b c d e f lon1 sfo3 tor1 blr1 syd1 atl1 ams3 nyc1 nyc2 sfo2 mkc1 mem1}
+_want_bonded=$(for n in $CHAIN21_BONDED; do case " $DROPPED_VALIDATORS " in *" $n "*) ;; *) printf '%s ' "$n";; esac; done)
+_want_bonded=${_want_bonded% }
+# word-split on purpose: compares the two name lists, spacing aside
+# shellcheck disable=SC2086
+_have_bonded=$(printf '%s ' $BONDED); _have_bonded=${_have_bonded% }
+[ "$_have_bonded" = "$_want_bonded" ] || {
+  echo "cut-chain22: BONDED='$BONDED' is not chain 21's bonded validators without $DROPPED_VALIDATORS ('$_want_bonded', in chain 21's order) — archive2 is dropped (owner, 2026-11-19), every other one kept" >&2; exit 1; }
+VALIDATOR_COUNT=$(( $(wc -w <<<"$GENESIS_NAMES") + $(wc -w <<<"$BONDED") ))
+VALIDATOR_QUORUM=$(( 2 * VALIDATOR_COUNT / 3 + 1 ))
 FAUCET_MINTERS=${FAUCET_MINTERS:-$GENESIS_NAMES}   # chain 21's list; another one needs FAUCET_MINTERS_CHANGED=1
 FAUCET_RECIPIENTS=${FAUCET_RECIPIENTS:-}           # unset: chain 21's genesis allowlist; a file ("<name> rand1…") changes it
 STAKE_RAND=${STAKE_RAND:-1000}
@@ -569,6 +592,7 @@ fi
 
 # shellcheck disable=SC2090
 export CHAIN_ID CHAIN21_GENESIS CHAIN21_HASH CHAIN21_GENESIS_SHA256 CHAIN21_TREASURY_ID CHAIN21_RPC VALIDATORS_TSV REGISTRATIONS BONDED GENESIS_NAMES \
+  CHAIN21_BONDED DROPPED_VALIDATORS VALIDATOR_COUNT VALIDATOR_QUORUM \
   FAUCET_MINTERS FAUCET_RECIPIENTS STAKE_RAND ALLOC_ADDRESSES ZUSD_CARRY WALLETS_DIRS RELAYER_DONE_DIR EXPECT_HC_BUNDLE \
   EXPECT_HC_AUTH MAX_PROGRAM_WORDS MAX_PROOF_BYTES MAX_BLOCK_BYTES MAX_CALL_ENVELOPE_BYTES \
   MAX_PROGRAM_PUBLIC_WORDS EPOCH_BLOCKS EMITTER_2 EMITTER_3 EMITTER_4 EMITTER_5 C21_EMITTER_2 C21_EMITTER_3 \
@@ -696,7 +720,29 @@ snap = {"taken_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
 snap["genesis_hash"] = rand("rand_getGenesisHash")
 if snap["genesis_hash"] != E["CHAIN21_HASH"]:
     sys.exit(f"cut-chain22: {E['CHAIN21_RPC']} serves {snap['genesis_hash']}, not chain 21")
-snap["status_height"] = rand("rand_status")["height"]
+# A PRUNED chain-21 node (prune_floor > 0) — the only kind left: rand-archive-2 is abandoned and e
+# and obs1 both report prune_floor 187556 (owner, 2026-11-19). A scan from it is accepted only on
+# PRUNED_SCAN_OK=1, the floor printed loudly and named on the cut record (scan-floor:). What it
+# loses (crates/randprotocol-client/src/wallet.rs `warn_pruned`, RS-1): shielded notes and spends
+# are COMPLETE — the node never prunes commitments or nullifiers; only a bridge deposit, token mint,
+# registration's initial mint or program payout committed below the floor whose envelope does NOT
+# open is missed (an honestly sealed one is still found). A wallet missing from the scan is still
+# refused by the uncovered-genesis-allocs check.
+PRUNED_WHAT = ("shielded notes and spends are complete (commitments and nullifiers are never pruned); only a bridge deposit, "
+               "token mint, registration mint or program payout below the floor whose envelope does not open is missed (RS-1)")
+def pruned_gate(where, floor):
+    if not floor:
+        return
+    if E.get("PRUNED_SCAN_OK") != "1":
+        sys.exit(f"cut-chain22: {E['CHAIN21_RPC']} is pruned (prune_floor {floor}) — no unpruned chain-21 node exists since rand-archive-2 was "
+                 f"abandoned (e and obs1 both prune below 187556). `{where}` refuses a pruned node unless PRUNED_SCAN_OK=1, which accepts it "
+                 f"on the record: {PRUNED_WHAT}. Set PRUNED_SCAN_OK=1 and name `scan-floor: {floor}` on the cut record")
+    print(f"cut-chain22: ⚠⚠⚠ PRUNED SCAN (PRUNED_SCAN_OK=1): {E['CHAIN21_RPC']} has pruned chain 21's blocks below height {floor} — "
+          f"{PRUNED_WHAT}; the cut record must say `scan-floor: {floor}` ⚠⚠⚠", file=sys.stderr)
+status = rand("rand_status")
+snap["status_height"] = status["height"]
+snap["prune_floor"] = int(status.get("prune_floor", 0) or 0)
+pruned_gate("snapshot", snap["prune_floor"])
 snap["validators"] = rand("rand_getValidators")
 snap["bridge"] = rand("rand_getBridgeState")
 snap["tokens"] = rand("rand_getTokens")
@@ -774,9 +820,27 @@ def rpc(method):
 if rpc("rand_getGenesisHash") != E["CHAIN21_HASH"]:
     sys.exit(f"cut-chain22: {E['CHAIN21_RPC']} is not chain 21")
 status0 = rpc("rand_status")
-if int(status0.get("prune_floor", 0) or 0) > 0:
-    sys.exit(f"cut-chain22: {E['CHAIN21_RPC']} is pruned (prune_floor {status0['prune_floor']}) — "
-             f"`balances` needs a full scan; point CHAIN21_RPC at an archive (obs1 or e; rand-archive-2 is abandoned, 2026-11-19)")
+# A PRUNED chain-21 node (prune_floor > 0) — the only kind left: rand-archive-2 is abandoned and e
+# and obs1 both report prune_floor 187556 (owner, 2026-11-19). A scan from it is accepted only on
+# PRUNED_SCAN_OK=1, the floor printed loudly and named on the cut record (scan-floor:). What it
+# loses (crates/randprotocol-client/src/wallet.rs `warn_pruned`, RS-1): shielded notes and spends
+# are COMPLETE — the node never prunes commitments or nullifiers; only a bridge deposit, token mint,
+# registration's initial mint or program payout committed below the floor whose envelope does NOT
+# open is missed (an honestly sealed one is still found). A wallet missing from the scan is still
+# refused by the uncovered-genesis-allocs check.
+PRUNED_WHAT = ("shielded notes and spends are complete (commitments and nullifiers are never pruned); only a bridge deposit, "
+               "token mint, registration mint or program payout below the floor whose envelope does not open is missed (RS-1)")
+def pruned_gate(where, floor):
+    if not floor:
+        return
+    if E.get("PRUNED_SCAN_OK") != "1":
+        sys.exit(f"cut-chain22: {E['CHAIN21_RPC']} is pruned (prune_floor {floor}) — no unpruned chain-21 node exists since rand-archive-2 was "
+                 f"abandoned (e and obs1 both prune below 187556). `{where}` refuses a pruned node unless PRUNED_SCAN_OK=1, which accepts it "
+                 f"on the record: {PRUNED_WHAT}. Set PRUNED_SCAN_OK=1 and name `scan-floor: {floor}` on the cut record")
+    print(f"cut-chain22: ⚠⚠⚠ PRUNED SCAN (PRUNED_SCAN_OK=1): {E['CHAIN21_RPC']} has pruned chain 21's blocks below height {floor} — "
+          f"{PRUNED_WHAT}; the cut record must say `scan-floor: {floor}` ⚠⚠⚠", file=sys.stderr)
+prune_floor = int(status0.get("prune_floor", 0) or 0)
+pruned_gate("balances", prune_floor)
 def rand(key, *args):
     p = subprocess.run([E["WALLET"], "--rpc", E["CHAIN21_RPC"], "--key", key, *args], capture_output=True, text=True)
     if p.stderr.strip():
@@ -864,7 +928,7 @@ if uncovered:
 
 json.dump({"chain21_hash": E["CHAIN21_HASH"], "taken_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
            "height_from": height0, "height_to": height1, "wallets": rows, "carried_rand_units": total,
-           "uncovered_genesis_allocs": uncovered, "rescanned": sync == ["sync", "--rescan"]},
+           "uncovered_genesis_allocs": uncovered, "rescanned": sync == ["sync", "--rescan"], "prune_floor": prune_floor},
           open(os.path.join(E["SNAP"], "balances.json"), "w"), indent=1)
 os.makedirs(os.path.dirname(E["ALLOC_ADDRESSES"]) or ".", exist_ok=True)
 with open(E["ALLOC_ADDRESSES"], "w") as out:
@@ -915,7 +979,22 @@ for name in E["BONDED"].split():
     need(addr in register, f"{name} ({addr}) is not in chain 21's register")
     rows.append({"name": name, "address": addr, "public_key": raw[8:8 + n].hex(), "payout": register[addr]["payout"]})
 stake = int(E["STAKE_RAND"]) * 10**9
-need(len(rows) == len(register) == 26, f"{len(rows)} validators assembled, chain 21's register holds {len(register)}")
+count = int(E["VALIDATOR_COUNT"])
+dropped_names = E["DROPPED_VALIDATORS"].split()
+names21 = E["GENESIS_NAMES"].split() + E["CHAIN21_BONDED"].split()
+need(len(rows) == count == 25, f"{len(rows)} validators assembled (VALIDATOR_COUNT {count}) — chain 22 starts with 25: chain 21's 26 without archive2")
+need(len(register) == len(names21) == len(g21["validators"]) == 26,
+     f"chain 21's register holds {len(register)} validators, its genesis {len(g21['validators'])} — expected chain 21's 26 (chain 22 keeps all but {', '.join(dropped_names)})")
+# chain 21's validator(s) chain 22 drops: the register entry that is none of the 25 — its stake is not recreated
+gone = [a for a in register if a not in {r["address"] for r in rows}]
+need(len(gone) == len(dropped_names), f"chain 21's register has {len(gone)} validator(s) outside chain 22's {count}, expected {len(dropped_names)} ({', '.join(dropped_names)})")
+g21_dropped = [v for n, v in zip(names21, g21["validators"]) if n in dropped_names]
+need(sorted(register[a]["payout"] for a in gone) == sorted(v["payout"] for v in g21_dropped),
+     f"the register entry chain 22 drops does not pay out where chain 21's genesis {', '.join(dropped_names)} does — the wrong validator is missing")
+for a in gone:
+    d = register[a]
+    print(f"cut-chain22: ⚠ DROPPED validator ({', '.join(dropped_names)}, owner 2026-11-19): {a[:16]}… — its chain-21 stake {d['stake']} units"
+          f"{' and ' + str(d.get('rewards')) + ' unwithdrawn reward units' if int(d.get('rewards', '0') or 0) else ''} NOT recreated on chain 22 (the record's drops: names it)")
 for r in rows:
     live = register.get(r["address"])
     need(live is not None, f"{r['name']} ({r['address']}) is not in chain 21's register")
@@ -925,12 +1004,12 @@ for r in rows:
     need(int(live.get("rewards", "0")) == 0 or E.get("REWARDS_DROPPED_OK"),
          f"{r['name']}: chain 21 shows {live['rewards']} unwithdrawn reward units — withdraw them before the cut "
          f"(rewards are not carried), or set REWARDS_DROPPED_OK=1 to drop them")
-need(len({r["public_key"] for r in rows}) == 26 and len({r["address"] for r in rows}) == 26, "a validator twice")
+need(len({r["public_key"] for r in rows}) == count and len({r["address"] for r in rows}) == count, "a validator twice")
 total_rewards = sum(int(register[r["address"]].get("rewards", "0")) for r in rows)
 if total_rewards:
     print(f"cut-chain22: ⚠ dropping {total_rewards} unwithdrawn reward unit(s) across the register (REWARDS_DROPPED_OK=1)")
-need([(v["public_key"], v["payout"]) for v in g21["validators"]] == [(r["public_key"], r["payout"]) for r in rows],
-     "the 26 are not chain 21's genesis validators (keys, payouts or order)")
+need([(v["public_key"], v["payout"]) for n, v in zip(names21, g21["validators"]) if n not in dropped_names] == [(r["public_key"], r["payout"]) for r in rows],
+     f"the {count} are not chain 21's genesis validators without {', '.join(dropped_names)} (keys, payouts or order)")
 json.dump(rows, open(os.path.join(E["TMP"], "validators.json"), "w"))
 with open(os.path.join(E["TMP"], "validator-args"), "w") as f:
     for r in rows:
@@ -938,7 +1017,7 @@ with open(os.path.join(E["TMP"], "validator-args"), "w") as f:
 t = g21["tokens"]
 json.dump({"registration_fee": t["registration_fee"], "mint_cap_per_day": t["mint_cap_per_day"], "tokens": []},
           open(os.path.join(E["TMP"], "tokens.json"), "w"))
-print(f"cut-chain22: 26 validators × {E['STAKE_RAND']} RAND, equal to chain 21's register at height {snap['status_height']}")
+print(f"cut-chain22: {count} validators × {E['STAKE_RAND']} RAND (quorum {E['VALIDATOR_QUORUM']}), equal to chain 21's register at height {snap['status_height']} without {', '.join(dropped_names)}")
 PY
 }
 
@@ -1123,7 +1202,7 @@ for line in open(dpath):
     f = line.split()
     if f:
         derived[f[0]] = f[1]
-need(set(derived) == set(names), f"the derived addresses name {sorted(derived)}, not the 26 validators")
+need(set(derived) == set(names), f"the derived addresses name {sorted(derived)}, not the {len(names)} validators")
 mismatch = [x for x in rows if x["address"] != derived[x["name"]]]
 if mismatch:
     need(E.get("FIXTURE_ADDRESSES_OK") == "1",
@@ -1330,10 +1409,22 @@ if os.path.isfile(bal_file):
         warnings.append("balances.json was NOT taken with `rand sync --rescan` (BALANCES_RESCAN=0) — a stale note store could have read low")
     rand_carry = f"== Σ scanned ({len(scanned)} wallets, heights {bal['height_from']}..{bal['height_to']})"
 else:
+    bal = {}
     need(E.get("NO_BALANCES"), f"no {bal_file or 'balances.json'} — run `balances` (the carry-over rule), or set NO_BALANCES=1 to cut from a hand-made list")
     rand_carry = "NOT checked against a scan (NO_BALANCES=1)"
     warnings.append("RAND allocs were not checked against scanned balances")
 g["alloc"] = g["alloc"] + token_notes
+# The carry scan's floor (PRUNED_SCAN_OK; the bash gate checked the record's scan-floor: line): the
+# snapshot's node and the balances' node, whichever pruned higher.
+scan_floor = max(int(snap.get("prune_floor", 0) or 0), int(bal.get("prune_floor", 0) or 0))
+if scan_floor:
+    need(E.get("PRUNED_SCAN_OK") == "1", f"the snapshot / balances were read from a node pruned below height {scan_floor} — set PRUNED_SCAN_OK=1 "
+                                          f"and name `scan-floor: {scan_floor}` on the cut record (no unpruned chain-21 node exists since rand-archive-2 was abandoned)")
+    warnings.append(f"PRUNED SCAN (PRUNED_SCAN_OK=1): chain 21 was scanned from height {scan_floor} — shielded notes and spends complete; a bridge "
+                    f"deposit, token mint, registration mint or program payout below it whose envelope does not open is missed (RS-1)")
+    rand_carry += f"; PRUNED SCAN from height {scan_floor}"
+else:
+    need(E.get("PRUNED_SCAN_OK") != "1", "PRUNED_SCAN_OK=1 is set, but neither the snapshot nor balances.json was read from a pruned node — unset it")
 
 # ── chain 21's state its own cut never carried (the header's OPEN 3–5). The multisig register's RAND
 # is CARRIED into chain 22's treasury (its balance == multisig_rand_held, asserted in the multisig
@@ -1636,7 +1727,7 @@ else:
     need(type(bd) is int and str(bd) == E["BEACON_COMMIT_DELAY_BLOCKS"] and 1 <= bd <= 1 << 20,
          f"beacon.commit_delay_blocks is {bd!r}, not BEACON_COMMIT_DELAY_BLOCKS {E['BEACON_COMMIT_DELAY_BLOCKS']!r} in 1..=1048576 (OPEN 10)")
     cm = bc["commitments"]
-    need(isinstance(cm, list) and len(cm) == len(g["validators"]) == 26, f"the beacon lists {len(cm) if isinstance(cm, list) else cm!r} commitments for {len(g['validators'])} validators — exactly one each")
+    need(isinstance(cm, list) and len(cm) == len(g["validators"]) == int(E["VALIDATOR_COUNT"]), f"the beacon lists {len(cm) if isinstance(cm, list) else cm!r} commitments for {len(g['validators'])} validators — exactly one each")
     need(all(list(c) == ["validator", "commitment"] and re.fullmatch(r"[0-9a-f]{64}", str(c["commitment"])) for c in cm),
          "a beacon commitment is not {validator, commitment: 64 lowercase hex}")
     need(len({c["validator"] for c in cm}) == len(cm) and len({c["commitment"] for c in cm}) == len(cm), "a beacon validator or commitment twice")
@@ -1689,8 +1780,11 @@ need(fees == b21.get("fees") or E.get("FEE_RECIPIENT_CHANGED"),
 if fees["recipient"] in {a for _, a, _ in alloc}:
     warnings.append("the bridge fee recipient is also a carried RAND wallet (an alloc) — its viewing key sees every fee note")
 need(g["epoch_blocks"] == int(E["EPOCH_BLOCKS"]) == g21["epoch_blocks"], "epoch_blocks is not chain 21's")
-need(len(g["validators"]) == 26 and all(v["stake"] == int(E["STAKE_RAND"]) * 10**9 for v in g["validators"]), "validators wrong")
+need(len(g["validators"]) == int(E["VALIDATOR_COUNT"]) == 25 and all(v["stake"] == int(E["STAKE_RAND"]) * 10**9 for v in g["validators"]), "validators wrong")
 need([v["public_key"] for v in g["validators"]] == [vals[n]["public_key"] for n in vals], "validator order/keys wrong")
+g21_by_pk = {v["public_key"]: v for v in g21["validators"]}
+need(all(v == g21_by_pk.get(v["public_key"]) for v in g["validators"]),
+     "not chain 21's shape: ['validators'] — a validator entry (stake, payout, …) differs from its chain-21 genesis entry")
 for i, n in enumerate(g["alloc"]):
     need(n.get("opening") is not None, f"alloc note {i} has no opening (core I-2)")
 need(sum(n["amount"] for n in g["alloc"] if n["opening"].get("asset", 0) == 1) == locked_total, "Σ zUSD notes != Σ locked")
@@ -1726,7 +1820,9 @@ need(g["max_block_bytes"] >= 3 * g["max_proof_bytes"] + 1048576,
 # backings' `locked`, the faucet lists, the treasury (salt, balance) and the new fields (asserted at
 # their values above), every byte is chain 21's: gas, staking, bridge, tokens, perps, multisig and
 # program_state are compared on their own lines below, the new fields taken out.
-excused = {"chain_id", "timestamp_ms", "alloc", "bridge", "tokens", "staking", "gas", "perps", "multisig", "program_state", "beacon"}
+# `validators`: chain 21's genesis list without archive2 (owner, 2026-11-19), asserted above
+# against the register and in py_validators against chain 21's genesis, key by key, in order.
+excused = {"chain_id", "timestamp_ms", "alloc", "bridge", "tokens", "staking", "gas", "perps", "multisig", "program_state", "beacon", "validators"}
 if E.get("LIMITS_CHANGED"):
     excused |= {"max_program_words", "max_proof_bytes", "max_block_bytes", "max_call_envelope_bytes", "max_program_public_words"}
 moved = sorted(k for k in set(g) | set(g21) if k not in excused and g.get(k) != g21.get(k))
@@ -1803,7 +1899,7 @@ PY
 # and without `tokens.incremental_root`; and (#168 / #189) without `program_state.reference_block_window`
 # and the beacon together (the beacon is refused without the window), with the window at another
 # value in range, without the beacon alone, with `beacon.commit_delay_blocks` at another value, and
-# with each one commitment changed (26 variants). Each must hash
+# with each one commitment changed (25 variants, one per validator). Each must hash
 # differently. A build that parses a field but leaves it out of the hash would launch a chain
 # without that rule. Chain 21's fields are compared equal to deploy/genesis-chain21.json, whose hash
 # this same rand-node re-derives (ca76c276…) — chain 21's own cut probed its sections. A field the
@@ -1894,10 +1990,10 @@ probe_fields() {   # <finished genesis> <its hash>
   done
   [ "$ok" -eq "$want" ] || { echo "cut-chain22: the field probe ran $ok variant(s), expected $want" >&2; exit 1; }
   # The full set: the audit-v10 eight, plus (#168 / #189) the window with the beacon, the window at
-  # another value, the beacon, its delay at another value, and one per commitment (26).
-  local full=$((8 + 4 + 26))
+  # another value, the beacon, its delay at another value, and one per commitment (VALIDATOR_COUNT, 25).
+  local full=$((8 + 4 + VALIDATOR_COUNT))
   [ -n "${PERPS_SKIPPED:-}${AUDIT_V10_SKIPPED:-}${BLOCK_CONTEXT_SKIPPED:-}" ] || [ "$ok" -eq "$full" ] \
-    || { echo "cut-chain22: the field probe ran $ok variant(s), expected $full (program_state.refuse_panics, multisig.max_accounts, perps.bound_payouts, perps.sparse_windows+max_window_heights+max_pending_digests, perps.max_window_heights at another value, perps.engine_program_log_height, perps.max_pending_digests, tokens.incremental_root; program_state.reference_block_window+beacon, the window at another value, beacon, beacon.commit_delay_blocks at another value, and each of the 26 commitments changed)" >&2; exit 1; }
+    || { echo "cut-chain22: the field probe ran $ok variant(s), expected $full (program_state.refuse_panics, multisig.max_accounts, perps.bound_payouts, perps.sparse_windows+max_window_heights+max_pending_digests, perps.max_window_heights at another value, perps.engine_program_log_height, perps.max_pending_digests, tokens.incremental_root; program_state.reference_block_window+beacon, the window at another value, beacon, beacon.commit_delay_blocks at another value, and each of the $VALIDATOR_COUNT commitments changed)" >&2; exit 1; }
   echo "cut-chain22: the new fields ($ok variants probed) are part of this rand-node's genesis hash"
 }
 
@@ -2200,7 +2296,7 @@ fi
 # payouts), no base file. BOTH describe chain 21 as the cut expects to find it: its genesis bridge
 # state unmoved (burn sequence 14; the four endpoints at their genesis floors 3/5/3/7 as next
 # sequences), zUSD locked ETH-USDT 22 / BSC-USDT 23.001999 / Tron-USDT 30 / Sol-USDT 25 == custody,
-# the register its 26 validators at 1 000 RAND; its treasury at its genesis signers and 100 000 RAND
+# the register its 26 validators at 1 000 RAND (archive2 among them: chain 22 keeps 25); its treasury at its genesis signers and 100 000 RAND
 # (as the live one holds it: multisig_rand_held 100000000000000 on 2026-11-19, which chain 22's
 # treasury carries, OPEN 3), the exchange empty (carried empty, OPEN 4) and no RAND in program
 # vaults; total_supply = its genesis notes + stakes + treasury. treasury.txt (both modes) lists SIX
@@ -2214,16 +2310,19 @@ exec(E["UNITS_PY"])
 g21 = json.load(open(E["CHAIN21_GENESIS"]))
 os.makedirs(f"{st}/snap"); os.makedirs(f"{st}/reg"); os.makedirs(f"{st}/tmp")
 gnames, bnames = E["GENESIS_NAMES"].split(), E["BONDED"].split()
+# chain 21's 26 (its register, in genesis order) and chain 22's 25 (without archive2, whose
+# registration file the fixture does not even write: nothing may need it)
+names21 = gnames + E["CHAIN21_BONDED"].split()
 names = gnames + bnames
-assert len(names) == len(g21["validators"]) == 26
+assert len(names21) == len(g21["validators"]) == 26 and len(names) == 25 and set(names21) - set(names) == set(E["DROPPED_VALIDATORS"].split())
 minters = g21["staking"]["faucet_minters"]
 assert len(minters) == len(gnames)
-addr = {n: (minters[i] if i < len(gnames) else f"FIXTUREaddr{i:02d}") for i, n in enumerate(names)}
+addr = {n: (minters[i] if i < len(gnames) else f"FIXTUREaddr{i:02d}") for i, n in enumerate(names21)}
 with open(f"{st}/validators.tsv", "w") as f:
-    for n, v in zip(names, g21["validators"]):
+    for n, v in zip(names21, g21["validators"]):
         if n in gnames:
             f.write(f"{n}\t{addr[n]}\t{v['public_key']}\tpeer\t{v['payout']}\n")
-for n, v in zip(names, g21["validators"]):
+for n, v in zip(names21, g21["validators"]):
     if n in bnames:
         pk = bytes.fromhex(v["public_key"])
         open(f"{st}/reg/{n}.txt", "w").write(f"validator {addr[n]} on chain 15\nregistration: {(len(pk).to_bytes(8, 'little') + pk + b'sig').hex()}\n")
@@ -2236,7 +2335,7 @@ assert total == 10000199900, "chain 21's zUSD supply is 100.001999: ETH-USDT 22,
 a21 = g21["multisig"]["accounts"][0]
 snap = {"taken_at": "dryrun" if dry else "selftest", "genesis_hash": E["CHAIN21_HASH"], "status_height": 50000,
         "validators": [{"address": addr[n], "stake": str(v["stake"]), "pending": [], "rewards": "0", "payout": v["payout"],
-                        "nonce": 0, "active": True} for n, v in zip(names, g21["validators"])],
+                        "nonce": 0, "active": True} for n, v in zip(names21, g21["validators"])],
         "bridge": {**{k: b[k] for k in ("emitter", "emitters", "guardian_set_index", "guardians", "pq_guardians", "pause_key")},
                    "burn_sequence": b["burn_sequence"], "mint_paused": False, "registration_fee": str(g21["tokens"]["registration_fee"]),
                    "rules_v2": {"global_mint_cap_per_window": str(b["rules_v2"]["global_mint_cap_per_window"]), "cap_window_secs": b["rules_v2"]["cap_window_secs"]},
@@ -2277,7 +2376,7 @@ open(f"{st}/cut-record.txt", "w").write(
     "#168 block context (reference_block_window) and #189 the randomness beacon\n"
     "carries: fixture register, bridge state, balances; the treasury 5 of 6 with six new signers, its balance carried from chain 21's multisig register; "
     "perps carried (empty), its genesis root chain 21's\n"
-    "drops: fixture: nothing beyond the fixture's own\nclients: fixture: none\n"
+    "drops: fixture: archive2's chain-21 validator stake (1000 RAND), not recreated\nclients: fixture: none\n"
     "second-operator: fixture\nrollback: fixture: keep chain 21 dirs and *.pre-c22 binaries a day\n")
 # The treasury: six FIXTURE signers, 5 of 6 — deterministic keys of a Dilithium2 public key's length
 # (SHAKE-256 of fixed labels: 1312 bytes, 2624 hex), none of them chain 21's — at the snapshot's
@@ -2321,7 +2420,8 @@ base = {k: g21[k] for k in ("chain_id", "timestamp_ms", "validators", "faucet", 
                            "epoch_blocks", "max_program_words", "max_proof_bytes", "max_block_bytes", "max_call_envelope_bytes",
                            "max_program_public_words", "envelope_bytes", "hardening_v6", "hc_auth")}
 tb, tg, bps = (int(x) for x in E["GAS_DYNAMIC"].split(","))
-base.update(chain_id=22, timestamp_ms=int(time.time() * 1000), alloc=rand_notes, hc_bundle=E["EXPECT_HC_BUNDLE"], hc_auth=E["EXPECT_HC_AUTH"],
+base.update(chain_id=22, timestamp_ms=int(time.time() * 1000), alloc=rand_notes,
+            validators=[v for n, v in zip(names21, g21["validators"]) if n in names], hc_bundle=E["EXPECT_HC_BUNDLE"], hc_auth=E["EXPECT_HC_AUTH"],
             max_proof_bytes=int(E["MAX_PROOF_BYTES"]), max_block_bytes=int(E["MAX_BLOCK_BYTES"]),
             hc_auth_multisig=E["EXPECT_HC_AUTH_MULTISIG"],
             tokens={"registration_fee": g21["tokens"]["registration_fee"], "mint_cap_per_day": g21["tokens"]["mint_cap_per_day"],
@@ -2392,7 +2492,7 @@ if [ "${SELFTEST:-}" = 1 ]; then
   python3 -c 'import json,sys; b=json.load(open(sys.argv[1])); b["multisig"]=json.load(open(sys.argv[2])); json.dump(b, open(sys.argv[1],"w"))' "$ST/base.json" "$ST/tmp/multisig.json"
   # The beacon (#189): py_beacon joins the fixture BEACON_TSV with the validators → $TMP/beacon.json.
   export BEACON_TSV=$ST/beacon.tsv
-  if py_validators >/dev/null && py_beacon >"$ST/log" 2>&1 && grep -q '26 commitments' "$ST/log" \
+  if py_validators >/dev/null && py_beacon >"$ST/log" 2>&1 && grep -q '25 commitments' "$ST/log" \
      && python3 - "$ST/tmp/beacon.json" "$ST/tmp/validators.json" "$ST/beacon.tsv" "$ST/tmp/beacon-record.txt" <<'PY'
 import json, sys
 b, v = json.load(open(sys.argv[1])), json.load(open(sys.argv[2]))
@@ -2402,7 +2502,7 @@ assert [c["validator"] for c in b["commitments"]] == [x["address"] for x in v]
 assert [c["commitment"] for c in b["commitments"]] == [t[x["name"]] for x in v]
 assert open(sys.argv[4]).read().splitlines() == [f"beacon-commitment: {x['name']} {x['address']} {t[x['name']]}" for x in v]
 PY
-  then ok "the fixture BEACON_TSV joins by name with the 26 validators: one commitment each, in validator order, delay 256, the record lines written"
+  then ok "the fixture BEACON_TSV joins by name with the 25 validators: one commitment each, in validator order, delay 256, the record lines written"
   else bad "the fixture beacon: $(tail -2 "$ST/log")"; fi
 
   fresh
@@ -2414,7 +2514,7 @@ g = json.load(open(E["OUT"]))
 g21 = json.load(open(E["CHAIN21_GENESIS"]))
 assert g["chain_id"] == 22 and g["hc_auth"] == g21["hc_auth"] and g["hc_bundle"] == g21["hc_bundle"]
 assert list(g) == list(g21) + ["beacon"], "every key chain 21 has, in chain 21's order — and the beacon, last"
-assert g["beacon"] == json.load(open(E["TMP"] + "/beacon.json")) and len(g["beacon"]["commitments"]) == 26 and g["beacon"]["commit_delay_blocks"] == 256
+assert g["beacon"] == json.load(open(E["TMP"] + "/beacon.json")) and len(g["beacon"]["commitments"]) == 25 and g["beacon"]["commit_delay_blocks"] == 256
 assert g["fees"] == g21["fees"] == {"burn_base": True, "burn_floor": True}
 assert g["hc_auth_multisig"] == g21["hc_auth_multisig"] == "9705f8e2f1bc8561848b29cb8efd57c37e3e39788fa58a5f03304d8019668247" != g["hc_auth"]
 p = g["perps"]
@@ -2446,22 +2546,24 @@ assert g["bridge"]["burn_sequence"] == 14 and g["bridge"]["guardian_set_index"] 
 assert g["staking"] == g21["staking"] and g["staking"]["max_stake_entry_bps_per_epoch"] == 2500 and g["staking"]["admission_by_vote"] is True
 assert "slashing" not in g["staking"] and "vesting" not in g and "aggregation" not in g
 assert [(b["chain"], b["locked"]) for b in g["tokens"]["tokens"][0]["backings"] if "locked" in b] == [(2, 2200000000), (3, 2300199900), (4, 3000000000), (5, 2500000000)]
-assert g["validators"] == g21["validators"] and g["consensus_domain"] == 1
+n21 = E["GENESIS_NAMES"].split() + E["CHAIN21_BONDED"].split()
+assert g["validators"] == [v for n, v in zip(n21, g21["validators"]) if n != "archive2"] and len(g["validators"]) == 25 and g["consensus_domain"] == 1
+assert g21["validators"][n21.index("archive2")] not in g["validators"]
 assert sum(n["amount"] for n in g["alloc"] if n["opening"].get("asset", 0) == 0) == sum(n["amount"] for n in g21["alloc"] if n["opening"].get("asset", 0) == 0)
 assert sum(n["amount"] for n in g["alloc"] if n["opening"].get("asset", 0) == 1) == 10000199900
 assert all(sum(len(v) // 2 for v in n["envelope"].values()) == 1860 for n in g["alloc"])
 PY
-    then ok "the chain-21 fixture assembles into a chain-22 genesis: chain 21's keys in chain 21's order and every section chain 21's, plus program_state.refuse_panics true (PST-1), perps bound_payouts true (PERP-6), sparse_windows true + max_window_heights 256 (PERP-101), engine_program_log_height 14 (CON-60), max_pending_digests 65536 (PERP-5), no initial_collateral, multisig.max_accounts 1 (MSA-4), tokens.incremental_root true, program_state.reference_block_window 256 (#168), the beacon last with 26 commitments and delay 256 (#189); the treasury 5 of 6 with six new signers (none of chain 21's), fresh salt, 100000 RAND carried from chain 21's multisig register (= multisig_rand_held), perps carried (empty) with no override; floors 3/5/3/7, burn sequence 14, 100.001999 zUSD locked on four backings"; else bad "assembled genesis content"; fi
+    then ok "the chain-21 fixture assembles into a chain-22 genesis: chain 21's keys in chain 21's order and every section chain 21's, plus program_state.refuse_panics true (PST-1), perps bound_payouts true (PERP-6), sparse_windows true + max_window_heights 256 (PERP-101), engine_program_log_height 14 (CON-60), max_pending_digests 65536 (PERP-5), no initial_collateral, multisig.max_accounts 1 (MSA-4), tokens.incremental_root true, program_state.reference_block_window 256 (#168), the beacon last with 25 commitments and delay 256 (#189); 25 validators, archive2 dropped; the treasury 5 of 6 with six new signers (none of chain 21's), fresh salt, 100000 RAND carried from chain 21's multisig register (= multisig_rand_held), perps carried (empty) with no override; floors 3/5/3/7, burn sequence 14, 100.001999 zUSD locked on four backings"; else bad "assembled genesis content"; fi
   else bad "the happy path refused"; fi
   cp "$ST/out.json" "$ST/good.json"
 
   export -f py_validators py_splice py_treasury py_variants py_beacon
-  # The field probe's variants (the probe itself needs a rand-node: DRY_RUN runs it): 38 on the
+  # The field probe's variants (the probe itself needs a rand-node: DRY_RUN runs it): 37 on the
   # finished file — the audit-v10 eight, the window (+ beacon) and the window at 257, the beacon and
-  # its delay at 257, each of the 26 commitments changed — each a different file, each still with
+  # its delay at 257, each of the 25 commitments changed — each a different file, each still with
   # chain 21's other fields.
   rm -rf "$ST/vtmp"; mkdir -p "$ST/vtmp"
-  if OUT=$ST/good.json TMP=$ST/vtmp bash -c py_variants && [ "$(cat "$ST/vtmp/variants/count")" = 38 ] \
+  if OUT=$ST/good.json TMP=$ST/vtmp bash -c py_variants && [ "$(cat "$ST/vtmp/variants/count")" = 37 ] \
      && python3 - "$ST/vtmp/variants" "$ST/good.json" <<'PY'
 import glob, json, os, sys
 d, g = sys.argv[1], json.load(open(sys.argv[2]))
@@ -2469,7 +2571,7 @@ names = sorted(os.path.basename(f)[:-5] for f in glob.glob(d + "/*.json"))
 assert names == sorted(["program_state.refuse_panics", "multisig.max_accounts", "perps.bound_payouts", "perps.sparse_windows+max_window_heights+max_pending_digests",
                         "perps.max_window_heights=257", "perps.engine_program_log_height", "perps.max_pending_digests", "tokens.incremental_root",
                         "program_state.reference_block_window+beacon", "program_state.reference_block_window=257", "beacon", "beacon.commit_delay_blocks=257"]
-                       + [f"beacon.commitments.{i:02d}" for i in range(26)]), names
+                       + [f"beacon.commitments.{i:02d}" for i in range(25)]), names
 v = json.load(open(d + "/program_state.reference_block_window+beacon.json"))
 assert "reference_block_window" not in v["program_state"] and "beacon" not in v and v["program_state"]["refuse_panics"] is True
 v = json.load(open(d + "/beacon.json"))
@@ -2477,10 +2579,10 @@ assert "beacon" not in v and v["program_state"]["reference_block_window"] == 256
 assert json.load(open(d + "/program_state.reference_block_window=257.json"))["program_state"]["reference_block_window"] == 257
 assert json.load(open(d + "/beacon.commit_delay_blocks=257.json"))["beacon"]["commit_delay_blocks"] == 257
 held = [c["commitment"] for c in g["beacon"]["commitments"]]
-for i in range(26):
+for i in range(25):
     c = json.load(open(d + f"/beacon.commitments.{i:02d}.json"))["beacon"]["commitments"]
     now = [x["commitment"] for x in c]
-    assert [j for j in range(26) if now[j] != held[j]] == [i] and now[i] not in held and len(set(now)) == 26, i
+    assert [j for j in range(25) if now[j] != held[j]] == [i] and now[i] not in held and len(set(now)) == 25, i
     assert [x["validator"] for x in c] == [x["validator"] for x in g["beacon"]["commitments"]]
 v = json.load(open(d + "/perps.sparse_windows+max_window_heights+max_pending_digests.json"))
 assert not {"sparse_windows", "max_window_heights", "max_pending_digests"} & set(v["perps"]) and v["perps"]["bound_payouts"] is True
@@ -2491,7 +2593,7 @@ for f in glob.glob(d + "/*.json"):
     x = json.load(open(f))
     assert x != g and set(x) - {"beacon"} == set(g) - {"beacon"}, f   # only the beacon's own variants drop a top-level key
 PY
-  then ok "the field probe writes its 38 variants (refuse_panics, max_accounts, bound_payouts, sparse_windows+max_window_heights+max_pending_digests, max_window_heights 257, engine_program_log_height, max_pending_digests, incremental_root; reference_block_window+beacon, reference_block_window 257, beacon, commit_delay_blocks 257, and each of the 26 commitments changed alone to a value no validator holds)"
+  then ok "the field probe writes its 37 variants (refuse_panics, max_accounts, bound_payouts, sparse_windows+max_window_heights+max_pending_digests, max_window_heights 257, engine_program_log_height, max_pending_digests, incremental_root; reference_block_window+beacon, reference_block_window 257, beacon, commit_delay_blocks 257, and each of the 25 commitments changed alone to a value no validator holds)"
   else bad "field probe variants: $(find "$ST/vtmp/variants" -name '*.json' 2>&1 | sed 's|.*/||' | tr '\n' ' ')"; fi
 
   # AUDIT_V10_SKIPPED (DRY_RUN's path on a build before v0.8.2): the base and the section files as
@@ -2676,6 +2778,24 @@ PY
   else bad "FIXTURE_ADDRESSES_OK: $(tail -1 "$ST/log")"; fi
   mv "$BJ.keep" "$BJ"
   mv "$DA" "$DA.case"; beacon_refuses "no derived addresses" "were not derived from their public keys" "$TSV_OK"; mv "$DA.keep" "$DA"; rm -f "$DA.case"
+  # ── a pruned carry scan (PRUNED_SCAN_OK, owner 2026-11-19) in py_splice ──
+  refuse "balances.json from a pruned node, no PRUNED_SCAN_OK" "$ST/snap/balances.json" 'd["prune_floor"] = 187556' "read from a node pruned below height 187556"
+  refuse "PRUNED_SCAN_OK=1 on an unpruned scan"   "$S" 'pass' "neither the snapshot nor balances.json was read from a pruned node" PRUNED_SCAN_OK=1
+  cp "$ST/snap/balances.json" "$ST/snap/balances.json.keep"
+  python3 -c 'import json,sys; p=sys.argv[1]; d=json.load(open(p)); d["prune_floor"] = 187556; json.dump(d, open(p,"w"))' "$ST/snap/balances.json"
+  fresh
+  if PRUNED_SCAN_OK=1 bash -c 'py_validators >/dev/null && py_splice' >"$ST/log" 2>&1 && grep -q 'PRUNED SCAN (PRUNED_SCAN_OK=1): chain 21 was scanned from height 187556' "$ST/log"; then
+    ok "balances.json from a pruned node with PRUNED_SCAN_OK=1 — accepted, with a warning naming the floor and what a pruned scan misses"
+  else bad "pruned balances with PRUNED_SCAN_OK=1: $(tail -2 "$ST/log")"; fi
+  mv "$ST/snap/balances.json.keep" "$ST/snap/balances.json"
+  # ── archive2 dropped (owner, 2026-11-19): chain 22 is chain 21's register without it ──
+  if [ ! -e "$ST/reg/archive2.txt" ]; then ok "no archive2 registration file exists in the fixture, and every step above ran without it"; else bad "the fixture wrote archive2's registration"; fi
+  refuse "chain 21's register without archive2 (25)" "$S" 'n = [v for v in d["validators"] if v["address"] == "FIXTUREaddr19"]; assert n; d["validators"].remove(n[0])' "chain 21's register holds 25 validators"
+  refuse "a stranger in place of archive2 in chain 21's register" "$S" 'n = [v for v in d["validators"] if v["address"] == "FIXTUREaddr19"][0]; n["payout"] = d["validators"][0]["payout"] + "x"' "the wrong validator is missing"
+  fresh
+  if bash -c 'py_validators' >"$ST/log" 2>&1 && grep -q 'DROPPED validator (archive2' "$ST/log" && grep -q '25 validators × 1000 RAND (quorum 17)' "$ST/log"; then
+    ok "py_validators keeps 25 of chain 21's 26 (quorum 17) and says archive2's chain-21 stake is not recreated"
+  else bad "archive2 dropped: $(tail -2 "$ST/log")"; fi
   # ── chain 21's state its cut never carried (OPEN 3–5): the register's RAND carried, the exchange
   #    carried empty, the program vaults dropped ──
   # the happy path above ran with no override: the register's RAND carried, the exchange carried (empty)
@@ -2695,7 +2815,7 @@ PY
   refuse "perps nonzero (supply perps_collateral_held), no override" "$S" 'd["supply"]["perps_collateral_held"] = "5"' "perps_collateral_held 5"
   refuse "perps nonzero (supply perps_rand_held), no override" "$S" 'd["supply"]["perps_rand_held"] = "9"' "perps_rand_held 9"
   refuse "RAND in chain 21's program vaults"       "$S" 'd["supply"]["program_rand_held"] = "1000"' "program vaults hold"
-  refuse "chain 22 seeding more than chain 21's total_supply" "$S" 'd["supply"]["total_supply"] = str(int(d["supply"]["total_supply"]) - 1)' "something is counted twice"
+  refuse "chain 22 seeding more than chain 21's total_supply" "$S" 'd["supply"]["total_supply"] = str(int(d["supply"]["total_supply"]) - 1000 * 10**9 - 1)' "something is counted twice"
   cp "$S" "$S.keep"
   python3 -c 'import json,sys; p=sys.argv[1]; d=json.load(open(p)); d["perps"]["accounts"] = 3; d["perp_accounts"]["accounts"] = [{"account": "cd" * 32}]; d["supply"]["program_rand_held"] = "1000"; d["treasury"]["vault"].append({"asset": 1, "amount": "5"}); json.dump(d, open(p,"w"))' "$S"
   fresh
@@ -2989,9 +3109,9 @@ PY
   # #168 / #189 read-backs: every commitment exactly at height 0; before block 1 the block context
   # is -32001 (the window then read from rand_getLimits alone); above height 0 a validator that
   # proposed holds its reveal — at most `height` of them
-  if check "$ST/good.json" && grep -q 'beacon at height 0: 26 of 26 commitments read back exactly' "$ST/log" \
+  if check "$ST/good.json" && grep -q 'beacon at height 0: 25 of 25 commitments read back exactly' "$ST/log" \
      && grep -q 'block context window (#168)' "$ST/log" && grep -q 'beacon_commit_delay_blocks (#189)' "$ST/log"; then
-    ok "check-limits reads back the window (rand_getLimits, rand_getBlockContext), the delay and all 26 commitments at height 0 (rand_getBeacon)"
+    ok "check-limits reads back the window (rand_getLimits, rand_getBlockContext), the delay and all 25 commitments at height 0 (rand_getBeacon)"
   else bad "check-limits, the beacon read-back: $(grep -E 'beacon|block context|✗' "$ST/log" | tail -3)"; fi
   cp "$ST/answers.json" "$ST/answers.keep"
   python3 -c "import json,sys; p=sys.argv[1]; a=json.load(open(p)); a['rand_getBlockContext'] = {'__error__': {'code': -32001, 'message': 'no block has closed yet'}}; json.dump(a, open(p,'w'))" "$ST/answers.json"
@@ -3000,8 +3120,8 @@ PY
   python3 -c "import json,sys; p=sys.argv[1]; a=json.load(open(p)); K=a['rand_getBeacon']; K['height'] = 5
 for i, r in enumerate(K['validators'][:3]): r['commitment'] = r['due'] = ('%02x' % (0xa0 + i)) * 32
 json.dump(a, open(p,'w'))" "$ST/answers.json"
-  if check "$ST/good.json" && grep -q 'beacon at height 5: 23 of 26 commitments read back exactly as the genesis lists them, 3 moved' "$ST/log"; then
-    ok "check-limits at height 5 accepts 3 validators whose commitment moved to their reveal (≤ height), the other 23 read back exactly"
+  if check "$ST/good.json" && grep -q 'beacon at height 5: 22 of 25 commitments read back exactly as the genesis lists them, 3 moved' "$ST/log"; then
+    ok "check-limits at height 5 accepts 3 validators whose commitment moved to their reveal (≤ height), the other 22 read back exactly"
   else bad "check-limits, height 5 with 3 moved: $(grep -E 'beacon|✗' "$ST/log" | tail -2)"; fi
   python3 -c "import json,sys; p=sys.argv[1]; a=json.load(open(p)); a['rand_getBeacon']['height'] = 2; json.dump(a, open(p,'w'))" "$ST/answers.json"
   if check "$ST/good.json"; then bad "check-limits accepted 3 moved commitments at height 2"
@@ -3157,6 +3277,8 @@ json.dump(a, open(p,'w'))" "$ST/answers.json"
   bash_refuses "PERPS_MAX_WINDOW_HEIGHTS=4097" "outside max_window_blocks..=MAX_WINDOW_HEIGHTS" PERPS_MAX_WINDOW_HEIGHTS=4097 --
   bash_refuses "PERPS_MAX_WINDOW_HEIGHTS=abc" "outside max_window_blocks..=MAX_WINDOW_HEIGHTS" PERPS_MAX_WINDOW_HEIGHTS=abc --
   bash_refuses "MULTISIG_MAX_ACCOUNTS=0" "is not a count ≥ 1" MULTISIG_MAX_ACCOUNTS=0 --
+  bash_refuses "BONDED with archive2 (chain 21's eight)" "archive2 is dropped (owner, 2026-11-19)" BONDED="obs1 archive2 g1 g2 g3 g4 g5 g6" --
+  bash_refuses "BONDED without g3 (only archive2 is dropped)" "is not chain 21's bonded validators without archive2" BONDED="obs1 g1 g2 g4 g5 g6" --
   bash_refuses "REFERENCE_BLOCK_WINDOW=255 (below the proof window)" "REFERENCE_BLOCK_WINDOW='255' is outside 256..=4096" REFERENCE_BLOCK_WINDOW=255 --
   bash_refuses "REFERENCE_BLOCK_WINDOW=4097" "REFERENCE_BLOCK_WINDOW='4097' is outside 256..=4096" REFERENCE_BLOCK_WINDOW=4097 --
   bash_refuses "REFERENCE_BLOCK_WINDOW empty (the beacon needs it)" "the beacon needs it" REFERENCE_BLOCK_WINDOW= --
@@ -3181,6 +3303,30 @@ json.dump(a, open(p,'w'))" "$ST/answers.json"
   bash_refuses "balances without the relayer's key file" "relayer.key.json is in none of" WALLETS_DIRS="$ST/wd" WALLET=/usr/bin/true ALLOC_ADDRESSES="$ST/none.txt" CHAIN21_RPC=http://127.0.0.1:9 -- balances "$ST/snap-bal"
   echo '{}' > "$ST/wd/relayer.key.json"
   bash_refuses "balances on a dead tunnel (relayer present)" "is not answering" WALLETS_DIRS="$ST/wd" WALLET=/usr/bin/true ALLOC_ADDRESSES="$ST/none.txt" CHAIN21_RPC=http://127.0.0.1:9 -- balances "$ST/snap-bal"
+  # A PRUNED chain-21 node (owner, 2026-11-19: e and obs1 report prune_floor 187556, rand-archive-2
+  # abandoned): `snapshot` and `balances` refuse it without PRUNED_SCAN_OK=1 and accept it with it,
+  # the floor printed loudly. A fake chain 21 on loopback and a fake `rand` that holds 5 RAND.
+  python3 -c 'import json,sys; json.dump({"rand_getGenesisHash": sys.argv[2], "rand_status": {"height": 190000, "prune_floor": 187556}}, open(sys.argv[1], "w"))' "$ST/pruned.json" "$CHAIN21_HASH"
+  fake_rpc "$ST/pruned.json" "$ST/pruned-port"; PRPC=http://127.0.0.1:$(cat "$ST/pruned-port")
+  # shellcheck disable=SC2016  # the fake's own source
+  printf '#!/usr/bin/env bash\ncase "$*" in *asset-balance*) echo "asset 1: 0";; *" balance"*) echo "balance: 5 RAND";; *" address"*) echo rand1SELFTESTpruned;; esac\nexit 0\n' > "$ST/fake-wallet"; chmod +x "$ST/fake-wallet"
+  mkdir -p "$ST/snap-pruned-1" "$ST/snap-pruned-2"; cp "$ST/snap/chain21-state.json" "$ST/snap-pruned-1/"; cp "$ST/snap/chain21-state.json" "$ST/snap-pruned-2/"
+  bash_refuses "balances on a pruned node without PRUNED_SCAN_OK (no unpruned chain-21 node exists)" "no unpruned chain-21 node exists since rand-archive-2 was abandoned" \
+    WALLETS_DIRS="$ST/wd" WALLET="$ST/fake-wallet" ALLOC_ADDRESSES="$ST/pruned-alloc-1.txt" CHAIN21_RPC="$PRPC" CHAIN21_GENESIS=deploy/genesis-chain21.json -- balances "$ST/snap-pruned-1"
+  if env -u PRUNED_SCAN_OK SELFTEST=0 PRUNED_SCAN_OK=1 WALLETS_DIRS="$ST/wd" WALLET="$ST/fake-wallet" ALLOC_ADDRESSES="$ST/pruned-alloc-2.txt" CHAIN21_RPC="$PRPC" \
+       CHAIN21_GENESIS=deploy/genesis-chain21.json bash "$0" balances "$ST/snap-pruned-2" >"$ST/log" 2>&1 \
+     && grep -q 'PRUNED SCAN (PRUNED_SCAN_OK=1).*below height 187556' "$ST/log" && grep -q 'scan-floor: 187556' "$ST/log" \
+     && python3 -c 'import json,sys; b=json.load(open(sys.argv[1])); assert b["prune_floor"] == 187556 and b["carried_rand_units"] == 5 * 10**9' "$ST/snap-pruned-2/balances.json"; then
+    ok "balances on a pruned node with PRUNED_SCAN_OK=1 — accepted, the floor 187556 printed loudly and written to balances.json"
+  else bad "balances, pruned, PRUNED_SCAN_OK=1: $(tail -2 "$ST/log")"; fi
+  bash_refuses "snapshot on a pruned node without PRUNED_SCAN_OK" "no unpruned chain-21 node exists since rand-archive-2 was abandoned" \
+    CHAIN21_RPC="$PRPC" CHAIN21_GENESIS=deploy/genesis-chain21.json -- snapshot "$ST/snap-pruned-3"
+  # with it, `snapshot` passes the floor (and then stops at the fake's missing validators: no more is served)
+  env -u PRUNED_SCAN_OK SELFTEST=0 PRUNED_SCAN_OK=1 CHAIN21_RPC="$PRPC" CHAIN21_GENESIS=deploy/genesis-chain21.json ETH_RPC="$PRPC" bash "$0" snapshot "$ST/snap-pruned-4" >"$ST/log" 2>&1 || true
+  if grep -q 'PRUNED SCAN (PRUNED_SCAN_OK=1).*below height 187556' "$ST/log" && ! grep -q 'no unpruned chain-21 node exists' "$ST/log"; then
+    ok "snapshot on a pruned node with PRUNED_SCAN_OK=1 — accepted past the floor check, the floor 187556 printed loudly"
+  else bad "snapshot, pruned, PRUNED_SCAN_OK=1: $(tail -2 "$ST/log")"; fi
+  kill "$FAKE_RPC_PID" 2>/dev/null || true; FAKE_RPC_PID=
   # A fake `rand`: `perp image-hc` prints FAKE_HC (default the pinned engine's) on stdout and
   # `engine_program_log_height ${FAKE_EPLH}` (default 14; none when FAKE_EPLH is set empty) on
   # stderr, as v0.8.2 does; anything else prints a fingerprint (the fee recipient's check).
@@ -3261,6 +3407,17 @@ json.dump(a, open(p,'w'))" "$ST/answers.json"
   bash_refuses "MULTISIG_NOT_CARRIED_OK=1, the record's drops: silent" "names no dropped multisig register" "${real_cut[@]}" MULTISIG_NOT_CARRIED_OK=1 CUT_RECORD="$ST/cut-record-drops-nothing.txt" --
   bash_refuses "PERPS_STATE_NOT_CARRIED_OK=1, the record's drops: silent" "names no dropped perps exchange state" "${real_cut[@]}" PERPS_STATE_NOT_CARRIED_OK=1 --
   bash_refuses "PROGRAM_VAULTS_DROPPED_OK=1, the record's drops: silent" "names no dropped program vaults" "${real_cut[@]}" PROGRAM_VAULTS_DROPPED_OK=1 --
+  bash_refuses "a cut record whose drops: does not name archive2's stake" "names no the dropped validator archive2" "${real_cut[@]}" CUT_RECORD="$ST/cut-record-drops-nothing.txt" --
+  # the cut on a pruned scan: PRUNED_SCAN_OK and the record's scan-floor: (the floor as a number)
+  mkdir -p "$ST/snap-pr"; cp "$ST/snap/chain21-state.json" "$ST/snap-pr/"
+  python3 -c 'import json,sys; p=sys.argv[1]; d=json.load(open(p)); d["prune_floor"] = 187556; json.dump(d, open(p,"w"))' "$ST/snap-pr/chain21-state.json"
+  python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); d["prune_floor"] = 187556; json.dump(d, open(sys.argv[2],"w"))' "$ST/snap/balances.json" "$ST/snap-pr/balances.json"
+  printf 'scan-floor: 187556\n' | cat "$ST/cut-record.txt" - > "$ST/cut-record-floor.txt"
+  printf 'scan-floor: 18755\n' | cat "$ST/cut-record.txt" - > "$ST/cut-record-floor-wrong.txt"
+  bash_refuses "the cut on a pruned scan without PRUNED_SCAN_OK" "read from a node pruned below height 187556 — set PRUNED_SCAN_OK=1" "${real_cut[@]}" CHAIN21_SNAPSHOT="$ST/snap-pr" CUT_RECORD="$ST/cut-record-floor.txt" --
+  bash_refuses "the cut on a pruned scan, a record without scan-floor:" "names no the carry scan's floor 187556" "${real_cut[@]}" CHAIN21_SNAPSHOT="$ST/snap-pr" PRUNED_SCAN_OK=1 --
+  bash_refuses "the cut on a pruned scan, a record naming another floor" "names no the carry scan's floor 187556" "${real_cut[@]}" CHAIN21_SNAPSHOT="$ST/snap-pr" PRUNED_SCAN_OK=1 CUT_RECORD="$ST/cut-record-floor-wrong.txt" --
+  bash_refuses "the cut on a pruned scan with PRUNED_SCAN_OK and the floor on record (passes, stops at EXPECT_NODE_VERSION)" "EXPECT_NODE_VERSION is unset" "${real_cut[@]}" CHAIN21_SNAPSHOT="$ST/snap-pr" PRUNED_SCAN_OK=1 CUT_RECORD="$ST/cut-record-floor.txt" --
   bash_refuses "a cut record whose carries: does not say perps is carried (empty)" "names no perps on its carries: line" "${real_cut[@]}" CUT_RECORD="$ST/cut-record-no-perps-carry.txt" --
   sed 's/^carries:.*/carries: fixture register, bridge state and balances; perps carried (empty)/; s/^reason:.*/&; the treasury 5 of 6/' "$ST/cut-record.txt" > "$ST/cut-record-treasury-in-reason.txt"
   bash_refuses "a cut record naming the treasury on reason: only (it is a carry)" "names no treasury on its carries: line" "${real_cut[@]}" CUT_RECORD="$ST/cut-record-treasury-in-reason.txt" --
@@ -3294,11 +3451,11 @@ json.dump(a, open(p,'w'))" "$ST/answers.json"
   printf 'reason: fixture\nrollback: fixture' > "$ST/record-beacon.txt"   # no trailing newline
   record_beacon "$ST/record-beacon.txt" 256 256 "$ST/tmp/beacon-record.txt"; record_beacon "$ST/record-beacon.txt" 256 256 "$ST/tmp/beacon-record.txt"
   if [ "$(_cut_record_value "$ST/record-beacon.txt" reference-block-window)" = 256 ] && [ "$(_cut_record_value "$ST/record-beacon.txt" beacon-commit-delay-blocks)" = 256 ] \
-     && [ "$(grep -c '^beacon-commitment: ' "$ST/record-beacon.txt")" = 26 ] && [ "$(grep -c '^reference-block-window:' "$ST/record-beacon.txt")" = 1 ] \
+     && [ "$(grep -c '^beacon-commitment: ' "$ST/record-beacon.txt")" = 25 ] && [ "$(grep -c '^reference-block-window:' "$ST/record-beacon.txt")" = 1 ] \
      && grep -q 'OWNER VALUES TO CONFIRM' "$ST/record-beacon.txt" && grep -q 'ON ITS OWN HOST and sends ONLY the printed commitment' "$ST/record-beacon.txt" \
      && grep -q 'nobody else ever' "$ST/record-beacon.txt" && grep -q 'OFFLINE, ENCRYPTED' "$ST/record-beacon.txt" \
      && [ "$(_cut_record_value "$ST/record-beacon.txt" rollback)" = fixture ]; then
-    ok "the cut record gets the window, the delay (owner values to confirm), 26 beacon-commitment: lines and the operator seed procedure, once"
+    ok "the cut record gets the window, the delay (owner values to confirm), 25 beacon-commitment: lines and the operator seed procedure, once"
   else bad "record_beacon: $(tail -3 "$ST/record-beacon.txt")"; fi
   # A fake rand-node for check-beacon-seed.sh: `address` prints FAKE_ADDR; `beacon commitment` names
   # FAKE_FILE_CHAIN / FAKE_FILE_VALIDATOR on stderr and the file's newest commitment on stdout (or
@@ -3394,7 +3551,7 @@ if [ "${DRY_RUN:-}" = 1 ]; then
   if [ ! -f "$BEACON_TSV" ]; then
     # No BEACON_TSV: one fresh random PLACEHOLDER commitment per validator (py_fixtures) — opened by
     # no seed, so a chain from this file could never propose. The real ones are the operators'.
-    echo "cut-chain22: DRY RUN — no BEACON_TSV ($BEACON_TSV): 26 random PLACEHOLDER beacon commitments → $ST/beacon.tsv" >&2
+    echo "cut-chain22: DRY RUN — no BEACON_TSV ($BEACON_TSV): $VALIDATOR_COUNT random PLACEHOLDER beacon commitments → $ST/beacon.tsv" >&2
     BEACON_TSV=$ST/beacon.tsv
   fi
   # The fixture register's bonded validators carry synthetic addresses; the beacon takes the ones
@@ -3473,11 +3630,29 @@ require_cut_record_mentions "$CUT_RECORD" '#189|beacon|PREVRANDAO' "the randomne
 [ "${MULTISIG_NOT_CARRIED_OK:-}" != 1 ] || require_cut_record_mentions "$CUT_RECORD" 'treasury|multisig' "dropped multisig register (MULTISIG_NOT_CARRIED_OK=1)" drops
 [ "${PERPS_STATE_NOT_CARRIED_OK:-}" != 1 ] || require_cut_record_mentions "$CUT_RECORD" 'perp' "dropped perps exchange state (PERPS_STATE_NOT_CARRIED_OK=1)" drops
 [ "${PROGRAM_VAULTS_DROPPED_OK:-}" != 1 ] || require_cut_record_mentions "$CUT_RECORD" 'program' "dropped program vaults (PROGRAM_VAULTS_DROPPED_OK=1)" drops
+# archive2 (owner, 2026-11-19) is no chain-22 validator: its chain-21 stake is a dropped balance.
+for n in $DROPPED_VALIDATORS; do
+  require_cut_record_mentions "$CUT_RECORD" "$n" "the dropped validator $n (its chain-21 stake is not recreated on chain 22)" drops
+done
 # An empty exchange is carried (OPEN 4, 2026-11-19): without the override, the carries: line says so.
 [ "${PERPS_STATE_NOT_CARRIED_OK:-}" = 1 ] || require_cut_record_mentions "$CUT_RECORD" 'perp' "perps on its carries: line (chain 21's exchange carried (empty), its genesis root asserted equal)" carries
 [ -n "$CHAIN21_SNAPSHOT" ] || { echo "cut-chain22: CHAIN21_SNAPSHOT is unset — run \`$0 snapshot <dir>\` while chain 21 is up" >&2; exit 1; }
 SNAPSHOT_FILE=$CHAIN21_SNAPSHOT/chain21-state.json; BALANCES_FILE=$CHAIN21_SNAPSHOT/balances.json
 export SNAPSHOT_FILE BALANCES_FILE
+# A pruned carry scan (owner, 2026-11-19: no unpruned chain-21 node exists — rand-archive-2 abandoned,
+# e and obs1 prune below 187556): only on PRUNED_SCAN_OK=1, and the record names the floor the
+# scan started at, as a plain number on its `scan-floor:` line (py_splice checks the override too).
+SCAN_FLOOR=$(python3 -c 'import json,os,sys
+f = 0
+for p in sys.argv[1:]:
+    if os.path.isfile(p):
+        f = max(f, int(json.load(open(p)).get("prune_floor", 0) or 0))
+print(f)' "$SNAPSHOT_FILE" "$BALANCES_FILE")
+if [ "$SCAN_FLOOR" -gt 0 ]; then
+  [ "${PRUNED_SCAN_OK:-}" = 1 ] || { echo "cut-chain22: the snapshot / balances in $CHAIN21_SNAPSHOT were read from a node pruned below height $SCAN_FLOOR — set PRUNED_SCAN_OK=1 (no unpruned chain-21 node exists since rand-archive-2 was abandoned) and name \`scan-floor: $SCAN_FLOOR\` on the cut record" >&2; exit 1; }
+  require_cut_record_mentions "$CUT_RECORD" "(^|[^0-9])${SCAN_FLOOR}([^0-9]|\$)" "the carry scan's floor $SCAN_FLOOR (PRUNED_SCAN_OK=1: chain 21 scanned from a pruned node)" scan-floor
+  echo "cut-chain22: ⚠ PRUNED SCAN: chain 21 was scanned from height $SCAN_FLOOR (PRUNED_SCAN_OK=1; the record's scan-floor: names it)" >&2
+fi
 for bin in "$NODE" "$WALLET"; do
   [ -x "$bin" ] || { echo "cut-chain22: $bin is not executable — the binaries of the cut build (v0.8.5 or later)" >&2; exit 1; }
 done
@@ -3769,7 +3944,7 @@ CS_RECORDED="appended to $CUT_RECORD as constraint-set-row:, an OPEN item"
 record_constraint_set_row "$CUT_RECORD" "$CS_ROW" || CS_RECORDED="⚠ NOT written to $CUT_RECORD (append failed) — copy it there by hand"
 BC_RECORDED="no beacon (BLOCK CONTEXT SKIPPED)"
 if [ -z "${BLOCK_CONTEXT_SKIPPED:-}" ]; then
-  BC_RECORDED="appended to $CUT_RECORD (reference-block-window:, beacon-commit-delay-blocks:, 26 beacon-commitment: lines, the operator procedure)"
+  BC_RECORDED="appended to $CUT_RECORD (reference-block-window:, beacon-commit-delay-blocks:, $VALIDATOR_COUNT beacon-commitment: lines, the operator procedure)"
   record_beacon "$CUT_RECORD" "$REFERENCE_BLOCK_WINDOW" "$BEACON_COMMIT_DELAY_BLOCKS" "$TMP/beacon-record.txt" \
     || BC_RECORDED="⚠ NOT written to $CUT_RECORD (append failed) — copy $TMP/beacon-record.txt there by hand"
 fi
@@ -3790,7 +3965,7 @@ cut-chain22: staking: chain 21's (max_stake_entry_bps_per_epoch $STAKE_ENTRY_BPS
 cut-chain22: program_state: cell_fee $PROGRAM_STATE_CELL_FEE$([ -n "${AUDIT_V10_SKIPPED:-}" ] && echo ", refuse_panics SKIPPED — NOT what chain 22 will be" || echo ", refuse_panics true (PST-1)")
 cut-chain22: tokens: incremental_root true (TOK-1)
 cut-chain22: block context: $([ -n "${BLOCK_CONTEXT_SKIPPED:-}" ] && echo "SKIPPED — NOT what chain 22 will be" || echo "program_state.reference_block_window $REFERENCE_BLOCK_WINDOW (#168) — OWNER VALUE TO CONFIRM (OPEN 9)")
-cut-chain22: beacon: $([ -n "${BLOCK_CONTEXT_SKIPPED:-}" ] && echo "SKIPPED — NOT what chain 22 will be" || echo "26 commitments from $BEACON_TSV, commit_delay_blocks $BEACON_COMMIT_DELAY_BLOCKS (#189) — OWNER VALUE TO CONFIRM (OPEN 10); $BC_RECORDED")
+cut-chain22: beacon: $([ -n "${BLOCK_CONTEXT_SKIPPED:-}" ] && echo "SKIPPED — NOT what chain 22 will be" || echo "$VALIDATOR_COUNT commitments from $BEACON_TSV, commit_delay_blocks $BEACON_COMMIT_DELAY_BLOCKS (#189) — OWNER VALUE TO CONFIRM (OPEN 10); $BC_RECORDED")
 cut-chain22: fees: $FEES_JSON (no subsidy_net_of_fees: aggregation is refused until re-measured)
 cut-chain22: perps: $([ -n "${PERPS_SKIPPED:-}" ] && echo "SKIPPED (no PERP_PROVER) — NOT what chain 22 will be" || echo "BTC-PERP on zUSD (asset 1), lot 100000, tick 100000000, 20x, maintenance 250 bps, fees 5/2 bps; max_tier 18, 24 inputs a block, 64 blocks a proof, min deposit 100000000 (1 zUSD)")
 cut-chain22: perps audit v10: $([ -n "${PERPS_SKIPPED:-}${AUDIT_V10_SKIPPED:-}" ] && echo "SKIPPED — NOT what chain 22 will be" || echo "bound_payouts true (PERP-6), initial_collateral absent (0), sparse_windows true + max_window_heights $PERPS_MAX_WINDOW_HEIGHTS (PERP-101), engine_program_log_height $ENGINE_PROGRAM_LOG_HEIGHT (CON-60), max_pending_digests $PERPS_MAX_PENDING_DIGESTS (PERP-5, decided 2026-11-05)")
@@ -3798,7 +3973,7 @@ cut-chain22: perps engine_hc: $([ -n "${PERPS_SKIPPED:-}" ] && echo "SKIPPED" ||
 cut-chain22: PERPS GENESIS ROOT ${PERP_GENESIS_ROOT:-SKIPPED}
 cut-chain22: multisig: create_fee $MULTISIG_CREATE_FEE (1 RAND)$([ -n "${AUDIT_V10_SKIPPED:-}" ] && echo ", max_accounts SKIPPED" || echo ", max_accounts $MULTISIG_MAX_ACCOUNTS (MSA-4)"); the treasury $TREASURY_THRESHOLD of $TREASURY_SIGNERS (six new signers, none of chain 21's), $(python3 -c 'import os,sys; exec(os.environ["UNITS_PY"]); print(fmt(int(open(sys.argv[1]).read())))' "$TMP/treasury-balance") RAND carried from chain 21's multisig register (= its multisig_rand_held), salt $(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["accounts"][0]["salt"])' "$TMP/multisig.json")
 cut-chain22: TREASURY ID $TREASURY_ID
-cut-chain22: 26 validators × $STAKE_RAND RAND (quorum 18); faucet minters: $FAUCET_MINTERS
+cut-chain22: $VALIDATOR_COUNT validators × $STAKE_RAND RAND (quorum $VALIDATOR_QUORUM; chain 21's 26 without $DROPPED_VALIDATORS, whose chain-21 stake is not recreated); faucet minters: $FAUCET_MINTERS
 cut-chain22: bridge: $(python3 -c "import json,sys;b=json.load(open(sys.argv[1]))['bridge'];print('emitters', json.dumps(b['emitters'], sort_keys=True), '| min_inbound_sequence', json.dumps(b['min_inbound_sequence'], sort_keys=True), '| burn_sequence', b['burn_sequence'], '| guardian set', b['guardian_set_index'], '| rotation', json.dumps(b['rotation']))" "$OUT")
 cut-chain22: carried beside the notes: chain 21's multisig register RAND (into the new 5-of-6 treasury; chain 21's account, id and signers are replaced) and its perps exchange, empty (the same genesis root).
 cut-chain22: NOT carried: shielded notes of wallets the operator does not hold, any unwithdrawn validator rewards, program vaults (durian's AMM is redeployed; PROGRAM_VAULTS_DROPPED_OK) and anything an override named — the cut record's drops: line.

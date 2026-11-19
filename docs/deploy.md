@@ -2034,11 +2034,31 @@ programs' state, but its script never counted their RAND. durian.market's AMM is
 chain 22, and the 200 RAND in its chain-21 pool is dropped.
 
 **Chain 21's history on record** (decision 7, 2026-11-19). rand-archive-2 (`ARCHIVE2`) is
-abandoned. Chain 21's history on record starts at height **187 556**, on hosts e and obs1. Point
-`snapshot` and `balances` (`CHAIN21_RPC`) at e or obs1, and state the floor on the cut record's
-`rollback:` line (the template asks what is kept): the record does not reach chain 21's genesis.
-`balances` refuses an RPC whose `rand_status.prune_floor` is above 0 (it rescans every wallet from
-leaf 0), so check what e and obs1 report before the scan.
+abandoned. Chain 21's history on record starts at height **187 556**, on hosts e and obs1, and
+both report `rand_status.prune_floor` 187556: no unpruned chain-21 node exists. State the floor on
+the cut record's `rollback:` line too (the template asks what is kept): the record does not reach
+chain 21's genesis.
+
+**The carry scan from a pruned node** (owner, 2026-11-19). `snapshot` and `balances` refuse a
+`CHAIN21_RPC` whose `prune_floor` is above 0 unless `PRUNED_SCAN_OK=1`; with it they print the
+floor loudly, `balances.json` and the snapshot record it, and the cut then needs
+`PRUNED_SCAN_OK=1` as well and a cut record whose `scan-floor:` line names the floor as a plain
+number (`scan-floor: 187556`); it refuses a record that does not, and the override when nothing
+was pruned. What a pruned scan loses (`crates/randprotocol-client/src/wallet.rs`, `warn_pruned`;
+RS-1): **shielded notes and spends are complete**, because the node never prunes its commitments
+or nullifiers. Only a bridge deposit (`bridge_attest`), token mint, registration's initial mint
+or program payout committed below the floor **whose envelope does not open** is missed; an
+honestly sealed one is still found. A wallet missing from the scan is still refused by the
+uncovered-genesis-allocs check.
+
+**archive2 is not a chain-22 validator** (owner, 2026-11-19; offline since about 9 November).
+`BONDED` defaults to `obs1 g1 g2 g3 g4 g5 g6`, and the cut refuses any other list (chain 21's
+bonded validators without archive2, in order). Chain 22 starts with **25 validators** (18 genesis +
+7 bonded; quorum 17), and the beacon takes 25 commitments. Nothing reads archive2's registration
+file or key. **archive2's chain-21 stake (1 000 RAND) and any unwithdrawn rewards are not recreated
+on chain 22**: the cut checks that the one chain-21 register entry outside the 25 pays out where
+chain 21's genesis archive2 does, prints the dropped stake, and refuses a record whose `drops:`
+line does not name archive2.
 
 **Rolling it out.** `deploy/cut-chain22-genesis.sh`, derived from chain 21's script with chain 21
 as the source (`snapshot` also reads `rand_getPerps`, `rand_getPerpAccounts` and the treasury's
@@ -2093,11 +2113,11 @@ fields are **spliced** by the script, like `perps`: `rand-node genesis
 --program-state-reference-block-window` (and `--beacon-commitment`, which needs it) is refused
 on the base file, which has no `bridge` or `perps` yet. The real cut refuses a build whose
 `genesis --help` lacks either flag; `DRY_RUN` skips both, loudly (`BLOCK CONTEXT SKIPPED`), and
-without a `BEACON_TSV` uses 26 random placeholder commitments. Asserted on the finished file
+without a `BEACON_TSV` uses 25 random placeholder commitments (one per chain-22 validator). Asserted on the finished file
 (`program_state` in `ProgramStateConfig`'s order, the beacon the file's last field, the
-commitments in validator order); **field-probed** — 30 variants beside the audit-v10 eight, each
+commitments in validator order); **field-probed** — 29 variants beside the audit-v10 eight, each
 of which must hash differently: without the window and the beacon together, the window at
-another value, without the beacon, the delay at another value, and each one of the 26
+another value, without the beacon, the delay at another value, and each one of the 25
 commitments changed; and written to the cut record as `reference-block-window:`,
 `beacon-commit-delay-blocks:` (both under an "owner values to confirm" comment), one
 `beacon-commitment: <name> <address> <hex>` per validator, and the operator procedure below. The

@@ -30,6 +30,14 @@ carries: <the register, the bridge state, the balances carried, by holder>
 # nothing.
 drops: <every balance not carried, with amounts; every non-operator balance>
 
+# The height the carry scan started at: `0` when `snapshot` and `balances` read an unpruned node,
+# else that node's `rand_status.prune_floor`, as a plain number (chain 22: 187556 — e and obs1
+# prune below it and rand-archive-2 is abandoned; the cut needs PRUNED_SCAN_OK=1 and refuses a
+# record whose scan-floor: does not name the floor). A pruned scan is complete for shielded notes
+# and spends; it misses only a bridge deposit, token mint, registration mint or program payout
+# below the floor whose envelope does not open (RS-1).
+scan-floor: <0, or the scanned node's prune_floor>
+
 # The client rebuild checklist, each item with the version or commit that was built against the
 # new chain and checked before the cut: the wallet CLI (`rand`), the clients repository's apps
 # (desktop, web, extension, iOS, Android), randscan, the website's WASM, the bridge relayer's
