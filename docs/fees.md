@@ -78,11 +78,11 @@ public value, `GAS_LIMIT` (`pv::GAS`), and the cpu AIR proves `GAS ≤ GAS_LIMIT
 
 and the pre-verify floor (before the proof is decoded) prices `outcome.gas_limit = 1`, so a verify
 still isn't bought for nothing. A bundle proof's `GAS_LIMIT` must equal the genesis constant
-`bundle_gas_limit` exactly — `20 479` (`gas_max(14, 0, 0)`) for today's tier-14 hidden-asset
-guest — or the proof is refused (`TxError::BundleGasLimit`, permanent): every bundle then
+`bundle_gas_limit` exactly — `22 527` (`gas_max(14, 0, 0)` under constraint set 11; `20 479` on
+chains 18–21) for today's tier-14 hidden-asset guest — or the proof is refused (`TxError::BundleGasLimit`, permanent): every bundle then
 publishes the same value, so a fixed price is still the right price for a fixed program. Chain 18
 also runs split authorisation (genesis `hc_auth`, v0.6.3), so every bundle carries a second, auth
-proof; its `GAS_LIMIT` must be `1 279` (`gas_max(10, 0, 0)`, the auth guest's tier-10 ceiling —
+proof; its `GAS_LIMIT` must be `1 407` (`gas_max(10, 0, 0)` under set 11, `1 279` before; the auth guest's tier-10 ceiling —
 no genesis field, one honest value) or it is refused (`TxError::AuthGasLimit`, permanent). The
 auth prover declares the ceiling by default, so wallets change nothing. On a
 chain without a `gas` section (`rand_getLimits.gas_metering` absent) both rules are absent and

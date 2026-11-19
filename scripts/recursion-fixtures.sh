@@ -26,9 +26,10 @@
 # A test that calls `fixture_proof` with a new k adds it to REQUIRED here, once.
 #
 # The pinned set. A fixture's notes are random, and the pinned-vectors test pins the 118-word
-# interface list and its digest (`3753f2fd…`) that those notes produce, so it passes on exactly
-# one set of bytes: the cache re-proved 2026-10-11 for the constraint-set-9 re-vendor (circuits
-# `57fb9dc`, the MODQ chip; it was `3534960f…` over the 2026-10-03 phase-2 cache), committed as
+# interface list and its digest (`517d13e4…`) that those notes produce, so it passes on exactly
+# one set of bytes: the cache re-proved 2026-11-20 for the constraint-set-11 re-vendor (circuits
+# `76a48dc`, Grain constants; before it the 2026-10-11 constraint-set-9 cache, circuits `57fb9dc`,
+# and `3534960f…` over the 2026-10-03 phase-2 cache), committed as
 # crates/randprotocol-node/fixtures/recursion (#131). A freshly proved set satisfies every
 # other fixture-backed test and fails that one at "the pinned 118-word interface list" (measured
 # 2026-10-06). So the check compares the three files against PINNED_SHA256 and exits 3 on a
@@ -58,9 +59,9 @@ set -euo pipefail
 REQUIRED=(Test-0 Test-1 Test-2)
 # sha256 of Test-0, Test-1, Test-2 in the pinned cache, in REQUIRED's order.
 PINNED_SHA256=(
-  1f837913c3bf006e50ed1f8fd56eabd3f7ed1091b8bcc75ea9fac2a2c981b98c
-  3f19d5515b008c5368df7326c2ab7d9e24add6411cdc221d5c029079e751e43c
-  08fddfc002932ca95af7142edd7689c36bc2bc9bc37209a8854c41e05e50365a
+  2cd78847ac686808ada9b95abcc7588e42cb96b0ad6e245c557d47b5f31923b4
+  641544f4488fb78d71bc990fc2c1b6d4e5d0b39097c199fa7694d41dfa748e23
+  c21895dd04414101c7d10fd49033f6c27f48e6c687ecbae3ca45cbb442a2e1b6
 )
 
 usage() {

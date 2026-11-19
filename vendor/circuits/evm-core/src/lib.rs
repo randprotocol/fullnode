@@ -20,6 +20,11 @@ pub trait Host {
     /// The Poseidon2 sponge over `words[..n]`, digest written to `words[..8]` (POSEIDON2 syscall
     /// semantics).
     fn poseidon2(&mut self, words: &mut [u32], n: usize);
+    /// Public input word `idx` (the `READ_PUBLIC` syscall), which [`block`] reads the
+    /// block-context words through. In the guest an index past the public segment can never be
+    /// satisfied, so such a run has no proof; a host without a segment answers 0 (no context
+    /// version is 0).
+    fn read_public(&mut self, idx: u32) -> u32;
 }
 
 /// The rate of Keccak-256 in bytes: 136, the low 34 words of the 50-word state.
@@ -49,20 +54,30 @@ pub fn keccak256<H: Host>(h: &mut H, msg: &[u8]) -> [u8; 32] {
         off += KECCAK_RATE;
     }
     // The final block: what is left of the message (possibly nothing — a length that is an exact
-    // multiple of the rate still needs a whole all-padding block) plus `0x01`…`0x80`.
+    // multiple of the rate still needs a whole all-padding block) plus `0x01`…`0x80`. It is
+    // absorbed straight out of `msg` like the full blocks: the whole words, then the last one to
+    // three bytes with the `0x01` after them, then the `0x80` in the rate's last byte. Staging it
+    // in a zeroed 136-byte buffer first (the first cut) cost a `memset`, a `memcpy` and 34 word
+    // loads for every call, however short the message, and a call hashes five to seven short
+    // messages (ZKVM-117).
     let take = msg.len() - off;
-    let mut block = [0u8; KECCAK_RATE];
-    block[..take].copy_from_slice(&msg[off..]);
-    block[take] ^= 0x01;
-    block[KECCAK_RATE - 1] ^= 0x80;
-    for i in 0..KECCAK_RATE / 4 {
-        state[i] ^= u32::from_le_bytes([
-            block[4 * i],
-            block[4 * i + 1],
-            block[4 * i + 2],
-            block[4 * i + 3],
-        ]);
+    let whole = take / 4;
+    let mut i = 0;
+    while i < whole {
+        let p = off + 4 * i;
+        state[i] ^= u32::from_le_bytes([msg[p], msg[p + 1], msg[p + 2], msg[p + 3]]);
+        i += 1;
     }
+    // `take <= 135`, so `whole <= 33` and the padding's first byte is inside the rate.
+    let rest = take - 4 * whole;
+    let mut last = 1u32 << (8 * rest);
+    let mut k = 0;
+    while k < rest {
+        last |= (msg[off + 4 * whole + k] as u32) << (8 * k);
+        k += 1;
+    }
+    state[whole] ^= last;
+    state[KECCAK_RATE / 4 - 1] ^= 0x8000_0000;
     h.keccak_f(&mut state);
     let mut out = [0u8; 32];
     for i in 0..8 {
@@ -71,13 +86,13 @@ pub fn keccak256<H: Host>(h: &mut H, msg: &[u8]) -> [u8; 32] {
     out
 }
 
-/// The longest `dhash` message this crate hashes: the 40-word public-output preimage plus its
+/// The longest `dhash` message this crate hashes: the 83-word public-output preimage plus its
 /// domain word.
-const DHASH_MAX_WORDS: usize = 41;
+const DHASH_MAX_WORDS: usize = 84;
 
 /// `hash(domain, msg) = poseidon2([domain, msg…])` — the domain-tagged sponge every leaf, node
 /// and digest here is built from, byte-identical to research's `notes::hash`. `1 + msg.len()`
-/// must be at most 41 words.
+/// must be at most 84 words.
 ///
 /// This is the *general* form, used once per call for the public-output digest. Every leaf and
 /// node goes through [`hash_pair`] instead, which is the same sponge with none of the copying —
@@ -135,3 +150,12 @@ pub fn hash_pair<H: Host>(h: &mut H, domain: u32, a: &[u32; 8], b: &[u32; 8]) ->
 // of each bounds-check panic location.
 #[cfg(feature = "ffi")]
 pub mod ffi;
+
+// Transient storage (EIP-1153). Declared after everything else, `ffi` included, for the reason
+// `ffi`'s comment gives: no line above moves, so neither does any panic location the translated
+// contracts' shims embed from this file.
+pub mod transient;
+
+// Block context (fullnode #168): the words an `InvokeAt`'s version-2 context carries, read from
+// the public segment by the block-context opcodes. Declared last, like `transient`.
+pub mod block;

@@ -218,6 +218,128 @@ pub struct PerpsConfig {
     /// 21), the log grows one digest a block until a proof lands.
     #[serde(default, skip_serializing_if = "is_zero_u64")]
     pub max_pending_digests: u64,
+    /// CON-601 (genesis-gated, default empty = unpinned): the state-proof verifier keys this chain
+    /// admits, each a shape and the SHA-256 of its precomputed key file. Set, a state proof whose
+    /// declared shape is not one listed here is refused `ProofRefused` from its header alone, at
+    /// validate and at apply, **before any verifier key is built**; and a node never builds a
+    /// listed key either — it loads each from the shipped file whose SHA-256 is listed
+    /// (`randprotocol-node`'s `perps_key`), and refuses to start without them. That is what lets a
+    /// 2 GB validator apply a block carrying a tier-18 state proof: the build peaks at ~3.3–4 GB,
+    /// the loaded key is ~14 KB (`docs/perps.md`, CON-601). Requires `engine_program_log_height`;
+    /// at most [`MAX_STATE_PROOF_KEYS`], in strictly increasing shape order. Empty (chain 21),
+    /// keys are built on demand under the CON-60 rules.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub state_proof_keys: Vec<StateProofKeyPin>,
+}
+
+/// CON-601: the most state-proof keys a genesis may pin — the canonical cache's size
+/// (`randprotocol-zkvm`'s `PERP_CANONICAL_KEYS`), where the node installs them. A chain's canonical
+/// set is four (one per public height of a 1..=64-block window).
+pub const MAX_STATE_PROOF_KEYS: usize = 8;
+
+/// CON-601: one pinned state-proof verifier key — the shape a state proof declares (its tier and
+/// the declared table heights a key is built for; no keccak or sha256 table, the engine calls
+/// neither) and the SHA-256 of the key file, the vendored machine's `VerifierKeyBlob::to_bytes()`
+/// for that shape. Field order is the shape order the list is sorted in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StateProofKeyPin {
+    pub tier: u8,
+    pub program_log_height: u8,
+    pub input_log_height: u8,
+    pub public_log_height: u8,
+    pub poseidon2_log_height: u8,
+    /// Lowercase hex in the file.
+    #[serde(with = "sha256_hex")]
+    pub sha256: [u8; 32],
+}
+
+impl StateProofKeyPin {
+    /// The proof shape this pin admits (no keccak or sha256 table).
+    pub fn shape(&self) -> crate::confidential::ProofShape {
+        crate::confidential::ProofShape {
+            tier: self.tier,
+            program_log_height: self.program_log_height,
+            input_log_height: self.input_log_height,
+            keccak_log_height: 0,
+            sha256_log_height: 0,
+            public_log_height: self.public_log_height,
+            poseidon2_log_height: self.poseidon2_log_height,
+        }
+    }
+
+    /// Whether a proof declaring `shape` is the one this pin admits.
+    pub fn admits(&self, shape: &crate::confidential::ProofShape) -> bool {
+        self.shape() == *shape
+    }
+
+    /// The pin's SHA-256 as lowercase hex.
+    pub fn sha256_hex(&self) -> String {
+        self.sha256.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// The shape's sort key: the five heights in field order.
+    fn shape_key(&self) -> [u8; 5] {
+        [self.tier, self.program_log_height, self.input_log_height, self.public_log_height, self.poseidon2_log_height]
+    }
+
+    /// What the genesis hash binds per pin: the five heights, then the digest.
+    fn commit_bytes(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&self.shape_key());
+        out.extend_from_slice(&self.sha256);
+    }
+}
+
+/// CON-601: the pinned state-proof shapes of a chain whose max tier is `max_tier` and whose engine
+/// image's program height is `engine_program_log_height` — the canonical shapes
+/// ([`canonical_input_log_height`]): tier `max_tier`, the tier's full poseidon2 height `t + 2`
+/// (`rand perp prove` declares it at a pinned tier), and one per public height a window of
+/// `1..=max_window_blocks` recorded blocks declares. The shapes only; the digests come from the key
+/// files. What `deploy/cut-chain22-genesis.sh` pins and `rand-node keygen-perp-vk` exports.
+pub fn canonical_state_proof_shapes(max_tier: u8, engine_program_log_height: u8, max_window_blocks: u64) -> Vec<crate::confidential::ProofShape> {
+    let mut publics: Vec<u8> = (1..=max_window_blocks.max(1)).map(|n| segment_public_log_height(state_proof_segment_words(n as usize))).collect();
+    publics.dedup();
+    publics
+        .into_iter()
+        .map(|public_log_height| crate::confidential::ProofShape {
+            tier: max_tier,
+            program_log_height: engine_program_log_height,
+            input_log_height: canonical_input_log_height(max_tier),
+            keccak_log_height: 0,
+            sha256_log_height: 0,
+            public_log_height,
+            poseidon2_log_height: max_tier.saturating_add(2),
+        })
+        .collect()
+}
+
+/// The fixed head of a state proof's public segment ([`state_proof_segment`]): the version, the
+/// two heights, the two roots, the payouts digest, the fees and the block count.
+pub const STATE_PROOF_SEGMENT_HEAD_WORDS: usize = 1 + 2 + 2 + 8 + 8 + 8 + 2 + 1;
+
+/// The length of the public segment of a state proof over `n` recorded blocks
+/// ([`state_proof_segment`]): its fixed head and eight words a block.
+pub fn state_proof_segment_words(n: usize) -> usize {
+    STATE_PROOF_SEGMENT_HEAD_WORDS + 8 * n
+}
+
+mod sha256_hex {
+    use serde::{Deserialize, Deserializer, Serializer};
+    pub fn serialize<S: Serializer>(d: &[u8; 32], s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&d.iter().map(|b| format!("{b:02x}")).collect::<String>())
+    }
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<[u8; 32], D::Error> {
+        let s = String::deserialize(d)?;
+        let bad = || serde::de::Error::custom(format!("sha256 {s:?} is not 64 lowercase hex characters"));
+        if s.len() != 64 || !s.bytes().all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c)) {
+            return Err(bad());
+        }
+        let mut out = [0u8; 32];
+        for (i, o) in out.iter_mut().enumerate() {
+            *o = u8::from_str_radix(&s[2 * i..2 * i + 2], 16).map_err(|_| bad())?;
+        }
+        Ok(out)
+    }
 }
 
 // Audit v10's fields are left out of a written genesis file while at their defaults, so a file this
@@ -287,7 +409,58 @@ impl PerpsConfig {
             out.extend_from_slice(b"max_pending_digests");
             out.extend_from_slice(&self.max_pending_digests.to_be_bytes());
         }
+        // CON-601: the pinned state-proof keys, tagged, counted, each shape and digest.
+        if !self.state_proof_keys.is_empty() {
+            out.extend_from_slice(b"state_proof_keys");
+            out.extend_from_slice(&(self.state_proof_keys.len() as u32).to_be_bytes());
+            for k in &self.state_proof_keys {
+                k.commit_bytes(&mut out);
+            }
+        }
         out
+    }
+
+    /// CON-601: the pin admitting a state proof of `shape`, when this chain pins its keys.
+    pub fn pinned_state_proof_key(&self, shape: &crate::confidential::ProofShape) -> Option<&StateProofKeyPin> {
+        self.state_proof_keys.iter().find(|k| k.admits(shape))
+    }
+
+    /// CON-601: [`PerpsConfig::state_proof_keys`]' own rules (part of [`Self::check`]).
+    fn check_state_proof_keys(&self) -> Result<(), String> {
+        let keys = &self.state_proof_keys;
+        if keys.is_empty() {
+            return Ok(());
+        }
+        if self.engine_program_log_height == 0 {
+            return Err("perps.state_proof_keys is set without engine_program_log_height (the keys are for the pinned engine's shape)".into());
+        }
+        if keys.len() > MAX_STATE_PROOF_KEYS {
+            return Err(format!("perps.state_proof_keys lists {} keys, more than {MAX_STATE_PROOF_KEYS}", keys.len()));
+        }
+        let max_public = segment_public_log_height(state_proof_segment_words(self.max_window_blocks as usize));
+        for (i, k) in keys.iter().enumerate() {
+            let at = format!("perps.state_proof_keys[{i}]");
+            if !TIERS.contains(&k.tier) || k.tier > self.max_tier {
+                return Err(format!("{at}: tier {} is not a proof tier at most max_tier {}", k.tier, self.max_tier));
+            }
+            if k.program_log_height != self.engine_program_log_height {
+                return Err(format!("{at}: program height {} is not the engine's {}", k.program_log_height, self.engine_program_log_height));
+            }
+            if !(1..=k.tier.saturating_add(2).min(16)).contains(&k.input_log_height) {
+                return Err(format!("{at}: input height {} is outside 1..={}", k.input_log_height, k.tier.saturating_add(2).min(16)));
+            }
+            if !(7..=max_public).contains(&k.public_log_height) {
+                return Err(format!("{at}: public height {} is outside 7..={max_public}, the heights a window of 1..={} blocks declares", k.public_log_height, self.max_window_blocks));
+            }
+            let p2_max = k.tier + 2;
+            if k.poseidon2_log_height > p2_max || k.poseidon2_log_height < 8 || (p2_max - k.poseidon2_log_height) % 2 != 0 {
+                return Err(format!("{at}: poseidon2 height {} is not one a tier-{} proof declares (8, 10, …, {p2_max})", k.poseidon2_log_height, k.tier));
+            }
+            if i > 0 && keys[i - 1].shape_key() >= k.shape_key() {
+                return Err(format!("{at}: the keys are not in strictly increasing shape order (a shape listed twice?)"));
+            }
+        }
+        Ok(())
     }
 
     pub fn check(&self) -> Result<(), String> {
@@ -330,6 +503,7 @@ impl PerpsConfig {
                 ));
             }
         }
+        self.check_state_proof_keys()?;
         if self.engine_program_log_height > MAX_ENGINE_PROGRAM_LOG_HEIGHT {
             return Err(format!(
                 "perps.engine_program_log_height {} is above {MAX_ENGINE_PROGRAM_LOG_HEIGHT}",
@@ -521,7 +695,7 @@ pub fn state_proof_segment(
     fees: u64,
     digests: &[Word8],
 ) -> Vec<u32> {
-    let mut w = Vec::with_capacity(32 + 8 * digests.len());
+    let mut w = Vec::with_capacity(state_proof_segment_words(digests.len()));
     w.push(PERP_VERSION);
     push_u64(&mut w, from);
     push_u64(&mut w, to);
@@ -727,6 +901,17 @@ struct PerpsExt2 {
     max_pending_digests: u64,
 }
 
+/// CON-601: the trailer's third version, written instead of the second only when the chain pins
+/// its state-proof keys ([`PerpsConfig::state_proof_keys`]): [`PerpsExt2`]'s fields, then the
+/// pins. A row without pins keeps writing the first or second version, byte for byte.
+pub const PERSISTED_EXT_TAG_3: &[u8; 16] = b"rand-perps-ext-3";
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct PerpsExt3 {
+    v2: PerpsExt2,
+    state_proof_keys: Vec<StateProofKeyPin>,
+}
+
 /// The owned twin of [`PerpsConfigV0`], for [`PerpsV0`].
 #[derive(Serialize, Deserialize)]
 struct PerpsConfigV0Owned {
@@ -819,7 +1004,14 @@ impl Perps {
             collateral_in: self.collateral_in,
             collateral_out: self.collateral_out,
         };
-        if c.max_pending_digests != 0 {
+        if !c.state_proof_keys.is_empty() {
+            let ext3 = PerpsExt3 {
+                v2: PerpsExt2 { v1: ext, max_pending_digests: c.max_pending_digests },
+                state_proof_keys: c.state_proof_keys.clone(),
+            };
+            out.extend_from_slice(PERSISTED_EXT_TAG_3);
+            out.extend_from_slice(&bincode::serialize(&ext3).expect("serializes"));
+        } else if c.max_pending_digests != 0 {
             let ext2 = PerpsExt2 { v1: ext, max_pending_digests: c.max_pending_digests };
             out.extend_from_slice(PERSISTED_EXT_TAG_2);
             out.extend_from_slice(&bincode::serialize(&ext2).expect("serializes"));
@@ -840,15 +1032,17 @@ impl Perps {
         let v0: PerpsV0 = prefix.deserialize_from(&mut rest)?;
         let exact = || bincode::DefaultOptions::new().with_fixint_encoding().reject_trailing_bytes();
         let ext = if rest.is_empty() {
-            PerpsExt2::default()
+            PerpsExt3::default()
         } else if let Some(body) = rest.strip_prefix(PERSISTED_EXT_TAG.as_slice()) {
-            PerpsExt2 { v1: exact().deserialize::<PerpsExt>(body)?, max_pending_digests: 0 }
+            PerpsExt3 { v2: PerpsExt2 { v1: exact().deserialize::<PerpsExt>(body)?, max_pending_digests: 0 }, state_proof_keys: Vec::new() }
         } else if let Some(body) = rest.strip_prefix(PERSISTED_EXT_TAG_2.as_slice()) {
-            exact().deserialize::<PerpsExt2>(body)?
+            PerpsExt3 { v2: exact().deserialize::<PerpsExt2>(body)?, state_proof_keys: Vec::new() }
+        } else if let Some(body) = rest.strip_prefix(PERSISTED_EXT_TAG_3.as_slice()) {
+            exact().deserialize::<PerpsExt3>(body)?
         } else {
             return Err(Box::new(bincode::ErrorKind::Custom("perps row: an unknown trailer".into())));
         };
-        let PerpsExt2 { v1: ext, max_pending_digests } = ext;
+        let PerpsExt3 { v2: PerpsExt2 { v1: ext, max_pending_digests }, state_proof_keys } = ext;
         let c = v0.config;
         Ok(Perps {
             config: PerpsConfig {
@@ -866,6 +1060,7 @@ impl Perps {
                 max_window_heights: ext.max_window_heights,
                 engine_program_log_height: ext.engine_program_log_height,
                 max_pending_digests,
+                state_proof_keys,
             },
             accounts: v0.accounts,
             oracle: v0.oracle,
@@ -1606,6 +1801,16 @@ pub(super) fn verify_state_proof(
             ))
             .into());
         }
+        // CON-601, under the genesis key pins: the declared shape must be one the chain pinned a
+        // key for — from the header alone, before the executor touches a key, so no block can
+        // make a validator build one (a node loads every pinned key from its file at startup).
+        if !c.state_proof_keys.is_empty() && c.pinned_state_proof_key(&shape).is_none() {
+            return Err(PerpError::ProofRefused(format!(
+                "declared shape {shape:?} is not one of the chain's {} pinned state-proof key shapes (perps.state_proof_keys)",
+                c.state_proof_keys.len()
+            ))
+            .into());
+        }
     }
     let outcome = executor.verify_perp(&c.engine_hc, c.max_tier, segment, proof).map_err(|e| match e {
         ConfidentialError::CallTierTooHigh { tier, max } => PerpError::TierTooHigh { tier, max },
@@ -2198,6 +2403,7 @@ pub(crate) mod tests {
             max_window_heights: 0,
             engine_program_log_height: 0,
             max_pending_digests: 0,
+            state_proof_keys: Vec::new(),
             markets: vec![MarketSpec {
                 id: 0,
                 symbol: "X-PERP".into(),
@@ -4189,6 +4395,124 @@ pub(crate) mod tests {
         assert_eq!(serde_json::from_value::<PerpsConfig>(json).unwrap(), c, "absent means unpinned");
         pinned.engine_program_log_height = 14;
         assert!(serde_json::to_string(&pinned).unwrap().contains("\"engine_program_log_height\":14"));
+    }
+
+    fn pin(shape: &crate::confidential::ProofShape, d: u8) -> StateProofKeyPin {
+        StateProofKeyPin {
+            tier: shape.tier,
+            program_log_height: shape.program_log_height,
+            input_log_height: shape.input_log_height,
+            public_log_height: shape.public_log_height,
+            poseidon2_log_height: shape.poseidon2_log_height,
+            sha256: [d; 32],
+        }
+    }
+
+    /// CON-601: under the genesis' pinned state-proof keys a proof declaring any shape not listed
+    /// — another input height, another tier — is refused from its header at validate and at
+    /// apply, before the executor is asked (the stub counts the key builds verifying would cost:
+    /// none); a pinned shape is verified as before. Without the field (chain 21) the same proofs
+    /// verify, as before.
+    #[test]
+    fn con601_under_pinned_keys_an_unpinned_shape_is_refused_before_any_key() {
+        use crate::confidential::{stub_perp_key_builds, STUB_PERP_PROGRAM_LOG_HEIGHT as PLH};
+        let (mut l, request) = withdrawn(5);
+        let payouts = vec![PerpPayout { request, amount: 5 }];
+        let seg = segment_on(&l, 0, 2, &[7; 8], &payouts, 0);
+        let at = |tier: u8, h: [u8; 4]| proof_tx(0, 2, [7; 8], payouts.clone(), 0, StubExecutor::make_perp_proof_shaped(&ENGINE, tier, outs(2), &seg, h));
+        let pinned_shape = StubExecutor.perp_proof_shape(&StubExecutor::make_perp_proof_shaped(&ENGINE, 16, outs(2), &seg, [PLH, 3, 0, 0])).unwrap();
+        l.perps_mut().unwrap().config.engine_program_log_height = PLH;
+        let unpinned = [(16, [PLH, 4, 0, 0]), (14, [PLH, 3, 0, 0])];
+        for (t, h) in unpinned {
+            assert_eq!(l.validate(&at(t, h), &StubExecutor), Ok(()), "no pins: {t} {h:?} verifies");
+        }
+        l.perps_mut().unwrap().config.state_proof_keys = vec![pin(&pinned_shape, 1)];
+        assert_eq!(l.validate(&at(16, [PLH, 3, 0, 0]), &StubExecutor), Ok(()), "the pinned shape verifies");
+        let builds = stub_perp_key_builds();
+        for (t, h) in unpinned {
+            match refusal(&l, &at(t, h)) {
+                TxError::Perps(PerpError::ProofRefused(why)) => assert!(why.contains("pinned state-proof key shapes"), "{why}"),
+                e => panic!("{t} {h:?}: {e:?}"),
+            }
+        }
+        assert_eq!(stub_perp_key_builds(), builds, "refused before the executor: no key build");
+        // And at apply: refused, nothing written.
+        l.set_height(3);
+        let before = l.clone();
+        assert!(apply(&mut l, &at(16, [PLH, 4, 0, 0])).is_err());
+        assert!(l == before);
+        assert_eq!(stub_perp_key_builds(), builds);
+    }
+
+    /// CON-601: the `state_proof_keys` field — checked, written to the file and bound into the
+    /// section's commit (so the genesis hash) only when set, round-tripped through JSON and the
+    /// node's persisted row; the chain-21 section's bytes do not move.
+    #[test]
+    fn con601_state_proof_keys_are_checked_and_bound_only_when_set() {
+        let mut c = sample_config();
+        c.max_tier = 18;
+        c.max_window_blocks = 64;
+        let base = c.commit_bytes();
+        let json = serde_json::to_value(&c).unwrap();
+        assert!(!json.as_object().unwrap().contains_key("state_proof_keys"), "written only when set");
+        assert_eq!(serde_json::from_value::<PerpsConfig>(json).unwrap(), c, "absent means unpinned");
+        let shapes = canonical_state_proof_shapes(18, 14, 64);
+        assert_eq!(shapes.iter().map(|s| (s.tier, s.input_log_height, s.public_log_height, s.poseidon2_log_height)).collect::<Vec<_>>(),
+                   vec![(18, 16, 7, 20), (18, 16, 8, 20), (18, 16, 9, 20), (18, 16, 10, 20)]);
+        let mut pinned = c.clone();
+        pinned.state_proof_keys = shapes.iter().enumerate().map(|(i, s)| pin(s, i as u8 + 1)).collect();
+        assert!(pinned.check().unwrap_err().contains("without engine_program_log_height"));
+        pinned.engine_program_log_height = 14;
+        let eplh = pinned.commit_bytes();
+        assert_eq!(pinned.check(), Ok(()));
+        let mut want = [base.clone(), b"engine_program_log_height".to_vec(), vec![14], b"state_proof_keys".to_vec(), 4u32.to_be_bytes().to_vec()].concat();
+        for (i, s) in shapes.iter().enumerate() {
+            want.extend_from_slice(&[18, 14, 16, s.public_log_height, 20]);
+            want.extend_from_slice(&[i as u8 + 1; 32]);
+        }
+        assert_eq!(eplh, want);
+        // Every byte of a pin moves the commit.
+        let mut other = pinned.clone();
+        other.state_proof_keys[3].sha256[31] ^= 1;
+        assert_ne!(other.commit_bytes(), pinned.commit_bytes());
+        // JSON: lowercase hex, round trip; a bad digest does not parse.
+        let text = serde_json::to_string(&pinned).unwrap();
+        assert!(text.contains(&format!("\"sha256\":\"{}\"", "01".repeat(32))), "{text}");
+        assert_eq!(serde_json::from_str::<PerpsConfig>(&text).unwrap(), pinned);
+        assert!(serde_json::from_str::<PerpsConfig>(&text.replace(&"01".repeat(32), &"0G".repeat(32))).is_err());
+        assert!(serde_json::from_str::<PerpsConfig>(&text.replace(&"01".repeat(32), &"01".repeat(31))).is_err());
+        // The rules.
+        let bad = |f: &dyn Fn(&mut PerpsConfig)| {
+            let mut b = pinned.clone();
+            f(&mut b);
+            b.check().unwrap_err()
+        };
+        assert!(bad(&|b| b.state_proof_keys[0].tier = 20).contains("tier 20"));
+        assert!(bad(&|b| b.state_proof_keys[0].program_log_height = 15).contains("not the engine's 14"));
+        assert!(bad(&|b| b.state_proof_keys[0].public_log_height = 11).contains("public height 11"));
+        assert!(bad(&|b| b.state_proof_keys[0].poseidon2_log_height = 19).contains("poseidon2 height 19"));
+        assert!(bad(&|b| b.state_proof_keys[0].input_log_height = 17).contains("input height 17"));
+        assert!(bad(&|b| b.state_proof_keys.swap(0, 1)).contains("strictly increasing"));
+        assert!(bad(&|b| b.state_proof_keys[1] = b.state_proof_keys[0]).contains("strictly increasing"));
+        assert!(bad(&|b| {
+            let k = b.state_proof_keys[0];
+            b.state_proof_keys = (0..9).map(|i| StateProofKeyPin { poseidon2_log_height: 4 + 2 * i, ..k }).collect();
+        })
+        .contains("more than 8"));
+        // The persisted row carries it (ext-3), and a row without it keeps its old trailer.
+        let (l, _) = withdrawn(5);
+        let mut p = l.perps().unwrap().clone();
+        let old_row = p.encode_persisted();
+        p.config.engine_program_log_height = 14;
+        p.config.state_proof_keys = pinned.state_proof_keys.clone();
+        let row = p.encode_persisted();
+        assert!(row.windows(16).any(|w| w == PERSISTED_EXT_TAG_3));
+        assert_eq!(Perps::decode_persisted(&row).unwrap().config, p.config);
+        p.config.max_pending_digests = 64;
+        assert_eq!(Perps::decode_persisted(&p.encode_persisted()).unwrap().config, p.config);
+        p.config.state_proof_keys.clear();
+        assert!(!p.encode_persisted().windows(16).any(|w| w == PERSISTED_EXT_TAG_3));
+        assert!(!old_row.windows(16).any(|w| w == PERSISTED_EXT_TAG_3));
     }
 
     /// CON-60: the canonical shape's formula, and its four public heights over 1..=64 blocks.

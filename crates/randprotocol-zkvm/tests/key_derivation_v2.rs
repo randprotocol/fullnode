@@ -61,8 +61,9 @@ fn the_mmcs_stream_answers_its_known_values() {
     assert_eq!(
         hex,
         [
-            "0abd7c39ca80b705", "8338764a19583721", "74ba1f7092ddcc3e", "f575a5c3320d071d",
-            "250d26a66bfcaf67", "b31fb5a39b4f79cf", "26903d35c61ff9bb", "d17a3f0625ab4fa2",
+            // Constraint set 11 (ZKVM-107): the Grain round constants moved the stream.
+            "ca87f94f22b0e50a", "c6b41555168e14c1", "b4f3ed8d9a62a5e0", "9694ab69dbbc6c23",
+            "51411bd45042f932", "93a122a0a99733ec", "d0c5b236e8e3cd80", "3449bf457e40db3c",
         ]
     );
     let mut bytes = [0u8; 16];

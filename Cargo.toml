@@ -105,12 +105,14 @@ opt-level = 2
 # chunk of rows, filled in parallel (vendor/p3-merkle-tree/src/counter_rng.rs; the proof format and
 # the verifier are unchanged). Everything else is the crates.io source.
 # `vendor/p3-batch-stark` is a third: p3-batch-stark 0.7.0 with a quotient-layout switch
-# (`QuotientLayout`), the circuits fork copied verbatim from circuits 5ff7676; circuits'
-# `vendor/PROVENANCE.md` and `recursion/docs/05-quotient-layout.md` are its record.
+# (`QuotientLayout`) and its self-check switch, the circuits fork copied verbatim from circuits
+# 76a48dc (constraint set 11); circuits' `vendor/PROVENANCE.md` and
+# `recursion/docs/05-quotient-layout.md` are its record.
 [patch.crates-io]
 p3-fri = { path = "vendor/p3-fri" }
 p3-merkle-tree = { path = "vendor/p3-merkle-tree" }
 # The quotient-layout fork (circuits `vendor/PROVENANCE.md`, `recursion/docs/05-quotient-layout.md`):
-# `QuotientLayout::PerChunk` is crates.io's behaviour byte for byte and is what `randprotocol-zkvm`
-# (the RV32 machine, every wallet proof) gets; `randprotocol-rvm` pins `PerInstance`.
+# `QuotientLayout::PerChunk` is crates.io's behaviour byte for byte; since constraint set 11 both
+# `randprotocol-zkvm` (the RV32 machine, every wallet proof, ZKVM-111) and `randprotocol-rvm` pin
+# `PerInstance`.
 p3-batch-stark = { path = "vendor/p3-batch-stark" }

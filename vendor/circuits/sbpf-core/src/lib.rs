@@ -1,6 +1,7 @@
 //! `sbpf-core`: the SBPF interpreter the Rand zkVM's Solana guest runs, as a `no_std` library with
-//! no allocation outside a fixed heap array, generic over a [`Host`] for the two things a guest
-//! cannot compute itself — the SHA-256 compression function and the Poseidon2 sponge. On the
+//! no allocation outside a fixed heap array, generic over a [`Host`] for the three things a guest
+//! cannot compute itself — the SHA-256 compression function, the Poseidon2 sponge and the Keccak-f
+//! permutation. On the
 //! target both are syscalls (`guest_sdk::sha256_compress`, `guest_sdk::poseidon2`); on the host
 //! they are the research crate's own reference functions (`sha256::compress`, `hash::sponge_hash`),
 //! so every opcode, the memory regions, the syscalls and the ELF loader are unit-tested natively
@@ -32,7 +33,7 @@ pub mod isa;
 pub mod memory;
 pub mod syscalls;
 
-/// The two things a guest cannot compute itself. Both operate in place on 32-bit words.
+/// The three things a guest cannot compute itself. Each operates in place on 32-bit words.
 pub trait Host {
     /// One SHA-256 compression of the 24-word `SYS_SHA256` argument: words `0..16` are the 512-bit
     /// message block as sixteen big-endian-*valued* words, words `16..24` the chaining state `H`.
@@ -41,6 +42,70 @@ pub trait Host {
     /// The Poseidon2 sponge over `words[..n]`, digest written to `words[..8]` (`POSEIDON2` syscall
     /// semantics).
     fn poseidon2(&mut self, words: &mut [u32], n: usize);
+    /// One Keccak-f[1600] permutation of the 25 lanes, each as two little-endian words — low word at
+    /// `2i`, high at `2i + 1` — in place (`KECCAK` syscall semantics). Only `sol_keccak256` reaches
+    /// it.
+    fn keccak_f(&mut self, state: &mut [u32; 50]);
+}
+
+/// Keccak-256 (Ethereum's and Solana's: rate 136 bytes, `0x01` domain padding) as a sponge over the
+/// host's permutation: the absorption and the padding are this crate's, the permutation is the
+/// host's. Byte-identical to `guest_sdk::keccak256` and to research's `keccak::keccak256`.
+///
+/// Streaming for the reason [`Sha256`] is: `sol_keccak256` hashes the concatenation of a
+/// program-chosen list of scattered slices. A byte is XORed straight into the state word it
+/// belongs to, so there is no block buffer to copy through.
+pub struct Keccak256 {
+    state: [u32; 50],
+    /// Bytes absorbed into the current block, `0..KECCAK_RATE`.
+    fill: usize,
+}
+
+/// Keccak-256's rate in bytes.
+const KECCAK_RATE: usize = 136;
+
+impl Default for Keccak256 {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Keccak256 {
+    pub const fn new() -> Self {
+        Keccak256 { state: [0; 50], fill: 0 }
+    }
+
+    /// XORs `b` into rate byte `at` (`at < KECCAK_RATE`, so the word index is below 34).
+    #[inline(always)]
+    fn xor_byte(&mut self, at: usize, b: u8) {
+        if let Some(w) = self.state.get_mut(at / 4) {
+            *w ^= u32::from(b) << (8 * (at % 4));
+        }
+    }
+
+    /// Absorbs `bytes`, permuting at every full block.
+    pub fn update<H: Host>(&mut self, h: &mut H, bytes: &[u8]) {
+        for &b in bytes {
+            self.xor_byte(self.fill, b);
+            self.fill += 1;
+            if self.fill == KECCAK_RATE {
+                h.keccak_f(&mut self.state);
+                self.fill = 0;
+            }
+        }
+    }
+
+    /// Pads (`0x01` … `0x80`) and returns the digest: the state's first 32 bytes.
+    pub fn finish<H: Host>(mut self, h: &mut H) -> [u8; 32] {
+        self.xor_byte(self.fill, 0x01);
+        self.xor_byte(KECCAK_RATE - 1, 0x80);
+        h.keccak_f(&mut self.state);
+        let mut out = [0u8; 32];
+        for i in 0..8 {
+            out[4 * i..4 * i + 4].copy_from_slice(&self.state[i].to_le_bytes());
+        }
+        out
+    }
 }
 
 /// SHA-256's initial hash value `H(0)` (FIPS 180-4 §5.3.3).
@@ -189,8 +254,8 @@ pub fn hash_words(h: &[u8; 32]) -> [u32; 8] {
     ]
 }
 
-/// The longest `dhash` message this crate hashes: the 24-word public-output preimage plus its
-/// domain word.
+/// The longest `dhash` message this crate hashes: the 24-word public-output preimage (three
+/// SHA-256 digests) plus its domain word.
 const DHASH_MAX_WORDS: usize = 32;
 
 /// `hash(domain, msg) = poseidon2([domain, msg…])` — the domain-tagged sponge, byte-identical to
@@ -208,3 +273,7 @@ pub fn dhash<H: Host>(h: &mut H, domain: u32, msg: &[u32]) -> [u32; 8] {
     out.copy_from_slice(&buf[..8]);
     out
 }
+
+/// ZKVM-117: the harness of an image that carries its own code (`sbpf2rv`). Declared last so the
+/// lines above keep their numbers — see the module docs.
+pub mod baked;

@@ -81,13 +81,18 @@ pub struct ProofShape {
     pub keccak_log_height: u8,
     pub sha256_log_height: u8,
     pub public_log_height: u8,
+    /// Constraint set 11 (ZKVM-112): the declared poseidon2 table height, a key component like the
+    /// rest (`randprotocol_zkvm::machine::VerifierKeyShape::poseidon2_log_height`).
+    pub poseidon2_log_height: u8,
 }
 
 /// A method added here must also be forwarded in the node's `verify_cache::CachingExecutor`, or
 /// that wrapper inherits the default. The private-multisig methods — `install_msauth_vk`,
 /// `enable_auth_multisig`, `build_msauth_key`, `auth_header`, `warm_auth_multisig` and
 /// `auth_multisig_key_ready` — have no default at all, so a wrapper that does not forward one
-/// does not compile.
+/// does not compile. The pinned state-proof key methods (CON-601) — `set_perp_pinned_keys`,
+/// `install_perp_vk` and `perp_pinned_keys_installed` — have defaults (no pins, refuse, 0) and are
+/// forwarded by both node wrappers (`CachingExecutor`, `AggExecutor`).
 pub trait ConfidentialExecutor: Send + Sync {
     /// Validate program code at deploy time (must be cheap: it runs inside block application)
     /// and return the code commitment recorded on chain.
@@ -243,6 +248,23 @@ pub trait ConfidentialExecutor: Send + Sync {
     /// CON-60: the genesis perps section's `max_tier` and `engine_program_log_height` (0 = none),
     /// told once at genesis load.
     fn set_perp_config(&self, _max_tier: u8, _engine_program_log_height: u8) {}
+    /// CON-601: the genesis perps section's pinned state-proof keys (`state_proof_keys`: each
+    /// shape and the SHA-256 of its key file), told once at genesis load. With any set, the
+    /// executor verifies a state proof only under a key installed from its pinned file
+    /// ([`Self::install_perp_vk`]) and **never builds one**: a shape not pinned, or pinned but not
+    /// installed, is refused before any key is touched. A no-op by default.
+    fn set_perp_pinned_keys(&self, _pins: &[(ProofShape, [u8; 32])]) {}
+    /// CON-601: install one pinned state-proof key from its file's bytes — refused unless their
+    /// SHA-256 is one [`Self::set_perp_pinned_keys`] named (checked before anything is decoded),
+    /// the blob is for this executor's profile and constraint set, and its shape is that pin's.
+    /// Returns the shape installed. Refuses by default (no key cache to install into).
+    fn install_perp_vk(&self, _blob: &[u8]) -> Result<ProofShape, String> {
+        Err("this executor holds no state-proof keys".into())
+    }
+    /// CON-601: how many pinned state-proof keys are installed (0 by default).
+    fn perp_pinned_keys_installed(&self) -> usize {
+        0
+    }
     /// [`Self::decode_invoke`]'s twin for [`Self::verify_perp`]: everything but the STARK
     /// verification, the segment's digest still compared. The ledger never calls this; kept as
     /// `verify_perp`'s header twin (no production caller). Defaults to the full verify.
@@ -515,14 +537,14 @@ const STUB_AUTH_BINDING: usize = 5 + 32 + 8;
 const STUB_AUTH_GAS: usize = STUB_AUTH_BINDING + 32;
 /// The gas limit a stub auth proof declares unless a test chooses one: `gas_max(10, 0, 0)`,
 /// what every real auth proof declares (tier 10, no hash table).
-pub const STUB_AUTH_GAS_LIMIT: u64 = 1_279;
+pub const STUB_AUTH_GAS_LIMIT: u64 = 1_407;
 /// Stub multisig auth proof (private multisig phase 4): [`STUB_AUTH_MARKER`]'s layout under its
 /// own marker — `msau:` || `c` || blake3("rand-stub-auth", hc bytes)[..8] || binding || gas — so
 /// `verify_auth`'s guest check is the same for both shapes.
 const STUB_MSAUTH_MARKER: &[u8; 5] = b"msau:";
 /// The gas limit a stub multisig auth proof declares unless a test chooses one:
 /// `gas::msauth_gas_limit_pin()`, what every real multisig auth proof declares.
-pub const STUB_MSAUTH_GAS_LIMIT: u64 = 436_159;
+pub const STUB_MSAUTH_GAS_LIMIT: u64 = 355_775;
 
 /// The shape of a well-formed stub auth proof of either marker, or `None`.
 fn stub_auth_shape(proof: &[u8]) -> Option<AuthShape> {
@@ -900,6 +922,7 @@ impl ConfidentialExecutor for StubExecutor {
             keccak_log_height: h[2],
             sha256_log_height: h[3],
             public_log_height: 0,
+            poseidon2_log_height: 0,
         })
     }
 
@@ -1225,9 +1248,9 @@ mod tests {
         let binding = [6u32; 8];
         let mut b = StubExecutor::make_bundle_proof(&hc, &digest, &binding);
         assert_eq!(StubExecutor.bundle_gas_limit(&b).unwrap(), Some(crate::gas::gas_max(14, 0, 0)));
-        assert_eq!(crate::gas::gas_max(14, 0, 0), 20_479, "(2^14 − 1) + 2^12, the absorb term included");
-        StubExecutor::with_bundle_gas(&mut b, 20_480);
-        assert_eq!(StubExecutor.bundle_gas_limit(&b).unwrap(), Some(20_480));
+        assert_eq!(crate::gas::gas_max(14, 0, 0), 22_527, "(2^14 − 1) + 3·2^11, the absorb term included");
+        StubExecutor::with_bundle_gas(&mut b, 22_528);
+        assert_eq!(StubExecutor.bundle_gas_limit(&b).unwrap(), Some(22_528));
         assert_eq!(StubExecutor.bundle_proof_digest(&hc, &b).unwrap(), digest);
         assert_eq!(StubExecutor.verify_bundle(&hc, &b, &binding), Ok(()));
         assert_eq!(StubExecutor.bundle_gas_limit(b"junk"), Err(ConfidentialError::MalformedProof));

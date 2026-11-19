@@ -1081,6 +1081,11 @@ fn a_reduce_row_reading_at_a_stale_clock_is_rejected() {
         }
         // acc = (10 − 4)·1 + (7 − 7)·3 + (30 − 6)·9 = 222.
         e.mem[4 + 9].value = F::from_u64(222);
+        // The forged event's own chain end: the trace builder recomputes the chain from the logged
+        // reads and `debug_assert`s it against the event, so without this the builder (not the
+        // prover) refuses the forgery in a debug-assertions build, and only a `--release` run
+        // reaches the AIR. (222 is the FORGED sum; the honest program publishes 267.)
+        e.reduce.as_mut().unwrap().acc_out = [F::from_u64(222), F::ZERO];
     }
     forge_accumulator_readback(&mut exec, F::from_u64(222));
     let mut t = build_traces(&p, &exec, Tier(8)).unwrap();
@@ -1323,6 +1328,7 @@ fn agg_shape_and_key(p: &randprotocol_zkvm::machine::Proof) -> (ZkInnerShape, Zk
         p.sha256_log_height,
         p.public_log_height,
         p.mem_log_height,
+        p.poseidon2_log_height,
     );
     let key = ZkInnerKey::of(FriProfile::Test, &shape);
     (shape, key)
@@ -2719,4 +2725,114 @@ fn the_immediate_form_alone_binds_the_sponge_source() {
 fn the_immediate_form_alone_binds_the_compress_sibling() {
     let (m, p2, t) = forge_word4_only(Op::Compress);
     assert!(rejects(|| prove_and_verify(&m, &p2, &t)), "COMPRESS read sibling 100 under a program whose word 4 says 96");
+}
+
+// ── RVM-202: isolating tests for three cpu AIR lines ─────────────────────────────────────────────
+//
+// `a_forged_equal_pair_at_an_assert_eq_site_is_rejected` and `an_address_above_two_to_the_twentyfour_
+// with_forged_limbs_is_rejected` above break several constraints at once (the pc chain, the range
+// lookup's multiplicities), so deleting any one AIR line leaves them passing. Each test below
+// forges ONE row so that exactly one of the three lines is false: the other lines of the same
+// gadget are evaluated on the forged row in the test itself (`cell`, plain field arithmetic) and
+// asserted to hold, and nothing else the row feeds is touched (the forged cells are read by no bus,
+// no lookup and no `NEXT_PC`: the row is an `FADD`/`MOV`/`LOAD`/`STORE`, never a branch, and the
+// limbs are permuted, not changed, so the byte multiset the range table counted is intact).
+// MUTATION CONTROL: with the targeted line deleted from `tables/cpu.rs` the forged trace satisfies
+// every remaining constraint and balances every bus, so `rejects()` is false and the test fails;
+// deleting any OTHER line leaves the target line to reject, so the test still passes.
+
+fn cell(t: &Traces, row: usize, c: usize) -> F {
+    t.cpu.values[row * cpu::col::WIDTH + c]
+}
+fn set(t: &mut Traces, row: usize, c: usize, v: F) {
+    t.cpu.values[row * cpu::col::WIDTH + c] = v;
+}
+
+/// The three equality-gadget lines on `row`: `[EQ_AUX bool, (D0−A0)·EQ_INV − (1−EQ_AUX), EQ_AUX·(D0−A0)]`.
+fn eq_lines(t: &Traces, row: usize) -> [F; 3] {
+    use cpu::col::*;
+    let (aux, inv, diff) = (cell(t, row, EQ_AUX), cell(t, row, EQ_INV), cell(t, row, D0) - cell(t, row, A0));
+    [aux * (aux - F::ONE), diff * inv - (F::ONE - aux), aux * diff]
+}
+
+/// `EQ_AUX·(D0 − A0) = 0`: row 2 is the `FADD` (D0 = 12, A0 = 7, so D0 ≠ A0). Claim "equal" with
+/// `EQ_INV = 0`: `EQ_AUX` is boolean and `(D0−A0)·0 = 1 − 1`, so only the product line is false.
+/// (`EQ_AUX` feeds `taken` only through `JEQ`/`JNE`, and this is neither.)
+#[test]
+fn eq_aux_claiming_equal_on_unequal_cells_is_rejected_by_the_product_line() {
+    let (m, p, mut t) = setup();
+    assert_ne!(cell(&t, 2, cpu::col::D0), cell(&t, 2, cpu::col::A0));
+    set(&mut t, 2, cpu::col::EQ_AUX, F::ONE);
+    set(&mut t, 2, cpu::col::EQ_INV, F::ZERO);
+    let l = eq_lines(&t, 2);
+    assert_eq!((l[0], l[1]), (F::ZERO, F::ZERO), "the other two lines of the gadget hold");
+    assert_ne!(l[2], F::ZERO, "only EQ_AUX·(D0−A0) is false");
+    assert!(rejects(|| prove_and_verify(&m, &p, &t)));
+}
+
+/// `(D0 − A0)·EQ_INV = 1 − EQ_AUX`, unequal cells: `EQ_AUX = 0` (so the product line holds) and an
+/// `EQ_INV` that is not the inverse.
+#[test]
+fn a_wrong_eq_inv_on_unequal_cells_is_rejected_by_the_inverse_line() {
+    for bad in [F::ZERO, F::ONE] {
+        let (m, p, mut t) = setup();
+        let honest = cell(&t, 2, cpu::col::EQ_INV);
+        assert_ne!(honest, bad);
+        set(&mut t, 2, cpu::col::EQ_INV, bad);
+        let l = eq_lines(&t, 2);
+        assert_eq!((l[0], l[2]), (F::ZERO, F::ZERO), "bool and product lines hold (EQ_AUX = 0)");
+        assert_ne!(l[1], F::ZERO, "only (D0−A0)·EQ_INV = 1−EQ_AUX is false");
+        assert!(rejects(|| prove_and_verify(&m, &p, &t)));
+    }
+}
+
+/// The same line, equal cells: a `MOV` has `D0 = A0`, honest `EQ_AUX = 1`, `EQ_INV = 0`. Claim
+/// `EQ_AUX = 0` ("unequal"): boolean, and `EQ_AUX·0 = 0`, so only `0·EQ_INV = 1 − 0` is false.
+#[test]
+fn eq_aux_claiming_unequal_on_equal_cells_is_rejected_by_the_inverse_line() {
+    let p = Program {
+        instrs: vec![
+            i(Op::Faddi, 1, 0, 7),  // 0
+            ir(Op::Mov, 2, 1, 0),   // 1: D0 = A0 = 7
+            i(Op::Public, 0, 2, 0), // 2..5
+            i(Op::Public, 0, 2, 0),
+            i(Op::Public, 0, 2, 0),
+            i(Op::Public, 0, 2, 0),
+            i(Op::Halt, 0, 0, 0),   // 6
+        ],
+        checkpoints: vec![],
+        reduce_layout: vec![],
+    };
+    let m = Machine::new(FriProfile::Test);
+    let exec = execute(&p, &[], 10_000).unwrap();
+    let mut t = build_traces(&p, &exec, Tier(8)).unwrap();
+    assert_eq!(cell(&t, 1, cpu::col::D0), cell(&t, 1, cpu::col::A0));
+    assert_eq!(cell(&t, 1, cpu::col::EQ_AUX), F::ONE);
+    prove_and_verify(&m, &p, &t).unwrap();
+    set(&mut t, 1, cpu::col::EQ_AUX, F::ZERO);
+    let l = eq_lines(&t, 1);
+    assert_eq!((l[0], l[2]), (F::ZERO, F::ZERO));
+    assert_ne!(l[1], F::ZERO, "only (D0−A0)·EQ_INV = 1−EQ_AUX is false");
+    assert!(rejects(|| prove_and_verify(&m, &p, &t)));
+}
+
+/// Single-cell `LOAD`/`STORE` address equality, `needs_check·(subject − limbs) = 0` with
+/// `subject = A0 + B`: rows 5 (`STORE`) and 6 (`LOAD`) both address cell 103, limbs `(103, 0, 0)`.
+/// Swapping `LIMB0` and `LIMB1` makes the limbs sum to `0 + 256·103 ≠ 103`, while the three bytes
+/// looked up on `RANGE8` are the same multiset (`{103, 0, 0}`), so the range argument balances;
+/// the RAM message uses `A0 + B`, not the limbs. Only the equality line is false.
+#[test]
+fn single_cell_load_and_store_limbs_that_do_not_sum_to_the_address_are_rejected_by_the_equality_line() {
+    use cpu::col::*;
+    for (row, name) in [(5usize, "STORE"), (6, "LOAD")] {
+        let (m, p, mut t) = setup();
+        let (l0, l1) = (cell(&t, row, LIMB0), cell(&t, row, LIMB1));
+        assert_eq!((l0, l1, cell(&t, row, LIMB2)), (F::from_u64(103), F::ZERO, F::ZERO), "{name} addresses cell 103");
+        set(&mut t, row, LIMB0, l1);
+        set(&mut t, row, LIMB1, l0);
+        let subject = cell(&t, row, A0) + cell(&t, row, B);
+        let limbs = cell(&t, row, LIMB0) + cell(&t, row, LIMB1) * F::from_u64(1 << 8) + cell(&t, row, LIMB2) * F::from_u64(1 << 16);
+        assert_ne!(subject, limbs, "{name}: the equality line is false");
+        assert!(rejects(|| prove_and_verify(&m, &p, &t)), "{name}");
+    }
 }

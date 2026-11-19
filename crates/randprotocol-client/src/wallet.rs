@@ -3505,9 +3505,11 @@ pub fn public_file_words(path: &Path) -> Result<Vec<u32>> {
 
 /// An ELF as public-input words, exactly as research's `SbpfCall::public_words` encodes it (the
 /// vendored `randprotocol_zkvm::sbpf`, reused here rather than restated): the byte length, then
-/// the bytes four per word, little-endian, the last word zero-padded.
+/// the bytes four per word, little-endian, the last word zero-padded; then, since constraint set
+/// 11's sBPF guest, the sysvar block's words — one zero word, no sysvars (a program that asks for
+/// Clock or Rent halts).
 pub fn elf_public_words(elf: &[u8]) -> Vec<u32> {
-    randprotocol_zkvm::sbpf::SbpfCall { elf: elf.to_vec(), input: Vec::new() }.public_words()
+    randprotocol_zkvm::sbpf::SbpfCall { elf: elf.to_vec(), input: Vec::new(), sysvars: None }.public_words()
 }
 
 /// The envelope caps a call is proved and sealed within: derived from the chain's
@@ -9577,7 +9579,8 @@ pub(crate) mod tests {
 
     /// `--public <file.so>`: the ELF is word-encoded exactly as research's
     /// `SbpfCall::public_words` does — its byte length, then its bytes four per word,
-    /// little-endian, zero-padded. The committed SPL Token ELF is 108 600 bytes, so 27 151 words.
+    /// little-endian, zero-padded, then (constraint set 11) the sysvar block's presence word — one
+    /// zero word, no sysvars. The committed SPL Token ELF is 108 600 bytes, so 27 151 + 1 words.
     #[test]
     fn a_public_elf_is_word_encoded_as_the_sbpf_guest_reads_it() {
         use randprotocol_zkvm::sbpf::{SbpfCall, SPL_TOKEN_ELF};
@@ -9585,15 +9588,16 @@ pub(crate) mod tests {
         let p = dir.path().join("spl_token.so");
         std::fs::write(&p, SPL_TOKEN_ELF).unwrap();
         let words = public_file_words(&p).unwrap();
-        assert_eq!(words.len(), 27_151);
+        assert_eq!(words.len(), 27_152);
+        assert_eq!(words[27_151], 0, "no sysvars");
         assert_eq!(&words[..8], &[108_600, 1_179_403_647, 65_794, 0, 0, 17_235_971, 1, 2_088]);
-        assert_eq!(words, SbpfCall { elf: SPL_TOKEN_ELF.to_vec(), input: vec![] }.public_words());
+        assert_eq!(words, SbpfCall { elf: SPL_TOKEN_ELF.to_vec(), input: vec![], sysvars: None }.public_words());
         // The ELF magic decides, not only the extension.
         let bare = dir.path().join("program");
         std::fs::write(&bare, SPL_TOKEN_ELF).unwrap();
         assert_eq!(public_file_words(&bare).unwrap(), words);
-        // A zero-padded tail: 5 bytes are the length and two words.
-        assert_eq!(elf_public_words(&[0x7f, b'E', b'L', b'F', 9]), vec![5, 0x464c_457f, 9]);
+        // A zero-padded tail: 5 bytes are the length and two words, then the no-sysvars word.
+        assert_eq!(elf_public_words(&[0x7f, b'E', b'L', b'F', 9]), vec![5, 0x464c_457f, 9, 0]);
         // A `.so` that is not an ELF is an error, not a text file of words.
         let fake = dir.path().join("fake.so");
         std::fs::write(&fake, "1 2 3").unwrap();
@@ -9855,18 +9859,21 @@ pub(crate) mod tests {
         assert_eq!(default_gas_limit(1, 10), 256);
         assert_eq!(default_gas_limit(256, 10), 256);
         assert_eq!(default_gas_limit(257, 10), 512);
-        // Tier 10's ceiling is gas_max(10, 0, 0) = 1 279 (1 023 cycles + the 2^8 absorb term), so
-        // 1 024 is a bucket under it and the next bucket, 1 280, is capped to it.
+        // Tier 10's ceiling is gas_max(10, 0, 0) = 1 407 since constraint set 11 (1 023 cycles +
+        // the 3·2^7 permutation term), so 1 024 and 1 280 are buckets under it and the next
+        // bucket, 1 536, is capped to it.
         assert_eq!(default_gas_limit(1_000, 10), 1_024);
-        assert_eq!(default_gas_limit(1_200, 10), 1_279, "capped at the tier's own ceiling");
+        assert_eq!(default_gas_limit(1_200, 10), 1_280);
+        assert_eq!(default_gas_limit(1_300, 10), 1_407, "capped at the tier's own ceiling");
         // 2^14 steps at tier 16 (the brief's 40 960 is not a multiple of 2^14; see the report).
         assert_eq!(default_gas_limit(38_412, 16), 49_152);
         assert_eq!(default_gas_limit(60_000, 16), 65_536);
-        assert_eq!(default_gas_limit(70_000, 16), 81_919, "capped at gas_max(16, 0, 0)");
+        assert_eq!(default_gas_limit(70_000, 16), 81_920);
+        assert_eq!(default_gas_limit(85_000, 16), 90_111, "capped at gas_max(16, 0, 0)");
         // A hashing call's ceiling is its header's, not the hash-free one.
         let ceiling = gas::gas_max(10, 7, 0);
         assert_eq!(gas_bucket(1_500, 10, ceiling), 1_536);
-        for exact in [1u64, 255, 256, 257, 700, 1_023, 1_279] {
+        for exact in [1u64, 255, 256, 257, 700, 1_023, 1_407] {
             assert!(default_gas_limit(exact, 10) >= exact, "never under the exact gas");
         }
     }
@@ -9875,11 +9882,11 @@ pub(crate) mod tests {
     fn a_declared_limit_outside_the_run_and_the_ceiling_is_refused_naming_the_bound() {
         let ceiling = gas::gas_max(10, 0, 0);
         assert!(check_gas_limit(500, 500, ceiling).is_ok());
-        assert!(check_gas_limit(1_279, 500, ceiling).is_ok());
+        assert!(check_gas_limit(1_407, 500, ceiling).is_ok());
         let e = check_gas_limit(499, 500, ceiling).unwrap_err().to_string();
         assert!(e.contains("exact gas 500"), "{e}");
-        let e = check_gas_limit(1_280, 500, ceiling).unwrap_err().to_string();
-        assert!(e.contains("ceiling 1279"), "{e}");
+        let e = check_gas_limit(1_408, 500, ceiling).unwrap_err().to_string();
+        assert!(e.contains("ceiling 1407"), "{e}");
     }
 
     /// Under a `gas` section the default is the declared limit's floor, whatever the header.
@@ -9967,10 +9974,10 @@ pub(crate) mod tests {
     fn a_bundle_gas_limit_other_than_the_guests_ceiling_is_refused() {
         assert!(check_bundle_gas_limit(None).is_ok());
         assert!(check_bundle_gas_limit(Some(gas::gas_max(14, 0, 0))).is_ok());
-        assert!(check_bundle_gas_limit(Some(20_479)).is_ok());
+        assert!(check_bundle_gas_limit(Some(22_527)).is_ok());
         // The pre-absorb-term value is another guest's now.
         let e = check_bundle_gas_limit(Some(16_383)).unwrap_err().to_string();
-        assert!(e.contains("16383") && e.contains("20479"), "{e}");
+        assert!(e.contains("16383") && e.contains("22527"), "{e}");
     }
 
 }

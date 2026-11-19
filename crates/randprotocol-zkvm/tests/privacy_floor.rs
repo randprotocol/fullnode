@@ -191,8 +191,8 @@ fn padded_hash_tables_verify_and_hide_presence() {
     assert_eq!((padded.keccak_log_height, padded.sha256_log_height), (MIN_PRIVATE_TABLE_LOG_HEIGHT, MIN_PRIVATE_TABLE_LOG_HEIGHT));
     // Nothing else in the header moves: the idle tables add no cycle and no memory access.
     assert_eq!(
-        (padded.tier, padded.program_log_height, padded.input_log_height, padded.public_log_height, padded.mem_log_height),
-        (plain.tier, plain.program_log_height, plain.input_log_height, plain.public_log_height, plain.mem_log_height)
+        (padded.tier, padded.program_log_height, padded.input_log_height, padded.public_log_height, padded.mem_log_height, padded.poseidon2_log_height),
+        (plain.tier, plain.program_log_height, plain.input_log_height, plain.public_log_height, plain.mem_log_height, plain.poseidon2_log_height)
     );
     assert_eq!(padded.batch.degree_bits.len(), plain.batch.degree_bits.len() + 2);
     m.verify(&p.digest(), &padded).expect("the unchanged verifier accepts all-padding hash tables");
@@ -205,7 +205,8 @@ fn padded_hash_tables_verify_and_hide_presence() {
         // Constraint set 8: and the declared gas limit, which by default is the header's own
         // ceiling (`gas::gas_max`) — the padded header declares both hash tables, so its ceiling
         // is higher. It says nothing the header's heights do not already say.
-        v[randprotocol_zkvm::tables::cpu::pv::GAS] = randprotocol_zkvm::gas::gas_max(Tier(10), MIN_PRIVATE_TABLE_LOG_HEIGHT, MIN_PRIVATE_TABLE_LOG_HEIGHT);
+        // Constraint set 11: at the header's declared poseidon2 height (`gas_max_declared`).
+        v[randprotocol_zkvm::tables::cpu::pv::GAS] = randprotocol_zkvm::gas::gas_max_declared(Tier(10), MIN_PRIVATE_TABLE_LOG_HEIGHT, MIN_PRIVATE_TABLE_LOG_HEIGHT, 0, padded.poseidon2_log_height);
         v
     });
     // The header a real one-permutation, one-compression call declares — the same two heights.

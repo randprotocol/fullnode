@@ -558,9 +558,9 @@ bridged one.
     warm shapes keep verifying. **The build is the memory cost**: its heap peaks at ~0.84 GB at
     tier 16 and ~3.3–4 GB at tier 18 (4× a tier step; measured with a counting allocator to tier
     16, msauth's tier-18 build at 4.0 GB). **A validator with less than 8 GB of memory should run
-    a chain whose perps `max_tier` is at most 16**, or — a follow-up, not built yet — load a
-    precomputed, hash-pinned state-proof key (13.7 KB, as the msauth key is loaded) instead of
-    building it.
+    a chain whose perps `max_tier` is at most 16**, or run a chain that pins its state-proof
+    keys (`perps.state_proof_keys`, below; chain 22), where it loads each 13.7 KB key, hash-pinned
+    as the msauth key is, instead of building it.
   - **the node's tier cap (CON-601).** Chain 21's `max_tier` is 18 and it has no engine pin, so a
     proof that passes every pre-key rule — no proving needed — makes a node build a tier-18 key
     (94 s and 3.56 GB resident measured in a debug build), more than a 2 GB or 4 GB host holds.
@@ -601,8 +601,21 @@ bridged one.
     passes at any tier. **The residual: a block.** Node policy cannot refuse a valid block (that
     would fork the node off the chain), so a block carrying a tier-18 state proof still makes
     every validator build its key, and a host under ~8 GB can be killed applying it. Chain 22's
-    genesis `engine_program_log_height` pin, with a `max_tier` the fleet can build (or the
-    validators given the memory), is the consensus fix;
+    genesis `engine_program_log_height` pin, with its pinned state-proof keys, is the consensus
+    fix (next item);
+  - **pinned state-proof keys (CON-601, chain 22).** A genesis may list
+    `perps.state_proof_keys`: up to 8 shapes, each with the SHA-256 of a precomputed key file
+    (`{tier, program_log_height, input_log_height, public_log_height, poseidon2_log_height,
+    sha256}`). The list is bound into the genesis hash only when set, and it requires
+    `engine_program_log_height`. On such a chain, a state proof whose declared shape is not
+    listed is refused before any key is touched, at validate and at apply. A listed shape
+    verifies only against the key the node loaded from its file at startup, held to the pinned
+    digest. The node never builds one, and it does not start without every file. So no block
+    and no pool entry can make a validator build a state-proof key. Chain 22 pins the four
+    canonical tier-18 shapes, with public heights 7, 8, 9 and 10 for windows up to 64 blocks
+    (`docs/deploy.md`, "The perps state-proof verifier keys"). The engine's prover makes those by
+    default and refuses `--smallest` on a pinned chain. A proof of any other shape (a lower
+    tier, `--smallest`, another input or poseidon2 height) is invalid on chain 22;
   - **the FRI transcript's structure, before the key (CON-601).** `perp_pre_key` (the pool's
     and the verify path's) also refuses a proof whose FRI transcript has commitments, commit-phase
     openings and commit-phase proof-of-work words of unequal counts, no commit round, a folding

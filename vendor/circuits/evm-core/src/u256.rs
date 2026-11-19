@@ -10,8 +10,24 @@
 //! hand-derived values.
 
 /// A 256-bit EVM word: limb 0 is the least significant 32 bits.
-#[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
+#[derive(Clone, Copy, Eq, Default, Debug)]
 pub struct U256(pub [u32; 8]);
+
+/// Eight words equal, compared as words. A derived `==` on `[u32; 8]` compiles to a `memcmp`
+/// *call* in the guest — `compiler_builtins`' byte loop, about 200 cycles for 32 bytes — and the
+/// interpreter compares a word on most opcodes (ZKVM-117: 15 649 of an ERC-20 transfer's cycles
+/// were that call). The OR of the XORs is branch-free and a tenth of it.
+#[inline(always)]
+pub fn words_eq(a: &[u32; 8], b: &[u32; 8]) -> bool {
+    ((a[0] ^ b[0]) | (a[1] ^ b[1]) | (a[2] ^ b[2]) | (a[3] ^ b[3]) | (a[4] ^ b[4]) | (a[5] ^ b[5]) | (a[6] ^ b[6]) | (a[7] ^ b[7])) == 0
+}
+
+impl PartialEq for U256 {
+    #[inline(always)]
+    fn eq(&self, other: &U256) -> bool {
+        words_eq(&self.0, &other.0)
+    }
+}
 
 impl U256 {
     pub const ZERO: U256 = U256([0; 8]);
@@ -55,7 +71,8 @@ impl U256 {
     }
 
     pub fn is_zero(&self) -> bool {
-        self.0 == [0u32; 8]
+        let w = &self.0;
+        (w[0] | w[1] | w[2] | w[3] | w[4] | w[5] | w[6] | w[7]) == 0
     }
 
     pub fn low_u32(&self) -> u32 {
@@ -472,4 +489,13 @@ fn significant_limbs(v: &[u32]) -> usize {
         n -= 1;
     }
     n
+}
+
+// The post-Shanghai additions, in an `impl` of their own at the end of the file so that no line
+// above moves (a guest image embeds the source line of each panic location it keeps).
+impl U256 {
+    /// `CLZ` (EIP-7939): the number of leading zero bits, 256 for zero.
+    pub fn clz(&self) -> U256 {
+        U256::from_u32(256 - self.bit_len())
+    }
 }

@@ -143,7 +143,7 @@ fn tier19_exit_twin() {
     let p = common::bundle_proofs(FriProfile::Test, 1).pop().unwrap();
     let shape = InnerShape::of(FriProfile::Test, p.proof.tier, p.proof.program_log_height,
         p.proof.input_log_height, p.proof.keccak_log_height, p.proof.sha256_log_height, p.proof.public_log_height,
-        p.proof.mem_log_height);
+        p.proof.mem_log_height, p.proof.poseidon2_log_height);
     let key = InnerKey::of(FriProfile::Test, &shape);
     let vp = verify_rv32(&shape, &key, Checkpoints::Off);
     let tape = WitnessTape::build(FriProfile::Test, &shape, &key, &p.proof).unwrap();

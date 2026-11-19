@@ -260,6 +260,7 @@ fn the_genesis_command_writes_the_perps_section_when_asked() {
         max_window_heights: 0,
         engine_program_log_height: 0,
         max_pending_digests: 0,
+        state_proof_keys: Vec::new(),
         markets: vec![MarketSpec {
             id: 0,
             symbol: "BTC-PERP".into(),
@@ -830,7 +831,7 @@ fn genesis_auth_multisig_guest_writes_this_builds_msauth_hc_and_needs_auth_guest
     let gen = read(&out);
     let want = word8_to_hex(&ZkExecutor::hc_auth_multisig());
     assert_eq!(gen.hc_auth_multisig.as_deref(), Some(want.as_str()));
-    assert_eq!(want, "9705f8e2f1bc8561848b29cb8efd57c37e3e39788fa58a5f03304d8019668247", "this build's msauth guest");
+    assert_eq!(want, "41db73c507ab1f24ebe76d9c425b42a08ed9a02b4b1284d410502729ce6b9cd1", "this build's msauth guest");
     let stdout = String::from_utf8_lossy(&ok.stdout);
     assert!(stdout.contains(&format!("hc_auth_multisig {want}")), "the operator is told: {stdout}");
     let executor = randprotocol_node::node::executor_for_profile(&gen.fri_profile).unwrap();

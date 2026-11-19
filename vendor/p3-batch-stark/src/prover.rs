@@ -28,6 +28,24 @@ use tracing::{debug_span, info_span, instrument};
 
 use crate::common::ProverData;
 use crate::layout::QuotientLayout; // RandProtocol patch (2026-10-04): quotient layout
+
+/// RandProtocol patch (2026-10-15): self-check switch (audit finding CS9-2). Whether a debug build's
+/// prover runs its two self-checks before committing — the per-instance constraint check
+/// (`check_constraints`) and the global lookup-balance check (`p3_lookup::debug_util::check_lookups`).
+/// Both are `#[cfg(debug_assertions)]` and panic on a trace that does not satisfy the AIR, which is
+/// right for an honest prover (it catches a trace-builder bug at the row that has it) and wrong for a
+/// test that proves a *forged* trace on purpose to see what the verifier says: the panic pre-empts the
+/// proof, so the verifier never runs and the test cannot assert on its typed error. `Skip` is for that
+/// test alone. It is not a soundness lever — the verifier is the check, and a skipped self-check only
+/// means a proof is produced that the verifier then refuses — and a release build has no self-check
+/// either way. Every entry point but `prove_batch_with_layout_and_self_check` enforces.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SelfCheck {
+    /// Run the debug-build self-checks (the default; upstream's behaviour).
+    Enforce,
+    /// Skip them: prove the trace as given and let the verifier judge it.
+    Skip,
+}
 use crate::config::{Challenge, Domain, StarkGenericConfig as SGC, Val};
 use crate::proof::{BatchCommitments, BatchOpenedValues, BatchProof, OpenedValuesWithLookups};
 use crate::symbolic::{
@@ -132,7 +150,8 @@ where
 ///
 /// A self-contained batch proof that can be verified with `verify_batch`.
 // RandProtocol patch (2026-10-04): quotient layout — upstream's span name, for every caller.
-#[instrument(name = "prove_batch", skip_all)]
+// RandProtocol patch (2026-10-15): self-check switch — the span and the body live on
+// `prove_batch_with_layout_and_self_check`; this enforces the self-checks, as upstream does.
 pub fn prove_batch_with_layout<
     SC,
     #[cfg(debug_assertions)] A: for<'a> Air<DebugConstraintBuilder<'a, Val<SC>, SC::Challenge>>
@@ -157,6 +176,44 @@ where
     <SC::Pcs as p3_commit::Pcs<SC::Challenge, SC::Challenger>>::ProverData: Sync,
     <SC::Pcs as p3_commit::Pcs<SC::Challenge, SC::Challenger>>::Commitment: Sync,
 {
+    prove_batch_with_layout_and_self_check(config, instances, prover_data, layout, SelfCheck::Enforce)
+}
+
+/// [`prove_batch_with_layout`] with the debug-build self-checks under the caller's control
+/// ([`SelfCheck`]). `SelfCheck::Enforce` is exactly `prove_batch_with_layout`; `SelfCheck::Skip`
+/// proves the instances as given, so a forged trace reaches the verifier in a debug build too. In a
+/// release build the two are the same function.
+// RandProtocol patch (2026-10-15): self-check switch (CS9-2). Upstream's span name, for every caller.
+#[instrument(name = "prove_batch", skip_all)]
+pub fn prove_batch_with_layout_and_self_check<
+    SC,
+    #[cfg(debug_assertions)] A: for<'a> Air<DebugConstraintBuilder<'a, Val<SC>, SC::Challenge>>
+        + Air<InteractionSymbolicBuilder<Val<SC>, SC::Challenge>>
+        + for<'a> Air<ProverConstraintFolderWithLookups<'a, SC>>
+        + Clone,
+    #[cfg(not(debug_assertions))] A: for<'a> Air<InteractionSymbolicBuilder<Val<SC>, SC::Challenge>>
+        + for<'a> Air<ProverConstraintFolderWithLookups<'a, SC>>
+        + Clone,
+>(
+    config: &SC,
+    instances: &[StarkInstance<'_, SC, A>],
+    prover_data: &ProverData<SC>,
+    layout: QuotientLayout,
+    self_check: SelfCheck,
+) -> BatchProof<SC>
+where
+    SC: SGC,
+    Val<SC>: PrimeField,
+    SymbolicExpressionExt<Val<SC>, SC::Challenge>: Algebra<SC::Challenge>,
+    Domain<SC>: Send + Sync,
+    SC::Pcs: Sync,
+    <SC::Pcs as p3_commit::Pcs<SC::Challenge, SC::Challenger>>::ProverData: Sync,
+    <SC::Pcs as p3_commit::Pcs<SC::Challenge, SC::Challenger>>::Commitment: Sync,
+{
+    // A release build has no self-check to switch; the parameter is read only under
+    // `debug_assertions` below.
+    #[cfg(not(debug_assertions))]
+    let _ = self_check;
     let common = &prover_data.common;
     // TODO: Extend if additional lookup gadgets are added.
     let lookup_gadget = LogUpGadget::new();
@@ -292,8 +349,9 @@ where
                 // Record the AIR's terminal for transcript observation and proof emission.
                 lookup_terminals[i] = terminal;
 
+                // RandProtocol patch (2026-10-15): self-check switch — skipped under `SelfCheck::Skip`.
                 #[cfg(debug_assertions)]
-                {
+                if self_check == SelfCheck::Enforce {
                     use crate::check_constraints::check_constraints;
 
                     let preprocessed_trace = inst.air.preprocessed_trace();
@@ -318,8 +376,9 @@ where
         });
 
     // Debug-only: verify that all lookup sums balance across instances.
+    // RandProtocol patch (2026-10-15): self-check switch — skipped under `SelfCheck::Skip`.
     #[cfg(debug_assertions)]
-    {
+    if self_check == SelfCheck::Enforce {
         use p3_lookup::debug_util::{LookupDebugInstance, check_lookups};
 
         let preprocessed_traces: Vec<_> = instances

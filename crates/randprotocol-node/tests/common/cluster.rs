@@ -150,6 +150,7 @@ pub async fn start_in_verify(
         prune_history,
         gas_policy: None,
         msauth: Default::default(),
+        perps_keys: Default::default(),
     })
     .await
     .expect("node starts");

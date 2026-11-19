@@ -74,7 +74,9 @@ pub mod domain {
     /// storage root is history-independent (`evm::leaf_hash`).
     pub const STORAGE_LEAF: u32 = 12;
     /// M4.3: the EVM guest's public-output digest,
-    /// `[codehash(8), pre_root(8), post_root(8), return_hash(8), logs_hash(8)]` (40 words).
+    /// `[codehash(8), pre_root(8), post_root(8), return_hash(8), logs_hash(8), address(8),
+    /// caller(8), callvalue(8), calldata_hash(8), context(8), gas_limit(1), gas_used(1)]`
+    /// (82 words; 40 before ZKVM-103/104, which added everything after `logs_hash`).
     pub const EVM_OUT: u32 = 13;
     /// M4.4: the sBPF guest's public-output digest, `[input_hash(8), output_hash(8)]` (16 words)
     /// — two SHA-256 digests, each packed `word[i] = LE(bytes[4i..4i+4])`, binding the instruction

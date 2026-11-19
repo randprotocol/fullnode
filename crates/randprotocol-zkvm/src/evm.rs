@@ -8,8 +8,9 @@
 //! syscalls compute (`keccak::keccak_f`, `hash::sponge_hash`) — `tests/evm_storage.rs` asserts
 //! host and guest agree on every index, leaf and root.
 //!
-//! The tree is `notes::DEPTH = 32` levels of the commitment tree's own node hash over storage
-//! leaves: position is the top 32 bits, big-endian, of `keccak256(slot as 32 big-endian bytes)`,
+//! The tree is [`DEPTH`] = 64 levels (storage layout 2; 32 under layout 1, [`layout_depth`]) of the
+//! commitment tree's own node hash over storage leaves: position is the top `DEPTH` bits,
+//! big-endian, of `keccak256(slot as 32 big-endian bytes)`,
 //! whose bit `i` (LSB first) chooses left/right at level `i` — `asm::emit_merkle_verify`'s
 //! convention. The leaf is canonical in the value, so the empty tree has a well-defined root and
 //! writing a slot back to zero restores it ([`leaf_hash`]).
@@ -17,13 +18,13 @@
 use std::collections::BTreeMap;
 use std::sync::OnceLock;
 
-use evm_core::abi::{run_call_with, Workspace};
-use evm_core::interp::Outcome;
+use evm_core::abi::{run_call_with, Statement, Workspace};
+use evm_core::interp::{Env, Outcome};
 use evm_core::u256::U256;
 
 use crate::hash::sponge_hash;
 use crate::keccak;
-use crate::notes::{self, domain, Word8, DEPTH};
+use crate::notes::{self, domain, Word8};
 
 /// [`evm_core::Host`] over this crate's reference primitives: the Keccak-f[1600] permutation the
 /// `KECCAK` syscall computes and the Poseidon2 sponge the `POSEIDON2` syscall computes. Every
@@ -41,19 +42,119 @@ impl evm_core::Host for HostRef {
         let digest = sponge_hash(&words[..n]);
         words[..8].copy_from_slice(&digest);
     }
+    /// No public segment: every word reads 0, which is no context version, so every
+    /// block-context opcode traps (`evm_core::block`) — what a version-1 context gives. A call
+    /// with a segment runs over [`HostPublic`].
+    fn read_public(&mut self, _idx: u32) -> u32 {
+        0
+    }
 }
 
-/// The leaf position of `slot`: the top 32 bits, big-endian, of `keccak256(slot)`, read as a `u32`
-/// whose bit `i` chooses left (0) or right (1) at level `i`.
-pub fn slot_index(slot: &U256) -> u32 {
+/// [`HostRef`] with a public segment: what the guest's `READ_PUBLIC` returns, for the
+/// block-context opcodes (`evm_core::block`). A read past the segment panics: in the guest it can
+/// never be satisfied, so such a run has no proof, and a test that reaches one has built the
+/// wrong segment.
+pub struct HostPublic<'a>(pub &'a [u32]);
+
+impl evm_core::Host for HostPublic<'_> {
+    fn keccak_f(&mut self, state: &mut [u32; 50]) {
+        HostRef.keccak_f(state)
+    }
+    fn poseidon2(&mut self, words: &mut [u32], n: usize) {
+        HostRef.poseidon2(words, n)
+    }
+    fn read_public(&mut self, idx: u32) -> u32 {
+        match self.0.get(idx as usize) {
+            Some(&w) => w,
+            None => panic!("READ_PUBLIC({idx}) past a {}-word segment: no proof", self.0.len()),
+        }
+    }
+}
+
+/// The block facts of an `InvokeAt`'s version-2 context (fullnode `BlockFacts`, issue #168), on
+/// chain `chain_id`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BlockFacts {
+    pub height: u64,
+    pub timestamp_ms: u64,
+    pub chain_id: u64,
+    pub basefee: u64,
+    /// The beacon's 32 bytes after the block's reveal; `None` on a chain without the beacon.
+    pub randomness: Option<[u8; 32]>,
+}
+
+impl BlockFacts {
+    /// The 17 block words the ledger puts at context words 11..28 (`BlockFacts::context_words`):
+    /// four u64s low word first, the randomness flag, then the beacon value as eight
+    /// little-endian words (all zero, and the flag 0, without one).
+    pub fn words(&self) -> [u32; 17] {
+        let mut w = [0u32; 17];
+        for (k, v) in [self.height, self.timestamp_ms / 1000, self.chain_id, self.basefee].into_iter().enumerate() {
+            w[2 * k] = v as u32;
+            w[2 * k + 1] = (v >> 32) as u32;
+        }
+        if let Some(r) = &self.randomness {
+            w[8] = 1;
+            for i in 0..8 {
+                w[9 + i] = u32::from_le_bytes(r[4 * i..4 * i + 4].try_into().unwrap());
+            }
+        }
+        w
+    }
+
+    /// An invoke's public segment for an EVM program (deploy-time public input empty):
+    /// `binding(8) ‖ context`, the context version 2 over a transition with no cells and no
+    /// payouts — header words 1..=10 all zero, then these 17 words.
+    pub fn segment(&self, binding: &Word8) -> Vec<u32> {
+        let mut s = binding.to_vec();
+        s.push(evm_core::block::CONTEXT_VERSION_BLOCK);
+        s.extend_from_slice(&[0; 10]);
+        s.extend_from_slice(&self.words());
+        s
+    }
+}
+
+/// A version-1 context's segment for an EVM program, `binding(8) ‖ [1, 0 × 10]`: an ordinary
+/// `Invoke` with no cells and no payouts.
+pub fn v1_segment(binding: &Word8) -> Vec<u32> {
+    let mut s = binding.to_vec();
+    s.push(1);
+    s.extend_from_slice(&[0; 10]);
+    s
+}
+
+/// The storage layouts (ZKVM-105): the tree's depth, which is also the width in bits of a leaf
+/// position. Layout 1 is depth 32, layout 2 depth 64; `evm_core::storage::LAYOUT_VERSION` is the
+/// one this build of `evm-core` runs natively (2), and `evm-v1.bin` is layout 1's image.
+pub const fn layout_depth(layout: u32) -> usize {
+    match layout {
+        1 => 32,
+        2 => 64,
+        _ => panic!("no such storage layout"),
+    }
+}
+
+/// The current layout's depth: `evm_core::storage::DEPTH`, 64.
+pub const DEPTH: usize = evm_core::storage::DEPTH;
+
+/// The leaf position of `slot` in the current layout: the top 64 bits, big-endian, of
+/// `keccak256(slot)`, read as an integer whose bit `i` chooses left (0) or right (1) at level `i`.
+pub fn slot_index(slot: &U256) -> u64 {
+    slot_index_at(slot, DEPTH)
+}
+
+/// The leaf position of `slot` in a tree of the given depth: the top `depth` bits of
+/// `keccak256(slot)`. `depth = 32` is layout 1's position.
+pub fn slot_index_at(slot: &U256, depth: usize) -> u64 {
+    assert!((1..=64).contains(&depth));
     let k = keccak::keccak256(&slot.to_be_bytes());
-    u32::from_be_bytes([k[0], k[1], k[2], k[3]])
+    u64::from_be_bytes([k[0], k[1], k[2], k[3], k[4], k[5], k[6], k[7]]) >> (64 - depth)
 }
 
 /// `H(STORAGE_LEAF, [slot(8), value(8)])`, **canonical in the value**: a zero value gives the one
 /// `H(STORAGE_LEAF, [0; 16])` whatever the slot is. So an absent slot, a never-written slot and a
 /// slot written back to zero are the same leaf; the storage root is history-independent and the
-/// empty tree's root is just this leaf lifted 32 levels ([`empty_root`]). Every leaf on both sides
+/// empty tree's root is just this leaf lifted `DEPTH` levels ([`empty_root`]). Every leaf on both sides
 /// — witnesses, verification, loads, stores and the default subtrees — goes through this function
 /// or its `evm_core::storage::leaf_hash` twin.
 pub fn leaf_hash(slot: &U256, value: &U256) -> Word8 {
@@ -74,62 +175,107 @@ fn node_hash(l: &Word8, r: &Word8) -> Word8 {
 }
 
 /// `defaults()[l]` is the root of an empty subtree of depth `l`: `defaults()[0]` is the zero-value
-/// leaf and `defaults()[l] = H(NODE, defaults()[l-1], defaults()[l-1])`. Computed once — the 32
-/// sponge hashes are the same for every tree, and `SparseTree` consults the table at every level
-/// where a subtree holds nothing.
-fn defaults() -> &'static [Word8; DEPTH + 1] {
-    static TABLE: OnceLock<[Word8; DEPTH + 1]> = OnceLock::new();
+/// leaf and `defaults()[l] = H(NODE, defaults()[l-1], defaults()[l-1])`. Computed once, to depth
+/// 64 — the sponge hashes are the same for every tree of every layout, and `SparseTree` consults
+/// the table at every level where a subtree holds nothing.
+fn defaults() -> &'static [Word8; 65] {
+    static TABLE: OnceLock<[Word8; 65]> = OnceLock::new();
     TABLE.get_or_init(|| {
-        let mut d = [[0u32; 8]; DEPTH + 1];
+        let mut d = [[0u32; 8]; 65];
         d[0] = leaf_hash(&U256::ZERO, &U256::ZERO);
-        for l in 1..=DEPTH {
+        for l in 1..=64 {
             d[l] = node_hash(&d[l - 1], &d[l - 1]);
         }
         d
     })
 }
 
-/// The root of the tree with no slot written: `defaults()[DEPTH]`.
+/// The root of the current layout's tree with no slot written: `defaults()[DEPTH]`.
 pub fn empty_root() -> Word8 {
     defaults()[DEPTH]
 }
 
 /// The host's contract storage: the written slots, keyed by leaf position, with empty subtrees
 /// standing in for everything else. Builds the roots and the witnesses the guest verifies.
-#[derive(Clone, Debug, Default)]
+///
+/// A tree has a depth: [`new`](SparseTree::new) is the current layout's (64),
+/// [`with_depth`](SparseTree::with_depth) any other — 32 for layout 1's image, and for
+/// [`migrate`](SparseTree::migrate).
+#[derive(Clone, Debug)]
 pub struct SparseTree {
+    depth: usize,
     /// Leaf position → (slot, value). Only non-zero values are held: a zero value is the default
     /// leaf, so storing one is removing the entry (and both hash the same).
-    entries: BTreeMap<u32, (U256, U256)>,
+    entries: BTreeMap<u64, (U256, U256)>,
+}
+
+impl Default for SparseTree {
+    fn default() -> Self {
+        SparseTree::new()
+    }
 }
 
 impl SparseTree {
     pub fn new() -> Self {
-        SparseTree::default()
+        SparseTree::with_depth(DEPTH)
+    }
+
+    /// An empty tree of the given depth (1..=64): 32 is storage layout 1, 64 layout 2.
+    pub fn with_depth(depth: usize) -> Self {
+        assert!((1..=64).contains(&depth));
+        SparseTree { depth, entries: BTreeMap::new() }
+    }
+
+    pub fn depth(&self) -> usize {
+        self.depth
+    }
+
+    /// The same slots and values in a tree of another depth: the one-time re-rooting a contract's
+    /// storage needs to move from layout 1 to layout 2 (`docs/04-guests.md`). The host does it
+    /// from the slots it holds; nothing is proved.
+    pub fn migrate(&self, depth: usize) -> SparseTree {
+        let mut t = SparseTree::with_depth(depth);
+        for (slot, value) in self.entries.values() {
+            t.insert(*slot, *value);
+        }
+        t
     }
 
     /// Write `value` at `slot`. A zero value removes the entry, which is the same tree either way
     /// because the leaf is canonical in the value.
     ///
-    /// Panics if two distinct slots collide on one leaf position — a 2^-32-per-pair event that
+    /// Panics if two distinct slots collide on one leaf position — a 2^-depth-per-pair event that
     /// would otherwise silently drop a slot, and the tests would rather see it than debug a root.
+    /// [`try_insert`](Self::try_insert) reports it instead.
     pub fn insert(&mut self, slot: U256, value: U256) {
-        let idx = slot_index(&slot);
+        if let Err(held) = self.try_insert(slot, value) {
+            panic!("the leaf position of slot {slot:?} is already held by a different slot, {held:?}");
+        }
+    }
+
+    /// [`insert`](Self::insert), returning the slot that already holds the position instead of
+    /// panicking — how a depth-32 tree shows a ground collision.
+    pub fn try_insert(&mut self, slot: U256, value: U256) -> Result<(), U256> {
+        let idx = slot_index_at(&slot, self.depth);
+        if let Some((held, _)) = self.entries.get(&idx) {
+            if *held != slot {
+                return Err(*held);
+            }
+        }
         if value.is_zero() {
             self.entries.remove(&idx);
-            return;
+        } else {
+            self.entries.insert(idx, (slot, value));
         }
-        if let Some((held, _)) = self.entries.get(&idx) {
-            assert_eq!(*held, slot, "leaf position {idx} is already held by a different slot");
-        }
-        self.entries.insert(idx, (slot, value));
+        Ok(())
     }
 
     /// The hash of the subtree at level `level` whose nodes all share the leaf-position prefix
     /// `prefix = index >> level`. Empty subtrees short-circuit to the default table, so the walk
-    /// costs `O(entries × DEPTH)` hashes rather than `O(2^DEPTH)`.
-    fn node_at(&self, level: usize, prefix: u64) -> Word8 {
-        let Some((_, (slot, value))) = self.entries.iter().find(|(i, _)| (**i as u64) >> level == prefix) else {
+    /// costs `O(entries × depth)` hashes rather than `O(2^depth)`. (`u128` so that `level = 64`,
+    /// the root of a depth-64 tree, is a shift like any other.)
+    fn node_at(&self, level: usize, prefix: u128) -> Word8 {
+        let Some((_, (slot, value))) = self.entries.iter().find(|(i, _)| (**i as u128) >> level == prefix) else {
             return defaults()[level];
         };
         if level == 0 {
@@ -141,11 +287,11 @@ impl SparseTree {
     }
 
     pub fn root(&self) -> Word8 {
-        self.node_at(DEPTH, 0)
+        self.node_at(self.depth, 0)
     }
 
     /// The witness for `slot`: its value (zero if the slot was never written) and, for each level
-    /// `l = 0..DEPTH`, the hash of the sibling subtree of the path's node at that level, bottom-up.
+    /// `l = 0..depth`, the hash of the sibling subtree of the path's node at that level, bottom-up.
     ///
     /// Panics, like [`insert`](Self::insert), if a *different* slot holds this leaf position:
     /// `entries` is keyed by position, so without the check the colliding slot's value and leaf
@@ -153,30 +299,32 @@ impl SparseTree {
     /// could. `insert` already makes that state unreachable through this type; the assert is here
     /// so it stays unreachable rather than being unreachable by argument.
     pub fn witness(&self, slot: &U256) -> Witness {
-        let idx = slot_index(slot);
+        let idx = slot_index_at(slot, self.depth);
         if let Some((held, _)) = self.entries.get(&idx) {
             assert_eq!(held, slot, "leaf position {idx} is held by a different slot");
         }
         let value = self.entries.get(&idx).map(|(_, v)| *v).unwrap_or(U256::ZERO);
-        let siblings = std::array::from_fn(|l| self.node_at(l, ((idx as u64) >> l) ^ 1));
+        let siblings = (0..self.depth).map(|l| self.node_at(l, ((idx as u128) >> l) ^ 1)).collect();
         Witness { slot: *slot, value, siblings }
     }
 }
 
-/// One slot's Merkle witness against a `SparseTree`'s root: the value and `DEPTH` siblings from
-/// the leaf up. `evm_core::storage::Witness` is the guest's copy, plus its own `verified` flag.
+/// One slot's Merkle witness against a `SparseTree`'s root: the value and one sibling per level
+/// from the leaf up (the tree's depth of them). `evm_core::storage::Witness` is the guest's copy,
+/// plus its own `verified` flag.
 #[derive(Clone, PartialEq, Debug)]
 pub struct Witness {
     pub slot: U256,
     pub value: U256,
-    pub siblings: [Word8; DEPTH],
+    pub siblings: Vec<Word8>,
 }
 
 impl Witness {
-    /// The input-vector encoding: `slot(8) ‖ value(8) ‖ sibling_0(8) ‖ … ‖ sibling_31(8)`, 272
-    /// words. 256-bit values are their own little-endian limbs, so nothing is byte-swapped.
+    /// The input-vector encoding: `slot(8) ‖ value(8) ‖ sibling_0(8) ‖ … `, 528 words in the
+    /// current layout (272 in layout 1). 256-bit values are their own little-endian limbs, so
+    /// nothing is byte-swapped.
     pub fn words(&self) -> Vec<u32> {
-        let mut w = Vec::with_capacity(WITNESS_WORDS);
+        let mut w = Vec::with_capacity(16 + 8 * self.siblings.len());
         w.extend_from_slice(&self.slot.0);
         w.extend_from_slice(&self.value.0);
         for sib in &self.siblings {
@@ -186,7 +334,8 @@ impl Witness {
     }
 }
 
-/// Words per witness in the input vector: slot 8 + value 8 + `DEPTH` × 8 siblings.
+/// Words per witness in the current layout's input vector: slot 8 + value 8 + `DEPTH` × 8
+/// siblings.
 pub const WITNESS_WORDS: usize = 16 + DEPTH * 8;
 
 /// One call to the EVM guest, host side: everything the input vector holds, plus the storage tree
@@ -201,6 +350,9 @@ pub struct EvmCall {
     pub caller: U256,
     pub callvalue: U256,
     pub gas_limit: u64,
+    /// The eight words the consuming chain binds its replay protection to (a transaction hash, a
+    /// nonce and chain id). The guest carries them into the public output and nothing else.
+    pub context: Word8,
     /// The pre-state storage. `witness(slot)` against this is what the guest verifies.
     pub tree: SparseTree,
     /// The slots a witness is supplied for, in the order they appear in the vector. A slot the
@@ -211,7 +363,7 @@ pub struct EvmCall {
 impl EvmCall {
     /// The input vector, exactly as the plan's Global Constraints lay it out:
     /// `[n_code, code…, n_calldata, calldata…, address(8), caller(8), callvalue(8), gas_limit(1),
-    /// pre_root(8), n_witnesses(1), witness…]`, byte strings packed 4 per word little-endian and
+    /// context(8), pre_root(8), n_witnesses(1), witness…]`, byte strings packed 4 per word little-endian and
     /// zero-padded, 256-bit values as their own little-endian limbs, each witness
     /// [`WITNESS_WORDS`] long.
     ///
@@ -224,7 +376,8 @@ impl EvmCall {
     /// testing the malformed path while looking like a real call. A test that *means* to exercise
     /// the rejection splices the duplicate into the word vector itself.
     pub fn input_words(&self) -> Vec<u32> {
-        let mut idxs: Vec<u32> = self.touched.iter().map(slot_index).collect();
+        let depth = self.tree.depth();
+        let mut idxs: Vec<u64> = self.touched.iter().map(|s| slot_index_at(s, depth)).collect();
         let n = idxs.len();
         idxs.sort_unstable();
         idxs.dedup();
@@ -237,6 +390,7 @@ impl EvmCall {
         w.extend_from_slice(&self.callvalue.0);
         assert!(self.gas_limit <= u32::MAX as u64, "the layout's gas_limit is one word");
         w.push(self.gas_limit as u32);
+        w.extend_from_slice(&self.context);
         w.extend_from_slice(&self.tree.root());
         w.push(self.touched.len() as u32);
         for slot in &self.touched {
@@ -254,11 +408,22 @@ impl EvmCall {
     /// root and the guest's witness-updated root are asserted equal, which is the one check that
     /// `StorageTree::store`'s sibling refresh and `SparseTree`'s rebuild agree.
     pub fn expected(&self) -> ([u32; 8], Outcome, SparseTree) {
+        self.expected_over(&mut HostRef)
+    }
+
+    /// [`expected`](EvmCall::expected) with `public` as the public segment the guest reads the
+    /// block-context words from (`evm_core::block`): an invoke's `binding ‖ context`,
+    /// [`BlockFacts::segment`] or [`v1_segment`].
+    pub fn expected_on(&self, public: &[u32]) -> ([u32; 8], Outcome, SparseTree) {
+        self.expected_over(&mut HostPublic(public))
+    }
+
+    fn expected_over<H: evm_core::Host>(&self, h: &mut H) -> ([u32; 8], Outcome, SparseTree) {
+        assert_eq!(self.tree.depth(), DEPTH, "evm-core runs the current layout natively; a layout-1 call goes through evm-v1.bin");
         let words = self.input_words();
         // The guest keeps this in `.bss`; a host test boxes it (146 KiB is not for a frame).
         let mut ws = Box::new(Workspace::ZERO);
-        let (out, o) =
-            run_call_with(&mut HostRef, &mut ws, |i| words[i as usize], words.len() as u32);
+        let (out, o) = run_call_with(h, &mut ws, |i| words[i as usize], words.len() as u32);
         let mut post = self.tree.clone();
         if o.status() == 1 {
             for i in 0..ws.input.storage.len() {
@@ -272,6 +437,154 @@ impl EvmCall {
             );
         }
         (out, o, post)
+    }
+
+    /// The call's environment as `evm-core` takes it.
+    pub fn env(&self) -> Env {
+        Env {
+            address: self.address,
+            caller: self.caller,
+            callvalue: self.callvalue,
+            gas_limit: self.gas_limit,
+        }
+    }
+
+    /// `evm_core::abi::public_output` for this call's calldata, environment and context over the
+    /// given code, roots and outcome — the guest's own function, for tests that vary one of the
+    /// four. [`EvmStatement`] is the independent recomputation.
+    pub fn output_for(&self, code: &[u8], pre_root: &Word8, post_root: &Word8, o: &Outcome) -> [u32; 8] {
+        let env = self.env();
+        let s = Statement {
+            code,
+            codehash: None,
+            calldata: &self.calldata,
+            env: &env,
+            context: &self.context,
+            pre_root,
+            post_root,
+        };
+        evm_core::abi::public_output(&mut HostRef, &s, o)
+    }
+}
+
+/// One log as a verifier holds it: the topics and the data, in full.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EvmLog {
+    pub topics: Vec<U256>,
+    pub data: Vec<u8>,
+}
+
+/// **The verifier's side of the EVM guest's public output** (ZKVM-103, ZKVM-104): what a chain
+/// that means to apply a call holds, and the eight output words a proof of exactly that call must
+/// carry. Computed from this crate's own Keccak and sponge, never from `evm-core`.
+///
+/// This is where authorisation is enforced. The guest binds `caller`, `address`, `callvalue`, the
+/// calldata, `gas_limit` and `context` into the digest but cannot know whether the caller agreed;
+/// the chain fills those six fields **from the transaction it authenticated** (the spender its
+/// signature or spend authority names, the calldata that spender signed, its own nonce or
+/// transaction hash in `context`) and accepts the proof only if
+/// [`accepts`](EvmStatement::accepts) holds. A proof made with any other caller — by a prover who
+/// holds the storage witnesses and nothing else — has other output words and is refused.
+///
+/// For a status other than 1 the chain sets `post_root = pre_root` and no logs, and for a status
+/// of 2 no return data and `gas_used = gas_limit`: [`output_words`](EvmStatement::output_words)
+/// hashes the fields exactly as given and applies no rule of its own.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EvmStatement {
+    /// The storage layout both roots are under (`evm_core::storage::LAYOUT_VERSION`): 1 for
+    /// `evm-v1.bin`'s depth-32 tree, 2 for `evm.bin`'s depth-64 one. A chain keeps it in the
+    /// contract's record beside the root, and admits the image of that layout for the contract.
+    pub layout: u32,
+    /// `keccak256` of the contract's runtime bytecode.
+    pub codehash: [u8; 32],
+    pub pre_root: Word8,
+    pub post_root: Word8,
+    pub return_data: Vec<u8>,
+    pub logs: Vec<EvmLog>,
+    pub address: U256,
+    pub caller: U256,
+    pub callvalue: U256,
+    pub calldata: Vec<u8>,
+    pub context: Word8,
+    pub gas_limit: u32,
+    pub gas_used: u32,
+}
+
+impl EvmStatement {
+    /// `keccak256(be32(n_logs) ‖ per log: be32(n_topics) ‖ topics ‖ keccak256(data))`.
+    pub fn logs_hash(&self) -> [u8; 32] {
+        let mut msg = (self.logs.len() as u32).to_be_bytes().to_vec();
+        for log in &self.logs {
+            msg.extend_from_slice(&(log.topics.len() as u32).to_be_bytes());
+            for t in &log.topics {
+                msg.extend_from_slice(&t.to_be_bytes());
+            }
+            msg.extend_from_slice(&keccak::keccak256(&log.data));
+        }
+        keccak::keccak256(&msg)
+    }
+
+    /// The 83-word `EVM_OUT` preimage.
+    pub fn preimage(&self) -> Vec<u32> {
+        let pack = |h: [u8; 32]| -> Word8 {
+            std::array::from_fn(|i| u32::from_le_bytes([h[4 * i], h[4 * i + 1], h[4 * i + 2], h[4 * i + 3]]))
+        };
+        let mut msg = Vec::with_capacity(83);
+        msg.push(self.layout);
+        msg.extend_from_slice(&pack(self.codehash));
+        msg.extend_from_slice(&self.pre_root);
+        msg.extend_from_slice(&self.post_root);
+        msg.extend_from_slice(&pack(keccak::keccak256(&self.return_data)));
+        msg.extend_from_slice(&pack(self.logs_hash()));
+        msg.extend_from_slice(&self.address.0);
+        msg.extend_from_slice(&self.caller.0);
+        msg.extend_from_slice(&self.callvalue.0);
+        msg.extend_from_slice(&pack(keccak::keccak256(&self.calldata)));
+        msg.extend_from_slice(&self.context);
+        msg.push(self.gas_limit);
+        msg.push(self.gas_used);
+        msg
+    }
+
+    /// The eight output words a proof of this statement carries: `status`, then words 0..6 of
+    /// `hash(EVM_OUT, preimage)`.
+    pub fn output_words(&self, status: u32) -> [u32; 8] {
+        let d = notes::hash(domain::EVM_OUT, &self.preimage());
+        let mut out = [0u32; 8];
+        out[0] = status;
+        out[1..8].copy_from_slice(&d[..7]);
+        out
+    }
+
+    /// Whether a proof's eight output words are a proof of this statement with this status — the
+    /// check a chain makes after `Machine::verify`, and the one that refuses a call the statement's
+    /// `caller` did not make.
+    pub fn accepts(&self, status: u32, outputs: &[u32; 8]) -> bool {
+        self.output_words(status) == *outputs
+    }
+}
+
+/// `transferOwnership` in sixteen bytes, for the authorisation tests: slot 0 holds the owner, and
+/// the call replaces it with `CALLDATALOAD(0)` if `CALLER` is the owner and reverts otherwise —
+/// `CALLER PUSH0 SLOAD EQ PUSH1 10 JUMPI PUSH0 PUSH0 REVERT JUMPDEST PUSH0 CALLDATALOAD PUSH0
+/// SSTORE STOP`. The smallest contract whose only guard is `msg.sender`.
+pub const OWNABLE_CODE: [u8; 16] =
+    [0x33, 0x5f, 0x54, 0x14, 0x60, 0x0a, 0x57, 0x5f, 0x5f, 0xfd, 0x5b, 0x5f, 0x35, 0x5f, 0x55, 0x00];
+
+/// A call to [`OWNABLE_CODE`] owned by `owner`, made as `caller`, handing ownership to `to`.
+pub fn ownable_transfer(owner: U256, caller: U256, to: U256, context: Word8) -> EvmCall {
+    let mut tree = SparseTree::new();
+    tree.insert(U256::ZERO, owner);
+    EvmCall {
+        code: OWNABLE_CODE.to_vec(),
+        calldata: to.to_be_bytes().to_vec(),
+        address: TOKEN,
+        caller,
+        callvalue: U256::ZERO,
+        gas_limit: 100_000,
+        context,
+        tree,
+        touched: vec![U256::ZERO],
     }
 }
 
@@ -393,6 +706,7 @@ pub fn erc20_transfer(from: U256, to: U256, amount: U256, balances: &[(U256, U25
         caller: from,
         callvalue: U256::ZERO,
         gas_limit: FIXTURE_GAS,
+        context: [0; 8],
         tree,
         touched: vec![mapping_slot(&from, SLOT_BALANCES), mapping_slot(&to, SLOT_BALANCES)],
     }

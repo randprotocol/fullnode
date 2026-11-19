@@ -52,7 +52,7 @@
 //! the dominant cost of an uncached verify (`docs/03-privacy.md`).
 
 use crate::isa::{Instr, Program};
-use crate::machine::{check_declared_heights, Backend, FriProfile, Machine, Proof, Tier, TIERS};
+use crate::machine::{Backend, FriProfile, Machine, Proof, Tier, TIERS};
 use crate::tables::cpu::pv;
 use crate::tables::{input, program, public};
 use randprotocol_core::confidential::{ConfidentialError, ConfidentialExecutor};
@@ -116,6 +116,8 @@ pub struct MsauthShape {
     pub modq_log_height: u8,
     pub public_log_height: u8,
     pub mem_log_height: u8,
+    /// Constraint set 11 (ZKVM-112): the declared poseidon2 height, `msauth::PINNED_POSEIDON2_LOG_HEIGHT`.
+    pub poseidon2_log_height: u8,
 }
 
 /// The precomputed msauth verifier key (plan Task 2b, spec §3.6).
@@ -140,11 +142,13 @@ pub mod msauth_vk {
     /// SHA-256 of `msauth-vk-production.bin`, the release asset every validator installs at
     /// `/usr/local/bin/msauth-vk-production.bin`. Consensus-critical (a wrong commitment could let
     /// a forged multisig proof verify): `tests/guest_provenance.rs` and `deploy/roll-all.sh` check
-    /// it. 23 754 bytes, from `rand-node keygen-msauth-vk --profile production` at circuits
-    /// d217252 (constraint set 9); deterministic, so any host regenerates it byte for byte.
-    pub const MSAUTH_VK_SHA256_PRODUCTION: &str = "68facb06c7f321aaf1d4d541acf6b5c0e9d7f17788ed1c9add6c5a8a8f7acd30";
-    /// SHA-256 of `crates/randprotocol-zkvm/keys/msauth-vk-test.bin` (tests only; 23 754 bytes).
-    pub const MSAUTH_VK_SHA256_TEST: &str = "c82250e7e7f8ca94246dc512091c1dafe402d5c0f6f4503e585d9381319443f5";
+    /// it. 23 851 bytes, from `rand-node keygen-msauth-vk --profile production` at circuits
+    /// 76a48dc (constraint set 11: Grain constants, the declared poseidon2 height 16 in the key's
+    /// shape, blob format 2); deterministic, so any host regenerates it byte for byte. Through
+    /// constraint set 9 (chain 21) it was 23 754 bytes, `68facb06…cd30`.
+    pub const MSAUTH_VK_SHA256_PRODUCTION: &str = "168d79a880b13b6d3e5b1f2a0f50561590712179c63189b52038cb2172a971b3";
+    /// SHA-256 of `crates/randprotocol-zkvm/keys/msauth-vk-test.bin` (tests only).
+    pub const MSAUTH_VK_SHA256_TEST: &str = "d30472df55cea4d4d7dadae006e914482781fbaedb7b7f7445a43de7588ddb3d";
 
     /// This build's pin for `profile`.
     pub fn pin(profile: FriProfile) -> &'static str {
@@ -196,6 +200,7 @@ pub mod msauth_vk {
             sha256_log_height: s.sha256_log_height,
             modq_log_height: s.modq_log_height,
             public_log_height: s.public_log_height,
+            poseidon2_log_height: s.poseidon2_log_height,
         }
     }
 
@@ -274,9 +279,7 @@ pub mod msauth_vk {
     }
 
     pub(super) fn machine_export(machine: &Machine, s: MsauthShape) -> Vec<u8> {
-        machine
-            .export_verifier_key_with_modq(Tier(s.tier), s.program_log_height, s.input_log_height, s.keccak_log_height, s.sha256_log_height, s.modq_log_height, s.public_log_height)
-            .to_bytes()
+        machine.export_verifier_key(key_shape(s)).to_bytes()
     }
 
     /// `machine.install_verifier_key_pinned(bytes, pin)`. After `Ok`, `verify`/`verify_public` at
@@ -289,6 +292,133 @@ pub mod msauth_vk {
             InstallKeyError::Profile { blob, machine } => MsauthVkError::Profile { got: blob, want: machine },
             other => MsauthVkError::Install(format!("{other:?}")),
         })
+    }
+}
+
+/// CON-601: the precomputed state-proof verifier keys (chain 22 on).
+///
+/// A block carrying a tier-18 state proof made every validator build its key — ~3.3–4 GB at
+/// tier 18, more than a 2 GB or 4 GB validator holds — and node policy cannot refuse a valid
+/// block. So a chain whose genesis lists `perps.state_proof_keys` (each a shape and the SHA-256
+/// of its key file) admits only those shapes, and a node **loads** each key from its file instead
+/// of building it, as it loads the msauth key ([`msauth_vk`]). The file is exactly the vendored
+/// machine's `VerifierKeyBlob::to_bytes()` for the shape, so its pin is the SHA-256 of the file
+/// bytes, checked before anything is decoded. Files live beside the binary
+/// (`/usr/local/bin/perp-vk-production-t18-pg14-in16-pub7-p2h20.bin`, …), or in
+/// `--perps-key-dir` / `RAND_PERPS_KEY_DIR`.
+///
+/// Unlike the msauth key, the pin that binds is the **genesis'**: a node installs exactly the
+/// files its genesis names. The digests below are this build's, of the chain-22 set
+/// ([`CHAIN22_SHAPES`]), for the release workflow, the roll scripts and the cut script to check a
+/// shipped file against (`rand-node keygen-perp-vk --print-pinned production`).
+pub mod perp_vk {
+    use crate::machine::{FriProfile, Machine};
+    pub use crate::machine::{InstallKeyError, VerifierKeyBlob, VerifierKeyShape};
+    use randprotocol_core::confidential::ProofShape;
+
+    /// The chain-22 perps sizing the shipped keys are for: `max_tier` 18, the pinned engine
+    /// image's program height 14, windows of 1..=64 recorded blocks.
+    pub const CHAIN22_MAX_TIER: u8 = 18;
+    pub const CHAIN22_ENGINE_PROGRAM_LOG_HEIGHT: u8 = 14;
+    pub const CHAIN22_MAX_WINDOW_BLOCKS: u64 = 64;
+
+    /// The chain-22 pinned shapes: the canonical shapes of tier 18 (input 16, poseidon2 20), one
+    /// per public height 7, 8, 9, 10 (`ledger::perps::canonical_state_proof_shapes`).
+    pub fn chain22_shapes() -> Vec<ProofShape> {
+        randprotocol_core::ledger::perps::canonical_state_proof_shapes(CHAIN22_MAX_TIER, CHAIN22_ENGINE_PROGRAM_LOG_HEIGHT, CHAIN22_MAX_WINDOW_BLOCKS)
+    }
+
+    /// No blob hashes to this: the value a pin holds until its blob exists.
+    pub const PIN_PENDING: &str = super::msauth_vk::PIN_PENDING;
+
+    /// SHA-256 of each chain-22 key file at the Production profile, in [`chain22_shapes`]'
+    /// order (public height 7, 8, 9, 10). Consensus-critical once a genesis names them (a crafted
+    /// preprocessed commitment could let a forged state proof verify): `deploy/cut-chain22-genesis.sh`
+    /// pins these into `perps.state_proof_keys`, and `tests/perp_vk.rs` regenerates them.
+    pub const CHAIN22_SHA256_PRODUCTION: [&str; 4] = [
+        "4dc1f18bdd6d9104ba1622710cf2c146f71759676dbdcb70dad036152242e8b4",
+        "6392e5e9b7348f3729ba2031e0e3ec9788d6ed62a14521526482c92615f55106",
+        "c31636aa281004163e6fe0debd81854f11d7bca6c8062a91b1501c7e593e5bf0",
+        "ae3d0dc276061fd2a87b2e91b239f6dcccb746b49dedeecfdb2aab977c95c370",
+    ];
+
+    /// This build's digests of the chain-22 key files for `profile`, as `(shape, sha256)`; Test
+    /// has none (its tier-18 build costs as much as Production's; tests pin their own small keys).
+    pub fn chain22_pins(profile: FriProfile) -> Vec<(ProofShape, &'static str)> {
+        match profile {
+            FriProfile::Production => chain22_shapes().into_iter().zip(CHAIN22_SHA256_PRODUCTION).collect(),
+            FriProfile::Test => Vec::new(),
+        }
+    }
+
+    fn profile_name(profile: FriProfile) -> &'static str {
+        match profile {
+            FriProfile::Production => "production",
+            FriProfile::Test => "test",
+        }
+    }
+
+    /// The fixed file name of `shape`'s key for `profile`:
+    /// `perp-vk-<profile>-t<tier>-pg<program>-in<input>-pub<public>-p2h<poseidon2>.bin`.
+    pub fn file_name(profile: FriProfile, shape: &ProofShape) -> String {
+        format!(
+            "perp-vk-{}-t{}-pg{}-in{}-pub{}-p2h{}.bin",
+            profile_name(profile),
+            shape.tier,
+            shape.program_log_height,
+            shape.input_log_height,
+            shape.public_log_height,
+            shape.poseidon2_log_height
+        )
+    }
+
+    /// The SHA-256 of `bytes`, lowercase hex ([`super::msauth_vk::digest`], the same function).
+    pub fn digest(bytes: &[u8]) -> String {
+        super::msauth_vk::digest(bytes)
+    }
+
+    /// The machine's key shape for a state proof's shape (no modq table).
+    pub fn key_shape(shape: &ProofShape) -> VerifierKeyShape {
+        super::perp_key_shape(shape)
+    }
+
+    /// The key file for `shape` at `profile`: the full build on a fresh machine, exported (the
+    /// `rand-node keygen-perp-vk` body; a big host at tier 18 — ~3.3–4 GB). Refused for a shape
+    /// the verifier would refuse or one with a hash table (the engine calls neither).
+    pub fn blob(profile: FriProfile, shape: &ProofShape) -> Result<Vec<u8>, String> {
+        if shape.keccak_log_height != 0 || shape.sha256_log_height != 0 {
+            return Err(format!("{shape:?}: a state-proof key has no keccak or sha256 table"));
+        }
+        let ks = key_shape(shape);
+        if !crate::machine::TIERS.contains(&(shape.tier as usize)) {
+            return Err(format!("{shape:?}: tier {} is not one of {:?}", shape.tier, crate::machine::TIERS));
+        }
+        ks.check().map_err(|e| format!("{shape:?}: {e:?}"))?;
+        Ok(Machine::new(profile).export_verifier_key(ks).to_bytes())
+    }
+
+    /// The checks a pinned blob passes before the machine installs it: its SHA-256 is
+    /// `want_digest` (on the raw bytes, first), it decodes, its profile is `profile`, and its shape
+    /// is `shape`'s key shape. The machine's install repeats the digest check and adds format,
+    /// constraint set, structure and lookups.
+    pub fn check(blob: &[u8], want_digest: &[u8; 32], profile: FriProfile, shape: &ProofShape) -> Result<VerifierKeyBlob, String> {
+        let got = crate::sha256::sha256(blob);
+        if &got != want_digest {
+            return Err(format!("has sha256 {}, not the pinned {}", hex(&got), hex(want_digest)));
+        }
+        let b = VerifierKeyBlob::from_bytes(blob).map_err(|e| format!("does not decode: {e:?}"))?;
+        if b.profile != profile {
+            return Err(format!("is for the {:?} profile; this node runs {profile:?}", b.profile));
+        }
+        let want = key_shape(shape);
+        if b.shape != want {
+            return Err(format!("holds the key for {:?}, not the pinned shape {want:?}", b.shape));
+        }
+        Ok(b)
+    }
+
+    pub fn hex(d: &[u8; 32]) -> String {
+        d.iter().map(|b| format!("{b:02x}")).collect()
     }
 }
 
@@ -353,7 +483,7 @@ pub const MAX_CALL_SHA256_LOG_HEIGHT: u8 = 13;
 
 /// COV-2 (2026-09-28): the smallest log height a call proof's input, keccak or sha256 table may
 /// declare and keep its contents private — 128 rows. The PCS is hiding, but a table of `h` rows is
-/// opened at 80 FRI queries plus two out-of-domain points, and once that is more evaluations than
+/// opened at 92 FRI queries (80 through set 10) plus two out-of-domain points, and once that is more evaluations than
 /// the `h` random rows mask, the openings determine the table: at 2^3 rows (every four-word call
 /// today) the proof carries its private inputs. The prover is being fixed upstream to floor all
 /// three tables here. **Not a validity rule**: `verify_call` does not check it, so a block carrying
@@ -610,7 +740,9 @@ pub fn fri_structure_violation(proof: &Proof, num_queries: usize) -> Option<Stri
 /// function; restated here for [`honest_fri_arities`], and pinned by
 /// `tests::verifier2_…`, which re-derives honest proofs' schedules from them (a re-vendor that
 /// moves one fails there).
-const FRI_LOG_BLOWUP: usize = 3;
+/// Constraint set 11: rate ¼ (`machine::LOG_BLOWUP` = 2; 3, rate ⅛, through set 10), read from the
+/// machine rather than restated now that it is public.
+const FRI_LOG_BLOWUP: usize = crate::machine::LOG_BLOWUP;
 const FRI_LOG_FINAL_POLY_LEN: usize = 0;
 const FRI_MAX_LOG_ARITY: usize = 3;
 const NUM_RANDOM_CODEWORDS: usize = 4;
@@ -806,6 +938,15 @@ pub struct ZkExecutor {
     /// installs), each with whether the pin is in `perp_lineage_machine` (true) or `perp_machine`
     /// (false) — counted per machine against its own cap.
     perp_pinned: std::sync::Mutex<PerpPins>,
+    /// CON-601: the genesis `perps.state_proof_keys` — each pinned shape and its key file's
+    /// SHA-256 — set once by [`ConfidentialExecutor::set_perp_pinned_keys`]. Set, a state proof
+    /// verifies only under a key installed from its pinned file
+    /// ([`ConfidentialExecutor::install_perp_vk`], into `perp_lineage_machine`), and no state-proof
+    /// key is ever built: an unpinned shape, or a pinned one whose file was not installed, is
+    /// refused before any key.
+    perp_key_pins: std::sync::OnceLock<std::collections::BTreeMap<randprotocol_core::confidential::ProofShape, [u8; 32]>>,
+    /// CON-601: the pinned shapes whose keys were installed from their files.
+    perp_keys_installed: std::sync::Mutex<std::collections::BTreeSet<randprotocol_core::confidential::ProofShape>>,
     /// The tier-18 msauth verifier key, built once (spec §3.5, pre-flight finding 3): measured at
     /// Production on the 48 GB laptop at 78.6 s and ~4.0 GB peak (and resident after, on macOS's
     /// allocator — the key itself is a commitment and lookups), on 2–4 GB validators, so four
@@ -872,6 +1013,8 @@ impl ZkExecutor {
             perp_engine_plh: std::sync::atomic::AtomicU8::new(0),
             perp_max_tier: std::sync::atomic::AtomicU8::new(0),
             perp_pinned: std::sync::Mutex::new(PerpPins::default()),
+            perp_key_pins: std::sync::OnceLock::new(),
+            perp_keys_installed: std::sync::Mutex::new(std::collections::BTreeSet::new()),
             msauth_key: std::sync::OnceLock::new(),
             msauth_key_builds: std::sync::atomic::AtomicUsize::new(0),
             msauth_key_source: std::sync::OnceLock::new(),
@@ -1053,14 +1196,18 @@ impl ZkExecutor {
         if proof.modq_log_height != NO_MODQ && !exact {
             return Err(ConfidentialError::InvalidProof("a call proof declares no modq table".into()));
         }
-        check_declared_heights(
+        // Constraint set 11 (ZKVM-112): the poseidon2 height is declared too, and ranged with the
+        // rest — one of the tier's admitted heights — before anything is sized from it.
+        crate::machine::check_declared_heights_with_modq(
             proof.tier,
             proof.program_log_height,
             proof.input_log_height,
             proof.keccak_log_height,
             proof.sha256_log_height,
+            NO_MODQ,
             proof.public_log_height,
             proof.mem_log_height,
+            proof.poseidon2_log_height,
         )
         .map_err(|e| ConfidentialError::InvalidProof(format!("declared shape: {e:?}")))?;
         if exact && proof.program_log_height != program_log_height {
@@ -1097,30 +1244,27 @@ impl ZkExecutor {
         //
         // Constraint set 9: and the modq table, absent (`NO_MODQ`) — a bundle and a single-key
         // auth proof declare none (MODQ spec §6 item 5).
+        //
+        // Constraint set 11 (ZKVM-112): and the poseidon2 height, at the tier's full `t + 2` —
+        // what the honest prover declares for both pinned guests (the bundle guest's 1 330+
+        // permutations need 2^16 at tier 14, the auth guest's 55 need 2^12 at tier 10:
+        // `Tier::poseidon2_log_height_for`), so a header declaring a shorter admitted table is
+        // refused here rather than buying a second key build.
         if exact
             && (proof.tier != Tier(pinned_tier)
                 || proof.keccak_log_height != NO_KECCAK
                 || proof.sha256_log_height != NO_SHA256
-                || proof.modq_log_height != NO_MODQ)
+                || proof.modq_log_height != NO_MODQ
+                || proof.poseidon2_log_height != Tier(pinned_tier).max_poseidon2_log_height())
         {
-            return Err(ConfidentialError::InvalidProof("tier, hash-table or modq height not the pinned guest's".into()));
+            return Err(ConfidentialError::InvalidProof("tier, hash-table, modq or poseidon2 height not the pinned guest's".into()));
         }
         // Reproduces `Machine::verify`'s own equality check, which is simultaneously the check
         // that the batch's *instance count* matches what `chips` would build — nine mandatory
         // tables (the public table since constraint set 6), plus one per optional hash table
         // declared — so a header that claims `keccak_log_height = 0` while carrying ten
         // instances dies here, before any verifier key is built.
-        if proof.batch.degree_bits
-            != self.machine.log_ext_degrees_pub(
-                proof.tier,
-                proof.program_log_height,
-                proof.input_log_height,
-                proof.keccak_log_height,
-                proof.sha256_log_height,
-                proof.public_log_height,
-                proof.mem_log_height,
-            )
-        {
+        if proof.batch.degree_bits != self.machine.log_ext_degrees_for(crate::machine::VerifierKeyShape::of_proof(proof), proof.mem_log_height) {
             return Err(ConfidentialError::InvalidProof("degree bits".into()));
         }
         // The eight published output words are read as `u32`s by both callers, and since S3 so
@@ -1387,14 +1531,16 @@ impl ZkExecutor {
             modq_log_height: o.min_modq_log_height,
             public_log_height: pubh,
             mem_log_height: o.min_mem_log_height,
+            poseidon2_log_height: o.poseidon2_log_height.expect("msauth::pinned_options pins the poseidon2 height (constraint set 11)"),
         }
     }
 
     /// The first header word of `p` that is not the multisig shape's, by name; `None` when all
-    /// eight (tier and seven heights) are exactly [`Self::msauth_heights`].
+    /// nine (tier and eight heights, the poseidon2 height since constraint set 11) are exactly
+    /// [`Self::msauth_heights`].
     fn msauth_header_mismatch(p: &Proof) -> Option<&'static str> {
         let s = Self::msauth_heights();
-        let fields: [(&'static str, bool); 8] = [
+        let fields: [(&'static str, bool); 9] = [
             ("tier", p.tier.0 == s.tier),
             ("program_log_height", p.program_log_height == s.program_log_height),
             ("input_log_height", p.input_log_height == s.input_log_height),
@@ -1403,6 +1549,7 @@ impl ZkExecutor {
             ("modq_log_height", p.modq_log_height == s.modq_log_height),
             ("public_log_height", p.public_log_height == s.public_log_height),
             ("mem_log_height", p.mem_log_height == s.mem_log_height),
+            ("poseidon2_log_height", p.poseidon2_log_height == s.poseidon2_log_height),
         ];
         fields.iter().find(|(_, ok)| !ok).map(|(name, _)| *name)
     }
@@ -1415,6 +1562,7 @@ impl ZkExecutor {
         p.tier == Tier(AUTH_TIER)
             && (p.program_log_height, p.input_log_height, p.public_log_height) == (plh, ilh, pubh)
             && (p.keccak_log_height, p.sha256_log_height, p.modq_log_height) == (NO_KECCAK, NO_SHA256, NO_MODQ)
+            && p.poseidon2_log_height == Tier(AUTH_TIER).max_poseidon2_log_height()
     }
 
     /// Which auth guest's pinned header `proof` declares (spec §3.1), from its canonical decode
@@ -1454,18 +1602,10 @@ impl ZkExecutor {
             proof.modq_log_height,
             proof.public_log_height,
             proof.mem_log_height,
+            proof.poseidon2_log_height,
         )
         .map_err(|e| ConfidentialError::InvalidProof(format!("declared shape: {e:?}")))?;
-        let want = self.msauth_machine.log_ext_degrees_with_modq(
-            Tier(s.tier),
-            s.program_log_height,
-            s.input_log_height,
-            s.keccak_log_height,
-            s.sha256_log_height,
-            s.modq_log_height,
-            s.public_log_height,
-            s.mem_log_height,
-        );
+        let want = self.msauth_machine.log_ext_degrees_for(msauth_vk::key_shape(s), s.mem_log_height);
         if proof.batch.degree_bits != want {
             return Err(ConfidentialError::InvalidProof("degree bits".into()));
         }
@@ -1530,15 +1670,7 @@ impl ZkExecutor {
         self.msauth_key_with(|| {
             let _ = self.msauth_key_source.set(msauth_vk::MsauthKeySource::Built);
             let s = Self::msauth_heights();
-            self.msauth_machine.verifier_key_with_modq(
-                Tier(s.tier),
-                s.program_log_height,
-                s.input_log_height,
-                s.keccak_log_height,
-                s.sha256_log_height,
-                s.modq_log_height,
-                s.public_log_height,
-            )
+            self.msauth_machine.verifier_key_for(msauth_vk::key_shape(s))
         })
     }
 
@@ -1573,18 +1705,10 @@ impl ZkExecutor {
         msauth_vk::check(blob, pin, self.msauth_machine.profile)?;
         msauth_vk::machine_install(&self.msauth_machine, blob, pin)?;
         let s = Self::msauth_heights();
-        // The machine holds the installed key in its slot for the 7-tuple, so this lookup returns
+        // The machine holds the installed key in its slot for the 8-component shape, so this lookup returns
         // it without a build; the `OnceLock` is the readiness flag, not a second copy.
         self.msauth_key.get_or_init(|| {
-            self.msauth_machine.verifier_key_with_modq(
-                Tier(s.tier),
-                s.program_log_height,
-                s.input_log_height,
-                s.keccak_log_height,
-                s.sha256_log_height,
-                s.modq_log_height,
-                s.public_log_height,
-            )
+            self.msauth_machine.verifier_key_for(msauth_vk::key_shape(s))
         });
         let _ = self.msauth_key_source.set(msauth_vk::MsauthKeySource::Loaded);
         Ok(())
@@ -1859,11 +1983,24 @@ impl ZkExecutor {
     ) -> Result<CallOutcome, ConfidentialError> {
         let proof = if verify {
             let proof = self.perp_pre_key(engine_hc, max_tier, segment, bytes)?;
-            // CON-60: the engine's own machines — the canonical one for the chain's canonical
-            // shapes, the general one otherwise; whichever already holds the key first.
-            self.perp_machine_for(&shape_of(&proof))
-                .verify_public(engine_hc, segment, &proof)
-                .map_err(|e| ConfidentialError::InvalidProof(format!("{e:?}")))?;
+            let shape = shape_of(&proof);
+            // CON-601: under pinned keys the key is the one installed from its file, never a
+            // build — `perp_pre_key` refused an unpinned shape; one pinned but not installed (a
+            // node started without its file, which `node::start` refuses) is refused here.
+            let machine = if self.perp_key_pins.get().is_some() {
+                if !Self::perp_cached_in(&self.perp_lineage_machine, &shape) {
+                    return Err(ConfidentialError::InvalidProof(format!(
+                        "the pinned state-proof key for {shape:?} is not loaded on this node (its key file, {}); a pinned key is never built",
+                        perp_vk::file_name(self.profile, &shape)
+                    )));
+                }
+                &self.perp_lineage_machine
+            } else {
+                // CON-60: the engine's own machines — the canonical one for the chain's canonical
+                // shapes, the general one otherwise; whichever already holds the key first.
+                self.perp_machine_for(&shape)
+            };
+            machine.verify_public(engine_hc, segment, &proof).map_err(|e| ConfidentialError::InvalidProof(format!("{e:?}")))?;
             proof
         } else {
             let proof = self.perp_header(max_tier, segment.len(), bytes)?;
@@ -1904,6 +2041,18 @@ impl ZkExecutor {
         // CON-601: the FRI transcript's structure, which `verify_fri` checks only after the key.
         if let Some(why) = fri_structure_violation(&proof, self.profile.num_queries()) {
             return Err(ConfidentialError::InvalidProof(why));
+        }
+        // CON-601: under the genesis key pins, only a pinned shape — the ledger refuses the rest
+        // from the header before it asks; this is the executor's own guard, so no caller of
+        // `verify_perp` (the pool's pre-screen included) can reach a key for another shape.
+        if let Some(pins) = self.perp_key_pins.get() {
+            let shape = shape_of(&proof);
+            if !pins.contains_key(&shape) {
+                return Err(ConfidentialError::InvalidProof(format!(
+                    "state proof shape {shape:?} is not one of the chain's {} pinned state-proof key shapes",
+                    pins.len()
+                )));
+            }
         }
         Ok(proof)
     }
@@ -1966,18 +2115,12 @@ impl ZkExecutor {
             && shape.input_log_height == randprotocol_core::ledger::perps::canonical_input_log_height(t)
             && shape.keccak_log_height == 0
             && shape.sha256_log_height == 0
+            && shape.poseidon2_log_height == Tier(t as usize).max_poseidon2_log_height()
             && self.is_perp_lineage(shape)
     }
 
     fn perp_cached_in(m: &Machine, shape: &randprotocol_core::confidential::ProofShape) -> bool {
-        m.has_cached_key(
-            Tier(shape.tier as usize),
-            shape.program_log_height,
-            shape.input_log_height,
-            shape.keccak_log_height,
-            shape.sha256_log_height,
-            shape.public_log_height,
-        )
+        m.has_cached_key(perp_key_shape(shape))
     }
 
     /// CON-60: the machine a state proof of `shape` verifies (and builds) in: the one already
@@ -2011,9 +2154,31 @@ impl ZkExecutor {
             let public_height = public::public_log_height(public_len);
             // Every tier a call may declare (`MAX_CALL_TIER` and below) — the cap and this loop
             // move together, so no admissible tier is ever an unwarmed key build at admission.
+            //
+            // Constraint set 11 (ZKVM-112): and every poseidon2 height an honest call of this
+            // program can declare — the prover picks the smallest admitted one that holds the
+            // run's permutations, so from the one holding the digests every call pays (at least
+            // one program row, the empty input's salt row, the segment's rows) up to the tier's
+            // full `t + 2`.
+            let mandatory = 1 + crate::hash::input_digest_row_count(0) + crate::hash::public_digest_row_count(public_len);
             for t in TIERS.iter().filter(|t| **t as u8 <= MAX_CALL_TIER) {
                 for &in_h in input_heights {
-                    self.machine.verifier_key(Tier(*t), log_height, in_h, NO_KECCAK, NO_SHA256, public_height);
+                    for p2 in Tier(*t).admitted_poseidon2_log_heights() {
+                        if mandatory * crate::tables::poseidon2::BLOCK > 1usize << p2 {
+                            continue;
+                        }
+                        let shape = crate::machine::VerifierKeyShape {
+                            tier: Tier(*t),
+                            program_log_height: log_height,
+                            input_log_height: in_h,
+                            keccak_log_height: NO_KECCAK,
+                            sha256_log_height: NO_SHA256,
+                            modq_log_height: NO_MODQ,
+                            public_log_height: public_height,
+                            poseidon2_log_height: p2,
+                        };
+                        self.machine.verifier_key_for(shape);
+                    }
                 }
             }
         })
@@ -2216,12 +2381,29 @@ struct ProofHeader {
     sha256_log_height: u8,
     _modq_log_height: u8,
     public_log_height: u8,
+    _mem_log_height: u8,
+    poseidon2_log_height: u8,
 }
 
 /// CON-60: the shape `bytes` declares (`ConfidentialExecutor::perp_proof_shape`), from its
 /// header alone: no allocation, no batch decode, no key. `None` when the header does not decode
 /// or names a tier past `u8`.
 /// The [`ProofShape`](randprotocol_core::confidential::ProofShape) of a decoded proof.
+/// The machine's key shape for a state proof's [`ProofShape`](randprotocol_core::confidential::ProofShape):
+/// no modq table (a state proof declaring one is refused before any key, `check_decoded_ref`).
+fn perp_key_shape(shape: &randprotocol_core::confidential::ProofShape) -> crate::machine::VerifierKeyShape {
+    crate::machine::VerifierKeyShape {
+        tier: Tier(shape.tier as usize),
+        program_log_height: shape.program_log_height,
+        input_log_height: shape.input_log_height,
+        keccak_log_height: shape.keccak_log_height,
+        sha256_log_height: shape.sha256_log_height,
+        modq_log_height: NO_MODQ,
+        public_log_height: shape.public_log_height,
+        poseidon2_log_height: shape.poseidon2_log_height,
+    }
+}
+
 fn shape_of(p: &Proof) -> randprotocol_core::confidential::ProofShape {
     randprotocol_core::confidential::ProofShape {
         tier: p.tier.0 as u8,
@@ -2230,6 +2412,7 @@ fn shape_of(p: &Proof) -> randprotocol_core::confidential::ProofShape {
         keccak_log_height: p.keccak_log_height,
         sha256_log_height: p.sha256_log_height,
         public_log_height: p.public_log_height,
+        poseidon2_log_height: p.poseidon2_log_height,
     }
 }
 
@@ -2242,6 +2425,7 @@ pub fn proof_shape(bytes: &[u8]) -> Option<randprotocol_core::confidential::Proo
         keccak_log_height: h.keccak_log_height,
         sha256_log_height: h.sha256_log_height,
         public_log_height: h.public_log_height,
+        poseidon2_log_height: h.poseidon2_log_height,
     })
 }
 
@@ -2498,6 +2682,39 @@ impl ConfidentialExecutor for ZkExecutor {
         self.perp_engine_plh.store(engine_program_log_height, std::sync::atomic::Ordering::SeqCst);
     }
 
+    /// CON-601: pinned mode, set once and only for a non-empty list (a second call is ignored).
+    fn set_perp_pinned_keys(&self, pins: &[(randprotocol_core::confidential::ProofShape, [u8; 32])]) {
+        if !pins.is_empty() {
+            let _ = self.perp_key_pins.set(pins.iter().copied().collect());
+        }
+    }
+
+    /// CON-601: [`perp_vk::check`] against the pin whose digest the bytes have (on the raw bytes,
+    /// before any decode), then the machine's own pinned install into the canonical machine,
+    /// where the key is pinned (never evicted).
+    fn install_perp_vk(&self, blob: &[u8]) -> Result<randprotocol_core::confidential::ProofShape, String> {
+        let Some(pins) = self.perp_key_pins.get() else {
+            return Err("this chain pins no state-proof keys (no perps.state_proof_keys)".into());
+        };
+        let got = crate::sha256::sha256(blob);
+        let Some((shape, want)) = pins.iter().find(|(_, d)| **d == got) else {
+            return Err(format!(
+                "has sha256 {}, which is none of the {} pinned state-proof key digests ({})",
+                perp_vk::hex(&got),
+                pins.len(),
+                pins.values().map(perp_vk::hex).collect::<Vec<_>>().join(", ")
+            ));
+        };
+        perp_vk::check(blob, want, self.profile, shape)?;
+        self.perp_lineage_machine.install_verifier_key_pinned(blob, want).map_err(|e| format!("the machine refused the key: {e:?}"))?;
+        self.perp_keys_installed.lock().unwrap().insert(*shape);
+        Ok(*shape)
+    }
+
+    fn perp_pinned_keys_installed(&self) -> usize {
+        self.perp_keys_installed.lock().unwrap().len()
+    }
+
     /// CON-60: pin `shape`'s key where it is built, once a proof of it verified — only when the
     /// key is built already (this never builds) and while that machine has a pin left
     /// ([`PERP_CANONICAL_PINS`] in the canonical machine, [`PERP_GENERAL_PINS`] in the general
@@ -2510,6 +2727,10 @@ impl ConfidentialExecutor for ZkExecutor {
     /// keep can take the same last pin meanwhile, and the lock the pool's lineage check reads is
     /// never held across a key operation.
     fn keep_perp_key(&self, shape: &randprotocol_core::confidential::ProofShape) {
+        // CON-601: pinned keys are installed (and pinned in their machine) from their files.
+        if self.perp_key_pins.get().is_some() {
+            return;
+        }
         let canonical = if Self::perp_cached_in(&self.perp_lineage_machine, shape) {
             true
         } else if Self::perp_cached_in(&self.perp_machine, shape) {
@@ -2535,17 +2756,7 @@ impl ConfidentialExecutor for ZkExecutor {
         // The export reads the key only if it is still cached: evicted meanwhile, nothing is
         // built here (this runs on the node loop) and the shape is kept by a later verify or
         // commit that finds its key built again.
-        let installed = m
-            .export_cached_verifier_key_with_modq(
-                Tier(shape.tier as usize),
-                shape.program_log_height,
-                shape.input_log_height,
-                shape.keccak_log_height,
-                shape.sha256_log_height,
-                0,
-                shape.public_log_height,
-            )
-            .is_some_and(|blob| m.install_verifier_key(&blob).is_ok());
+        let installed = m.export_cached_verifier_key(perp_key_shape(shape)).is_some_and(|blob| m.install_verifier_key(&blob).is_ok());
         let mut pins = self.perp_pinned.lock().unwrap();
         pins.reserved.remove(shape);
         if installed {
@@ -2558,18 +2769,12 @@ impl ConfidentialExecutor for ZkExecutor {
     /// proofs used) where a proof of it would verify, and pin it. A shape the header rules
     /// refuse — a tier outside `TIERS`, heights out of range — is skipped, never built.
     fn warm_perp(&self, shape: &randprotocol_core::confidential::ProofShape) {
-        if !TIERS.contains(&(shape.tier as usize))
-            || check_declared_heights(
-                Tier(shape.tier as usize),
-                shape.program_log_height,
-                shape.input_log_height,
-                shape.keccak_log_height,
-                shape.sha256_log_height,
-                shape.public_log_height,
-                Tier(shape.tier as usize).min_mem_log_height(),
-            )
-            .is_err()
-        {
+        // CON-601: under pinned keys nothing is ever built; the keys come from their files.
+        if self.perp_key_pins.get().is_some() {
+            return;
+        }
+        // Constraint set 11: the poseidon2 height is ranged with the rest (`VerifierKeyShape::check`).
+        if !TIERS.contains(&(shape.tier as usize)) || perp_key_shape(shape).check().is_err() {
             return;
         }
         // A warm key is built to be pinned: with its machine's pins taken it would only sit in
@@ -2586,14 +2791,7 @@ impl ConfidentialExecutor for ZkExecutor {
         }
         let m = if canonical { &self.perp_lineage_machine } else { &self.perp_machine };
         self.warming(|| {
-            m.verifier_key(
-                Tier(shape.tier as usize),
-                shape.program_log_height,
-                shape.input_log_height,
-                shape.keccak_log_height,
-                shape.sha256_log_height,
-                shape.public_log_height,
-            );
+            m.verifier_key_for(perp_key_shape(shape));
         });
         self.keep_perp_key(shape);
         // Whatever the keep did (it consumes the reservation when the key is still where it was
@@ -2931,13 +3129,18 @@ pub struct CallDryRun {
     pub tier: u8,
     pub keccak_log_height: u8,
     pub sha256_log_height: u8,
+    /// Constraint set 11 (ZKVM-112): the poseidon2 height the prover declares by default — the
+    /// smallest admitted one holding the run's permutations (`Tier::poseidon2_log_height_for`).
+    pub poseidon2_log_height: u8,
 }
 
 impl CallDryRun {
     /// The header's ceiling this run will prove under: what `--gas-limit max` (and a `None`
-    /// limit) declares.
+    /// limit) declares — at the default poseidon2 height since constraint set 11. A declared
+    /// limit above it makes the prover raise that height (`build_traces_salted_with`), up to the
+    /// full-table ceiling `gas::gas_max`.
     pub fn gas_max(&self) -> u64 {
-        crate::gas::gas_max(Tier(self.tier as usize), self.keccak_log_height, self.sha256_log_height)
+        crate::gas::gas_max_declared(Tier(self.tier as usize), self.keccak_log_height, self.sha256_log_height, NO_MODQ, self.poseidon2_log_height)
     }
 }
 
@@ -2952,6 +3155,9 @@ pub fn dry_run_call(program: &Program, inputs: &[u32], public: &[u32]) -> Result
     let tier = Tier::for_workload(exec.cycles() + digests, digests + absorb_rows)
         .map(|t| t.0 as u8)
         .ok_or_else(|| format!("no tier holds {} cycles", exec.cycles() + digests))?;
+    let poseidon2_log_height = Tier(tier as usize)
+        .poseidon2_log_height_for(digests + absorb_rows)
+        .ok_or_else(|| format!("tier {tier}'s poseidon2 table does not hold {} permutations", digests + absorb_rows))?;
     let keccaks = exec.events.iter().filter(|e| e.keccak_row.is_some()).count();
     let sha256s = exec.events.iter().filter(|e| e.sha256_row.is_some()).count();
     Ok(CallDryRun {
@@ -2959,6 +3165,7 @@ pub fn dry_run_call(program: &Program, inputs: &[u32], public: &[u32]) -> Result
         tier,
         keccak_log_height: crate::tables::keccak::keccak_log_height(keccaks),
         sha256_log_height: crate::tables::sha256::sha256_log_height(sha256s),
+        poseidon2_log_height,
     })
 }
 
@@ -3041,9 +3248,13 @@ pub fn prove_perp(
     segment: &[u32],
     tier: Option<u8>,
 ) -> Result<(Vec<u8>, [u32; 8], u8), String> {
-    let (proof, _) = Machine::new(profile)
-        .prove(program, witness, segment, tier.map(|t| Tier(t as usize)))
-        .map_err(|e| format!("{e:?}"))?;
+    // Constraint set 11 (ZKVM-112): at a pinned tier the poseidon2 table is declared at the tier's
+    // full `t + 2`, the canonical state-proof shape's (`is_perp_canonical`), so every window of a
+    // canonical prover shares one verifier key whatever its permutation count. Left to the prover
+    // (`tier` `None`), the smallest admitted height is declared, as for any call.
+    let tier = tier.map(|t| Tier(t as usize));
+    let opts = crate::machine::ProveOptions { poseidon2_log_height: tier.map(|t| t.max_poseidon2_log_height()), ..Default::default() };
+    let (proof, _) = Machine::new(profile).prove_with_options(program, witness, segment, tier, opts).map_err(|e| format!("{e:?}"))?;
     let outputs = std::array::from_fn(|i| proof.public_values[pv::OUT0 + i] as u32);
     Ok((proof.to_bytes(), outputs, proof.tier.0 as u8))
 }
@@ -3091,7 +3302,7 @@ fn prove_over_segment(
 ///
 /// The program table carries each instruction's fetch count (`MULT`), i.e. the call's control
 /// flow, and like every committed table it is hiding only while it has more random rows than the
-/// proof opens of it (80 FRI queries plus two out-of-domain points). The input, keccak and sha256
+/// proof opens of it (92 FRI queries since set 11, plus two out-of-domain points). The input, keccak and sha256
 /// tables are floored at 2^7 by the prover already (COV-2 / INT-6); the program table was not,
 /// because the chain pins its height to the deployed record's — so every program under 64 words
 /// (all 105 on chain 15 are 43) proves at 16 to 64 rows and publishes its fetch counts. Flooring it
@@ -3337,7 +3548,9 @@ mod tests {
     /// - the composite is the minimum of the two; the ethSTARK-conjectured query term
     ///   (`q · log2(1/ρ) + g`) is what the "≈ 100 bits, limited by the field" figure rests on.
     ///
-    /// Targets: 86 bits proven classical (the paper's `80 × 0.830 + 20 = 86.4`) and a field term
+    /// Constraint set 11 moved the profile to rate ¼ — 92 queries at `log2(2 / 1.25) = 0.678` bits
+    /// each plus 24 grinding bits, `92 × 0.678 + 24 = 86.38` proven (circuits' rate-¼ amendment)
+    /// where set 10's 80/⅛/20 gave 86.4. Targets: 86 bits proven classical and a field term
     /// at 100 bits (`2 · 64 − 25 − 3`; `p = 2^64 − 2^32 + 1` rounds to `2^64` in an f64, and the
     /// true term is `100 − 6.7·10⁻¹⁰`), so the conjectured composite is the paper's `≈ 100`. Every constant is read from where the
     /// prover and verifier read it, and each is pinned besides, so the test goes red when the
@@ -3366,7 +3579,7 @@ mod tests {
         let proven_composite = proven_query_bits.min(field_term_bits);
         let conjectured_composite = conjectured_query_bits.min(field_term_bits);
 
-        assert!((per_query - 0.830).abs() < 5e-4, "0.830 bits a query at ρ = 1/8, got {per_query}");
+        assert!((per_query - 0.678).abs() < 5e-4, "0.678 bits a query at ρ = 1/4, got {per_query}");
         assert!(
             proven_composite >= PROVEN_TARGET_BITS,
             "proven composite {proven_composite:.1} bits (queries {proven_query_bits:.1}, field {field_term_bits:.3}) is under the {PROVEN_TARGET_BITS}-bit target"
@@ -3379,9 +3592,9 @@ mod tests {
         assert!(conjectured_query_bits > field_term_bits, "under the conjecture the field, not the queries, is the bound");
         // The constants themselves, so a re-vendor that moves one is caught here by name and not
         // only by the arithmetic above.
-        assert_eq!(FriProfile::Production.num_queries(), 80);
-        assert_eq!(FriProfile::Production.pow_bits(), 20);
-        assert_eq!(super::FRI_LOG_BLOWUP, 3);
+        assert_eq!(FriProfile::Production.num_queries(), 92);
+        assert_eq!(FriProfile::Production.pow_bits(), 24);
+        assert_eq!(super::FRI_LOG_BLOWUP, 2);
         assert_eq!(<Challenge as BasedVectorSpace<Val>>::DIMENSION, 2);
         assert_eq!(Val::ORDER_U64, 0xffff_ffff_0000_0001, "Goldilocks, 2^64 − 2^32 + 1");
         assert_eq!(MAX_MEM_LOG_HEIGHT, 24);
@@ -3416,14 +3629,32 @@ mod tests {
                             crate::gas::gas_max_with_modq(Tier(t as usize), k, sh, m),
                             "tier {t} keccak {k} sha256 {sh} modq {m}"
                         );
+                        // Constraint set 11: every declared poseidon2 height, the clamped ones too.
+                        for p2 in [0u8, 4, 5, 7, 8, 10, 12, 14, 16, 18, 20, 22, 99] {
+                            assert_eq!(
+                                randprotocol_core::gas::gas_max_declared(t, k, sh, m, p2),
+                                crate::gas::gas_max_declared(Tier(t as usize), k, sh, m, p2),
+                                "tier {t} keccak {k} sha256 {sh} modq {m} poseidon2 {p2}"
+                            );
+                        }
                     }
                     checked += 1;
                 }
             }
         }
         assert_eq!(checked, 25 * 10 * 9);
-        assert_eq!(randprotocol_core::gas::gas_max(14, 0, 0), 20_479);
-        assert_eq!(randprotocol_core::gas::gas_max(10, 0, 0), 1_279);
+        assert_eq!(randprotocol_core::gas::gas_max(14, 0, 0), 22_527);
+        assert_eq!(randprotocol_core::gas::gas_max(10, 0, 0), 1_407);
+        // And the mirrored msauth header (tier, keccak, modq, poseidon2) is the vendored pin's.
+        assert_eq!(
+            (
+                randprotocol_core::types::MSAUTH_KECCAK_LOG_HEIGHT,
+                randprotocol_core::types::MSAUTH_MODQ_LOG_HEIGHT,
+                randprotocol_core::types::MSAUTH_POSEIDON2_LOG_HEIGHT
+            ),
+            (crate::msauth::PINNED_KECCAK_LOG_HEIGHT, crate::msauth::PINNED_MODQ_LOG_HEIGHT, crate::msauth::PINNED_POSEIDON2_LOG_HEIGHT)
+        );
+        assert_eq!(randprotocol_core::gas::msauth_gas_limit_pin(), 355_775);
     }
 
     /// The ledger mirrors this machine's public-value layout as `randprotocol_core::types::pv` (it
@@ -4072,6 +4303,7 @@ mod tests {
                 keccak_log_height: p.keccak_log_height,
                 sha256_log_height: p.sha256_log_height,
                 public_log_height: p.public_log_height,
+                poseidon2_log_height: p.poseidon2_log_height,
             }
         );
         assert_eq!(proof_shape(&bytes[..16]), Some(shape), "the header alone");
@@ -4091,7 +4323,8 @@ mod tests {
         let program = crate::guests::fib(10);
         let binding = [9u32; TX_BINDING_WORDS];
         let (bytes, _, _) = prove_call_hardened(FriProfile::Test, &program, &[], &[], &binding, [0; 4], None, None).unwrap();
-        let base = proof_shape(&bytes).unwrap();
+        // A state proof declares its tier's full poseidon2 height (`prove_perp` with a tier).
+        let base = proof_shape(&bytes).map(|s| ProofShape { poseidon2_log_height: crate::machine::Tier(s.tier as usize).max_poseidon2_log_height(), ..s }).unwrap();
         let with_input = |h: u8| ProofShape { input_log_height: h, ..base };
         let (s, t, u) = (with_input(7), with_input(8), with_input(9));
         let zk = ZkExecutor::with_perp_key_capacity(FriProfile::Test, 2);
@@ -4103,8 +4336,8 @@ mod tests {
         zk.warm_perp(&s);
         assert_eq!(zk.perp_key_builds(), 1, "one build per shape");
         // Two more shapes through a two-key cache: the pinned one stays, the unpinned LRU goes.
-        zk.perp_machine.verifier_key(Tier(t.tier as usize), t.program_log_height, t.input_log_height, 0, 0, t.public_log_height);
-        zk.perp_machine.verifier_key(Tier(u.tier as usize), u.program_log_height, u.input_log_height, 0, 0, u.public_log_height);
+        zk.perp_machine.verifier_key_for(perp_key_shape(&t));
+        zk.perp_machine.verifier_key_for(perp_key_shape(&u));
         assert!(zk.perp_key_ready(&s), "pinned");
         assert!(zk.perp_key_ready(&u));
         assert!(!zk.perp_key_ready(&t), "evicted");
@@ -4112,7 +4345,7 @@ mod tests {
         zk.warm_perp(&ProofShape { tier: 11, ..base });
         assert_eq!(zk.perp_key_builds(), 3);
         // Call keys live elsewhere: the calls' machine holds none of these.
-        assert!(!zk.machine.has_cached_key(Tier(s.tier as usize), s.program_log_height, s.input_log_height, 0, 0, s.public_log_height));
+        assert!(!zk.machine.has_cached_key(perp_key_shape(&s)));
         // Lineage: `s` is pinned, so a shape sharing its program/keccak/sha heights is lineage;
         // another program height is not.
         assert!(zk.is_perp_lineage(&with_input(10)));
@@ -4136,8 +4369,9 @@ mod tests {
         fresh.set_perp_config(18, base.program_log_height);
         assert!(fresh.is_perp_lineage(&base));
         assert!(!fresh.is_perp_lineage(&ProofShape { keccak_log_height: 5, ..base }), "a hash table is not the engine's");
-        let canon = ProofShape { tier: 18, input_log_height: 16, ..base };
+        let canon = ProofShape { tier: 18, input_log_height: 16, poseidon2_log_height: 20, ..base };
         assert!(fresh.is_perp_canonical(&canon));
+        assert!(!fresh.is_perp_canonical(&ProofShape { poseidon2_log_height: 18, ..canon }), "below the tier's full poseidon2 height");
         assert!(!fresh.is_perp_canonical(&ProofShape { input_log_height: 15, ..canon }));
         assert!(!fresh.is_perp_canonical(&ProofShape { tier: 16, ..canon }));
     }
@@ -4154,7 +4388,8 @@ mod tests {
         let program = crate::guests::fib(10);
         let binding = [9u32; TX_BINDING_WORDS];
         let (bytes, _, _) = prove_call_hardened(FriProfile::Test, &program, &[], &[], &binding, [0; 4], None, None).unwrap();
-        let base = proof_shape(&bytes).unwrap();
+        // A state proof declares its tier's full poseidon2 height (`prove_perp` with a tier).
+        let base = proof_shape(&bytes).map(|s| ProofShape { poseidon2_log_height: crate::machine::Tier(s.tier as usize).max_poseidon2_log_height(), ..s }).unwrap();
         let a = ZkExecutor::new(FriProfile::Test);
         let b = ZkExecutor::new(FriProfile::Test);
         a.set_perp_config(base.tier, base.program_log_height);
@@ -4165,7 +4400,7 @@ mod tests {
         let gate = &PERP_KEY_BUILD_GATE;
         let before = gate.builds();
         let build = |zk: &ZkExecutor, s: ProofShape| {
-            zk.perp_machine_for(&s).verifier_key(Tier(s.tier as usize), s.program_log_height, s.input_log_height, 0, 0, s.public_log_height);
+            zk.perp_machine_for(&s).verifier_key_for(perp_key_shape(&s));
         };
         std::thread::scope(|t| {
             t.spawn(|| a.warm_perp(&shape(canon_h))); // the canonical machine, through the warm
@@ -4206,18 +4441,18 @@ mod tests {
         let base = proof_shape(&bytes).unwrap();
         let zk = ZkExecutor::new(FriProfile::Test);
         let m = &zk.perp_machine;
-        let t = Tier(base.tier as usize);
-        let export = |h: u8| m.export_cached_verifier_key_with_modq(t, base.program_log_height, h, 0, 0, 0, base.public_log_height);
+        let at = |h: u8| perp_key_shape(&randprotocol_core::confidential::ProofShape { input_log_height: h, ..base });
+        let export = |h: u8| m.export_cached_verifier_key(at(h));
         assert!(export(7).is_none(), "not built: nothing to export");
         assert_eq!(zk.perp_key_builds(), 0, "and nothing built by asking");
-        m.verifier_key(t, base.program_log_height, 7, 0, 0, base.public_log_height);
+        m.verifier_key_for(at(7));
         let cached = export(7).expect("built: exported from the cache");
-        let full = m.export_verifier_key_with_modq(t, base.program_log_height, 7, 0, 0, 0, base.public_log_height);
+        let full = m.export_verifier_key(at(7));
         assert_eq!(cached.to_bytes(), full.to_bytes(), "the same blob the full export gives");
         assert_eq!(zk.perp_key_builds(), 1);
         // Fill the general cache past its size: the first key is evicted.
         for h in 8..8 + PERP_GENERAL_KEYS as u8 {
-            m.verifier_key(t, base.program_log_height, h, 0, 0, base.public_log_height);
+            m.verifier_key_for(at(h));
         }
         let builds = zk.perp_key_builds();
         assert!(export(7).is_none(), "evicted: nothing to export");
@@ -4269,7 +4504,8 @@ mod tests {
         let program = crate::guests::fib(10);
         let binding = [9u32; TX_BINDING_WORDS];
         let (bytes, _, _) = prove_call_hardened(FriProfile::Test, &program, &[], &[], &binding, [0; 4], None, None).unwrap();
-        let base = proof_shape(&bytes).unwrap();
+        // A state proof declares its tier's full poseidon2 height (`prove_perp` with a tier).
+        let base = proof_shape(&bytes).map(|s| ProofShape { poseidon2_log_height: crate::machine::Tier(s.tier as usize).max_poseidon2_log_height(), ..s }).unwrap();
         let zk = ZkExecutor::new(FriProfile::Test);
         zk.set_perp_config(base.tier, base.program_log_height);
         let canon_h = randprotocol_core::ledger::perps::canonical_input_log_height(base.tier);
@@ -4278,7 +4514,7 @@ mod tests {
         // Four valid general shapes "verify" (built, then kept): one pin, and never more than
         // two keys held, where the global cap of 8 let this cache grow to 9.
         for s in &general {
-            zk.perp_machine.verifier_key(Tier(s.tier as usize), s.program_log_height, s.input_log_height, 0, 0, s.public_log_height);
+            zk.perp_machine.verifier_key_for(perp_key_shape(&s));
             zk.keep_perp_key(s);
             assert!(zk.perp_machine.cached_keys() <= PERP_GENERAL_KEYS, "{} keys", zk.perp_machine.cached_keys());
         }

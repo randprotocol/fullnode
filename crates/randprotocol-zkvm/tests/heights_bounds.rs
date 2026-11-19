@@ -195,7 +195,7 @@ fn the_workload_pick_also_flips_exactly_at_each_permutation_budget() {
 #[test]
 fn gas_max_is_the_four_term_formula_at_every_tier() {
     for &t in &TIERS {
-        let base = ((1u64 << t) - 1) + (1u64 << (t - 2));
+        let base = ((1u64 << t) - 1) + (POSEIDON2_ABSORB_GAS - 1) * (1u64 << (t - 3));
         assert_eq!(gas_max(Tier(t), 0, 0), base, "tier {t}");
         for h in FLOOR..=keccak::MAX_LOG_HEIGHT {
             assert_eq!(gas_max(Tier(t), h, 0) - base, (1u64 << h) / 32 * (KECCAK_GAS - 1), "tier {t} klh {h}");
@@ -221,7 +221,7 @@ fn gas_max_is_monotone_in_the_tier_and_in_each_height() {
     // A sub-block height contributes nothing: fewer rows than one block is zero blocks.
     assert_eq!(gas_max(Tier(10), 4, 0), gas_max(Tier(10), 0, 0));
     assert_eq!(gas_max(Tier(10), 0, 5), gas_max(Tier(10), 0, 0));
-    assert_eq!(gas_max(Tier(10), 5, 6), gas_max(Tier(10), 0, 0) + 191 + 63, "exactly one block each");
+    assert_eq!(gas_max(Tier(10), 5, 6), gas_max(Tier(10), 0, 0) + (KECCAK_GAS - 1) + (SHA256_GAS - 1), "exactly one block each");
 }
 
 #[test]
@@ -267,14 +267,14 @@ fn gas_of_is_the_prefix_rows_plus_the_row_weights_and_grows_with_the_inputs() {
     let e = execute(&p, &inputs, &[], 10_000).unwrap();
     let rows: u64 = e.events.iter().map(row_gas).sum();
     let prefix = |n_in: usize, n_pub: usize| (p.digest_rows() + randprotocol_zkvm::hash::input_digest_row_count(n_in) + randprotocol_zkvm::hash::public_digest_row_count(n_pub)) as u64;
-    assert_eq!(gas_of(&p, &inputs, &[], &e.events), prefix(4, 0) + rows);
+    assert_eq!(gas_of(&p, &inputs, &[], &e.events), POSEIDON2_ABSORB_GAS * prefix(4, 0) + rows);
     // The digest prefix is charged for what is *committed*, whether or not the guest reads it:
     // four more private words are one more indigest row, and four public words one pubdigest row
     // (the empty segment's header row is already paid).
     let more: Vec<u32> = inputs.iter().copied().chain([1, 2, 3, 4]).collect();
-    assert_eq!(gas_of(&p, &more, &[], &e.events), prefix(4, 0) + rows + 1);
-    assert_eq!(gas_of(&p, &inputs, &[1, 2, 3, 4], &e.events), prefix(4, 0) + rows);
-    assert_eq!(gas_of(&p, &inputs, &[1, 2, 3, 4, 5], &e.events), prefix(4, 0) + rows + 1);
+    assert_eq!(gas_of(&p, &more, &[], &e.events), POSEIDON2_ABSORB_GAS * prefix(4, 0) + rows + POSEIDON2_ABSORB_GAS);
+    assert_eq!(gas_of(&p, &inputs, &[1, 2, 3, 4], &e.events), POSEIDON2_ABSORB_GAS * prefix(4, 0) + rows);
+    assert_eq!(gas_of(&p, &inputs, &[1, 2, 3, 4, 5], &e.events), POSEIDON2_ABSORB_GAS * prefix(4, 0) + rows + POSEIDON2_ABSORB_GAS);
     // And every run under the header fits the ceiling.
     assert!(gas_of(&p, &inputs, &[], &e.events) <= gas_max(Tier::for_cycles(e.cycles() + prefix(4, 0) as usize).unwrap(), 0, 0));
 }

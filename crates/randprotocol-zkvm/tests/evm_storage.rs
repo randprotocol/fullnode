@@ -8,7 +8,7 @@
 
 use evm_core::storage::{self as gs, StorageTree};
 use evm_core::u256::U256;
-use randprotocol_zkvm::evm::{empty_root, leaf_hash, slot_index, HostRef, SparseTree, Witness};
+use randprotocol_zkvm::evm::{empty_root, leaf_hash, slot_index, slot_index_at, HostRef, SparseTree, Witness};
 use randprotocol_zkvm::notes::domain;
 
 fn s(v: u32) -> U256 { U256::from_u32(v) }
@@ -30,7 +30,10 @@ fn domain_tags_agree_between_the_note_layer_and_the_guest_crate() {
 #[test]
 fn the_guest_crates_keccak256_and_dhash_match_the_research_reference() {
     let mut h = HostRef;
-    for len in [0usize, 1, 135, 136, 137, 272] {
+    // Every length through two blocks and into a third: the last block is absorbed straight out
+    // of the message (whole words, then one to three bytes with the padding after them), so each
+    // residue mod 4 at each distance from the block's end is its own case.
+    for len in 0usize..=300 {
         let msg: Vec<u8> = (0..len).map(|i| (i as u8).wrapping_mul(37).wrapping_add(11)).collect();
         assert_eq!(evm_core::keccak256(&mut h, &msg), randprotocol_zkvm::keccak::keccak256(&msg), "keccak256 of {len} bytes");
     }
@@ -49,7 +52,10 @@ fn host_and_guest_hash_the_same_leaves_indices_and_roots() {
     }
     // the index is the top 32 bits of keccak256(slot) big-endian
     let k = randprotocol_zkvm::keccak::keccak256(&s(1).to_be_bytes());
-    assert_eq!(slot_index(&s(1)), u32::from_be_bytes([k[0], k[1], k[2], k[3]]));
+    assert_eq!(slot_index(&s(1)), u64::from_be_bytes([k[0], k[1], k[2], k[3], k[4], k[5], k[6], k[7]]));
+    // layout 1's position is the top half of layout 2's
+    assert_eq!(slot_index_at(&s(1), 32), u32::from_be_bytes([k[0], k[1], k[2], k[3]]) as u64);
+    assert_eq!(slot_index_at(&s(1), 32), slot_index(&s(1)) >> 32);
     let t = SparseTree::new();
     assert_eq!(t.root(), empty_root());
     let guest = StorageTree::new(empty_root());
@@ -221,6 +227,7 @@ fn the_host_refuses_to_build_a_vector_with_two_witnesses_at_one_position() {
         caller: U256::ZERO,
         callvalue: U256::ZERO,
         gas_limit: 1_000,
+        context: [0; 8],
         tree,
         touched: vec![s(1), s(1)],
     };
@@ -250,65 +257,155 @@ fn the_guest_fold_is_the_note_trees_index_convention() {
 }
 
 #[test]
-fn witness_words_are_272_and_round_trip() {
+fn witness_words_are_528_and_round_trip() {
     let mut t = SparseTree::new();
     t.insert(s(9), s(9));
     let w = t.witness(&s(9));
     let words = w.words();
-    assert_eq!(words.len(), 272);
+    assert_eq!(words.len(), 528);
+    assert_eq!(words.len(), randprotocol_zkvm::evm::WITNESS_WORDS);
     assert_eq!(&words[..8], &w.slot.0);
     assert_eq!(&words[8..16], &w.value.0);
     assert_eq!(&words[16..24], &w.siblings[0]);
-    assert_eq!(&words[264..], &w.siblings[31]);
+    assert_eq!(&words[520..], &w.siblings[63]);
+    // layout 1: a depth-32 tree's witness is the 272 words it always was
+    let mut t1 = SparseTree::with_depth(32);
+    t1.insert(s(9), s(9));
+    assert_eq!(t1.witness(&s(9)).words().len(), 272);
+    assert_ne!(t1.root(), t.root(), "the two layouts root the same storage differently");
 }
 
-fn into_guest(w: Witness) -> gs::Witness { gs::Witness { slot: w.slot, value: w.value, siblings: w.siblings, verified: false } }
-
-/// The evm-core storage-index lead from the 2026-09-27 zkVM review, measured rather than argued.
-/// A leaf position is only 32 bits of `keccak256(slot)`, so a *pair* of colliding slots is a
-/// birthday search (~2^16 slots — found here) and a slot colliding with one *chosen* victim slot is
-/// a second-preimage search on 32 bits (~2^32 Keccaks: seconds on a GPU). The per-call refusal of
-/// a colliding pair is `two_witnesses_at_one_leaf_position_are_refused_at_push`; this is the
-/// consequence *across* calls the docs had not stated: while one slot of the pair holds a non-zero
-/// value, the other cannot be touched at all — not read, not written — by any call, because the
-/// position's leaf binds the holder's slot and no witness for the other slot can hash to it. It
-/// stops the moment the holder is back at zero. No forgery (every successful call's roots are
-/// consistent) and no loss (a call that touches the frozen slot halts before any state changes);
-/// a targeted, persistent denial of one slot — `docs/04-guests.md`, "Known limitation (storage
-/// index)", has the verdict.
+/// `read_witness` (the guest's path: a witness read word by word into place) is `push` of the same
+/// witness: the same tree, the same loads and stores, the same refusals — and a refused witness
+/// takes nothing.
 #[test]
-fn a_ground_colliding_slot_freezes_its_partner_while_it_holds_a_value() {
-    // The birthday search: slots 0, 1, 2, … until two share a leaf position.
+fn a_witness_read_into_place_is_the_witness_pushed() {
+    let mut t = SparseTree::new();
+    for i in 1..=4u32 {
+        t.insert(s(i), s(10 * i));
+    }
+    let mut h = HostRef;
+    let mut pushed = StorageTree::new(t.root());
+    let mut read = StorageTree::new(t.root());
+    for i in 1..=4u32 {
+        let w = t.witness(&s(i));
+        let words = w.words();
+        let mut it = words.iter().copied();
+        read.read_witness(&mut h, || it.next().unwrap()).unwrap();
+        assert!(it.next().is_none(), "a witness is exactly its {} words", words.len());
+        pushed.push(&mut h, into_guest(w)).unwrap();
+    }
+    assert_eq!(read.len(), 4);
+    for i in 0..4 {
+        assert_eq!(read.witness(i).slot, pushed.witness(i).slot);
+        assert_eq!(read.witness(i).value, pushed.witness(i).value);
+        assert_eq!(read.witness(i).siblings, pushed.witness(i).siblings);
+        assert!(!read.witness(i).verified);
+    }
+    for i in 1..=4u32 {
+        assert_eq!(read.load(&mut h, &s(i)).unwrap(), s(10 * i));
+        read.store(&mut h, &s(i), s(7 * i)).unwrap();
+        pushed.store(&mut h, &s(i), s(7 * i)).unwrap();
+        t.insert(s(i), s(7 * i));
+        assert_eq!(read.root(), pushed.root());
+        assert_eq!(read.root(), t.root());
+    }
+    // the same slot again: refused, and the tree is as it was
+    let dup = t.witness(&s(1)).words();
+    let mut it = dup.iter().copied();
+    assert!(matches!(read.read_witness(&mut h, || it.next().unwrap()), Err(gs::StorageError::DuplicateIndex)));
+    assert_eq!(read.len(), 4);
+    assert_eq!(read.load(&mut h, &s(1)).unwrap(), s(7));
+    // a tampered witness is taken (it is checked when used) and then does not verify
+    let mut bad = t.witness(&s(9)).words();
+    bad[20] ^= 1;
+    let mut it = bad.iter().copied();
+    read.read_witness(&mut h, || it.next().unwrap()).unwrap();
+    assert!(matches!(read.load(&mut h, &s(9)), Err(gs::StorageError::BadWitness)));
+    // and the table is full at MAX_WITNESSES
+    let mut full = StorageTree::new(t.root());
+    for i in 100..100 + gs::MAX_WITNESSES as u32 {
+        let w = t.witness(&s(i)).words();
+        let mut it = w.iter().copied();
+        full.read_witness(&mut h, || it.next().unwrap()).unwrap();
+    }
+    assert!(matches!(full.read_witness(&mut h, || 0), Err(gs::StorageError::TooMany)));
+}
+
+fn into_guest(w: Witness) -> gs::Witness { gs::Witness { slot: w.slot, value: w.value, siblings: w.siblings.try_into().unwrap(), verified: false } }
+
+/// **ZKVM-105.** Under storage layout 1 a leaf position was 32 bits of `keccak256(slot)`: a pair
+/// of colliding slots is a birthday search (~2^16 slots — found here) and a slot colliding with
+/// one *chosen* victim slot a 32-bit second preimage (~2^32 Keccaks: seconds on a GPU). While one
+/// slot of such a pair held a value, the other could not be read or written by any call — the
+/// freeze the 2026-09-27 review measured (`tests/emulated_guests.rs` still shows it on layout 1's
+/// image). Layout 2's position is 64 bits. The pair found here is the evidence that the wider
+/// index is really used: it collides in the top 32 bits and not in the top 64, the layout-1 tree
+/// cannot hold both and the layout-2 tree holds both, and with `a` holding a value `b` is read
+/// and written like any other slot. Finding a second slot for a chosen one's 64-bit position is
+/// a 64-bit second preimage, ~2^64 Keccaks; a colliding pair of the attacker's own choosing is
+/// still a birthday search, now ~2^32, and still buys nothing against a slot it did not choose
+/// (and `push` still refuses two witnesses at one position, as before).
+#[test]
+fn a_pair_that_collides_on_32_bits_does_not_freeze_under_the_64_bit_index() {
+    // The birthday search on layout 1's position: slots 0, 1, 2, … until two share it.
     let mut seen = std::collections::HashMap::new();
     let (a, b) = (0u32..1 << 20)
-        .find_map(|i| seen.insert(slot_index(&s(i)), i).map(|j| (s(j), s(i))))
+        .find_map(|i| seen.insert(slot_index_at(&s(i), 32), i).map(|j| (s(j), s(i))))
         .expect("a 32-bit collision among 2^20 slots (~2^16 expected)");
     assert_ne!(a, b);
-    assert_eq!(slot_index(&a), slot_index(&b));
-    let mut h = HostRef;
+    assert_eq!(slot_index_at(&a, 32), slot_index_at(&b, 32));
+    assert_ne!(slot_index(&a), slot_index(&b), "the pair collides on 64 bits too");
+    // … and none of the 2^20 slots collides with another on 64 bits.
+    let mut wide = std::collections::HashSet::new();
+    assert!((0u32..1 << 20).all(|i| wide.insert(slot_index(&s(i)))), "a 64-bit collision among 2^20 slots");
 
-    // `a` holds a value. A witness for `b` must fold to the root from `b`'s position — `a`'s — and
-    // whatever value it claims, its leaf `H(STORAGE_LEAF, b, v)` (or the zero leaf) is not `a`'s.
+    // Layout 1 cannot hold both slots at all.
+    let mut t1 = SparseTree::with_depth(32);
+    t1.insert(a, s(7));
+    assert_eq!(t1.try_insert(b, s(1)), Err(a));
+
+    // Layout 2: `a` holds a value, and `b` is an ordinary slot — absent, readable, writable.
+    let mut h = HostRef;
     let mut t = SparseTree::new();
     t.insert(a, s(7));
-    let siblings = t.witness(&a).siblings;
-    for claimed in [U256::ZERO, s(7), s(1)] {
-        let mut g = StorageTree::new(t.root());
-        g.push(&mut h, gs::Witness { slot: b, value: claimed, siblings, verified: false }).unwrap();
-        assert!(matches!(g.load(&mut h, &b), Err(gs::StorageError::BadWitness)), "b is readable claiming {claimed:?}");
-        let mut g = StorageTree::new(t.root());
-        g.push(&mut h, gs::Witness { slot: b, value: claimed, siblings, verified: false }).unwrap();
-        assert!(matches!(g.store(&mut h, &b, s(1)), Err(gs::StorageError::BadWitness)), "b is writable claiming {claimed:?}");
-    }
-    // `a` itself is untouched by the collision.
     let mut g = StorageTree::new(t.root());
     g.push(&mut h, into_guest(t.witness(&a))).unwrap();
+    g.push(&mut h, into_guest(t.witness(&b))).expect("two positions, two witnesses");
     assert_eq!(g.load(&mut h, &a).unwrap(), s(7));
-
-    // Once `a` is back at zero the position's leaf is the canonical zero leaf, and `b` is usable.
-    t.insert(a, U256::ZERO);
-    let mut g = StorageTree::new(t.root());
-    g.push(&mut h, into_guest(t.witness(&b))).unwrap();
     assert_eq!(g.load(&mut h, &b).unwrap(), U256::ZERO);
     g.store(&mut h, &b, s(9)).unwrap();
+    assert_eq!(g.load(&mut h, &a).unwrap(), s(7), "a is untouched by b's store");
+    t.insert(b, s(9));
+    assert_eq!(g.root(), t.root());
+    // both hold values at once, which layout 1 could never represent
+    g.store(&mut h, &a, s(8)).unwrap();
+    t.insert(a, s(8));
+    assert_eq!(g.root(), t.root());
+}
+
+/// Moving a contract's storage from layout 1 to layout 2 is re-inserting its slots: the same
+/// values, another root, and every slot provable under the new one.
+#[test]
+fn migrating_a_tree_keeps_every_slot_under_the_new_layouts_root() {
+    let mut t1 = SparseTree::with_depth(32);
+    for i in 1..=5u32 {
+        t1.insert(s(i), s(100 + i));
+    }
+    let t2 = t1.migrate(64);
+    assert_eq!((t1.depth(), t2.depth()), (32, 64));
+    assert_ne!(t1.root(), t2.root());
+    let mut direct = SparseTree::new();
+    for i in 1..=5u32 {
+        direct.insert(s(i), s(100 + i));
+    }
+    assert_eq!(t2.root(), direct.root(), "migration is history-independent");
+    let mut h = HostRef;
+    let mut g = StorageTree::new(t2.root());
+    for i in 1..=5u32 {
+        g.push(&mut h, into_guest(t2.witness(&s(i)))).unwrap();
+        assert_eq!(g.load(&mut h, &s(i)).unwrap(), s(100 + i));
+    }
+    // and back again gives the layout-1 root it started from
+    assert_eq!(t2.migrate(32).root(), t1.root());
 }

@@ -154,3 +154,49 @@ pub fn widen(trace: &RowMajorMatrix<F>, blind: &Blind) -> RowMajorMatrix<F> {
     }
     RowMajorMatrix::new(v, wide)
 }
+
+/// [`widen`] of a trace the caller owns, in its own buffer (ZKVM-110): the buffer is grown to the
+/// wider size and the rows are moved up from the last to the first, so the narrow trace does not
+/// stay alive beside the wide one for the whole proof. The same matrix as `widen(&trace, blind)`.
+pub fn widen_owned(trace: RowMajorMatrix<F>, blind: &Blind) -> RowMajorMatrix<F> {
+    let (h, w) = (trace.height(), trace.width());
+    let wide = w + col::WIDTH;
+    let mut v = trace.values;
+    // `reserve_exact`, or `resize` would grow the buffer the amortised way — to twice the narrow
+    // trace for any table wider than the blind, which is the second copy this exists to avoid.
+    v.reserve_exact(h * wide - v.len());
+    v.resize(h * wide, F::ZERO);
+    // Row `r` moves from `r·w` to `r·wide`, which is at or past its old place, so going from the
+    // last row down never overwrites a row that has not moved yet; its five blind cells then lie
+    // wholly past every unmoved row (they start at `r·wide + w ≥ (r+1)·w`) and are cleared of
+    // whatever narrow rows used to be there.
+    for r in (1..h).rev() {
+        v.copy_within(r * w..(r + 1) * w, r * wide);
+        v[r * wide + w..(r + 1) * wide].fill(F::ZERO);
+    }
+    if h > 0 {
+        v[w..w + 4].copy_from_slice(blind);
+        v[w + col::FIRST] = F::ONE;
+    }
+    RowMajorMatrix::new(v, wide)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The in-place widening is the copying one, cell for cell — at the shapes a table can have
+    /// (wide and narrow, one row and many), with every cell distinct and non-zero so a row left
+    /// behind, moved twice or not cleared shows.
+    #[test]
+    fn widen_owned_is_widen() {
+        let blind: Blind = [F::from_u64(901), F::from_u64(902), F::from_u64(903), F::from_u64(904)];
+        for (h, w) in [(1usize, 1usize), (1, 9), (2, 1), (4, 3), (8, 5), (16, 6), (128, 4), (64, 275), (256, 2)] {
+            let narrow = RowMajorMatrix::new((0..h * w).map(|i| F::from_u64(i as u64 + 1)).collect(), w);
+            let copied = widen(&narrow, &blind);
+            let moved = widen_owned(narrow, &blind);
+            assert_eq!(moved.width(), copied.width(), "{h} x {w}");
+            assert_eq!(moved.values, copied.values, "{h} x {w}");
+        }
+    }
+}

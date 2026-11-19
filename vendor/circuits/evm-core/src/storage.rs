@@ -1,21 +1,24 @@
-//! The contract storage tree (Task 2 of the M4.3 plan): a depth-32 sparse binary Merkle tree
-//! over 256-bit slots, hashed with the domain-tagged Poseidon2 sponge the note layer already
+//! The contract storage tree (Task 2 of the M4.3 plan): a sparse binary Merkle tree of depth
+//! [`DEPTH`] (64 in storage layout 2, the default; 32 in layout 1, the `storage-v1` feature — see
+//! [`LAYOUT_VERSION`]) over 256-bit slots, hashed with the domain-tagged Poseidon2 sponge the note layer already
 //! uses, so `SLOAD`/`SSTORE` are the note tree's `MERKLE_VERIFY` in Rust rather than a Keccak
 //! walk.
 //!
 //! The guest never holds the tree: it holds the pre-state root and one [`Witness`] per slot the
-//! run touches (value plus 32 siblings, bottom-up, supplied through the input vector). A witness
+//! run touches (value plus [`DEPTH`] siblings, bottom-up, supplied through the input vector). A witness
 //! is verified against the current root the first time its slot is used; a slot the bytecode
 //! touches without a witness is [`StorageError::NoWitness`], which the interpreter turns into an
 //! exceptional halt.
 //!
-//! **Leaf position** is the top 32 bits, big-endian, of `keccak256(slot as 32 big-endian bytes)`
-//! read as a `u32` whose bit `i` (LSB first) chooses left (0) or right (1) at level `i` — the
-//! note tree's `emit_merkle_verify` convention exactly.
+//! **Leaf position** is the top [`DEPTH`] bits, big-endian, of `keccak256(slot as 32 big-endian
+//! bytes)` read as an integer whose bit `i` (LSB first) chooses left (0) or right (1) at level `i`
+//! — the note tree's `emit_merkle_verify` convention exactly. In layout 1 that was 32 bits, and a
+//! slot landing on a *chosen* victim slot's position cost about 2^32 Keccaks (ZKVM-105); in layout
+//! 2 it is 64 bits and costs about 2^64.
 //!
 //! **At most one witness per leaf position** ([`StorageTree::push`]): a second witness at a
 //! position already taken is [`StorageError::DuplicateIndex`], which the ABI turns into a parse
-//! error (status 2, `post_root = pre_root`). Two *distinct* slots ground into one 32-bit position
+//! error (status 2, `post_root = pre_root`). Two *distinct* slots ground into one position
 //! would otherwise both verify whenever the position is empty — both leaves are the canonical
 //! `H(STORAGE_LEAF, [0; 16])` under identical siblings — and then a call that read both before
 //! writing both would bind a `post_root` holding only the second store while the interpreter
@@ -32,13 +35,36 @@
 //! one is stale. [`StorageTree::store`] refreshes exactly those, level by level, so a witness
 //! stays valid against the new root whether or not it had already been verified.
 
-use crate::u256::U256;
+use crate::u256::{words_eq, U256};
 use crate::{hash_pair, keccak256, Host};
 
-/// Depth of the storage tree: `notes::DEPTH`.
+/// Words in the Merkle walk's sliding buffer ([`StorageTree::walk`]): one 17-word sponge message,
+/// and nine more words for every level the window slides down.
+const SCRATCH_WORDS: usize = 17 + 9 * DEPTH;
+
+/// The storage layout this build of the crate implements, bound as the first word of the public
+/// output's preimage (`abi`), so a root is never read under the wrong layout:
+///
+/// * **1** — depth 32, the leaf position the top 32 bits of `keccak256(slot)`. Built only with
+///   the `storage-v1` feature (`guests-compiled/evm-v1`), for contracts whose storage was rooted
+///   under it.
+/// * **2** — depth 64, the top 64 bits. The default.
+///
+/// A layout is a property of the *image*: each has its own `hc`, a chain admits both side by
+/// side, and a contract's record says which layout its root is under (`docs/04-guests.md`).
+#[cfg(not(feature = "storage-v1"))]
+pub const LAYOUT_VERSION: u32 = 2;
+#[cfg(feature = "storage-v1")]
+pub const LAYOUT_VERSION: u32 = 1;
+
+/// Depth of the storage tree, and the width in bits of a leaf position.
+#[cfg(not(feature = "storage-v1"))]
+pub const DEPTH: usize = 64;
+#[cfg(feature = "storage-v1")]
 pub const DEPTH: usize = 32;
-/// The most slots one call may touch (plan's Global Constraints).
-pub const MAX_WITNESSES: usize = 16;
+
+/// The most slots one call may touch. 16 through layout 1's first image; 32 since ZKVM-105.
+pub const MAX_WITNESSES: usize = 32;
 
 /// `notes::domain::STORAGE_LEAF` — a storage leaf, `[slot(8), value(8)]`. Mirrored here because
 /// `evm-core` cannot depend on `research`; `tests/evm_storage.rs` asserts the two agree.
@@ -48,8 +74,8 @@ pub const NODE_DOMAIN: u32 = 7;
 /// `notes::domain::EVM_OUT` — the guest's 40-word public-output preimage (used in Task 4).
 pub const EVM_OUT_DOMAIN: u32 = 13;
 
-/// A Merkle witness for one slot: its value in the pre-state and the 32 sibling hashes from the
-/// leaf up. `verified` is the guest's own bookkeeping, not part of the input — it is set once the
+/// A Merkle witness for one slot: its value in the pre-state and the [`DEPTH`] sibling hashes from
+/// the leaf up. `verified` is the guest's own bookkeeping, not part of the input — it is set once the
 /// witness has been checked against the root, and stays set across stores because
 /// [`StorageTree::store`] refreshes the siblings the update invalidated.
 #[derive(Clone, Copy)]
@@ -77,7 +103,7 @@ pub enum StorageError {
     /// More than [`MAX_WITNESSES`] witnesses were pushed.
     TooMany,
     /// Two witnesses claim one leaf position — the same slot twice, or two slots ground into one
-    /// 32-bit index. Refused at [`StorageTree::push`]: see the module doc.
+    /// index. Refused at [`StorageTree::push`]: see the module doc.
     DuplicateIndex,
 }
 
@@ -95,8 +121,12 @@ pub struct StorageTree {
     witnesses: [Witness; MAX_WITNESSES],
     n: usize,
     /// `slot_index` of each pushed witness, cached at `push` so `store` does no Keccak per
-    /// witness per level (16 × 32 of them otherwise).
-    indices: [u32; MAX_WITNESSES],
+    /// witness per level.
+    indices: [u64; MAX_WITNESSES],
+    /// The Merkle walk's buffer ([`walk`](Self::walk)). Here rather than on the stack so that the
+    /// guest pays nothing to zero it: it is `.bss`, and every word a sponge call reads is written
+    /// by the walk first.
+    scratch: [u32; SCRATCH_WORDS],
 }
 
 impl StorageTree {
@@ -108,10 +138,11 @@ impl StorageTree {
         witnesses: [Witness::EMPTY; MAX_WITNESSES],
         n: 0,
         indices: [0; MAX_WITNESSES],
+        scratch: [0; SCRATCH_WORDS],
     };
 
     pub fn new(pre_root: [u32; 8]) -> Self {
-        StorageTree { root: pre_root, witnesses: [Witness::EMPTY; MAX_WITNESSES], n: 0, indices: [0; MAX_WITNESSES] }
+        StorageTree { root: pre_root, ..StorageTree::ZERO }
     }
 
     /// Re-arm a tree in place for a new call: the given pre-state root, no witnesses. The witness
@@ -167,8 +198,130 @@ impl StorageTree {
         Ok(())
     }
 
+    /// [`push`](Self::push) for a witness still on the input tape: its slot, value and siblings
+    /// are read word by word from `next` **into place** — `slot(8) ‖ value(8) ‖ sibling_0(8) ‖ …`,
+    /// the input vector's own order — with the same refusals as `push`. Building a [`Witness`]
+    /// and handing it to `push` moves about 2 KiB twice, a `memcpy` call that cost 5 168 guest
+    /// cycles per witness (ZKVM-117); this moves nothing.
+    ///
+    /// A refused witness leaves the tree as it was (its words have been read and are ignored).
+    pub fn read_witness<H: Host, F: FnMut() -> u32>(&mut self, h: &mut H, mut next: F) -> Result<(), StorageError> {
+        if self.n == MAX_WITNESSES {
+            return Err(StorageError::TooMany);
+        }
+        let w = &mut self.witnesses[self.n];
+        let mut k = 0;
+        while k < 8 {
+            w.slot.0[k] = next();
+            k += 1;
+        }
+        let mut k = 0;
+        while k < 8 {
+            w.value.0[k] = next();
+            k += 1;
+        }
+        let mut l = 0;
+        while l < DEPTH {
+            let sib = &mut w.siblings[l];
+            let mut k = 0;
+            while k < 8 {
+                sib[k] = next();
+                k += 1;
+            }
+            l += 1;
+        }
+        w.verified = false;
+        let idx = slot_index(h, &self.witnesses[self.n].slot);
+        for j in 0..self.n {
+            if self.indices[j] == idx {
+                return Err(StorageError::DuplicateIndex);
+            }
+        }
+        self.indices[self.n] = idx;
+        self.n += 1;
+        Ok(())
+    }
+
     fn find(&self, slot: &U256) -> Option<usize> {
         (0..self.n).find(|&i| self.witnesses[i].slot == *slot)
+    }
+
+    /// Hash witness `i`'s leaf (its slot with `value`) up its path and return the root that gives.
+    /// With `refresh`, every *other* witness's sibling at the level where its path diverges from
+    /// this one is replaced by this path's node there (`diverges[j]`, `u8::MAX` for none) — what a
+    /// store needs.
+    ///
+    /// **The walk hashes in place, in a window that slides down a buffer** (ZKVM-117). A node is
+    /// `POSEIDON2` over 17 words `[NODE, left(8), right(8)]`, and the syscall leaves the digest in
+    /// the first eight words of its message. So the next level's message is laid *around* the
+    /// digest instead of copying it: if the path's node is the left child, the window moves down
+    /// one word — the digest is already where `left` goes — and if it is the right child, down
+    /// nine. Each level then writes only the domain word and the sibling. The first cut built a
+    /// fresh 17-word message per level and copied the digest out and back in (`hash_pair`), which
+    /// with the call overhead was about 207 guest cycles a level against the syscall's own 8.
+    fn walk<H: Host>(&mut self, h: &mut H, i: usize, value: &U256, diverges: Option<&[u8; MAX_WITNESSES]>) -> [u32; 8] {
+        let buf = &mut self.scratch;
+        // The leaf: `[STORAGE_LEAF, slot(8), value(8)]`, all zeros for a zero value (canonical).
+        let mut p = SCRATCH_WORDS - 17;
+        {
+            let w: &mut [u32; 17] = (&mut buf[p..p + 17]).try_into().unwrap();
+            w[0] = STORAGE_LEAF_DOMAIN;
+            let zero = value.is_zero();
+            let slot = &self.witnesses[i].slot.0;
+            let mut k = 0;
+            while k < 8 {
+                w[1 + k] = if zero { 0 } else { slot[k] };
+                w[9 + k] = if zero { 0 } else { value.0[k] };
+                k += 1;
+            }
+            h.poseidon2(w, 17);
+        }
+        // The path's bits come off the bottom of a running copy: a 64-bit shift by one is a few
+        // instructions on the 32-bit guest, where `idx >> l` is a library call per level.
+        let mut bits = self.indices[i];
+        let mut l = 0;
+        while l < DEPTH {
+            if let Some(d) = diverges {
+                let mut j = 0;
+                while j < self.n {
+                    if d[j] as usize == l {
+                        let mut k = 0;
+                        while k < 8 {
+                            self.witnesses[j].siblings[l][k] = buf[p + k];
+                            k += 1;
+                        }
+                    }
+                    j += 1;
+                }
+            }
+            let sib = &self.witnesses[i].siblings[l];
+            // Left child: the digest at `p..p+8` becomes `left` of a window one word lower.
+            // Right child: it becomes `right` of a window nine words lower.
+            let at = if bits & 1 == 0 {
+                p -= 1;
+                9
+            } else {
+                p -= 9;
+                1
+            };
+            let w: &mut [u32; 17] = (&mut buf[p..p + 17]).try_into().unwrap();
+            w[0] = NODE_DOMAIN;
+            let mut k = 0;
+            while k < 8 {
+                w[at + k] = sib[k];
+                k += 1;
+            }
+            h.poseidon2(w, 17);
+            bits >>= 1;
+            l += 1;
+        }
+        let mut out = [0u32; 8];
+        let mut k = 0;
+        while k < 8 {
+            out[k] = buf[p + k];
+            k += 1;
+        }
+        out
     }
 
     /// Hash the witness's leaf up its path and compare with the current root. Idempotent: a
@@ -178,13 +331,8 @@ impl StorageTree {
         if self.witnesses[i].verified {
             return Ok(());
         }
-        let idx = self.indices[i];
-        let mut cur = leaf_hash(h, &self.witnesses[i].slot, &self.witnesses[i].value);
-        for l in 0..DEPTH {
-            let sib = self.witnesses[i].siblings[l];
-            cur = if (idx >> l) & 1 == 0 { node_hash(h, &cur, &sib) } else { node_hash(h, &sib, &cur) };
-        }
-        if cur != self.root {
+        let value = self.witnesses[i].value;
+        if !words_eq(&self.walk(h, i, &value, None), &self.root) {
             return Err(StorageError::BadWitness);
         }
         self.witnesses[i].verified = true;
@@ -208,38 +356,30 @@ impl StorageTree {
         let prev = self.witnesses[i].value;
         self.witnesses[i].value = value;
         let idx = self.indices[i];
-        let mut cur = leaf_hash(h, slot, &value);
-        for l in 0..DEPTH {
-            // `cur` is this path's node at level `l`. Any other witness whose path agrees with
-            // ours strictly above level `l` and differs at level `l` has that very node as its
-            // sibling at level `l` — and it is the only sibling of its path this update touched.
-            // With one witness there is no other path at all (the common case for a one-slot call),
-            // so the scan is skipped rather than run `DEPTH` times over nothing.
-            if self.n > 1 {
-                for j in 0..self.n {
-                    if j == i {
-                        continue;
-                    }
-                    let jdx = self.indices[j];
-                    let same_above = l == DEPTH - 1 || (idx >> (l + 1)) == (jdx >> (l + 1));
-                    let differs_here = ((idx >> l) & 1) != ((jdx >> l) & 1);
-                    if same_above && differs_here {
-                        self.witnesses[j].siblings[l] = cur;
-                    }
-                }
+        // Another witness's path agrees with this one strictly above some level and differs at
+        // it: the highest set bit of the two positions' XOR. Its sibling at exactly that level is
+        // this path's node there, and that is the only sibling of its path this update touches.
+        // The level is found once per witness here, so the walk below compares a byte per witness
+        // per level rather than shifting two 64-bit positions.
+        let mut diverges = [0u8; MAX_WITNESSES];
+        if self.n > 1 {
+            for j in 0..self.n {
+                // Positions are distinct (`push`), so the XOR is non-zero for every `j != i`; for
+                // `j == i` it is zero and the level is set past the top, where nothing matches.
+                let x = idx ^ self.indices[j];
+                diverges[j] = if x == 0 { u8::MAX } else { (63 - x.leading_zeros()) as u8 };
             }
-            let sib = self.witnesses[i].siblings[l];
-            cur = if (idx >> l) & 1 == 0 { node_hash(h, &cur, &sib) } else { node_hash(h, &sib, &cur) };
         }
-        self.root = cur;
+        self.root = self.walk(h, i, &value, if self.n > 1 { Some(&diverges) } else { None });
         Ok(prev)
     }
 }
 
-/// The leaf position of `slot`: the top 32 bits, big-endian, of `keccak256(slot)`.
-pub fn slot_index<H: Host>(h: &mut H, slot: &U256) -> u32 {
+/// The leaf position of `slot`: the top [`DEPTH`] bits, big-endian, of `keccak256(slot)`.
+pub fn slot_index<H: Host>(h: &mut H, slot: &U256) -> u64 {
     let k = keccak256(h, &slot.to_be_bytes());
-    u32::from_be_bytes([k[0], k[1], k[2], k[3]])
+    let top = u64::from_be_bytes([k[0], k[1], k[2], k[3], k[4], k[5], k[6], k[7]]);
+    top >> (64 - DEPTH)
 }
 
 /// `H(STORAGE_LEAF, [slot(8), value(8)])`, canonical in the value: a zero value gives the one

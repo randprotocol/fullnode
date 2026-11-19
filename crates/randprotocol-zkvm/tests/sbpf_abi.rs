@@ -154,18 +154,28 @@ fn output_hash_covers_lamports_and_data_of_every_account() {
 }
 
 #[test]
+fn the_empty_return_hash_is_sha256_of_nothing() {
+    // `run_decoded` uses the constant instead of a compression when a run returns no data.
+    assert_eq!(abi::EMPTY_RETURN_HASH, randprotocol_zkvm::sha256::sha256(&[]));
+    assert_eq!(abi::EMPTY_RETURN_HASH, sbpf::return_hash_of(&[]));
+    assert_eq!(abi::EMPTY_RETURN_HASH, sbpf_core::sha256(&mut HostRef, &[]));
+}
+
+#[test]
 fn the_public_output_binds_the_input_and_the_post_state() {
     let mut h = HostRef;
     let input_hash = randprotocol_zkvm::sha256::sha256(b"an input");
     let out_hash = randprotocol_zkvm::sha256::sha256(b"a post-state");
-    let out = abi::public_output(&mut h, 1, &input_hash, &out_hash);
+    let ret_hash = sbpf::return_hash_of(b"some return data");
+    let out = abi::public_output(&mut h, 1, &input_hash, &out_hash, &ret_hash);
 
     // `out0` is the status word; `out1..7` are words 0..6 of the domain-tagged Poseidon2 sponge
-    // over the **16**-word preimage (M4.4's was 24: the `program_hash` group is gone, because the
-    // ELF is in the public segment and `H_PUB` binds it), mirrored here with `notes::hash`.
+    // over the **24**-word preimage — `input_hash ‖ output_hash ‖ return_hash` (there is no
+    // `program_hash` group: the ELF is in the public segment and `H_PUB` binds it) — mirrored here
+    // with `notes::hash`.
     assert_eq!(out[0], 1);
-    let mut msg = [0u32; 16];
-    for (i, bytes) in [input_hash, out_hash].iter().enumerate() {
+    let mut msg = [0u32; 24];
+    for (i, bytes) in [input_hash, out_hash, ret_hash].iter().enumerate() {
         for j in 0..8 {
             msg[8 * i + j] = u32::from_le_bytes(bytes[4 * j..4 * j + 4].try_into().unwrap());
         }
@@ -175,31 +185,36 @@ fn the_public_output_binds_the_input_and_the_post_state() {
     assert_eq!(notes::domain::SBPF_OUT, 14);
     assert_eq!(abi::SBPF_OUT_DOMAIN, notes::domain::SBPF_OUT);
 
-    // Both digests, and the status word, are bound: changing any one changes the output.
-    assert_ne!(abi::public_output(&mut h, 0, &input_hash, &out_hash), out);
-    assert_ne!(abi::public_output(&mut h, 2, &input_hash, &out_hash), out);
-    assert_ne!(abi::public_output(&mut h, 1, &out_hash, &out_hash), out);
-    assert_ne!(abi::public_output(&mut h, 1, &input_hash, &input_hash), out);
-    // And the two are not interchangeable: swapping them is a different preimage.
-    assert_ne!(abi::public_output(&mut h, 1, &out_hash, &input_hash), out);
+    // All three digests, and the status word, are bound: changing any one changes the output.
+    assert_ne!(abi::public_output(&mut h, 0, &input_hash, &out_hash, &ret_hash), out);
+    assert_ne!(abi::public_output(&mut h, 2, &input_hash, &out_hash, &ret_hash), out);
+    assert_ne!(abi::public_output(&mut h, 1, &out_hash, &out_hash, &ret_hash), out);
+    assert_ne!(abi::public_output(&mut h, 1, &input_hash, &input_hash, &ret_hash), out);
+    assert_ne!(abi::public_output(&mut h, 1, &input_hash, &out_hash, &sbpf::return_hash_of(&[])), out);
+    assert_ne!(abi::public_output(&mut h, 1, &input_hash, &out_hash, &out_hash), out);
+    // And they are not interchangeable: swapping two is a different preimage.
+    assert_ne!(abi::public_output(&mut h, 1, &out_hash, &input_hash, &ret_hash), out);
+    assert_ne!(abi::public_output(&mut h, 1, &input_hash, &ret_hash, &out_hash), out);
     // The status word is `out0` only: it does not enter the digest, so the low seven words of two
     // runs that differ only in status are the same.
-    let zero = abi::public_output(&mut h, 0, &input_hash, &out_hash);
+    let zero = abi::public_output(&mut h, 0, &input_hash, &out_hash, &ret_hash);
     assert_eq!(&zero[1..], &out[1..]);
 }
 
 #[test]
 fn the_two_input_vectors_round_trip_through_their_cursors() {
-    // Public `[n_elf, elf bytes…]` and private `[n_input, input bytes…]`, each byte string four per
+    // Public `[n_elf, elf bytes…, n_sysvars, sysvar bytes…]` and private `[n_input, input bytes…]`, each byte string four per
     // word little-endian and zero-padded. The instruction is a real serialized region, because
     // `decode_input` refuses one that is not (`abi::check_region`).
     let region = sbpf::serialize_aligned(&[account(5, 3)], b"ix", &[7u8; 32]);
-    let call = sbpf::SbpfCall { elf: (0..=250u8).collect(), input: region.clone() };
+    let call = sbpf::SbpfCall { elf: (0..=250u8).collect(), input: region.clone(), sysvars: None };
     let public = call.public_words();
     let private = call.input_words();
     assert_eq!(public[0], 251);
     assert_eq!(public[1], u32::from_le_bytes([0, 1, 2, 3]));
-    assert_eq!(public.len(), 1 + 251usize.div_ceil(4));
+    // … then the sysvar block's length word: 0, this call carries none.
+    assert_eq!(public.len(), 1 + 251usize.div_ceil(4) + 1);
+    assert_eq!(public[public.len() - 1], 0);
     assert_eq!(private[0] as usize, region.len());
     assert_eq!(private.len(), 1 + region.len().div_ceil(4));
 
@@ -209,6 +224,35 @@ fn the_two_input_vectors_round_trip_through_their_cursors() {
     abi::decode_input(&mut ws.input, &mut pc, &mut sc).unwrap();
     assert_eq!(&ws.input.elf[..ws.input.elf_len], &call.elf[..]);
     assert_eq!(&ws.input.input[..ws.input.input_len], &call.input[..]);
+    assert_eq!(ws.input.sysvars_len, 0);
+
+    // With a sysvar block: 57 bytes after the ELF, Clock's 40 then Rent's 17.
+    let block = sbpf::sysvar_block(&sbpf::FIXTURE_CLOCK, &sbpf::DEFAULT_RENT);
+    let with = sbpf::SbpfCall { sysvars: Some(block), ..call.clone() };
+    let public_with = with.public_words();
+    assert_eq!(public_with.len(), public.len() + 57usize.div_ceil(4));
+    assert_eq!(public_with[public.len() - 1], 57);
+    let mut pc = abi::InputCursor::new(|i| public_with[i as usize], public_with.len() as u32);
+    let mut sc = abi::InputCursor::new(|i| private[i as usize], private.len() as u32);
+    abi::decode_input(&mut ws.input, &mut pc, &mut sc).unwrap();
+    assert_eq!(&ws.input.sysvars[..ws.input.sysvars_len], &block[..]);
+    // A sysvar block of any other length is refused, and so is a public vector that stops before
+    // the block's length word (the old `[n_elf, elf bytes…]` layout).
+    for bad in [1u32, 40, 56, 58, 1 << 20] {
+        let mut words = public[..public.len() - 1].to_vec();
+        words.push(bad);
+        words.extend(std::iter::repeat(0).take(20));
+        let mut pc = abi::InputCursor::new(|i| words[i as usize], words.len() as u32);
+        let mut sc = abi::InputCursor::new(|i| private[i as usize], private.len() as u32);
+        assert_eq!(
+            abi::decode_input(&mut ws.input, &mut pc, &mut sc),
+            Err(abi::ParseError::SysvarsMalformed),
+            "a {bad}-byte sysvar block"
+        );
+    }
+    let mut pc = abi::InputCursor::new(|i| public[i as usize], public.len() as u32 - 1);
+    let mut sc = abi::InputCursor::new(|i| private[i as usize], private.len() as u32);
+    assert_eq!(abi::decode_input(&mut ws.input, &mut pc, &mut sc), Err(abi::ParseError::Truncated));
 
     // A vector that ends before its layout does is a parse error, not a panic — and it is the same
     // error whichever of the two segments runs out.
@@ -226,7 +270,7 @@ fn the_two_input_vectors_round_trip_through_their_cursors() {
     );
     // A private vector that parses but is not a serialized instruction is refused too — the cursors
     // are only half of what makes a pair of vectors a call.
-    let not_a_region = sbpf::SbpfCall { elf: call.elf.clone(), input: b"the input".to_vec() };
+    let not_a_region = sbpf::SbpfCall { elf: call.elf.clone(), input: b"the input".to_vec(), sysvars: None };
     let junk = not_a_region.input_words();
     let mut pc = abi::InputCursor::new(|i| public[i as usize], public.len() as u32);
     let mut sc = abi::InputCursor::new(|i| junk[i as usize], junk.len() as u32);
@@ -258,7 +302,7 @@ fn a_malformed_input_vector_is_status_two_with_a_canonical_digest() {
     let z = [0u8; 32];
     // The canonical malformed output: status 2 over two all-zero digests, so a verifier that
     // recomputes the digest from the instruction it meant to run gets something else.
-    let want = abi::public_output(&mut h, 2, &z, &z);
+    let want = abi::public_output(&mut h, 2, &z, &z, &z);
     // A public vector that ends mid-ELF…
     let out = abi::run_call(
         &mut h,
@@ -503,7 +547,7 @@ fn a_region_with_a_non_zero_pinned_byte_is_refused_by_guest_and_host() {
         assert_eq!(out[0], 2, "{what}");
         assert_eq!(result, Err(Halt::BadElf), "{what}");
         let z = [0u8; 32];
-        assert_eq!(out, abi::public_output(&mut HostRef, 2, &z, &z), "{what}");
+        assert_eq!(out, abi::public_output(&mut HostRef, 2, &z, &z, &z), "{what}");
     }
 }
 
@@ -634,7 +678,7 @@ fn lamports_writer(lamports: u64, tail: &[[u8; 8]]) -> Vec<u8> {
 
 /// Runs one whole call the way the guest will: the input vector through `abi::run_call_with`.
 fn run(elf: &[u8], input: &[u8]) -> ([u32; 8], Result<u64, Halt>, Vec<u8>) {
-    let call = sbpf::SbpfCall { elf: elf.to_vec(), input: input.to_vec() };
+    let call = sbpf::SbpfCall { elf: elf.to_vec(), input: input.to_vec(), sysvars: None };
     let public = call.public_words();
     let private = call.input_words();
     let mut ws = Box::new(abi::Workspace::ZERO);
@@ -683,7 +727,7 @@ fn a_successful_run_publishes_status_one_and_the_post_state() {
     assert_eq!(post_hash, expected_output_hash(&[&expected_post]));
     assert_eq!(
         out,
-        abi::public_output(&mut h, 1, &sbpf::canonical_input_hash_of(&input), &post_hash)
+        abi::public_output(&mut h, 1, &sbpf::canonical_input_hash_of(&input), &post_hash, &sbpf::return_hash_of(&[]))
     );
 }
 
@@ -714,6 +758,7 @@ fn a_nonzero_return_publishes_status_zero_over_the_pre_state() {
             0,
             &sbpf::canonical_input_hash_of(&input),
             &pre_hash, // the PRE-state
+            &sbpf::return_hash_of(&[]),
         )
     );
     // The error code itself is not published (the seven digest words are spoken for), so two
@@ -760,6 +805,7 @@ fn an_exceptional_halt_publishes_status_two_over_the_pre_state() {
         2,
         &sbpf::canonical_input_hash_of(&input),
         &pre_hash, // the PRE-state, not the mutated region
+        &sbpf::return_hash_of(&[]),
     );
     assert_eq!(out, want);
 
@@ -853,7 +899,7 @@ fn a_workspace_can_be_reused_without_carrying_state_over() {
     let mut ws = Box::new(abi::Workspace::ZERO);
     let mut h = HostRef;
     for elf in [&writer, &leaky] {
-        let call = sbpf::SbpfCall { elf: elf.clone(), input: input.clone() };
+        let call = sbpf::SbpfCall { elf: elf.clone(), input: input.clone(), sysvars: None };
         let public = call.public_words();
         let private = call.input_words();
         let (out, result) = abi::run_call_with(
@@ -935,7 +981,7 @@ fn the_spl_token_transfer_fixture_runs_natively() {
     assert_eq!(input_hash, abi::canonical_input_hash(&mut h, &call.input, &SPL_TOKEN_ID));
     assert_eq!(abi::program_id(&call.input), SPL_TOKEN_ID);
     let out_hash = abi::output_hash(&mut h, &post_region);
-    let want = abi::public_output(&mut h, 1, &input_hash, &out_hash);
+    let want = abi::public_output(&mut h, 1, &input_hash, &out_hash, &sbpf::return_hash_of(&[]));
     assert_eq!(out, want);
     assert_ne!(out[1..], [0u32; 7], "the digest words must not be zero");
 
@@ -998,9 +1044,10 @@ fn an_executor_that_delegates_to_the_vm_gives_the_interpreter_output() {
 
     let mut ws_got = Box::new(abi::Workspace::ZERO);
     let mut h_got = HostRef;
-    let mut run_vm = |h: &mut HostRef, p: &sbpf_core::elf::Program<'_>, mem: sbpf_core::memory::Memory<'_>| {
-        sbpf_core::interp::Vm::new(h, p, mem).run()
-    };
+    let mut run_vm = |h: &mut HostRef,
+                      p: &sbpf_core::elf::Program<'_>,
+                      mem: sbpf_core::memory::Memory<'_>,
+                      env: &mut abi::CallEnv<'_>| abi::interpret(h, p, mem, env);
     let got = abi::run_call_with_executor(
         &mut h_got,
         &mut ws_got,
@@ -1089,7 +1136,6 @@ fn the_sbpf_abi_reads_the_elf_from_the_public_segment() {
         &mut h,
         1,
         &randprotocol_zkvm::sbpf::canonical_input_hash_of(&call.input),
-        &randprotocol_zkvm::sbpf::output_hash_of(&call.input_post_state()),
-    );
+        &randprotocol_zkvm::sbpf::output_hash_of(&call.input_post_state()), &sbpf::return_hash_of(&[]));
     assert_eq!(out, want);
 }

@@ -141,6 +141,10 @@ pub struct PerpsState {
     /// The recorded heights no state proof has covered, ascending: the blocks the next window
     /// runs the engine over.
     pub pending_heights: Vec<u64>,
+    /// CON-601: the shapes of the genesis' pinned state-proof keys (`state_proof_keys`), empty
+    /// when unset (chain 21) or from a node that predates the field. Set, a proof of any other
+    /// shape is refused by every node, so `rand perp prove` proves at the canonical shape only.
+    pub state_proof_keys: Vec<randprotocol_core::confidential::ProofShape>,
 }
 
 impl PerpsState {
@@ -168,6 +172,17 @@ impl PerpsState {
             },
             pending_heights: match v["pending_heights"].as_array() {
                 Some(a) => a.iter().map(|h| u64_of(h, "pending_heights")).collect::<Result<_>>()?,
+                None => Vec::new(),
+            },
+            state_proof_keys: match v["state_proof_keys"].as_array() {
+                Some(a) => a
+                    .iter()
+                    .map(|k| {
+                        serde_json::from_value::<randprotocol_core::ledger::perps::StateProofKeyPin>(k.clone())
+                            .map(|k| k.shape())
+                            .map_err(|e| anyhow!("rand_getPerps.state_proof_keys: {e}"))
+                    })
+                    .collect::<Result<_>>()?,
                 None => Vec::new(),
             },
         })
@@ -662,6 +677,13 @@ pub async fn prove_and_submit_state_proof_shaped(
 ) -> Result<(Hash, u8, usize)> {
     let state = PerpsState::fetch(rpc).await?;
     let canonical = proves_canonical(canonical, &state);
+    // CON-601: a chain pinning its state-proof keys admits their shapes only — the canonical ones.
+    if !state.state_proof_keys.is_empty() && !canonical {
+        bail!(
+            "this chain pins its state-proof keys (rand_getPerps.state_proof_keys, {} shapes): only the canonical shape is admitted; drop --smallest",
+            state.state_proof_keys.len()
+        );
+    }
     job.check_for(state.sparse_windows)?;
     let executor = ZkExecutor::new(profile);
     let (segment, r_from, r_to) = job_segment(job, &executor);
@@ -764,6 +786,12 @@ pub async fn prove_and_submit_state_proof_shaped(
             "the proof is tier {proved_tier}, over this chain's max_tier {}: nothing submitted",
             state.max_tier
         );
+    }
+    if !state.state_proof_keys.is_empty() {
+        let shape = randprotocol_zkvm::executor::proof_shape(&proof).ok_or_else(|| anyhow!("the proof's header does not decode"))?;
+        if !state.state_proof_keys.contains(&shape) {
+            bail!("the proof declares {shape:?}, none of the chain's pinned state-proof key shapes: nothing submitted");
+        }
     }
     let proof_bytes = proof.len();
     wallet::check_proof_size(proof_bytes, wallet::proof_cap(rpc.limits().await?.as_ref()))?;
@@ -1013,6 +1041,7 @@ mod tests {
             max_window_heights: 16,
             engine_program_log_height: 0,
             pending_heights: pending,
+            state_proof_keys: Vec::new(),
         }
     }
 

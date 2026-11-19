@@ -185,6 +185,7 @@ async fn start_configured(dir: &tempfile::TempDir, key: &Keypair, genesis: Genes
         // pays the policy floor it reads from `rand_getLimits`.
         gas_policy: Some(randprotocol_core::gas::GasPolicy::DEFAULT),
         msauth,
+        perps_keys: Default::default(),
     })
     .await
     .expect("node starts")
@@ -1340,7 +1341,7 @@ async fn a_private_multisig_receives_spends_rotates_and_refuses_one_signature_en
     let auth = &tx.bundle.as_ref().unwrap().auth_proof;
     let hdr = decode_canonical(auth).unwrap();
     let s = ZkExecutor::msauth_heights();
-    // R-hide: every declared height — all eight header fields — is the pinned shape.
+    // R-hide: every declared height — all nine header fields (the poseidon2 height since set 11) — is the pinned shape.
     let declared = randprotocol_zkvm::executor::MsauthShape {
         tier: hdr.tier.0,
         program_log_height: hdr.program_log_height,
@@ -1350,6 +1351,7 @@ async fn a_private_multisig_receives_spends_rotates_and_refuses_one_signature_en
         modq_log_height: hdr.modq_log_height,
         public_log_height: hdr.public_log_height,
         mem_log_height: hdr.mem_log_height,
+        poseidon2_log_height: hdr.poseidon2_log_height,
     };
     assert_eq!(declared, s, "R-hide");
     assert_eq!(hdr.public_values[randprotocol_zkvm::tables::cpu::pv::GAS], gas::msauth_gas_limit_pin(), "R-gas");

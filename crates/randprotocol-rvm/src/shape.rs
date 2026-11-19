@@ -25,16 +25,17 @@ use p3_lookup::LogUpGadget;
 use p3_symmetric::{CryptographicHasher, PaddingFreeSponge};
 use p3_uni_stark::StarkGenericConfig;
 use randprotocol_zkvm::machine::{
-    chips, Challenge, Chip, Config, FriProfile, Machine, Perm, Proof, Tier, Val,
+    chips_at, Challenge, Chip, Config, FriProfile, Machine, Perm, Proof, Tier, Val, VerifierKeyShape,
 };
 
-/// The inner RV32 machine's `log_blowup`, from `research`'s `generic_config`
-/// (`research/src/machine.rs`): a literal there and a literal here — `InnerShape::of` cannot read it
-/// back off a `FriParameters` because the `Config`'s PCS keeps them private. Cross-checked against a
-/// real inner proof by `tests/verifier.rs` (`Σ log_arities + INNER_LOG_BLOWUP == log_global_max_height`).
-/// The rVM's own proofs are at `machine::RvmFri::of(profile).log_blowup` (rate ¼ since `docs/07`);
-/// every reader takes the value from the shape it is reading, `VerifierShape::log_blowup`.
-pub const INNER_LOG_BLOWUP: usize = 3;
+/// The inner RV32 machine's `log_blowup`: `research`'s `machine::LOG_BLOWUP` (rate 1/4 since
+/// constraint set 11, ZKVM-111 — both profiles; through set 10 it was 3). `InnerShape::of` cannot
+/// read it back off a `FriParameters` because the `Config`'s PCS keeps them private, so it is
+/// named here. Cross-checked against a real inner proof by `tests/verifier.rs`
+/// (`Σ log_arities + INNER_LOG_BLOWUP == log_global_max_height`). The rVM's own proofs are at
+/// `machine::RvmFri::of(profile).log_blowup` (also rate ¼ since `docs/07`); every reader takes the
+/// value from the shape it is reading, `VerifierShape::log_blowup`.
+pub const INNER_LOG_BLOWUP: usize = randprotocol_zkvm::machine::LOG_BLOWUP;
 /// `log_final_poly_len`, same source: the final polynomial is a single coefficient.
 pub const LOG_FINAL_POLY_LEN: usize = 0;
 /// `max_log_arity`, same source: FRI folds by at most 8 per round.
@@ -85,9 +86,12 @@ pub struct InnerShape {
     /// value exists — the public instance is in every batch, last in `chips()` order.
     pub public_log_height: u8,
     pub mem_log_height: u8,
+    /// Constraint set 11 (ZKVM-112): the poseidon2 table's declared height, one of
+    /// `Tier::admitted_poseidon2_log_heights` (through set 10 it was always `t + 2`).
+    pub poseidon2_log_height: u8,
     pub num_queries: usize,
     pub query_pow_bits: usize,
-    /// Per instance, `log2(|extended trace domain|)` — `Machine::log_ext_degrees`.
+    /// Per instance, `log2(|extended trace domain|)` — `Machine::log_ext_degrees_for`.
     pub degree_bits: Vec<usize>,
     /// Per instance, the main trace width (`BaseAir::width`), *without* the hiding wrapper's four
     /// random codewords.
@@ -146,7 +150,8 @@ pub enum ShapeError {
 }
 
 impl InnerShape {
-    /// The shape of any proof at `(profile, tier, the six declared heights)`.
+    /// The shape of any proof at `(profile, tier, the seven declared heights)` — the six of set 10
+    /// and, since constraint set 11, the poseidon2 table's.
     ///
     /// Panics when the heights are ones `Machine::verify` would refuse outright
     /// (`check_declared_heights`), because a verifier program for a shape no proof can have is a
@@ -161,6 +166,7 @@ impl InnerShape {
         sha256_log_height: u8,
         public_log_height: u8,
         mem_log_height: u8,
+        poseidon2_log_height: u8,
     ) -> Self {
         Self::try_of(
             profile,
@@ -171,6 +177,7 @@ impl InnerShape {
             sha256_log_height,
             public_log_height,
             mem_log_height,
+            poseidon2_log_height,
         )
         .expect("a verifier program is built for a shape a proof can actually have")
     }
@@ -185,38 +192,39 @@ impl InnerShape {
         sha256_log_height: u8,
         public_log_height: u8,
         mem_log_height: u8,
+        poseidon2_log_height: u8,
     ) -> Result<Self, ShapeError> {
-        randprotocol_zkvm::machine::check_declared_heights(
+        // The shape is chip-free of MODQ (`matches` refuses a proof declaring one), so the modq
+        // height is 0; the poseidon2 height is range-checked here with the others, so no program
+        // exists for a height `Machine::verify` would refuse.
+        randprotocol_zkvm::machine::check_declared_heights_with_modq(
             tier,
             program_log_height,
             input_log_height,
             keccak_log_height,
             sha256_log_height,
+            0,
             public_log_height,
             mem_log_height,
+            poseidon2_log_height,
         )
         .map_err(|e| ShapeError::DeclaredHeights(format!("{e:?}")))?;
 
         let machine = machine(profile);
         let is_zk = machine.config.is_zk();
-        let airs = chips(tier, keccak_log_height, sha256_log_height);
-        let degree_bits = machine.log_ext_degrees(
+        let key_shape = VerifierKeyShape {
             tier,
             program_log_height,
             input_log_height,
             keccak_log_height,
             sha256_log_height,
+            modq_log_height: 0,
             public_log_height,
-            mem_log_height,
-        );
-        let common = machine.verifier_key(
-            tier,
-            program_log_height,
-            input_log_height,
-            keccak_log_height,
-            sha256_log_height,
-            public_log_height,
-        );
+            poseidon2_log_height,
+        };
+        let airs = key_shape.chips();
+        let degree_bits = machine.log_ext_degrees_for(key_shape, mem_log_height);
+        let common = machine.verifier_key_for(key_shape);
 
         let widths: Vec<usize> = airs.iter().map(BaseAir::<Val>::width).collect();
         let num_public_values: Vec<usize> =
@@ -263,6 +271,7 @@ impl InnerShape {
             sha256_log_height,
             public_log_height,
             mem_log_height,
+            poseidon2_log_height,
             num_queries: profile.num_queries(),
             query_pow_bits: profile.pow_bits(),
             degree_bits,
@@ -345,14 +354,21 @@ impl InnerShape {
     /// `randprotocol_zkvm::machine::val_mmcs_for_tests`).
     #[doc(hidden)]
     pub fn common_data(&self) -> std::sync::Arc<p3_batch_stark::CommonData<Config>> {
-        machine(self.profile()).verifier_key(
-            Tier(self.tier),
-            self.program_log_height,
-            self.input_log_height,
-            self.keccak_log_height,
-            self.sha256_log_height,
-            self.public_log_height,
-        )
+        machine(self.profile()).verifier_key_for(self.key_shape())
+    }
+
+    /// The RV32 machine's key shape this inner shape verifies under (no MODQ table).
+    pub fn key_shape(&self) -> VerifierKeyShape {
+        VerifierKeyShape {
+            tier: Tier(self.tier),
+            program_log_height: self.program_log_height,
+            input_log_height: self.input_log_height,
+            keccak_log_height: self.keccak_log_height,
+            sha256_log_height: self.sha256_log_height,
+            modq_log_height: 0,
+            public_log_height: self.public_log_height,
+            poseidon2_log_height: self.poseidon2_log_height,
+        }
     }
 
     /// `max(degree_bits) + INNER_LOG_BLOWUP`, the height every query index is sampled from — and, by the
@@ -372,6 +388,7 @@ impl InnerShape {
             self.sha256_log_height as usize,
             self.public_log_height as usize,
             self.mem_log_height as usize,
+            self.poseidon2_log_height as usize,
             self.num_queries,
             self.query_pow_bits,
             self.instances(),
@@ -392,7 +409,8 @@ impl InnerShape {
 
     /// The `Header` segment's contents, which the program reads and pins word by word:
     /// `[tier, program_log_height, input_log_height, keccak_log_height, sha256_log_height,
-    ///   public_log_height, mem_log_height, num_queries, log_arities…]`.
+    ///   public_log_height, mem_log_height, poseidon2_log_height, num_queries, log_arities…]`
+    /// (`poseidon2_log_height` since constraint set 11).
     ///
     /// These are exactly the words a *proof* carries (or, for `num_queries`, that the profile
     /// fixes and the schedule that the proof's `commit_phase_openings` declare), so the program's
@@ -407,6 +425,7 @@ impl InnerShape {
             self.sha256_log_height as usize,
             self.public_log_height as usize,
             self.mem_log_height as usize,
+            self.poseidon2_log_height as usize,
             self.num_queries,
         ];
         w.extend(self.log_arities.iter().copied());
@@ -427,6 +446,7 @@ impl InnerShape {
             && proof.sha256_log_height == self.sha256_log_height
             && proof.public_log_height == self.public_log_height
             && proof.mem_log_height == self.mem_log_height
+            && proof.poseidon2_log_height == self.poseidon2_log_height
             // The shape is chip-free of MODQ (nine instances): a proof that declares a modq table is
             // refused by name here, not only indirectly through its ten-entry `degree_bits`.
             && proof.modq_log_height == 0
@@ -502,14 +522,7 @@ impl InnerKey {
     /// is seeded from a fixed constant precisely so that it is).
     pub fn of(profile: FriProfile, shape: &InnerShape) -> Self {
         let machine = machine(profile);
-        let common = machine.verifier_key(
-            Tier(shape.tier),
-            shape.program_log_height,
-            shape.input_log_height,
-            shape.keccak_log_height,
-            shape.sha256_log_height,
-            shape.public_log_height,
-        );
+        let common = machine.verifier_key_for(shape.key_shape());
         let roots = common
             .preprocessed
             .as_ref()
@@ -618,6 +631,7 @@ impl ProofBatch for Proof {
             self.sha256_log_height as u64,
             self.public_log_height as u64,
             self.mem_log_height as u64,
+            self.poseidon2_log_height as u64,
         ]
     }
 }
@@ -685,9 +699,9 @@ pub trait VerifierShape: Clone + PartialEq + Eq + std::fmt::Debug {
     /// adds this and nothing else.
     fn log_blowup(&self) -> usize;
     /// How the proofs of this shape commit their quotient chunks (`docs/05-quotient-layout.md`):
-    /// the RV32 machine's proofs one matrix per chunk (Plonky3's layout, which the aggregate
-    /// program's emitted code — and digest — is pinned to); the rVM's own proofs one matrix per
-    /// instance (`machine::QUOTIENT_LAYOUT`). The replay, the tape and the program's quotient
+    /// one matrix per instance on both machines since constraint set 11 (the RV32 machine's
+    /// `randprotocol_zkvm::machine::QUOTIENT_LAYOUT`, which through set 10 was Plonky3's one matrix per
+    /// chunk; the rVM's own `machine::QUOTIENT_LAYOUT`). The replay, the tape and the program's quotient
     /// round all follow this one answer.
     fn quotient_layout(&self) -> p3_batch_stark::QuotientLayout;
     fn num_lookups(&self) -> &[usize];
@@ -753,7 +767,8 @@ impl VerifierShape for InnerShape {
         INNER_LOG_BLOWUP
     }
     fn quotient_layout(&self) -> p3_batch_stark::QuotientLayout {
-        p3_batch_stark::QuotientLayout::PerChunk
+        // The RV32 machine's live layout (`PerInstance` since constraint set 11, ZKVM-111).
+        randprotocol_zkvm::machine::QUOTIENT_LAYOUT
     }
     fn num_lookups(&self) -> &[usize] {
         &self.num_lookups
@@ -783,7 +798,7 @@ impl VerifierShape for InnerShape {
         self.common_data()
     }
     fn constraint_chips(&self) -> Vec<Chip> {
-        chips(Tier(self.tier), self.keccak_log_height, self.sha256_log_height)
+        chips_at(Tier(self.tier), self.keccak_log_height, self.sha256_log_height, 0, self.poseidon2_log_height as usize)
     }
     fn shape_words(&self) -> Vec<F> {
         self.shape_words()

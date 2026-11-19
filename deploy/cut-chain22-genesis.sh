@@ -16,7 +16,8 @@
 #     max_window_heights is an OPERATOR INPUT (OPEN 1; the owner chose 256 on 2026-11-19);
 #   - `perps.engine_program_log_height` (CON-60, docs/perps.md:65): the pinned engine's program
 #     height, DERIVED like engine_hc (`rand perp image-hc` prints it on stderr) and pinned here as
-#     EXPECT_ENGINE_PROGRAM_LOG_HEIGHT 14 (the pinned image f286a611…, read 2026-10-29 with v0.8.2);
+#     EXPECT_ENGINE_PROGRAM_LOG_HEIGHT 14 (the pinned image, 482215a8… under constraint set 11; also 14
+#     for f286a611…, the same bytes under set 9, read 2026-10-29 with v0.8.2);
 #   - `perps.max_pending_digests: 65536` (PERP-5, audit v12, docs/perps.md:67): the cap on recorded
 #     digests no state proof has covered — an OWNER DECISION, taken 2026-11-05 (OPEN 8); needs
 #     sparse_windows and a v0.8.5+ build (436c1af0), which the cut refuses below it;
@@ -126,7 +127,9 @@
 #      `drops:` must name it; set with nothing to drop, it is refused.
 #   4. Chain 21's perps exchange — DECIDED 2026-11-19: CARRIED (EMPTY). It holds 0 collateral and
 #      0 RAND, and chain 22's engine starts from `perp-prover genesis-state` over the same market
-#      list on the same engine: the same root as chain 21's genesis, da0e3a53…, asserted equal.
+#      list on the same engine image: the same 26 genesis words as chain 21's, hashed under constraint
+#      set 11's Grain Poseidon2 — the RECORDED set-11 root a45d8fda…98b4 (PERP_GENESIS_ROOT_DECIDED,
+#      not chain 21's set-9 da0e3a53…), asserted equal.
 #      When the snapshot shows the exchange empty (rand_getPerps accounts, listed accounts,
 #      pending_withdrawals, collateral counters; rand_getSupply perps_collateral_held and
 #      perps_rand_held — the ledger counters count only since each node's v0.8.2 roll, so
@@ -221,13 +224,17 @@
 #     when it does not); RPL-2 program vaults' RAND (rand_getSupply.program_rand_held — chain 21's
 #     record dropped "the programs' state", but its script never counted it) is DROPPED on
 #     PROGRAM_VAULTS_DROPPED_OK (durian's AMM is redeployed on chain 22; its pool's 200 RAND goes).
+#     (The script pins nothing of the AMM: it is redeployed after the cut, from the same image, whose
+#     program id db2148e6…2bda is the blake3 of the code and does not move; its set-11 hc is be19a49a…,
+#     durian.market artifacts/durian-amm.image.bin.hc.)
 #     Each override, when set, must be named on the cut record's `drops:` line.
 #   * EVERYTHING ELSE IS CHAIN 21'S, ASSERTED EQUAL: what chain 21's script switched on — `fees`
-#     {burn_base, burn_floor}; `perps` (BTC-PERP on zUSD, the pinned engine f286a611…, tier 18, 24
-#     inputs, 64 blocks, min deposit 1 zUSD — and its genesis_root, re-derived by perp-prover, must
-#     equal chain 21's da0e3a53…); `multisig` create_fee 1 RAND and one treasury (now 5 of 6, new
+#     {burn_base, burn_floor}; `perps` (BTC-PERP on zUSD, tier 18, 24 inputs, 64 blocks, min deposit
+#     1 zUSD; the engine is chain 21's image under constraint set 11, engine_hc 482215a8… (chain 21's
+#     f286a611… is the same bytes under set 9) — and its genesis_root, re-derived by perp-prover, must
+#     equal the recorded set-11 root a45d8fda…98b4); `multisig` create_fee 1 RAND and one treasury (now 5 of 6, new
 #     signers, the balance carried — OPEN 3);
-#     hc_auth_multisig 9705f8e2… (the file's last field) with 6 MiB proofs and 19 MiB blocks (still
+#     hc_auth_multisig (the file's last field; constraint set 11's 41db73c5…, not chain 21's 9705f8e2…) with 6 MiB proofs and 19 MiB blocks (still
 #     pending the measured production msauth proof, MSA-1/2); and chain 20's shape before it
 #     (testnet, binding_domain 1, proof_window_blocks 1024, the gas section with ceilings and the
 #     paying byte load, bridge.rotation, bridge.fees 10/10 bps to the fingerprinted recipient,
@@ -287,8 +294,9 @@
 #     place that sees a host's seed file; `check-limits` reads one RPC from the operator's machine).
 #
 # The inputs outside the repository (chain 21's, re-pointed at ~/.rand-chain22 where the cut writes):
-#   PERP_IMAGE / EXPECT_ENGINE_HC / PERP_PROVER   as chain 21's (f286a611…; durian.market's perp-prover,
-#                     built from the commit that pinned the image or later: state layout version 2).
+#   PERP_IMAGE / EXPECT_ENGINE_HC / PERP_PROVER   chain 21's image (sha256 77dfc228…), whose set-11 hc is
+#                     482215a8… (durian.market feat/cs11-chain22, PR #2); durian's perp-prover,
+#                     built from the commit that pinned the image or later: state layout version 2.
 #   TREASURY          default ~/.rand-chain22/treasury.txt, chain 21's format: `signer <name> <2624
 #                     hex>` × 6 in order (none of them chain 21's), `threshold 5`, `balance <RAND>`
 #                     equal to chain 21's multisig_rand_held (OPEN 3). Public keys only.
@@ -394,11 +402,12 @@ WALLETS_DIRS=${WALLETS_DIRS:-$HOME/.rand-chain17/alloc-wallets $HOME/.rand-chain
 REQUIRED_WALLETS=${REQUIRED_WALLETS:-relayer}      # `balances`: <name>.key.json that must be under WALLETS_DIRS before the scan (the relayer's link went missing once)
 BALANCES_RESCAN=${BALANCES_RESCAN:-1}              # `balances`: `rand sync --rescan` (from leaf 0) — never trust a laptop note store
 RELAYER_DONE_DIR=${RELAYER_DONE_DIR:-}             # optional: a copy of the relayer's done/ (done/<chain>/<seq>; the relayer runs on rand-relayer-1), a floor cross-check
-EXPECT_HC_BUNDLE=${EXPECT_HC_BUNDLE:-60af094acfe65d85fdb18fb3d06cf9085dcf28c96e59e87f1ee527226e6e3fce}   # bundle guest v3, chain 21's
-EXPECT_HC_AUTH=${EXPECT_HC_AUTH:-1e4e347f44cf86750b30a9a4bdf9ec9256efe353d4ff8017451eca7d195639c1}     # the auth guest, chain 21's
-# private multisig's auth guest (MSAUTH_HC), chain 21's hc_auth_multisig: `rand-node genesis
+EXPECT_HC_BUNDLE=${EXPECT_HC_BUNDLE:-00782b22b1efdf6bbc4d9001b27baa28c03e75732090c6ccd494ddd1365c141e}   # bundle guest v3 under constraint set 11 (chain 21's, set 9: 60af094a…)
+EXPECT_HC_AUTH=${EXPECT_HC_AUTH:-8373994c200819c899236f822f0315efea213b3506a1df0785544a6c90a46078}     # the auth guest under constraint set 11 (chain 21's, set 9: 1e4e347f…)
+# private multisig's auth guest (MSAUTH_HC) under constraint set 11 (chain 21's hc_auth_multisig, set 9,
+# is 9705f8e2…): `rand-node genesis
 # --auth-multisig-guest` writes the build's own; any other expected value is refused below.
-HC_AUTH_MULTISIG_DECIDED=9705f8e2f1bc8561848b29cb8efd57c37e3e39788fa58a5f03304d8019668247
+HC_AUTH_MULTISIG_DECIDED=41db73c507ab1f24ebe76d9c425b42a08ed9a02b4b1284d410502729ce6b9cd1
 EXPECT_HC_AUTH_MULTISIG=${EXPECT_HC_AUTH_MULTISIG:-$HC_AUTH_MULTISIG_DECIDED}
 
 # ── the limits: chain 21's, asserted equal to its genesis unless LIMITS_CHANGED=1: 6 MiB proofs and
@@ -467,7 +476,7 @@ SOL_PROGRAM=${SOL_PROGRAM:-FGA3kY3RjfDKjUszJESMYtYXAbsnkFhhoxM3Mb34vycu}
 # ── gas: chain 21's section (its POOL-2 ceilings and paying byte load included), asserted equal ─
 GAS_PRICE=${GAS_PRICE:-100}
 BYTE_PRICE=${BYTE_PRICE:-800}
-BUNDLE_GAS_LIMIT=${BUNDLE_GAS_LIMIT:-20479}                  # gas_max(14, 0, 0), every bundle proof's declared limit
+BUNDLE_GAS_LIMIT=${BUNDLE_GAS_LIMIT:-22527}                  # gas_max(14, 0, 0), every bundle proof's declared limit
 GAS_DYNAMIC=${GAS_DYNAMIC:-$((MAX_BLOCK_BYTES / 2)),262144,1250}
 MAX_GAS_PRICE=${MAX_GAS_PRICE:-10000}                        # 100× the start (docs/deploy.md, POOL-2)
 MAX_BYTE_PRICE=${MAX_BYTE_PRICE:-80000}                      # 100× the start
@@ -493,11 +502,19 @@ FEES_JSON='{"burn_base": true, "burn_floor": true}'
 # equal — BTC-PERP on zUSD (asset 1, eight decimals: tick and min_deposit 10^8 are $1 and 1 zUSD),
 # 20x / 250 bps, max_tier 18 with 24 inputs (durian.market's gated `block-24-14liq`), 64 blocks a
 # window. engine_hc and genesis_root are not in it: the cut derives both (genesis_root must come out
-# equal to chain 21's, the same markets on the same engine).
+# equal to PERP_GENESIS_ROOT_DECIDED, the same markets on the same engine under constraint set 11).
 # shellcheck disable=SC2089  # JSON text in a string, exported whole, never word-split
 PERPS_JSON='{"collateral_asset": 1, "max_tier": 18, "max_window_blocks": 64, "max_block_inputs": 24, "min_deposit": 100000000,
  "markets": [{"id": 0, "symbol": "BTC-PERP", "lot": 100000, "tick": 100000000, "max_leverage": 20, "maintenance_bps": 250, "taker_fee_bps": 5, "maker_fee_bps": 2}]}'
-ENGINE_HC_DECIDED=f286a61171e274278ec8d18d7853e5f36799ed8dc5a3e31e0077ad89ef1d1573   # durian.market artifacts/perp-engine.image.bin.hc (afe4d31), chain 21's
+# Constraint set 11 (circuits 76a48dca) moves every hc and root, not the image: chain 21's engine
+# image (sha256 77dfc228…d52f, the same bytes) has hc 482215a8… under set 11 (durian.market
+# feat/cs11-chain22 artifacts/perp-engine.image.bin.hc; `rand perp image-hc` of #194/#195), and the
+# same market list's genesis words (sha256 bb32f0c4…6066, identical to chain 21's) hash to the root
+# below (`perp-prover genesis-state` → `rand perp genesis-root`, a5e08a98, recorded 2026-11-20).
+ENGINE_HC_DECIDED=482215a8df02dff341265c38212c47e23fc8bfb3c3297afe9c385d6a63e65073   # set 11: chain 21's image
+ENGINE_HC_CHAIN21=f286a61171e274278ec8d18d7853e5f36799ed8dc5a3e31e0077ad89ef1d1573   # set 9: chain 21's genesis names it (asserted on CHAIN21_GENESIS)
+PERP_GENESIS_ROOT_DECIDED=a45d8fdab8cf7dab972e76dd6a7a18d9e82fc8210afab672a161ee60021698b4   # set 11: the root the cut must derive
+PERP_GENESIS_ROOT_CHAIN21=da0e3a53d93e50ec03fa40c6d2bd3dad8b9c7b4f542175e86a1dea567cbb9846   # set 9: chain 21's genesis root
 EXPECT_ENGINE_HC=${EXPECT_ENGINE_HC:-$ENGINE_HC_DECIDED}   # any other value is refused below (the decision names this image)
 DURIAN=${DURIAN:-$HOME/Github/randprotocol/durian.market}   # read only: the engine image
 PERP_IMAGE=${PERP_IMAGE:-$DURIAN/artifacts/perp-engine.image.bin}
@@ -513,7 +530,8 @@ PERP_GENESIS_ROOT=${PERP_GENESIS_ROOT:-}                     # set by the cut (p
 #     (max_window_blocks) ..= 4096 (MAX_WINDOW_HEIGHTS).
 #   - engine_program_log_height (CON-60): the pinned image's program height, which `rand perp image-hc`
 #     prints on stderr — derived at the cut and refused unless it is EXPECT_ENGINE_PROGRAM_LOG_HEIGHT.
-#     14 is what v0.8.2's `rand perp image-hc` prints for f286a611… (read 2026-10-29).
+#     14 is what v0.8.2's `rand perp image-hc` prints for f286a611… (read 2026-10-29), and what
+#     #194/#195's prints for 482215a8… (the same image under set 11, read 2026-11-20).
 #   - max_pending_digests 65536 (PERP-5, audit v12; docs/perps.md genesis table) — the OWNER'S
 #     DECISION of 2026-11-05 (OPEN 8): about 18 h of input-bearing blocks with no prover; ~2.6 MB
 #     of log. It caps the recorded digests no state proof has covered (deposits, orders, cancels
@@ -527,6 +545,20 @@ PERPS_MAX_PENDING_DIGESTS=65536                              # OPEN 8, decided 2
 NODE_VERSION_FLOOR=0.8.5                                     # the first release with perps.max_pending_digests (436c1af0)
 EXPECT_ENGINE_PROGRAM_LOG_HEIGHT=${EXPECT_ENGINE_PROGRAM_LOG_HEIGHT:-$ENGINE_PROGRAM_LOG_HEIGHT_DECIDED}
 ENGINE_PROGRAM_LOG_HEIGHT=                                   # set by the cut (`rand perp image-hc` stderr), never the environment; the selftest sets a fixture
+#   - state_proof_keys (CON-601, monorepo#23) — DECIDED 2026-11-19 (item 9 above): the pinned,
+#     precomputed state-proof verifier keys validators LOAD instead of building (a block carrying a
+#     tier-18 state proof made every validator build a ~1.7–4 GB key). Four keys, the canonical
+#     shapes of max_tier 18 over the engine's program height 14 — input 16, poseidon2 20, public
+#     7, 8, 9, 10 (windows of 1..=11, 12..=27, 28..=59, 60..=64 blocks) — each written with the
+#     SHA-256 of its shipped file in PERPS_KEY_DIR (default this tree's crates/randprotocol-zkvm/keys,
+#     the release's perp-vk-production-*.bin), and each file held to this rand-node's own pin
+#     (`rand-node keygen-perp-vk --print-pinned production`) before it is written. Not overridable
+#     but for the directory; the probe node loads them from there (RAND_PERPS_KEY_DIR).
+PERPS_KEY_DIR=${PERPS_KEY_DIR:-crates/randprotocol-zkvm/keys}
+# [tier, program, input, public, poseidon2] per key, in the field's order.
+PERPS_STATE_PROOF_SHAPES_DECIDED='[[18, 14, 16, 7, 20], [18, 14, 16, 8, 20], [18, 14, 16, 9, 20], [18, 14, 16, 10, 20]]'
+PERPS_STATE_PROOF_KEYS_JSON=                                 # set by the cut from the files (`keygen-perp-vk --genesis-json`), never the environment
+PERPS_KEY_PINS=                                              # set by the cut: this rand-node's `keygen-perp-vk --print-pinned production` ("<file> <sha256>" lines)
 # ── chain 21's `multisig` section (docs/multisig.md): create_fee 1 RAND, ONE account — the treasury,
 # now 5 of 6 (the owner's rule: a multisig is always 5 of 6, decided for chain 22 on 2026-11-19),
 # six NEW signers (none of chain 21's), a fresh salt, its balance CARRIED from chain 21's multisig
@@ -572,7 +604,7 @@ AUDIT_V10_SKIPPED=
 BLOCK_CONTEXT_SKIPPED_FROM_ENV=${BLOCK_CONTEXT_SKIPPED:-}
 BLOCK_CONTEXT_SKIPPED=
 [ "$EXPECT_HC_AUTH_MULTISIG" = "$HC_AUTH_MULTISIG_DECIDED" ] || {
-  echo "cut-chain22: EXPECT_HC_AUTH_MULTISIG=$EXPECT_HC_AUTH_MULTISIG is not chain 21's multisig auth guest ($HC_AUTH_MULTISIG_DECIDED, MSAUTH_HC) — another guest edits this script and docs/deploy.md together" >&2; exit 1; }
+  echo "cut-chain22: EXPECT_HC_AUTH_MULTISIG=$EXPECT_HC_AUTH_MULTISIG is not constraint set 11's multisig auth guest ($HC_AUTH_MULTISIG_DECIDED, MSAUTH_HC) — another guest edits this script and docs/deploy.md together" >&2; exit 1; }
 [ "$EXPECT_ENGINE_HC" = "$ENGINE_HC_DECIDED" ] || {
   echo "cut-chain22: EXPECT_ENGINE_HC=$EXPECT_ENGINE_HC is not the decided engine ($ENGINE_HC_DECIDED, durian.market's pinned image) — another engine edits this script and docs/deploy.md together" >&2; exit 1; }
 [ "$EXPECT_ENGINE_PROGRAM_LOG_HEIGHT" = "$ENGINE_PROGRAM_LOG_HEIGHT_DECIDED" ] || {
@@ -602,8 +634,10 @@ export CHAIN_ID CHAIN21_GENESIS CHAIN21_HASH CHAIN21_GENESIS_SHA256 CHAIN21_TREA
   ETH_RPC BSC_RPC TRON_API SOL_RPC SOL_PROGRAM GAS_PRICE BYTE_PRICE BUNDLE_GAS_LIMIT GAS_DYNAMIC MAX_GAS_PRICE MAX_BYTE_PRICE \
   GAS_BYTE_LOAD ENVELOPE_BYTES BINDING_DOMAIN PROOF_WINDOW_BLOCKS STAKE_ENTRY_BPS ROTATION_DELAY_SECS ROTATION_NEEDS_POSSESSION \
   PROGRAM_STATE_CELL_FEE BALANCES_RESCAN BRIDGE_MINT_BPS BRIDGE_BURN_BPS FEE_RECIPIENT \
-  FEE_RECIPIENT_FINGERPRINT FEES_JSON PERPS_JSON ENGINE_HC_DECIDED EXPECT_ENGINE_HC PERP_GENESIS_ROOT \
+  FEE_RECIPIENT_FINGERPRINT FEES_JSON PERPS_JSON ENGINE_HC_DECIDED ENGINE_HC_CHAIN21 EXPECT_ENGINE_HC PERP_GENESIS_ROOT \
+  PERP_GENESIS_ROOT_DECIDED PERP_GENESIS_ROOT_CHAIN21 \
   PERPS_SKIPPED PERPS_V10_JSON PERPS_MAX_WINDOW_HEIGHTS EXPECT_ENGINE_PROGRAM_LOG_HEIGHT ENGINE_PROGRAM_LOG_HEIGHT PERPS_MAX_PENDING_DIGESTS \
+  PERPS_KEY_DIR PERPS_STATE_PROOF_SHAPES_DECIDED PERPS_STATE_PROOF_KEYS_JSON PERPS_KEY_PINS \
   MULTISIG_CREATE_FEE TREASURY_THRESHOLD TREASURY_SIGNERS TREASURY MULTISIG_MAX_ACCOUNTS \
   PROGRAM_STATE_REFUSE_PANICS TOKENS_INCREMENTAL_ROOT AUDIT_V10_SKIPPED EXPECT_HC_AUTH_MULTISIG \
   REFERENCE_BLOCK_WINDOW BEACON_COMMIT_DELAY_BLOCKS BEACON_TSV BLOCK_CONTEXT_SKIPPED
@@ -1126,7 +1160,8 @@ PY
 # and PERP_GENESIS_ROOT, in PerpsConfig's field order, then — unless AUDIT_V10_SKIPPED — the new
 # fields: bound_payouts, sparse_windows, max_window_heights (PERPS_MAX_WINDOW_HEIGHTS),
 # engine_program_log_height (ENGINE_PROGRAM_LOG_HEIGHT, from `rand perp image-hc`) and
-# max_pending_digests (PERPS_MAX_PENDING_DIGESTS, OPEN 8); never initial_collateral (OPEN 4). py_splice puts it into the file.
+# max_pending_digests (PERPS_MAX_PENDING_DIGESTS, OPEN 8) and state_proof_keys (PERPS_STATE_PROOF_KEYS_JSON,
+# CON-601); never initial_collateral (OPEN 4). py_splice puts it into the file.
 py_perps() {
   python3 - <<'PY'
 import json, os, re, sys
@@ -1152,6 +1187,14 @@ if not E.get("AUDIT_V10_SKIPPED"):
         sys.exit(f"cut-chain22: PERPS_MAX_PENDING_DIGESTS {mpd!r} is not in max_window_blocks..=1048576 (PERP-5)")
     section.update(bound_payouts=v10["bound_payouts"], sparse_windows=v10["sparse_windows"],
                    max_window_heights=int(mwh), engine_program_log_height=int(eplh), max_pending_digests=int(mpd))
+    # CON-601: the pinned state-proof keys, as perps_keys_step read them off the shipped files.
+    try:
+        spk = json.loads(E.get("PERPS_STATE_PROOF_KEYS_JSON") or "null")
+    except ValueError:
+        spk = None
+    if not (isinstance(spk, list) and spk):
+        sys.exit("cut-chain22: PERPS_STATE_PROOF_KEYS_JSON is not a list of keys — the perps_keys_step (CON-601) did not run")
+    section.update(state_proof_keys=spk)
 json.dump(section, open(os.path.join(E["TMP"], "perps.json"), "w"), indent=1)
 PY
 }
@@ -1554,8 +1597,11 @@ g = {k: g[k] for k in order if k in g}
 need(g["chain_id"] == int(E["CHAIN_ID"]) == 22, f"chain_id is {g['chain_id']}")
 need(g.get("hardening_v6") is True, "hardening_v6 is not true — --hardening-v6 did not take")
 need(g["hc_bundle"] == E["HC_REPORTED"], "hc_bundle is not what this rand-node reports")
-need(g["hc_bundle"] == g21["hc_bundle"] == E["EXPECT_HC_BUNDLE"], f"hc_bundle {g['hc_bundle']} is not chain 21's bundle guest v3")
-need(g.get("hc_auth") == g21.get("hc_auth") == E["EXPECT_HC_AUTH"], f"hc_auth {g.get('hc_auth')} is not chain 21's auth guest")
+# Constraint set 11 moved every guest digest (Grain constants): chain 22 names set 11's, chain 21 set 9's.
+need(g["hc_bundle"] == E["EXPECT_HC_BUNDLE"] == "00782b22b1efdf6bbc4d9001b27baa28c03e75732090c6ccd494ddd1365c141e" and g21["hc_bundle"] == "60af094acfe65d85fdb18fb3d06cf9085dcf28c96e59e87f1ee527226e6e3fce",
+     f"hc_bundle {g['hc_bundle']} is not constraint set 11's bundle guest v3")
+need(g.get("hc_auth") == E["EXPECT_HC_AUTH"] == "8373994c200819c899236f822f0315efea213b3506a1df0785544a6c90a46078" and g21.get("hc_auth") == "1e4e347f44cf86750b30a9a4bdf9ec9256efe353d4ff8017451eca7d195639c1",
+     f"hc_auth {g.get('hc_auth')} is not constraint set 11's auth guest")
 need(g["faucet"] is True and g["confidential"] is True and g["fri_profile"] == "production", "faucet/confidential/fri_profile wrong")
 need("aggregation" not in g, "an aggregation section is present — none belongs in chain 22")
 need("vesting" not in g, "a vesting section is present — none belongs in chain 22")
@@ -1578,15 +1624,23 @@ need(same_json(fees_section, want_fees) and same_json(fees_section, g21["fees"])
 PERPS_DECIDED = {"collateral_asset": 1, "max_tier": 18, "max_window_blocks": 64, "max_block_inputs": 24, "min_deposit": 100000000,
                  "markets": [{"id": 0, "symbol": "BTC-PERP", "lot": 100000, "tick": 100000000, "max_leverage": 20,
                               "maintenance_bps": 250, "taker_fee_bps": 5, "maker_fee_bps": 2}]}
-ENGINE_HC_DECIDED = "f286a61171e274278ec8d18d7853e5f36799ed8dc5a3e31e0077ad89ef1d1573"
-V10_FIELDS = ("bound_payouts", "sparse_windows", "max_window_heights", "engine_program_log_height", "max_pending_digests")
+ENGINE_HC_DECIDED = E["ENGINE_HC_DECIDED"]   # set 11 (482215a8…): chain 21's image under the Grain constants
+ENGINE_HC_CHAIN21 = E["ENGINE_HC_CHAIN21"]   # set 9 (f286a611…): what chain 21's genesis names
+PERP_GENESIS_ROOT_DECIDED = E["PERP_GENESIS_ROOT_DECIDED"]   # set 11 (a45d8fda…): the recorded root
+need(ENGINE_HC_DECIDED == "482215a8df02dff341265c38212c47e23fc8bfb3c3297afe9c385d6a63e65073" != ENGINE_HC_CHAIN21
+     == "f286a61171e274278ec8d18d7853e5f36799ed8dc5a3e31e0077ad89ef1d1573"
+     and PERP_GENESIS_ROOT_DECIDED == "a45d8fdab8cf7dab972e76dd6a7a18d9e82fc8210afab672a161ee60021698b4" != E["PERP_GENESIS_ROOT_CHAIN21"]
+     == "da0e3a53d93e50ec03fa40c6d2bd3dad8b9c7b4f542175e86a1dea567cbb9846",
+     "the decided engine / genesis root constants were edited — set 11's 482215a8… / a45d8fda… and chain 21's f286a611… / da0e3a53…")
+V10_FIELDS = ("bound_payouts", "sparse_windows", "max_window_heights", "engine_program_log_height", "max_pending_digests", "state_proof_keys")
 need(same_json(json.loads(E["PERPS_JSON"]), PERPS_DECIDED), "PERPS_JSON is not chain 21's perps section (BTC-PERP on zUSD, 20x / 250 bps, tier 18, 24 inputs)")
 need(same_json(json.loads(E["PERPS_V10_JSON"]), {"bound_payouts": True, "sparse_windows": True}),
      "PERPS_V10_JSON is not the decided {bound_payouts: true, sparse_windows: true} (PERP-6, PERP-101)")
 need(E["PERPS_MAX_PENDING_DIGESTS"] == "65536", f"PERPS_MAX_PENDING_DIGESTS is {E['PERPS_MAX_PENDING_DIGESTS']!r}, not the decided 65536 (PERP-5, OPEN 8)")
 need(E["EXPECT_ENGINE_PROGRAM_LOG_HEIGHT"] == "14", f"EXPECT_ENGINE_PROGRAM_LOG_HEIGHT is {E['EXPECT_ENGINE_PROGRAM_LOG_HEIGHT']}, not the pinned engine's 14")
 p21 = g21["perps"]
-need(same_json({k: v for k, v in p21.items() if k not in ("engine_hc", "genesis_root")}, PERPS_DECIDED) and p21["engine_hc"] == ENGINE_HC_DECIDED,
+need(same_json({k: v for k, v in p21.items() if k not in ("engine_hc", "genesis_root")}, PERPS_DECIDED) and p21["engine_hc"] == ENGINE_HC_CHAIN21
+     and p21["genesis_root"] == E["PERP_GENESIS_ROOT_CHAIN21"],
      "chain 21's genesis perps section is not the decided one (CHAIN21_GENESIS?)")
 perps = g.get("perps")
 v10_skipped = bool(E.get("AUDIT_V10_SKIPPED"))
@@ -1609,20 +1663,44 @@ else:
              f"that {m['max_leverage']}x implies (perp-core: ⌈notional / max_leverage⌉) — a max-leverage position would open liquidatable")
     need(perps["max_tier"] == 18, f"perps.max_tier is {perps['max_tier']!r}, not 18 (the production sizing; owner 2026-11-19: tier 18 "
                                   f"stays, CON-601 met by a pinned precomputed state-proof key — tier 16 cannot prove a mass liquidation)")
-    # TODO(CON-601, owner 2026-11-19): once the pinned tier-18 state-proof key PR lands (the key
-    # built once, its hash a chain-22 genesis field, validators loading it as they load the
-    # msauth key), assert that field here: present, equal to the hash of the shipped key file
-    # (as RAND_MSAUTH_VK is checked), and add it to the field probe and to check-limits. The
-    # field does not exist yet — no name is assumed here.
+    # CON-601 (owner 2026-11-19): the pinned state-proof keys validators load instead of building —
+    # perps.state_proof_keys, exactly the four canonical tier-18 shapes, each with the SHA-256 of its
+    # shipped file in PERPS_KEY_DIR, which is also this rand-node's own pin (PERPS_KEY_PINS, from
+    # `keygen-perp-vk --print-pinned production`). The field probe and check-limits cover it too.
+    if not v10_skipped:
+        import hashlib
+        spk = perps.get("state_proof_keys")
+        SPK_SHAPE = ["tier", "program_log_height", "input_log_height", "public_log_height", "poseidon2_log_height"]
+        shapes = json.loads(E["PERPS_STATE_PROOF_SHAPES_DECIDED"])
+        need(isinstance(spk, list) and all(isinstance(k, dict) and list(k) == SPK_SHAPE + ["sha256"] for k in spk)
+             and [[k[f] for f in SPK_SHAPE] for k in spk] == shapes,
+             f"perps.state_proof_keys is {spk!r}, not the four canonical tier-18 shapes {shapes} (tier, program, input, public, "
+             f"poseidon2 — CON-601, owner 2026-11-19)")
+        pins = dict(l.split() for l in E.get("PERPS_KEY_PINS", "").splitlines() if l.strip())
+        names = []
+        for k in spk if isinstance(spk, list) else []:
+            name = (f"perp-vk-production-t{k['tier']}-pg{k['program_log_height']}-in{k['input_log_height']}"
+                    f"-pub{k['public_log_height']}-p2h{k['poseidon2_log_height']}.bin")
+            names.append(name)
+            path = os.path.join(E["PERPS_KEY_DIR"], name)
+            got = hashlib.sha256(open(path, "rb").read()).hexdigest() if os.path.isfile(path) else None
+            need(got is not None, f"perps.state_proof_keys: no key file {path} (PERPS_KEY_DIR: the release's perp-vk-production-*.bin)")
+            need(k["sha256"] == got, f"perps.state_proof_keys: {name} is pinned as {k['sha256']}, but the shipped file {path} has sha256 {got}")
+            need(pins.get(name) == got, f"perps.state_proof_keys: {name} has sha256 {got}, not this rand-node's pin {pins.get(name)} "
+                                        f"(`keygen-perp-vk --print-pinned production`) — a key file of another build or constraint set")
+        need(sorted(pins) == sorted(names), f"this rand-node pins the key files {sorted(pins)}, not the genesis' {sorted(names)}")
     need(perps["max_block_inputs"] == 24, f"perps.max_block_inputs is {perps['max_block_inputs']!r}, not 24 — the production sizing at tier 18 "
          f"(durian.market's gated case block-24-14liq); nothing measured more")
-    need(perps["engine_hc"] == E["EXPECT_ENGINE_HC"] == ENGINE_HC_DECIDED == p21["engine_hc"],
-         f"perps.engine_hc {perps['engine_hc']} is not the pinned engine {ENGINE_HC_DECIDED} (durian.market artifacts/perp-engine.image.bin)")
+    need(perps["engine_hc"] == E["EXPECT_ENGINE_HC"] == ENGINE_HC_DECIDED != p21["engine_hc"],
+         f"perps.engine_hc {perps['engine_hc']} is not the pinned engine {ENGINE_HC_DECIDED} (durian.market artifacts/perp-engine.image.bin "
+         f"under constraint set 11; chain 21's {p21['engine_hc'][:8]}… is the set-9 hc of the same image)")
     need(re.fullmatch(r"[0-9a-f]{64}", E.get("PERP_GENESIS_ROOT", "")) and perps["genesis_root"] == E["PERP_GENESIS_ROOT"],
          f"perps.genesis_root {perps['genesis_root']} is not the root this cut derived ({E.get('PERP_GENESIS_ROOT') or 'none'}) from the markets")
-    need(perps["genesis_root"] == p21["genesis_root"] or E.get("FIXTURE_ROOT_OK") == "1",
-         f"perps.genesis_root {perps['genesis_root']} is not chain 21's {p21['genesis_root']} — the same markets on the same engine must give "
-         f"the same root (another perp-prover state layout?)")
+    need(perps["genesis_root"] == PERP_GENESIS_ROOT_DECIDED or E.get("FIXTURE_ROOT_OK") == "1",
+         f"perps.genesis_root {perps['genesis_root']} is not the recorded set-11 root {PERP_GENESIS_ROOT_DECIDED} — the same markets on the "
+         f"same engine under constraint set 11 must give it (another perp-prover state layout, or a rand of another constraint set?)")
+    need(perps["genesis_root"] != p21["genesis_root"],
+         f"perps.genesis_root is chain 21's set-9 root {p21['genesis_root']} — a rand of constraint set 9 derived it")
     need(same_json({k: v for k, v in perps.items() if k not in ("engine_hc", "genesis_root") + V10_FIELDS}, PERPS_DECIDED),
          f"perps is not chain 21's section: {sorted(k for k in PERPS_DECIDED if not same_json(perps.get(k), PERPS_DECIDED[k]))} differ")
     # the new fields (PERP-6, PERP-101, CON-60), each at its value on the finished file
@@ -1684,9 +1762,9 @@ else:
     need(type(cap) is int and str(cap) == E.get("MULTISIG_MAX_ACCOUNTS") and cap >= len(accts),
          f"multisig.max_accounts is {cap!r}, not MULTISIG_MAX_ACCOUNTS {E.get('MULTISIG_MAX_ACCOUNTS')!r} (≥ {len(accts)}, the seeded treasury counts; OPEN 2)")
     need(list(ms) == ["create_fee", "accounts", "max_accounts"], f"the multisig section lists {list(ms)}, not MultisigConfig's order")
-# ── chain 21's hc_auth_multisig (private multisig), on the finished file ──────────────────────────
-need(E["EXPECT_HC_AUTH_MULTISIG"] == "9705f8e2f1bc8561848b29cb8efd57c37e3e39788fa58a5f03304d8019668247" == g21["hc_auth_multisig"],
-     f"EXPECT_HC_AUTH_MULTISIG is {E['EXPECT_HC_AUTH_MULTISIG']}, not chain 21's multisig auth guest (MSAUTH_HC)")
+# ── hc_auth_multisig (private multisig) under constraint set 11, on the finished file ──────────────────────────
+need(E["EXPECT_HC_AUTH_MULTISIG"] == "41db73c507ab1f24ebe76d9c425b42a08ed9a02b4b1284d410502729ce6b9cd1" and g21["hc_auth_multisig"] == "9705f8e2f1bc8561848b29cb8efd57c37e3e39788fa58a5f03304d8019668247",
+     f"EXPECT_HC_AUTH_MULTISIG is {E['EXPECT_HC_AUTH_MULTISIG']}, not constraint set 11's multisig auth guest (MSAUTH_HC)")
 need("hc_auth_multisig" in g, "no hc_auth_multisig — --auth-multisig-guest did not take")
 need(bool(g.get("hc_auth")), "hc_auth_multisig needs hc_auth (the multisig auth guest authorises bundle guest v3's spends)")
 need(g["hc_auth_multisig"].lower() != str(g.get("hc_auth")).lower(), "hc_auth_multisig must differ from hc_auth")
@@ -1748,7 +1826,7 @@ need(g.get("gas") is not None, "the gas section is missing — --gas-price did n
 gas = g["gas"]
 need(int(gas["gas_price"]) == int(E["GAS_PRICE"]) and int(gas["byte_price"]) == int(E["BYTE_PRICE"]),
      f"gas prices are {gas['gas_price']}/{gas['byte_price']}, expected {E['GAS_PRICE']}/{E['BYTE_PRICE']}")
-need(int(gas["bundle_gas_limit"]) == int(E["BUNDLE_GAS_LIMIT"]) == 20479, f"bundle_gas_limit is {gas['bundle_gas_limit']}, not gas_max(14, 0, 0) = 20479")
+need(int(gas["bundle_gas_limit"]) == int(E["BUNDLE_GAS_LIMIT"]) == 22527, f"bundle_gas_limit is {gas['bundle_gas_limit']}, not gas_max(14, 0, 0) = 22527 (constraint set 11)")
 need(gas.get("metering") == "circuit", f"gas.metering is {gas.get('metering')!r}")
 need(gas.get("dynamic") is not None, "gas.dynamic is missing — --gas-dynamic did not take (Phase 2 is off)")
 dyn = gas["dynamic"]
@@ -1763,9 +1841,12 @@ need(str(dyn.get("max_gas_price")) == E["MAX_GAS_PRICE"] == "10000", f"gas.dynam
 need(str(dyn.get("max_byte_price")) == E["MAX_BYTE_PRICE"] == "80000", f"gas.dynamic.max_byte_price is {dyn.get('max_byte_price')!r}, not \"80000\" — --max-byte-price did not take")
 need(dyn.get("byte_load") == E["GAS_BYTE_LOAD"] == "paying", f"gas.dynamic.byte_load is {dyn.get('byte_load')!r}, not \"paying\" — --gas-byte-load paying did not take")
 # chain 21's section but for the byte target, which follows chain 22's max_block_bytes (half of it,
-# asserted above): 9961472 at the 19 MiB both chains decide.
+# asserted above): 9961472 at the 19 MiB both chains decide; and the bundle limit, which constraint
+# set 11 moved from chain 21's 20479 to 22527 (asserted above).
 want_gas_section = copy.deepcopy(g21["gas"])
 want_gas_section["dynamic"]["target_block_bytes"] = g["max_block_bytes"] // 2
+need(int(g21["gas"]["bundle_gas_limit"]) == 20479, f"chain 21's bundle_gas_limit is {g21['gas']['bundle_gas_limit']}, not set 9's 20479")
+want_gas_section["bundle_gas_limit"] = 22527
 need(gas == want_gas_section or E.get("GAS_CHANGED"), f"the gas section {gas} is not chain 21's {want_gas_section} (GAS_CHANGED=1 if intended)")
 # the staking section
 st = g["staking"]
@@ -1830,7 +1911,9 @@ need(g["max_block_bytes"] >= 3 * g["max_proof_bytes"] + 1048576,
 # program_state are compared on their own lines below, the new fields taken out.
 # `validators`: chain 21's genesis list without archive2 (owner, 2026-11-19), asserted above
 # against the register and in py_validators against chain 21's genesis, key by key, in order.
-excused = {"chain_id", "timestamp_ms", "alloc", "bridge", "tokens", "staking", "gas", "perps", "multisig", "program_state", "beacon", "validators"}
+# The guest digests are excused too: constraint set 11 moved them (asserted at set 11's values above).
+excused = {"chain_id", "timestamp_ms", "alloc", "bridge", "tokens", "staking", "gas", "perps", "multisig", "program_state", "beacon", "validators",
+           "hc_bundle", "hc_auth", "hc_auth_multisig"}
 if E.get("LIMITS_CHANGED"):
     excused |= {"max_program_words", "max_proof_bytes", "max_block_bytes", "max_call_envelope_bytes", "max_program_public_words"}
 moved = sorted(k for k in set(g) | set(g21) if k not in excused and g.get(k) != g21.get(k))
@@ -1850,8 +1933,8 @@ need({**{k: v for k, v in g["tokens"].items() if k != "incremental_root"}, "toke
      "the tokens section differs from chain 21's in more than the backings' locked amounts and incremental_root")
 # the sections that gain a field: chain 21's once the new field is taken out
 if perps is not None:
-    # genesis_root: asserted equal to chain 21's above (FIXTURE_ROOT_OK only for the selftest's fixture root)
-    skip = V10_FIELDS + ("genesis_root",)
+    # engine_hc and genesis_root: asserted to the set-11 values above (FIXTURE_ROOT_OK only for the selftest's fixture root)
+    skip = V10_FIELDS + ("engine_hc", "genesis_root")
     need(same_json({k: v for k, v in perps.items() if k not in skip}, {k: v for k, v in p21.items() if k not in skip}),
          f"perps differs from chain 21's in more than the new fields: {sorted(k for k in set(perps) | set(p21) if k not in skip and not same_json(perps.get(k), p21.get(k)))}")
 need(same_json({k: v for k, v in g["program_state"].items() if k not in ("refuse_panics", "reference_block_window")}, g21["program_state"]),
@@ -1877,7 +1960,7 @@ if perps:
     print(f"cut-chain22: perps: {m['symbol']} on zUSD (asset 1), lot {m['lot']}, tick {m['tick']}, {m['max_leverage']}x, maintenance {m['maintenance_bps']} bps, "
           f"fees {m['taker_fee_bps']}/{m['maker_fee_bps']} bps; max_tier {perps['max_tier']}, {perps['max_block_inputs']} inputs a block, "
           f"{perps['max_window_blocks']} blocks a proof, min deposit {perps['min_deposit']}; engine {perps['engine_hc'][:12]}…, genesis root {perps['genesis_root']} "
-          f"({'= chain 21' + chr(39) + 's' if perps['genesis_root'] == p21['genesis_root'] else 'FIXTURE_ROOT_OK: NOT chain 21' + chr(39) + 's'}; "
+          f"({'= the recorded set-11 root' if perps['genesis_root'] == PERP_GENESIS_ROOT_DECIDED else 'FIXTURE_ROOT_OK: NOT the recorded set-11 root'}; "
           f"{'chain 21' + chr(39) + 's exchange CARRIED (EMPTY)' if perps_carried_empty else 'chain 21' + chr(39) + 's exchange NOT carried (PERPS_STATE_NOT_CARRIED_OK=1)'}); NEW: bound_payouts {perps.get('bound_payouts', 'SKIPPED')}, sparse_windows {perps.get('sparse_windows', 'SKIPPED')}, "
           f"max_window_heights {perps.get('max_window_heights', 'SKIPPED')}, engine_program_log_height {perps.get('engine_program_log_height', 'SKIPPED')}, "
           f"max_pending_digests {perps.get('max_pending_digests', 'SKIPPED')}, "
@@ -1897,13 +1980,65 @@ for w in warnings:
 PY
 }
 
+# ══ the cut: the perps genesis root — the market list → perp-prover's genesis words → this build's root ═
+# The words are chain 21's (the same markets, the same engine image, perp-prover's state layout 2);
+# constraint set 11's Grain Poseidon2 hashes them to the RECORDED root PERP_GENESIS_ROOT_DECIDED
+# (a45d8fda…, 2026-11-20), and only to it: chain 21's set-9 root (a rand of set 9) and any other
+# value are refused before the section is written.
+perp_genesis_root_step() {
+  PERPS_STEP=markets py_perps
+  "$PERP_PROVER" genesis-state --markets "$TMP/perps-markets.json" --out "$TMP/perp-state0.json" \
+    || { echo "cut-chain22: \`$PERP_PROVER genesis-state\` failed" >&2; exit 1; }
+  PERP_GENESIS_ROOT=$("$WALLET" perp genesis-root --state "$TMP/perp-state0.json" | tail -1)
+  [[ $PERP_GENESIS_ROOT =~ ^[0-9a-f]{64}$ ]] || { echo "cut-chain22: \`rand perp genesis-root\` printed '$PERP_GENESIS_ROOT', not a root" >&2; exit 1; }
+  [ "$PERP_GENESIS_ROOT" != "$PERP_GENESIS_ROOT_CHAIN21" ] \
+    || { echo "cut-chain22: \`$WALLET perp genesis-root\` printed chain 21's set-9 root $PERP_GENESIS_ROOT_CHAIN21 — a rand of constraint set 9; chain 22 needs v0.8.7 (set 11)" >&2; exit 1; }
+  [ "$PERP_GENESIS_ROOT" = "$PERP_GENESIS_ROOT_DECIDED" ] \
+    || { echo "cut-chain22: \`$WALLET perp genesis-root\` printed $PERP_GENESIS_ROOT, not the recorded set-11 root $PERP_GENESIS_ROOT_DECIDED (the same markets on the same engine) — another perp-prover state layout or constraint set" >&2; exit 1; }
+  export PERP_GENESIS_ROOT
+}
+
+# ══ the cut, step 1e: the pinned state-proof keys (CON-601) — the shipped files → PERPS_STATE_PROOF_KEYS_JSON ═
+# This rand-node's own pins (`keygen-perp-vk --print-pinned production`: four "<file> <sha256>"
+# lines, none pending) name the files; each must be in PERPS_KEY_DIR with exactly that SHA-256 (by
+# shasum and by the node's own `--check`). Then `--genesis-json` writes the field from the files,
+# and RAND_PERPS_KEY_DIR points the loopback probe node at them. py_splice asserts the field again.
+perps_keys_step() {
+  local pins name want got n=0
+  "$NODE" keygen-perp-vk --help >/dev/null 2>&1 \
+    || { echo "cut-chain22: $NODE has no keygen-perp-vk — a build before CON-601's pinned state-proof keys; chain 22 pins them (owner, 2026-11-19)" >&2; exit 1; }
+  pins=$("$NODE" keygen-perp-vk --print-pinned production 2>/dev/null) \
+    || { echo "cut-chain22: \`$NODE keygen-perp-vk --print-pinned production\` failed" >&2; exit 1; }
+  [ -d "$PERPS_KEY_DIR" ] || { echo "cut-chain22: PERPS_KEY_DIR $PERPS_KEY_DIR is not a directory (the release's perp-vk-production-*.bin)" >&2; exit 1; }
+  while read -r name want; do
+    [ -n "$name" ] || continue
+    n=$((n + 1))
+    [[ $want =~ ^[0-9a-f]{64}$ ]] && [[ ! $want =~ ^0+$ ]] \
+      || { echo "cut-chain22: $NODE pins $name as '$want' — no key file yet (a build before the keys were generated)" >&2; exit 1; }
+    [ -f "$PERPS_KEY_DIR/$name" ] || { echo "cut-chain22: no key file $PERPS_KEY_DIR/$name (PERPS_KEY_DIR: the release's perp-vk-production-*.bin)" >&2; exit 1; }
+    got=$(shasum -a 256 "$PERPS_KEY_DIR/$name" | cut -c1-64)
+    [ "$got" = "$want" ] || { echo "cut-chain22: $PERPS_KEY_DIR/$name has sha256 $got, not this rand-node's pin $want" >&2; exit 1; }
+    [ "$("$NODE" keygen-perp-vk --check "$PERPS_KEY_DIR/$name" 2>/dev/null)" = "$want" ] \
+      || { echo "cut-chain22: \`$NODE keygen-perp-vk --check $PERPS_KEY_DIR/$name\` is not $want" >&2; exit 1; }
+  done <<<"$pins"
+  [ "$n" -eq 4 ] || { echo "cut-chain22: $NODE pins $n state-proof key files, not the four of chain 22 (tier 18, public heights 7–10)" >&2; exit 1; }
+  PERPS_KEY_PINS=$pins
+  PERPS_STATE_PROOF_KEYS_JSON=$("$NODE" keygen-perp-vk --genesis-json "$PERPS_KEY_DIR") \
+    || { echo "cut-chain22: \`$NODE keygen-perp-vk --genesis-json $PERPS_KEY_DIR\` failed" >&2; exit 1; }
+  RAND_PERPS_KEY_DIR=$(cd "$PERPS_KEY_DIR" && pwd)
+  export PERPS_KEY_PINS PERPS_STATE_PROOF_KEYS_JSON RAND_PERPS_KEY_DIR
+  echo "cut-chain22: perps state-proof keys: $n files in $PERPS_KEY_DIR, each this rand-node's pin → perps.state_proof_keys (CON-601)"
+}
+
 # ══ the field probe: the new fields are part of this rand-node's genesis hash ═══════════════════
 # Copies of the finished file each without one new thing, every one still a valid genesis (each
 # field is optional, with chain 21's meaning when absent): without `program_state.refuse_panics`,
 # without `multisig.max_accounts`, without `perps.bound_payouts`, without `perps.sparse_windows`,
 # `perps.max_window_heights` and `perps.max_pending_digests` together (the last two are refused
 # without the first), with `perps.max_window_heights` at another value in range (it cannot be
-# dropped alone), without `perps.engine_program_log_height`, without `perps.max_pending_digests`,
+# dropped alone), without `perps.engine_program_log_height` (and the pinned keys, refused without
+# it), without `perps.state_proof_keys`, with one of its digests changed (CON-601), without
+# `perps.max_pending_digests`,
 # and without `tokens.incremental_root`; and (#168 / #189) without `program_state.reference_block_window`
 # and the beacon together (the beacon is refused without the window), with the window at another
 # value in range, without the beacon alone, with `beacon.commit_delay_blocks` at another value, and
@@ -1946,7 +2081,15 @@ if "sparse_windows" in p:
     variant("perps.max_window_heights=" + str(mwh + 1 if mwh < 4096 else mwh - 1), ["perps", "max_window_heights"],
             set_to=mwh + 1 if mwh < 4096 else mwh - 1)
 if "engine_program_log_height" in p:
-    variant("perps.engine_program_log_height", ["perps", "engine_program_log_height"])
+    # CON-601: the pinned keys are refused without the engine pin, so they go with it.
+    variant("perps.engine_program_log_height" + ("+state_proof_keys" if "state_proof_keys" in p else ""),
+            ["perps", "engine_program_log_height"], *([["perps", "state_proof_keys"]] if "state_proof_keys" in p else []))
+if "state_proof_keys" in p:
+    # CON-601: without the pinned keys, and with one pinned digest changed (its last nibble).
+    variant("perps.state_proof_keys", ["perps", "state_proof_keys"])
+    d0 = p["state_proof_keys"][0]["sha256"]
+    variant("perps.state_proof_keys.0.sha256", ["perps", "state_proof_keys", 0, "sha256"],
+            set_to=d0[:-1] + "0123456789abcdef"[(int(d0[-1], 16) + 1) % 16])
 if "max_pending_digests" in p:
     variant("perps.max_pending_digests", ["perps", "max_pending_digests"])
 if "incremental_root" in g["tokens"]:
@@ -1997,11 +2140,12 @@ probe_fields() {   # <finished genesis> <its hash>
     ok=$((ok + 1))
   done
   [ "$ok" -eq "$want" ] || { echo "cut-chain22: the field probe ran $ok variant(s), expected $want" >&2; exit 1; }
-  # The full set: the audit-v10 eight, plus (#168 / #189) the window with the beacon, the window at
-  # another value, the beacon, its delay at another value, and one per commitment (VALIDATOR_COUNT, 25).
-  local full=$((8 + 4 + VALIDATOR_COUNT))
+  # The full set: the audit-v10 eight and CON-601's two, plus (#168 / #189) the window with the
+  # beacon, the window at another value, the beacon, its delay at another value, and one per
+  # commitment (VALIDATOR_COUNT, 25).
+  local full=$((8 + 2 + 4 + VALIDATOR_COUNT))
   [ -n "${PERPS_SKIPPED:-}${AUDIT_V10_SKIPPED:-}${BLOCK_CONTEXT_SKIPPED:-}" ] || [ "$ok" -eq "$full" ] \
-    || { echo "cut-chain22: the field probe ran $ok variant(s), expected $full (program_state.refuse_panics, multisig.max_accounts, perps.bound_payouts, perps.sparse_windows+max_window_heights+max_pending_digests, perps.max_window_heights at another value, perps.engine_program_log_height, perps.max_pending_digests, tokens.incremental_root; program_state.reference_block_window+beacon, the window at another value, beacon, beacon.commit_delay_blocks at another value, and each of the $VALIDATOR_COUNT commitments changed)" >&2; exit 1; }
+    || { echo "cut-chain22: the field probe ran $ok variant(s), expected $full (program_state.refuse_panics, multisig.max_accounts, perps.bound_payouts, perps.sparse_windows+max_window_heights+max_pending_digests, perps.max_window_heights at another value, perps.engine_program_log_height+state_proof_keys, perps.state_proof_keys, a pinned key digest changed, perps.max_pending_digests, tokens.incremental_root; program_state.reference_block_window+beacon, the window at another value, beacon, beacon.commit_delay_blocks at another value, and each of the $VALIDATOR_COUNT commitments changed)" >&2; exit 1; }
   echo "cut-chain22: the new fields ($ok variants probed) are part of this rand-node's genesis hash"
 }
 
@@ -2065,7 +2209,7 @@ else:
     want("perps collateral_asset", P.get("collateral_asset"), 1)
     want("perps markets", P.get("markets"), [{"id": 0, "symbol": "BTC-PERP", "lot": 100000, "tick": 100000000, "max_leverage": 20,
                                               "maintenance_bps": 250, "taker_fee_bps": 5, "maker_fee_bps": 2}])
-    want("perps engine_hc", P.get("engine_hc"), "f286a61171e274278ec8d18d7853e5f36799ed8dc5a3e31e0077ad89ef1d1573")
+    want("perps engine_hc", P.get("engine_hc"), "482215a8df02dff341265c38212c47e23fc8bfb3c3297afe9c385d6a63e65073")
     want("perps genesis_root", P.get("genesis_root"), gp["genesis_root"])
     want("perps proved_root (at launch)", P.get("proved_root"), gp["genesis_root"])
     want("perps proved_height (at launch)", P.get("proved_height"), 0)
@@ -2082,6 +2226,12 @@ else:
     want("perps max_window_heights (PERP-101)", P.get("max_window_heights"), gp.get("max_window_heights", 0))
     want("perps engine_program_log_height (CON-60)", P.get("engine_program_log_height"), gp.get("engine_program_log_height", 0))
     want("perps max_pending_digests (PERP-5)", P.get("max_pending_digests"), gp.get("max_pending_digests", 0))
+    # CON-601: the pinned state-proof keys, as the genesis lists them, and this node holding every one
+    # (loaded from its file at startup — a node that could not load one refused to start).
+    want("perps state_proof_keys (CON-601)", P.get("state_proof_keys"), gp.get("state_proof_keys", []))
+    nk = len(gp.get("state_proof_keys", []))
+    want("status perps_keys (CON-601)", (rpc("rand_status") or {}).get("perps_keys"),
+         {"source": "loaded" if nk else "absent", "keys": nk})
 # multisig — the create fee, the treasury seeded at genesis (its RAND carried from chain 21's register;
 # the node counts it as `multisig_issued`), 5 of 6, and the account cap (MSA-4; absent from
 # the served limits when the genesis has none, i.e. a DRY_RUN that skipped audit v10)
@@ -2105,7 +2255,7 @@ want("max_gas_price", L.get("max_gas_price"), "10000")
 want("max_byte_price", L.get("max_byte_price"), "80000")
 want("byte_load", L.get("byte_load"), "paying")
 want("gas_metering", L.get("gas_metering"), "circuit")
-want("bundle_gas_limit", L.get("bundle_gas_limit"), 20479)
+want("bundle_gas_limit", L.get("bundle_gas_limit"), 22527)
 want("adjust_bps", L.get("adjust_bps"), 1250)
 want("envelope_bytes", L.get("envelope_bytes"), 1860)
 want("hardening_v6", L.get("hardening_v6"), True)
@@ -2414,7 +2564,8 @@ json.dump({**{k: d[k] for k in ("collateral_asset", "max_tier", "max_window_bloc
            "engine_hc": E["EXPECT_ENGINE_HC"], "genesis_root": E["PERP_GENESIS_ROOT"], "markets": d["markets"],
            "bound_payouts": v10["bound_payouts"], "sparse_windows": v10["sparse_windows"],
            "max_window_heights": int(E["PERPS_MAX_WINDOW_HEIGHTS"]), "engine_program_log_height": int(E["ENGINE_PROGRAM_LOG_HEIGHT"]),
-           "max_pending_digests": int(E["PERPS_MAX_PENDING_DIGESTS"])},
+           "max_pending_digests": int(E["PERPS_MAX_PENDING_DIGESTS"]),
+           "state_proof_keys": json.loads(E["PERPS_STATE_PROOF_KEYS_JSON"])},
           open(f"{st}/tmp/perps.json", "w"))
 open(f"{st}/faucet-recipients-changed.txt", "w").write("someone rand1SELFTESTfaucetrecipientchanged\n")
 with open(f"{st}/tmp/token-notes.jsonl", "w") as f:
@@ -2478,8 +2629,22 @@ if [ "${SELFTEST:-}" = 1 ]; then
   # happy path is the real cut's (OPEN 3, OPEN 4 — the exchange is empty, carried).
   PERPS_MAX_WINDOW_HEIGHTS=256 MULTISIG_MAX_ACCOUNTS=1 ENGINE_PROGRAM_LOG_HEIGHT=14
   TREASURY_SALT=$(printf '5a%.0s' $(seq 32))
+  # CON-601: the pinned state-proof keys from this tree's committed files — what `keygen-perp-vk
+  # --genesis-json` and `--print-pinned production` print for them (the cut asks the rand-node).
+  read -r -d '' SPK_PY <<'PY' || true
+import hashlib, json, os, sys
+d, shapes = os.environ["PERPS_KEY_DIR"], json.loads(os.environ["PERPS_STATE_PROOF_SHAPES_DECIDED"])
+keys, pins = [], []
+for t, pg, i, pub, p2 in shapes:
+    name = f"perp-vk-production-t{t}-pg{pg}-in{i}-pub{pub}-p2h{p2}.bin"
+    h = hashlib.sha256(open(os.path.join(d, name), "rb").read()).hexdigest()
+    keys.append({"tier": t, "program_log_height": pg, "input_log_height": i, "public_log_height": pub, "poseidon2_log_height": p2, "sha256": h})
+    pins.append(f"{name} {h}")
+print(json.dumps(keys) if sys.argv[1] == "json" else "\n".join(pins))
+PY
+  PERPS_STATE_PROOF_KEYS_JSON=$(python3 -c "$SPK_PY" json); PERPS_KEY_PINS=$(python3 -c "$SPK_PY" pins)
   export ST FIXTURE_MODE=selftest FEE_RECIPIENT PERP_GENESIS_ROOT PERPS_MAX_WINDOW_HEIGHTS MULTISIG_MAX_ACCOUNTS ENGINE_PROGRAM_LOG_HEIGHT \
-    TREASURY_SALT FIXTURE_ROOT_OK=1
+    TREASURY_SALT FIXTURE_ROOT_OK=1 PERPS_STATE_PROOF_KEYS_JSON PERPS_KEY_PINS
   py_fixtures
   NEW_EMITTER=$(printf '0%.0s' $(seq 63))1
   export SNAPSHOT_FILE=$ST/snap/chain21-state.json BALANCES_FILE=$ST/snap/balances.json CHAIN21_GENESIS=$ST/genesis-chain21.json \
@@ -2520,16 +2685,20 @@ import json, os
 E = os.environ
 g = json.load(open(E["OUT"]))
 g21 = json.load(open(E["CHAIN21_GENESIS"]))
-assert g["chain_id"] == 22 and g["hc_auth"] == g21["hc_auth"] and g["hc_bundle"] == g21["hc_bundle"]
+assert g["chain_id"] == 22 and g["hc_auth"] == "8373994c200819c899236f822f0315efea213b3506a1df0785544a6c90a46078" != g21["hc_auth"] and g["hc_bundle"] == "00782b22b1efdf6bbc4d9001b27baa28c03e75732090c6ccd494ddd1365c141e" != g21["hc_bundle"]
 assert list(g) == list(g21) + ["beacon"], "every key chain 21 has, in chain 21's order — and the beacon, last"
 assert g["beacon"] == json.load(open(E["TMP"] + "/beacon.json")) and len(g["beacon"]["commitments"]) == 25 and g["beacon"]["commit_delay_blocks"] == 256
 assert g["fees"] == g21["fees"] == {"burn_base": True, "burn_floor": True}
-assert g["hc_auth_multisig"] == g21["hc_auth_multisig"] == "9705f8e2f1bc8561848b29cb8efd57c37e3e39788fa58a5f03304d8019668247" != g["hc_auth"]
+assert g["hc_auth_multisig"] == "41db73c507ab1f24ebe76d9c425b42a08ed9a02b4b1284d410502729ce6b9cd1" != g21["hc_auth_multisig"] == "9705f8e2f1bc8561848b29cb8efd57c37e3e39788fa58a5f03304d8019668247" and g["hc_auth_multisig"] != g["hc_auth"]
 p = g["perps"]
 assert list(p) == ["collateral_asset", "max_tier", "max_window_blocks", "max_block_inputs", "min_deposit", "engine_hc", "genesis_root", "markets",
-                   "bound_payouts", "sparse_windows", "max_window_heights", "engine_program_log_height", "max_pending_digests"], list(p)
-assert {k: v for k, v in p.items() if k not in ("genesis_root", "bound_payouts", "sparse_windows", "max_window_heights", "engine_program_log_height", "max_pending_digests")} \
-    == {k: v for k, v in g21["perps"].items() if k != "genesis_root"}
+                   "bound_payouts", "sparse_windows", "max_window_heights", "engine_program_log_height", "max_pending_digests", "state_proof_keys"], list(p)
+assert [(k["tier"], k["program_log_height"], k["input_log_height"], k["public_log_height"], k["poseidon2_log_height"]) for k in p["state_proof_keys"]] \
+    == [(18, 14, 16, 7, 20), (18, 14, 16, 8, 20), (18, 14, 16, 9, 20), (18, 14, 16, 10, 20)]
+assert [k["sha256"] for k in p["state_proof_keys"]] == [l.split()[1] for l in E["PERPS_KEY_PINS"].splitlines()]
+assert {k: v for k, v in p.items() if k not in ("engine_hc", "genesis_root", "bound_payouts", "sparse_windows", "max_window_heights", "engine_program_log_height", "max_pending_digests", "state_proof_keys")} \
+    == {k: v for k, v in g21["perps"].items() if k not in ("engine_hc", "genesis_root")}
+assert p["engine_hc"] == "482215a8df02dff341265c38212c47e23fc8bfb3c3297afe9c385d6a63e65073" != g21["perps"]["engine_hc"] == "f286a61171e274278ec8d18d7853e5f36799ed8dc5a3e31e0077ad89ef1d1573"
 assert p["genesis_root"] == "ab" * 32
 assert p["bound_payouts"] is True and p["sparse_windows"] is True and p["max_window_heights"] == 256 and p["engine_program_log_height"] == 14
 assert p["max_pending_digests"] == 65536
@@ -2545,7 +2714,7 @@ assert list(g["program_state"]) == ["cell_fee", "refuse_panics", "reference_bloc
 assert g["tokens"] == {**g21["tokens"], "incremental_root": True}
 assert g["testnet"] is True and g["binding_domain"] == 1 and g["proof_window_blocks"] == 1024
 assert (g["max_proof_bytes"], g["max_block_bytes"]) == (g21["max_proof_bytes"], g21["max_block_bytes"]) == (6291456, 19922944)
-assert g["gas"] == g21["gas"] and g["gas"]["dynamic"]["target_block_bytes"] == 9961472 and g["gas"]["dynamic"]["byte_load"] == "paying"
+assert g["gas"] == {**g21["gas"], "bundle_gas_limit": 22527} and g21["gas"]["bundle_gas_limit"] == 20479 and g["gas"]["dynamic"]["target_block_bytes"] == 9961472 and g["gas"]["dynamic"]["byte_load"] == "paying"
 assert g["bridge"]["rotation"] == g21["bridge"]["rotation"] == {"delay_secs": 86400, "needs_possession": True}
 assert g["bridge"]["fees"] == g21["bridge"]["fees"] and g["bridge"]["fees"]["mint_bps"] == g["bridge"]["fees"]["burn_bps"] == 10
 assert list(g["bridge"]) == list(g21["bridge"])
@@ -2561,23 +2730,24 @@ assert sum(n["amount"] for n in g["alloc"] if n["opening"].get("asset", 0) == 0)
 assert sum(n["amount"] for n in g["alloc"] if n["opening"].get("asset", 0) == 1) == 10000199900
 assert all(sum(len(v) // 2 for v in n["envelope"].values()) == 1860 for n in g["alloc"])
 PY
-    then ok "the chain-21 fixture assembles into a chain-22 genesis: chain 21's keys in chain 21's order and every section chain 21's, plus program_state.refuse_panics true (PST-1), perps bound_payouts true (PERP-6), sparse_windows true + max_window_heights 256 (PERP-101), engine_program_log_height 14 (CON-60), max_pending_digests 65536 (PERP-5), no initial_collateral, multisig.max_accounts 1 (MSA-4), tokens.incremental_root true, program_state.reference_block_window 256 (#168), the beacon last with 25 commitments and delay 256 (#189); 25 validators, archive2 dropped; the treasury 5 of 6 with six new signers (none of chain 21's), fresh salt, 100000 RAND carried from chain 21's multisig register (= multisig_rand_held), perps carried (empty) with no override; floors 3/5/3/7, burn sequence 14, 100.001999 zUSD locked on four backings"; else bad "assembled genesis content"; fi
+    then ok "the chain-21 fixture assembles into a chain-22 genesis: chain 21's keys in chain 21's order and every section chain 21's, plus program_state.refuse_panics true (PST-1), perps bound_payouts true (PERP-6), sparse_windows true + max_window_heights 256 (PERP-101), engine_program_log_height 14 (CON-60), max_pending_digests 65536 (PERP-5), the four pinned tier-18 state-proof keys at the committed files' digests (CON-601), no initial_collateral, multisig.max_accounts 1 (MSA-4), tokens.incremental_root true, program_state.reference_block_window 256 (#168), the beacon last with 25 commitments and delay 256 (#189); 25 validators, archive2 dropped; the treasury 5 of 6 with six new signers (none of chain 21's), fresh salt, 100000 RAND carried from chain 21's multisig register (= multisig_rand_held), perps carried (empty) with no override; floors 3/5/3/7, burn sequence 14, 100.001999 zUSD locked on four backings"; else bad "assembled genesis content"; fi
   else bad "the happy path refused"; fi
   cp "$ST/out.json" "$ST/good.json"
 
   export -f py_validators py_splice py_treasury py_variants py_beacon
-  # The field probe's variants (the probe itself needs a rand-node: DRY_RUN runs it): 37 on the
-  # finished file — the audit-v10 eight, the window (+ beacon) and the window at 257, the beacon and
+  # The field probe's variants (the probe itself needs a rand-node: DRY_RUN runs it): 39 on the
+  # finished file — the audit-v10 eight, CON-601's two, the window (+ beacon) and the window at 257, the beacon and
   # its delay at 257, each of the 25 commitments changed — each a different file, each still with
   # chain 21's other fields.
   rm -rf "$ST/vtmp"; mkdir -p "$ST/vtmp"
-  if OUT=$ST/good.json TMP=$ST/vtmp bash -c py_variants && [ "$(cat "$ST/vtmp/variants/count")" = 37 ] \
+  if OUT=$ST/good.json TMP=$ST/vtmp bash -c py_variants && [ "$(cat "$ST/vtmp/variants/count")" = 39 ] \
      && python3 - "$ST/vtmp/variants" "$ST/good.json" <<'PY'
 import glob, json, os, sys
 d, g = sys.argv[1], json.load(open(sys.argv[2]))
 names = sorted(os.path.basename(f)[:-5] for f in glob.glob(d + "/*.json"))
 assert names == sorted(["program_state.refuse_panics", "multisig.max_accounts", "perps.bound_payouts", "perps.sparse_windows+max_window_heights+max_pending_digests",
-                        "perps.max_window_heights=257", "perps.engine_program_log_height", "perps.max_pending_digests", "tokens.incremental_root",
+                        "perps.max_window_heights=257", "perps.engine_program_log_height+state_proof_keys", "perps.max_pending_digests", "tokens.incremental_root",
+                        "perps.state_proof_keys", "perps.state_proof_keys.0.sha256",
                         "program_state.reference_block_window+beacon", "program_state.reference_block_window=257", "beacon", "beacon.commit_delay_blocks=257"]
                        + [f"beacon.commitments.{i:02d}" for i in range(25)]), names
 v = json.load(open(d + "/program_state.reference_block_window+beacon.json"))
@@ -2597,11 +2767,17 @@ assert not {"sparse_windows", "max_window_heights", "max_pending_digests"} & set
 v = json.load(open(d + "/perps.max_pending_digests.json"))
 assert "max_pending_digests" not in v["perps"] and v["perps"]["sparse_windows"] is True and v["perps"]["max_window_heights"] == 256
 assert json.load(open(d + "/perps.max_window_heights=257.json"))["perps"]["max_window_heights"] == 257
+v = json.load(open(d + "/perps.engine_program_log_height+state_proof_keys.json"))["perps"]
+assert not {"engine_program_log_height", "state_proof_keys"} & set(v) and v["max_pending_digests"] == 65536
+v = json.load(open(d + "/perps.state_proof_keys.json"))["perps"]
+assert "state_proof_keys" not in v and v["engine_program_log_height"] == 14
+v = json.load(open(d + "/perps.state_proof_keys.0.sha256.json"))["perps"]["state_proof_keys"]
+assert v[1:] == g["perps"]["state_proof_keys"][1:] and v[0]["sha256"] != g["perps"]["state_proof_keys"][0]["sha256"] and v[0]["sha256"][:-1] == g["perps"]["state_proof_keys"][0]["sha256"][:-1]
 for f in glob.glob(d + "/*.json"):
     x = json.load(open(f))
     assert x != g and set(x) - {"beacon"} == set(g) - {"beacon"}, f   # only the beacon's own variants drop a top-level key
 PY
-  then ok "the field probe writes its 37 variants (refuse_panics, max_accounts, bound_payouts, sparse_windows+max_window_heights+max_pending_digests, max_window_heights 257, engine_program_log_height, max_pending_digests, incremental_root; reference_block_window+beacon, reference_block_window 257, beacon, commit_delay_blocks 257, and each of the 25 commitments changed alone to a value no validator holds)"
+  then ok "the field probe writes its 39 variants (refuse_panics, max_accounts, bound_payouts, sparse_windows+max_window_heights+max_pending_digests, max_window_heights 257, engine_program_log_height+state_proof_keys, state_proof_keys, a pinned key digest changed, max_pending_digests, incremental_root; reference_block_window+beacon, reference_block_window 257, beacon, commit_delay_blocks 257, and each of the 25 commitments changed alone to a value no validator holds)"
   else bad "field probe variants: $(find "$ST/vtmp/variants" -name '*.json' 2>&1 | sed 's|.*/||' | tr '\n' ' ')"; fi
 
   # AUDIT_V10_SKIPPED (DRY_RUN's path on a build before v0.8.2): the base and the section files as
@@ -2613,7 +2789,7 @@ PY
 import json, sys
 b, p, m = (json.load(open(f)) for f in sys.argv[1:4])
 del b["program_state"]["refuse_panics"]; b["multisig"] = m
-for k in ("bound_payouts", "sparse_windows", "max_window_heights", "engine_program_log_height", "max_pending_digests"):
+for k in ("bound_payouts", "sparse_windows", "max_window_heights", "engine_program_log_height", "max_pending_digests", "state_proof_keys"):
     del p[k]
 json.dump(b, open(sys.argv[1], "w")); json.dump(p, open(sys.argv[2], "w"))
 PY
@@ -2699,7 +2875,9 @@ PY
   refuse "max_pending_digests before engine_program_log_height" "$PJ" 'e = d.pop("engine_program_log_height"); d["engine_program_log_height"] = e' "out of PerpsConfig's order"
   refuse "the new perps fields out of order"       "$PJ" 'd = {"bound_payouts": d.pop("bound_payouts"), **d}' "out of PerpsConfig's order"
   refuse "a PERPS_V10_JSON off the decision"       "$S" 'pass' "PERPS_V10_JSON is not the decided" PERPS_V10_JSON='{"bound_payouts": false, "sparse_windows": true}'
-  refuse "a genesis root not chain 21's"           "$S" 'pass' "the same markets on the same engine must give" FIXTURE_ROOT_OK=
+  refuse "a genesis root not the recorded set-11 root" "$S" 'pass' "is not the recorded set-11 root" FIXTURE_ROOT_OK=
+  refuse "chain 21's set-9 genesis root"           "$PJ" 'd["genesis_root"] = "da0e3a53d93e50ec03fa40c6d2bd3dad8b9c7b4f542175e86a1dea567cbb9846"' "a rand of constraint set 9 derived it" PERP_GENESIS_ROOT=da0e3a53d93e50ec03fa40c6d2bd3dad8b9c7b4f542175e86a1dea567cbb9846
+  refuse "chain 21's set-9 engine hc"              "$PJ" 'd["engine_hc"] = "f286a61171e274278ec8d18d7853e5f36799ed8dc5a3e31e0077ad89ef1d1573"' "is not the pinned engine"
   # MSA-4: multisig.max_accounts (in the base, as the --multisig file holds it)
   refuse "no multisig.max_accounts"                "$B" 'del d["multisig"]["max_accounts"]' "not the file this cut wrote"
   refuse "max_accounts not the operator's"         "$S" 'pass' "not MULTISIG_MAX_ACCOUNTS '2'" MULTISIG_MAX_ACCOUNTS=2
@@ -2856,6 +3034,16 @@ PY
   refuse "maintenance 500 bps at 20x (= initial)"  "$PJ" 'd["markets"][0]["maintenance_bps"] = 500' "at or above the initial margin 500 bps"
   refuse "max_block_inputs 25"                     "$PJ" 'd["max_block_inputs"] = 25' "max_block_inputs is 25, not 24"
   refuse "max_tier 20"                             "$PJ" 'd["max_tier"] = 20' "max_tier is 20, not 18"
+  # CON-601: the pinned state-proof keys — the four canonical shapes, each at its shipped file's digest
+  refuse "no perps.state_proof_keys (CON-601)"      "$PJ" 'del d["state_proof_keys"]' "perps carries the fields"
+  refuse "a pinned key digest off its file"          "$PJ" 'd["state_proof_keys"][2]["sha256"] = "cd" * 32' "but the shipped file"
+  refuse "three pinned keys, not four"               "$PJ" 'd["state_proof_keys"].pop()' "not the four canonical tier-18 shapes"
+  refuse "a pinned key at tier 16"                   "$PJ" 'd["state_proof_keys"][0]["tier"] = 16' "not the four canonical tier-18 shapes"
+  refuse "a pinned key at poseidon2 height 18"       "$PJ" 'd["state_proof_keys"][3]["poseidon2_log_height"] = 18' "not the four canonical tier-18 shapes"
+  refuse "the pinned keys out of order"              "$PJ" 'd["state_proof_keys"].reverse()' "not the four canonical tier-18 shapes"
+  refuse "a pinned key with a stray field"           "$PJ" 'd["state_proof_keys"][0]["note"] = 1' "not the four canonical tier-18 shapes"
+  refuse "a key file this rand-node does not pin"    "$PJ" 'pass' "not this rand-node's pin" PERPS_KEY_PINS="$(sed '1s/ .*/ '"$(printf 'ee%.0s' $(seq 32))"'/' <<<"$PERPS_KEY_PINS")"
+  refuse "no key file in PERPS_KEY_DIR"              "$PJ" 'pass' "no key file" PERPS_KEY_DIR="$ST/no-keys"
   refuse "a tick at nine decimals (10^9 = \$10)"   "$PJ" 'd["markets"][0]["tick"] = 1000000000' "perps is not chain 21's section: ['markets'] differ"
   refuse "min_deposit at nine decimals (10 zUSD)"  "$PJ" 'd["min_deposit"] = 1000000000' "perps is not chain 21's section: ['min_deposit'] differ"
   refuse "an unknown perps field"                  "$PJ" 'd["extra"] = 1' "perps carries the fields"
@@ -2894,7 +3082,7 @@ d["supply"]["total_supply"] = str(2**66); json.dump(d, open(sys.argv[4], "w"))' 
   refuse "hc_auth_multisig absent"                 "$B" 'del d["hc_auth_multisig"]' "--auth-multisig-guest did not take"
   refuse "hc_auth_multisig not this build's"       "$B" 'd["hc_auth_multisig"] = "cd" * 32' "is not this build's multisig auth guest"
   refuse "hc_auth_multisig equal to hc_auth"       "$B" 'd["hc_auth_multisig"] = d["hc_auth"]' "must differ from hc_auth"
-  refuse "hc_auth missing beside hc_auth_multisig" "$B" 'del d["hc_auth"]' "is not chain 21's auth guest"
+  refuse "hc_auth missing beside hc_auth_multisig" "$B" 'del d["hc_auth"]' "is not constraint set 11's auth guest"
   refuse "max_proof_bytes under 4 MiB"             "$B" 'd["max_proof_bytes"] = 4194303' "cannot hold a multisig auth proof"
   refuse "hc_auth_multisig not what the node wrote" "$S" 'pass' "is not what this rand-node wrote" HC_AUTH_MULTISIG_REPORTED="$(printf 'cd%.0s' $(seq 32))"
   # the treasury file itself (py_treasury), each refusal before a section is written
@@ -2999,7 +3187,7 @@ d["supply"]["total_supply"] = str(2**66); json.dump(d, open(sys.argv[4], "w"))' 
   elif grep -qF "sealed in the legacy format" "$ST/log"; then ok "a legacy (1 348-B) zUSD note — $(grep -o 'cut-chain22: .*' "$ST/log" | tail -1 | cut -c1-110)"
   else bad "a legacy (1 348-B) zUSD note — wrong refusal: $(tail -1 "$ST/log")"; fi
   mv "$TN.orig" "$TN"
-  refuse "hc_auth not chain 21's"            "$G" 'd["hc_auth"] = "cd" * 32' "is not chain 21's auth guest"
+  refuse "hc_auth not set 11's"              "$G" 'd["hc_auth"] = "cd" * 32' "is not constraint set 11's auth guest"
   # the bridge: emitters, floors, custody
   refuse "a snapshot read at other emitters" "$S" 'd["source"]["emitters"]["2"] = "00" * 31 + "01"' "other emitters than this cut lists"
   refuse "a guardian rotation on chain 21"   "$S" 'd["bridge"]["guardian_set_index"] = 2' "BRIDGE_ROTATED=1"
@@ -3067,10 +3255,11 @@ bk = ({"enabled": True, "height": 0, "value": "5e" * 32, "commit_delay_blocks": 
                       for c in sorted(b["commitments"], key=lambda c: c["validator"])]} if b else {"enabled": False})
 json.dump({"rand_getGenesisHash": "ab" * 32,
            "rand_getBlockContext": ctx, "rand_getBeacon": bk,
-           "rand_status": {"chain_id": 22, "hc_bundle": g["hc_bundle"], "hc_auth": g["hc_auth"], "hc_auth_multisig": g["hc_auth_multisig"], "fri_profile": "production"},
+           "rand_status": {"chain_id": 22, "hc_bundle": g["hc_bundle"], "hc_auth": g["hc_auth"], "hc_auth_multisig": g["hc_auth_multisig"], "fri_profile": "production",
+                           "perps_keys": {"source": "loaded" if p.get("state_proof_keys") else "absent", "keys": len(p.get("state_proof_keys", []))}},
            "rand_getLimits": {"proof_window_blocks": 1024, "binding_domain": 1, "testnet": True, "admission_by_vote": True, "slashing": None,
                               "max_gas_price": d["max_gas_price"], "max_byte_price": d["max_byte_price"], "byte_load": "paying",
-                              "gas_metering": "circuit", "bundle_gas_limit": 20479, "adjust_bps": 1250, "envelope_bytes": 1860,
+                              "gas_metering": "circuit", "bundle_gas_limit": 22527, "adjust_bps": 1250, "envelope_bytes": 1860,
                               "hardening_v6": True, "hc_auth": g["hc_auth"], "max_proof_bytes": g["max_proof_bytes"], "max_block_bytes": g["max_block_bytes"],
                               "hc_auth_multisig": g["hc_auth_multisig"],
                               "program_state": pl,
@@ -3082,6 +3271,7 @@ json.dump({"rand_getGenesisHash": "ab" * 32,
            "rand_getPerps": {"enabled": True, "collateral_asset": 1, "max_tier": 18, "max_window_blocks": 64,
                              "sparse_windows": p.get("sparse_windows", False), "max_window_heights": p.get("max_window_heights", 0),
                              "engine_program_log_height": p.get("engine_program_log_height", 0), "max_pending_digests": p.get("max_pending_digests", 0),
+                             "state_proof_keys": p.get("state_proof_keys", []),
                              "max_block_inputs": 24, "min_deposit": "100000000",
                              "engine_hc": p["engine_hc"], "genesis_root": p["genesis_root"], "markets": p["markets"],
                              "proved_root": p["genesis_root"], "proved_height": 0, "head_height": 0, "pending_heights": [], "medians": [],
@@ -3145,6 +3335,8 @@ json.dump(a, open(p,'w'))" "$ST/answers.json"
            'P["accounts"] = 1' 'P["pending_withdrawals"] = 1' 'P["sparse_windows"] = False' 'P["max_window_heights"] = 0' 'P["max_window_heights"] = 64' \
            'P["engine_program_log_height"] = 0' 'P["engine_program_log_height"] = 15' \
            'P["max_pending_digests"] = 0' 'P["max_pending_digests"] = 1048576' 'del P["max_pending_digests"]' \
+           'P["state_proof_keys"] = []' 'del P["state_proof_keys"]' 'P["state_proof_keys"].pop()' 'P["state_proof_keys"][0]["sha256"] = "cd" * 32' \
+           'a["rand_status"]["perps_keys"] = {"source": "absent", "keys": 0}' 'a["rand_status"]["perps_keys"]["keys"] = 3' 'del a["rand_status"]["perps_keys"]' \
            'L["multisig"] = None' 'L["multisig"]["create_fee"] = "0"' 'del L["multisig"]["max_accounts"]' 'L["multisig"]["max_accounts"] = 2' \
            'S["multisig_issued"] = "0"' 'M["threshold"] = 3' 'M["threshold"] = 2' 'M["signers"].reverse()' 'a["rand_getMultisig"] = None' \
            'T["incremental_root"] = False' 'del T["incremental_root"]' 'T["bound_note_value"] = False' \
@@ -3209,8 +3401,11 @@ json.dump(a, open(p,'w'))" "$ST/answers.json"
   if [ "$(deploy/check-constraint-set.sh --chain "$CHAIN_ID" --genesis-hash "$AB" --print-row 2>/dev/null)" = "$WANT_ROW" ] && [[ "$N" =~ ^[0-9]+$ ]]; then
     ok "check-constraint-set.sh --print-row prints the row alone: $WANT_ROW"
   else bad "--print-row printed '$(deploy/check-constraint-set.sh --chain "$CHAIN_ID" --genesis-hash "$AB" --print-row 2>&1 | tail -1)', not '$WANT_ROW'"; fi
-  if deploy/check-constraint-set.sh --chain 21 --genesis-hash "$CHAIN21_HASH" --binary-set "$N" >"$ST/log" 2>&1 && grep -q 'chain 21, .* — the row is there' "$ST/log"; then
-    ok "the committed table holds chain 21's row at this tree's constraint set $N"
+  # Constraint set 11 is chain 22's alone: chain 21's row stays at set 9, and this tree's set-$N
+  # build is refused it (check-constraint-set.sh wants the row at the tree's set and finds 9).
+  if grep -qF "    (21, \"$CHAIN21_HASH\", 9)," "$CS" && ! deploy/check-constraint-set.sh --chain 21 --genesis-hash "$CHAIN21_HASH" --binary-set "$N" >"$ST/log" 2>&1 \
+     && grep -qF "found for chain 21 or that hash: 21 $CHAIN21_HASH 9" "$ST/log"; then
+    ok "the committed table holds chain 21's row at constraint set 9, and this tree (set $N) is not chain 21's"
   else bad "chain 21's row in the committed table: $(tail -1 "$ST/log")"; fi
   if row_check "$ST/cs-row.rs" --binary-set "$N"; then ok "a table with chain $CHAIN_ID's row at set $N is accepted"; else bad "a table with the row: $(tail -2 "$ST/log")"; fi
   for c in "none:a table without chain $CHAIN_ID's row" "wrongset:the row under another constraint set ($((N - 1)))" "otherhash:a chain-$CHAIN_ID row with another genesis hash" \
@@ -3296,7 +3491,7 @@ json.dump(a, open(p,'w'))" "$ST/answers.json"
   bash_refuses "BEACON_COMMIT_DELAY_BLOCKS=1048577" "is outside 1..=1048576" BEACON_COMMIT_DELAY_BLOCKS=1048577 --
   bash_refuses "BEACON_COMMIT_DELAY_BLOCKS empty" "is outside 1..=1048576" BEACON_COMMIT_DELAY_BLOCKS= --
   bash_refuses "an EXPECT_ENGINE_PROGRAM_LOG_HEIGHT off the pin" "is not the pinned engine's program height" EXPECT_ENGINE_PROGRAM_LOG_HEIGHT=15 --
-  bash_refuses "an EXPECT_HC_AUTH_MULTISIG off chain 21's guest" "is not chain 21's multisig auth guest" EXPECT_HC_AUTH_MULTISIG="$(printf 'cd%.0s' $(seq 32))" --
+  bash_refuses "an EXPECT_HC_AUTH_MULTISIG off chain 21's guest" "is not constraint set 11's multisig auth guest" EXPECT_HC_AUTH_MULTISIG="$(printf 'cd%.0s' $(seq 32))" --
   bash_refuses "an EXPECT_ENGINE_HC off the decided engine" "is not the decided engine" EXPECT_ENGINE_HC="$(printf 'cd%.0s' $(seq 32))" --
   # A genesis dir holding chain 21's committed file and not chain 22's (once chain 22 is cut,
   # deploy/ holds genesis-chain22.json and `refuse_reused_chain_id 22` would fire first).
@@ -3354,6 +3549,50 @@ json.dump(a, open(p,'w'))" "$ST/answers.json"
   fp_case "a missing fee recipient file is refused" refuse "no fee recipient file" FAKE_WALLET="$ST/fake-rand" FEE_RECIPIENT_FILE="$ST/none.txt"
   fp_case "a fee recipient file of two lines is refused" refuse "more than one line" FAKE_WALLET="$ST/fake-rand" FEE_RECIPIENT_FILE="$ST/fee-two.txt"
   fp_case "a wallet that prints no fingerprint is refused" refuse "printed no fingerprint" FAKE_WALLET=/usr/bin/true FEE_RECIPIENT_FILE="$ST/fee-ok.txt"
+  # CON-601: perps_keys_step against a fake rand-node whose `keygen-perp-vk` answers from the
+  # committed files (--print-pinned: PERPS_KEY_PINS, or FAKE_PINS; --check: the file's sha256;
+  # --genesis-json: PERPS_STATE_PROOF_KEYS_JSON), and a copy of the files with one byte changed.
+  # shellcheck disable=SC2016  # the fake's own source
+  printf '#!/usr/bin/env bash\n[ "$1" = keygen-perp-vk ] || exit 1\n[ -z "${FAKE_NO_PVK:-}" ] || exit 2\ncase "$2" in\n  --help) echo usage;;\n  --print-pinned) printf "%%s\\n" "${FAKE_PINS:-$PERPS_KEY_PINS}";;\n  --check) shasum -a 256 "$3" 2>/dev/null | cut -c1-64;;\n  --genesis-json) printf "%%s\\n" "$FAKE_SPK_JSON";;\n  *) exit 1;;\nesac\n' > "$ST/fake-pvk-node"; chmod +x "$ST/fake-pvk-node"
+  mkdir -p "$ST/pvk-bad"; cp "$PERPS_KEY_DIR"/perp-vk-production-*.bin "$ST/pvk-bad/"
+  f=$(ls "$ST/pvk-bad"/perp-vk-production-t18-pg14-in16-pub8-p2h20.bin); printf '\001' | dd of="$f" bs=1 seek=100 conv=notrunc 2>/dev/null
+  export -f perps_keys_step
+  pk_case() {  # <description> <want ok|refuse> <phrase> <env…>
+    local what=$1 want=$2 phrase=$3; shift 3
+    # shellcheck disable=SC2016  # expanded by the child bash
+    if env NODE="$ST/fake-pvk-node" FAKE_SPK_JSON="$PERPS_STATE_PROOF_KEYS_JSON" PERPS_STATE_PROOF_KEYS_JSON= RAND_PERPS_KEY_DIR= "$@" bash -c 'perps_keys_step && [ -n "$PERPS_STATE_PROOF_KEYS_JSON" ] && [ -d "$RAND_PERPS_KEY_DIR" ] && echo "json $PERPS_STATE_PROOF_KEYS_JSON"' >"$ST/log" 2>&1; then r=ok; else r=refuse; fi
+    if [ "$r" = "$want" ] && grep -qF -- "$phrase" "$ST/log"; then ok "perps_keys_step: $what — $(grep -o 'cut-chain22: .*' "$ST/log" | tail -1 | cut -c1-110)"
+    else bad "perps_keys_step: $what — got $r: $(tail -1 "$ST/log")"; fi
+  }
+  pk_case "the committed files, each this rand-node's pin" ok "4 files in"
+  pk_case "a file with one byte changed" refuse "not this rand-node's pin" PERPS_KEY_DIR="$ST/pvk-bad"
+  pk_case "a rand-node whose pins are pending (no key files yet)" refuse "no key file yet" FAKE_PINS="$(sed 's/ .*/ '"$(printf '0%.0s' $(seq 64))"'/' <<<"$PERPS_KEY_PINS")"
+  pk_case "a rand-node pinning three files" refuse "pins 3 state-proof key files, not the four" FAKE_PINS="$(head -3 <<<"$PERPS_KEY_PINS")"
+  pk_case "a missing PERPS_KEY_DIR" refuse "is not a directory" PERPS_KEY_DIR="$ST/no-keys"
+  mkdir -p "$ST/pvk-three"; cp "$PERPS_KEY_DIR"/perp-vk-production-t18-pg14-in16-pub{7,8,9}-p2h20.bin "$ST/pvk-three/"
+  pk_case "a PERPS_KEY_DIR without one of the files" refuse "no key file" PERPS_KEY_DIR="$ST/pvk-three"
+  pk_case "a rand-node without keygen-perp-vk (before CON-601)" refuse "has no keygen-perp-vk" FAKE_NO_PVK=1
+  # The perps genesis root step against a fake perp-prover (writes 26 words; FAKE_PROVER_FAIL fails
+  # it) and a fake rand whose `perp genesis-root` prints FAKE_ROOT: only the recorded set-11 root passes.
+  # shellcheck disable=SC2016  # the fakes' own source
+  printf '#!/usr/bin/env bash\n[ -z "${FAKE_PROVER_FAIL:-}" ] || exit 3\n[ "$1" = genesis-state ] && [ -s "$3" ] || exit 1\necho "[2,0,0,0,0,0,0,1,0,100000,0,100000000,0,20,250,5,2,0,0,0,0,0,0,0,0,0]" > "$5"\n' > "$ST/fake-root-prover"
+  printf '#!/usr/bin/env bash\n[ "$1 $2" = "perp genesis-root" ] && [ -s "$4" ] || exit 1\necho "$FAKE_ROOT"\n' > "$ST/fake-root-rand"
+  chmod +x "$ST/fake-root-prover" "$ST/fake-root-rand"
+  export -f perp_genesis_root_step py_perps
+  gr_case() {  # <description> <want ok|refuse> <phrase> <env…>
+    local what=$1 want=$2 phrase=$3 r; shift 3
+    mkdir -p "$ST/gr-tmp"
+    # shellcheck disable=SC2016  # expanded by the child bash
+    if env TMP="$ST/gr-tmp" PERP_PROVER="$ST/fake-root-prover" WALLET="$ST/fake-root-rand" PERP_GENESIS_ROOT= "$@" \
+         bash -c 'perp_genesis_root_step && echo "root $PERP_GENESIS_ROOT"' >"$ST/log" 2>&1; then r=ok; else r=refuse; fi
+    if [ "$r" = "$want" ] && grep -qF -- "$phrase" "$ST/log"; then ok "perp_genesis_root_step: $what — $(tail -1 "$ST/log" | cut -c1-110)"
+    else bad "perp_genesis_root_step: $what — got $r: $(tail -1 "$ST/log")"; fi
+  }
+  gr_case "the recorded set-11 root" ok "root $PERP_GENESIS_ROOT_DECIDED" FAKE_ROOT="$PERP_GENESIS_ROOT_DECIDED"
+  gr_case "chain 21's set-9 root (a rand of set 9)" refuse "a rand of constraint set 9" FAKE_ROOT="$PERP_GENESIS_ROOT_CHAIN21"
+  gr_case "another root" refuse "not the recorded set-11 root" FAKE_ROOT="$(printf 'cd%.0s' $(seq 32))"
+  gr_case "no root printed" refuse "not a root" FAKE_ROOT=
+  gr_case "a failing perp-prover" refuse "genesis-state\` failed" FAKE_PROVER_FAIL=1 FAKE_ROOT="$PERP_GENESIS_ROOT_DECIDED"
   # A fake rand-node: `genesis --help` lists every flag the cut needs but FAKE_DROP (one flag left
   # out) and --program-state-refuse-panics only unless FAKE_V10_FLAG is set empty; `--version` says
   # FAKE_VERSION (default 0.8.5); nothing else answers (init prints no hash). A fake perp-prover and engine image.
@@ -3627,8 +3866,8 @@ require_cut_record_mentions "$CUT_RECORD" 'PERP-101|sparse.windows|max_window_he
 # build that key (3.56 GB resident measured; docs/perps.md "the node's tier cap"), and no node
 # policy can refuse a valid block. Decided 2026-11-19 (OPEN 9): validators load the pinned
 # tier-18 state-proof key (genesis pin), never build it; the record says so.
-# TODO(CON-601): when the pinned-key genesis field exists, the cut asserts it (py_splice, at the
-# perps max_tier check); until then this record line is the only CON-601 gate.
+# The field itself, perps.state_proof_keys, is asserted by py_splice (at the perps max_tier check)
+# from the shipped files (perps_keys_step), probed in the hash and read back by check-limits.
 require_cut_record_mentions "$CUT_RECORD" 'CON-601|pinned.*state.proof.key|validator.memory|key.build' "CON-601 (validators load the pinned tier-18 state-proof key, genesis pin, never build it: monorepo#23)" reason carries clients
 # The two features the owner added on 2026-11-18: the record says the chain carries them.
 require_cut_record_mentions "$CUT_RECORD" '#168|#184|reference.block|block.context' "the EVM block context (#168, program_state.reference_block_window)" reason carries
@@ -3805,6 +4044,9 @@ T21=$(treasury_id_of "$CHAIN21_GENESIS")
 [ "$T21" = "$CHAIN21_TREASURY_ID" ] || { echo "cut-chain22: $NODE derives chain 21's treasury id '${T21:-nothing}', not CHAIN21_TREASURY_ID $CHAIN21_TREASURY_ID" >&2; exit 1; }
 echo "cut-chain22: chain 21's treasury id ${T21:0:12}… (rand-node multisig id over its genesis account)"
 
+# CON-601: the pinned state-proof keys, from the shipped files (before the perps section is written).
+[ -n "${PERPS_SKIPPED:-}${AUDIT_V10_SKIPPED:-}" ] || perps_keys_step
+
 py_validators
 
 # The beacon (#189): BEACON_TSV joined by name with the validators, at the addresses their public
@@ -3825,11 +4067,7 @@ export TREASURY_ID
 
 # The perps section: the market list → perp-prover's genesis words → this build's root.
 if [ -z "${PERPS_SKIPPED:-}" ]; then
-  PERPS_STEP=markets py_perps
-  "$PERP_PROVER" genesis-state --markets "$TMP/perps-markets.json" --out "$TMP/perp-state0.json"
-  PERP_GENESIS_ROOT=$("$WALLET" perp genesis-root --state "$TMP/perp-state0.json" | tail -1)
-  [[ $PERP_GENESIS_ROOT =~ ^[0-9a-f]{64}$ ]] || { echo "cut-chain22: \`rand perp genesis-root\` printed '$PERP_GENESIS_ROOT', not a root" >&2; exit 1; }
-  export PERP_GENESIS_ROOT
+  perp_genesis_root_step
   PERPS_STEP=section py_perps
   echo "cut-chain22: perps genesis root $PERP_GENESIS_ROOT ($PERP_PROVER genesis-state → $WALLET perp genesis-root); the section is spliced after zUSD"
 fi
@@ -3978,7 +4216,7 @@ cut-chain22: block context: $([ -n "${BLOCK_CONTEXT_SKIPPED:-}" ] && echo "SKIPP
 cut-chain22: beacon: $([ -n "${BLOCK_CONTEXT_SKIPPED:-}" ] && echo "SKIPPED — NOT what chain 22 will be" || echo "$VALIDATOR_COUNT commitments from $BEACON_TSV, commit_delay_blocks $BEACON_COMMIT_DELAY_BLOCKS (#189) — OWNER VALUE TO CONFIRM (OPEN 10); $BC_RECORDED")
 cut-chain22: fees: $FEES_JSON (no subsidy_net_of_fees: aggregation is refused until re-measured)
 cut-chain22: perps: $([ -n "${PERPS_SKIPPED:-}" ] && echo "SKIPPED (no PERP_PROVER) — NOT what chain 22 will be" || echo "BTC-PERP on zUSD (asset 1), lot 100000, tick 100000000, 20x, maintenance 250 bps, fees 5/2 bps; max_tier 18, 24 inputs a block, 64 blocks a proof, min deposit 100000000 (1 zUSD)")
-cut-chain22: perps audit v10: $([ -n "${PERPS_SKIPPED:-}${AUDIT_V10_SKIPPED:-}" ] && echo "SKIPPED — NOT what chain 22 will be" || echo "bound_payouts true (PERP-6), initial_collateral absent (0), sparse_windows true + max_window_heights $PERPS_MAX_WINDOW_HEIGHTS (PERP-101), engine_program_log_height $ENGINE_PROGRAM_LOG_HEIGHT (CON-60), max_pending_digests $PERPS_MAX_PENDING_DIGESTS (PERP-5, decided 2026-11-05)")
+cut-chain22: perps audit v10: $([ -n "${PERPS_SKIPPED:-}${AUDIT_V10_SKIPPED:-}" ] && echo "SKIPPED — NOT what chain 22 will be" || echo "bound_payouts true (PERP-6), initial_collateral absent (0), sparse_windows true + max_window_heights $PERPS_MAX_WINDOW_HEIGHTS (PERP-101), engine_program_log_height $ENGINE_PROGRAM_LOG_HEIGHT (CON-60), max_pending_digests $PERPS_MAX_PENDING_DIGESTS (PERP-5, decided 2026-11-05), state_proof_keys: the four tier-18 keys from $PERPS_KEY_DIR (CON-601)")
 cut-chain22: perps engine_hc: $([ -n "${PERPS_SKIPPED:-}" ] && echo "SKIPPED" || echo "$EXPECT_ENGINE_HC ($PERP_IMAGE)")
 cut-chain22: PERPS GENESIS ROOT ${PERP_GENESIS_ROOT:-SKIPPED}
 cut-chain22: multisig: create_fee $MULTISIG_CREATE_FEE (1 RAND)$([ -n "${AUDIT_V10_SKIPPED:-}" ] && echo ", max_accounts SKIPPED" || echo ", max_accounts $MULTISIG_MAX_ACCOUNTS (MSA-4)"); the treasury $TREASURY_THRESHOLD of $TREASURY_SIGNERS (six new signers, none of chain 21's), $(python3 -c 'import os,sys; exec(os.environ["UNITS_PY"]); print(fmt(int(open(sys.argv[1]).read())))' "$TMP/treasury-balance") RAND carried from chain 21's multisig register (= its multisig_rand_held), salt $(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["accounts"][0]["salt"])' "$TMP/multisig.json")
@@ -3993,7 +4231,7 @@ cut-chain22: CONSTRAINT-SET ROW — OPEN (issue #166): add this line to CHAIN_CO
     $CS_ROW
 cut-chain22: before each validator's node starts, ON ITS HOST: deploy/check-beacon-seed.sh --genesis $OUT --datadir <datadir> --key <node key> (its beacon.seed.json opens its genesis commitment); after the start, the same with --rpc 127.0.0.1:8545
 cut-chain22: after launch: NODE=… $0 check-limits <first node's RPC> $OUT   (before the first bundle, deposit and state proof)
-cut-chain22: operations: msauth-vk-production.bin (sha256 68facb06…cd30) beside rand-node on every chain-22 node; NTP on every validator (perps block time is consensus input); a perp-view service and a prover host (~22 GB a proof) whose perp-prover builds sparse jobs (durian 28cebfb+); token collateral is outside the supply audit (M6).
+cut-chain22: operations: msauth-vk-production.bin (sha256 168d79a8…71b3, constraint set 11) and the four perp-vk-production-t18-*.bin (perps.state_proof_keys, CON-601) beside rand-node on every chain-22 node; NTP on every validator (perps block time is consensus input); a perp-view service and a prover host (~22 GB a proof) whose perp-prover builds sparse jobs (durian 28cebfb+); token collateral is outside the supply audit (M6).
 
 ⚠  Stamped $AGE s ago; the chain's clock starts there. Launch within MINUTES, or delete $OUT and re-cut.
 EOF

@@ -54,6 +54,19 @@
 //! block", pins the modq chip's 16 periodic columns. The key tuple is now 7 wide (`mlh`). The
 //! constraint-set-8 `common` pins this replaces were `fd2f4f49…`, `99eed72b…`, `8792f659…`,
 //! `9690b474…`.
+//!
+//! Constraint set 10 (ZKV-5) changed no digest here: it adds no column, lookup or preprocessed
+//! table, only the weight of a row in the gas chain, and neither half of `CommonData` carries
+//! ordinary constraints. A red-free run here is therefore not evidence that the AIR is unchanged.
+//!
+//! Re-pinned for constraint set 11 (ZKVM-202, the gas re-weighting): the cpu table's appended
+//! `MODQ_W` column and the fourth field of the `MODQ` lookup (the call's per-op weight, cpu and modq
+//! sides) change every shape's packed lookups — the modq-free shapes too, since the cpu declares its
+//! `MODQ` lookup in every batch — so every `common` moved and no `commitment` did (no preprocessed
+//! column changed). The weights themselves (`KECCAK_GAS`, `SHA256_GAS`, `POSEIDON2_ABSORB_GAS`) are
+//! ordinary constraints and would not have moved a digest alone. The constraint-set-9/10 `common`
+//! pins this replaces were `d945789b…`, `0adff627…`, `eed808f7…`, `52b999fc…`, `aa129c0d…` (same
+//! order as the shapes below).
 use p3_batch_stark::CommonData;
 use randprotocol_zkvm::machine::{Config, FriProfile, Machine, Tier};
 use randprotocol_zkvm::tables::{input, keccak, program, public, sha256};
@@ -85,6 +98,15 @@ fn digests(common: &CommonData<Config>) -> (String, String) {
     (hex(&Sha256::digest(&cap)), hex(&all.finalize()))
 }
 
+/// Constraint set 11 moved every key three ways at once: the Grain round constants (ZKVM-107: the
+/// poseidon2 chip's preprocessed constants, and the `key_derivation_v2` salt stream, which is a
+/// Poseidon2 stream), rate 1/4 (ZKVM-111: the preprocessed LDE is half as tall) and the declared
+/// poseidon2 height (ZKVM-112: the shapes below are at the full `t + 2`, the height the six-height
+/// `verifier_key_with_modq` builds; `the_floor_height_key_answers_its_known_digest` pins one at a
+/// declared height). The set-10 pins were, in the order below: `1442e70e…`/`d58a149a…`,
+/// `54991bdd…`/`56a30a19…`, `0337aeae…`/`815e7e5a…`, `c277ab16…`/`47561c55…`,
+/// `91bffa9b…`/`b0f27590…`.
+///
 /// One pinned shape: a name, the verifier-key arguments, and its `(commitment, common)` digests.
 ///
 /// One pair serves both profiles, and that is measured, not assumed: the profile changes only the
@@ -123,8 +145,8 @@ fn shapes() -> Vec<Shape> {
             mlh: 0,
             publh: public::MIN_LOG_HEIGHT,
             want: (
-                "1442e70e1ddc7e9c6eabf1a6e29bd9ea37d1996d81f89768af967b77ddc3fd41",
-                "d945789bc249eda9b3667e1cb6b4ee38c44bd1ce498acb20afa663a5d65b5146",
+                "2a50a24cf337142b714149b0de3503cf6567db1ca44d9952e748bdec90df000f",
+                "5a873066b05c1a892db19c0030ec6d710a93dbbb6051e62a73e6547c707c410f",
             ),
         },
         Shape {
@@ -137,8 +159,8 @@ fn shapes() -> Vec<Shape> {
             mlh: 0,
             publh: binding_publh,
             want: (
-                "54991bdde2fdf6112181fde865e25cf94fae6084cb31ef33d9f58cb4645a6cc4",
-                "0adff6278abf635c3f86fd3e3f6751f0b8c690ccdb98a51acb9926b1dfb47b5b",
+                "c08d2086306e6cf6f002117515d4e295cfd8bdb006bb90688613281283e7527a",
+                "1f0d48fc5db56bb9983605a55587633b98d3450ca5d817376fe7614192a6bed7",
             ),
         },
         Shape {
@@ -151,8 +173,8 @@ fn shapes() -> Vec<Shape> {
             mlh: 0,
             publh: public::MIN_LOG_HEIGHT,
             want: (
-                "0337aeaecbd7d601ac4b502153c29589ae290f179e277b2f66e1f4c29d3c48cb",
-                "eed808f70e50bf81e1b788f643dc28be4cf494d376983fc7faf63df634c2e2c6",
+                "d7bf8d3eee2248ed67519b7a4aa23b3c1f33a5ed253ac66d5b1c70246033021c",
+                "4cc1f18451868b12be1c2a51bb95d55ada8d2d1f72217a83a98601ecd5b68862",
             ),
         },
         Shape {
@@ -165,8 +187,8 @@ fn shapes() -> Vec<Shape> {
             mlh: 0,
             publh: public::MIN_LOG_HEIGHT,
             want: (
-                "c277ab160af3160092c4a33220724276fabc2cd26e6229c5dae535eb16ba3760",
-                "52b999fcf7f4f94dc89095853729e74914d5f90d46db1fd00e1ae56e0ff68cc9",
+                "a9c665d2cd830327f3958c35b493ef2c66eeef458c46c5526c57ce5b672ed749",
+                "0db6e06751d45e1f230ebe71b6b36b5f686debec5a056f1a94acf83cba64a7bb",
             ),
         },
         Shape {
@@ -179,8 +201,8 @@ fn shapes() -> Vec<Shape> {
             mlh: randprotocol_zkvm::tables::modq::modq_log_height(1),
             publh: public::MIN_LOG_HEIGHT,
             want: (
-                "91bffa9b1cb59d4dc85ff092b7c6180355a8680b3f559d70eabd323a1fad5448",
-                "aa129c0dcbb26432ed5609e130a9a3c3de1f3a7f49028f96cb0c6e868e7e9cdb",
+                "f721b745ad2bc18852ad4d6f36ff2fd2d8459fb01f959b1edf80db7d92c6bbb4",
+                "ae173971e14ce3c28862690e55ed1370f954efb343df1df8c50daa177a8f34c5",
             ),
         },
     ]
@@ -215,3 +237,19 @@ fn two_machines_compute_the_same_key() {
     let d = |m: &Machine| digests(&m.verifier_key(Tier(10), program::MIN_LOG_HEIGHT, input::input_log_height(0), 0, 0, public::MIN_LOG_HEIGHT));
     assert_eq!(d(&a), d(&b));
 }
+
+/// Constraint set 11 (ZKVM-112): a key at a declared poseidon2 height — the first shape above with
+/// the table at the floor, `2^8`, where a tier-10 call that hashes nothing lands. A different key
+/// from the full-height one, pinned the same way.
+#[test]
+fn the_floor_height_key_answers_its_known_digest() {
+    use randprotocol_zkvm::machine::VerifierKeyShape;
+    let shape = VerifierKeyShape { poseidon2_log_height: 8, ..VerifierKeyShape::full_height(Tier(10), program::MIN_LOG_HEIGHT, input::input_log_height(0), 0, 0, 0, public::MIN_LOG_HEIGHT) };
+    shape.check().unwrap();
+    for profile in [FriProfile::Test, FriProfile::Production] {
+        let (commitment, all) = digests(&Machine::new(profile).verifier_key_for(shape));
+        eprintln!("{profile:?} | tier 10 floor shape, poseidon2 2^8: (\"{commitment}\", \"{all}\")");
+        assert_eq!((commitment.as_str(), all.as_str()), FLOOR_WANT, "{profile:?}");
+    }
+}
+const FLOOR_WANT: (&str, &str) = ("52ac2e89aac71f90257c5a232532f5bfef682f16a2d0faacd0448bb5eaf53cea", "49f058cabc95d34c894540edb71ff5c6c07e3011891f8c38b3aa2f9f2fb7b8ad");

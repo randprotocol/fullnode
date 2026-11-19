@@ -72,10 +72,12 @@ env:
   CXXFLAGS: -include cstdint
   # The circuits commit this tree's vendored crates were synced from (deploy/sync-zkvm.sh). Bump it
   # in the same commit as a re-vendor, or CI builds this workspace against a tree it did not vendor.
-  # 56b7061 is circuits branch feat/scan-compact: main c83b1c7 (tree aggregation, 4a244b6) plus
-  # viewing.rs's ScanKey and EnvelopeHead; recursion/ is 4a244b6's. The rand-zkvm-cuda revs stay
-  # at the pushed 71e1a04, where rand-zkvm-cuda/ is identical to this commit's.
-  CIRCUITS_PIN: b3e21d9ea16225452bcd03a94317cb61e1705979
+  # 41d64acd is circuits main at constraint set 11 (chain 22: Grain constants, the declared
+  # poseidon2 height, the rate-1/4 per-instance quotient layout, versioned rVM keys, cell-count
+  # gas; set 11 itself landed at 76a48dc) plus circuits #27, the EVM guest's block context v2
+  # (fullnode #168: NUMBER/TIMESTAMP/CHAINID/BASEFEE/PREVRANDAO from an InvokeAt's public
+  # context words; evm.bin hc 3869b014...). Both rand-zkvm-cuda revs name this commit too.
+  CIRCUITS_PIN: 41d64acd0fec1c6b15be18a8c7707ddce61ff790
 
 jobs:
   check-and-test:
@@ -255,10 +257,11 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: circuits/rand-guest
-      # Builds fib, keccak256, evm, sbpf, dilithium-verify and msauth from source with `rand-guest
-      # build` and compares: the four image containers byte for byte, the two legacy flat pins by
-      # program (base_pc, words, hc). circuits' gate lists all six at the pin (private multisig).
-      - name: circuits rebuilds the six guests from source
+      # Builds fib, keccak256, evm, evm-v1, sbpf, dilithium-verify and msauth from source with
+      # `rand-guest build` and compares: the image containers byte for byte, the legacy flat pins by
+      # program (base_pc, words, hc). circuits' gate lists all seven at the pin (constraint set 11
+      # added evm-v1, the EVM guest at output layout 1).
+      - name: circuits rebuilds the seven guests from source
         working-directory: circuits/rand-guest
         run: cargo test --release --test build -- --exact build_reproduces_every_committed_image_and_reports_hc
       # Inline rather than circuits' `contracts/build.sh`: that script's `mktemp -t erc20.runtime.hex`

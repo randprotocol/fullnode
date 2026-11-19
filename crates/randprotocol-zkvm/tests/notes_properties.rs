@@ -357,3 +357,83 @@ fn verify_row_names_each_way_a_row_can_lie() {
     assert_eq!(verify_row(&ledger, &Disclosure::Transaction { tx: 0, key: TxKey::random() }, &r), Err(RowError::Commitment), "the wrong key does not open it");
     assert_eq!(verify_row(&ledger, &d, &r), Err(RowError::Scope), "a party disclosure produces no Transaction rows");
 }
+
+/// A hand-made party row over mint `tx`: what a dishonest producer of a disclosure report writes,
+/// with every travel-rule field copied faithfully from `note`.
+fn party_row(tx: usize, role: Role, note: Note) -> randprotocol_zkvm::viewing::Row {
+    randprotocol_zkvm::viewing::Row {
+        tx,
+        source: RowSource::Transfer,
+        slot: 0,
+        role,
+        sender: note.from,
+        receiver: note.pk,
+        amount: note.amount,
+        asset: note.asset,
+        time: note.time,
+        cm_out: note.commitment(),
+        nf: None,
+        note,
+        spent: None,
+    }
+}
+
+/// VK-1001 (audit v14): a party row needs both halves — the envelope's part for that role opens
+/// under the party's key to the row's note, *and* the note names the party's address in that
+/// role. Before the fix `verify_row` checked only the address, so a note that merely names the
+/// party (anyone can mint one here; on a chain the guests bind `from` to the spender, but nothing
+/// binds `pk`) verified as that party's `Sent` or `Received` row with an envelope the party's
+/// key cannot open.
+#[test]
+fn a_party_row_needs_the_envelope_to_open_and_the_note_to_name_the_party() {
+    let mut ledger = Ledger::new(7);
+    let (alice, bob, carol, mallory) = (Party::new(), Party::new(), Party::new(), Party::new());
+    let alice_d = Disclosure::Party(alice.vk);
+    let mut mint = |owner: &Party, from: &Party, sealed_by: &Party, sealed_to: &Party, amount: u64| -> (usize, Note) {
+        let note = Note::new(owner.vk.pk(), from.vk.pk(), amount, 0, 7);
+        let tx = ledger.mint(&note, Envelope::seal(&sealed_by.vk, &sealed_to.vk.address(), &note, &TxKey::random())).unwrap();
+        (tx, note)
+    };
+    // 0: honest — alice pays bob.
+    let (honest_tx, honest) = mint(&bob, &alice, &alice, &bob, 10);
+    // 1: a false Sent row — the note says alice created it, but mallory sealed it (her ovk).
+    let (false_sent_tx, false_sent) = mint(&carol, &alice, &mallory, &carol, 11);
+    // 2: a false Received row — the note says alice owns it, but it is sealed to carol.
+    let (false_recv_tx, false_recv) = mint(&alice, &mallory, &mallory, &carol, 12);
+    // 3: the envelope opens for alice as receiver, but the note is mallory's own.
+    let (opens_recv_tx, opens_recv) = mint(&mallory, &mallory, &mallory, &alice, 13);
+    // 4: the sender part is sealed with alice's ovk (a holder of her viewing key can), but the
+    //    note's creator is mallory.
+    let (opens_sent_tx, opens_sent) = mint(&carol, &mallory, &alice, &carol, 14);
+    // 5: alice's own note to herself, sealed to her address by mallory: received, not sent.
+    let (recv_only_tx, recv_only) = mint(&alice, &alice, &mallory, &alice, 15);
+    // 6: alice's own note, sealed by her to carol's address: sent, not received.
+    let (sent_only_tx, sent_only) = mint(&alice, &alice, &alice, &carol, 16);
+
+    let check = |tx: usize, role: Role, note: Note| verify_row(&ledger, &alice_d, &party_row(tx, role, note));
+    // Honest rows pass, hand-made or scanned, under the party that holds them.
+    assert_eq!(check(honest_tx, Role::Sent, honest), Ok(()));
+    assert_eq!(verify_row(&ledger, &Disclosure::Party(bob.vk), &party_row(honest_tx, Role::Received, honest)), Ok(()));
+    assert_eq!(check(recv_only_tx, Role::Received, recv_only), Ok(()));
+    assert_eq!(check(sent_only_tx, Role::Sent, sent_only), Ok(()));
+    for p in [&alice, &bob, &carol, &mallory] {
+        let d = Disclosure::Party(p.vk);
+        for r in scan(&ledger, &d) {
+            // `scan` lists every envelope the key opens, whatever the note inside says, so a row
+            // it produced is refused exactly when the note does not name the party.
+            let names_the_party = match r.role { Role::Received => r.receiver == p.vk.pk(), _ => r.sender == p.vk.pk() };
+            assert_eq!(verify_row(&ledger, &d, &r), if names_the_party { Ok(()) } else { Err(RowError::Party) }, "tx {} {:?}", r.tx, r.role);
+        }
+    }
+    // The two false rows: the note names alice, her key does not open the envelope.
+    assert_eq!(check(false_sent_tx, Role::Sent, false_sent), Err(RowError::Envelope), "a false Sent row");
+    assert_eq!(check(false_recv_tx, Role::Received, false_recv), Err(RowError::Envelope), "a false Received row");
+    // The converse: her key opens the envelope, the note names somebody else.
+    assert_eq!(check(opens_recv_tx, Role::Received, opens_recv), Err(RowError::Party));
+    assert_eq!(check(opens_sent_tx, Role::Sent, opens_sent), Err(RowError::Party));
+    // Each role is held to its own part of the envelope: the other part opening is not enough.
+    assert_eq!(check(recv_only_tx, Role::Sent, recv_only), Err(RowError::Envelope), "only the receiver part opens");
+    assert_eq!(check(sent_only_tx, Role::Received, sent_only), Err(RowError::Envelope), "only the sender part opens");
+    // And a row cannot borrow another transaction's envelope: the honest note under a false tx.
+    assert_eq!(check(false_sent_tx, Role::Sent, honest), Err(RowError::Commitment));
+}

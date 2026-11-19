@@ -339,6 +339,29 @@ mod harness {
         run(&t, &range, &c, &twin(&c)).unwrap();
     }
 
+    /// Constraint set 11 (ZKVM-202): the chip prices the call. Its `MODQ` entry is
+    /// `(clk, base, a1, weight − 1)` with the weight of the op the block performs, so an asker — the
+    /// cpu's stand-in, free to name any price — is answered only at that op's: every op asked at
+    /// each other weight, at the pre-set-11 flat 168 and at nothing is refused, one ask at a time
+    /// with the other three honest.
+    #[test]
+    fn a_call_asked_at_another_ops_weight_is_rejected_standalone() {
+        use super::common::modq_run::run_priced;
+        use randprotocol_zkvm::gas::{modq_gas, modq_op};
+        let (c, t, range) = built();
+        let honest: Vec<(u32, u32, u32, F)> = c.iter().map(|(ev, _)| (ev.clk, ev.base, ev.a1, F::from_u64(modq_gas(modq_op(ev.a1)) - 1))).collect();
+        assert_eq!(honest.iter().map(|a| a.3).collect::<Vec<_>>(), [192u64, 192, 263, 303].map(F::from_u64), "NTT, INTT, DOT4, MSUB4");
+        run_priced(&t, &range, &honest, &twin(&c)).unwrap();
+        for i in 0..honest.len() {
+            for claimed in [1u64, 168, 193, 264, 304] {
+                if F::from_u64(claimed - 1) == honest[i].3 { continue; }
+                let mut asks = honest.clone();
+                asks[i].3 = F::from_u64(claimed - 1);
+                assert!(rejects(|| run_priced(&t, &range, &asks, &twin(&c))), "call {i} asked at a weight of {claimed} was answered");
+            }
+        }
+    }
+
     #[test]
     fn a_tampered_output_limb_is_rejected_standalone() {
         let (c, mut t, range) = built();
@@ -411,8 +434,8 @@ mod machine {
         let p = modq_program(&[NTT0]);
         let e = randprotocol_zkvm::emulator::execute(&p, &[], &[], 1 << 16).unwrap();
         let row = e.events.iter().find(|e| e.modq.is_some()).unwrap();
-        assert_eq!(randprotocol_zkvm::gas::row_gas(row), randprotocol_zkvm::gas::MODQ_GAS);
-        assert_eq!(randprotocol_zkvm::gas::gas_max_with_modq(Tier(10), 0, 0, 10) - randprotocol_zkvm::gas::gas_max(Tier(10), 0, 0), randprotocol_zkvm::gas::MODQ_GAS - 1);
+        assert_eq!(randprotocol_zkvm::gas::row_gas(row), randprotocol_zkvm::gas::MODQ_NTT_GAS);
+        assert_eq!(randprotocol_zkvm::gas::gas_max_with_modq(Tier(10), 0, 0, 10) - randprotocol_zkvm::gas::gas_max(Tier(10), 0, 0), randprotocol_zkvm::gas::MODQ_MAX_GAS - 1);
     }
 
     /// The `MODQ` bus has no provider when the batch declares no modq table, so a cpu `SYS_MODQ`
@@ -452,7 +475,7 @@ mod machine {
     fn an_out_of_range_modq_height_is_rejected() {
         use randprotocol_zkvm::machine::{check_declared_heights_with_modq, VerifyError};
         use randprotocol_zkvm::tables::modq::{MAX_LOG_HEIGHT, MIN_LOG_HEIGHT};
-        let c = |t: usize, mlh: u8| check_declared_heights_with_modq(Tier(t), 7, 7, 0, 0, mlh, 7, (t + 2) as u8);
+        let c = |t: usize, mlh: u8| check_declared_heights_with_modq(Tier(t), 7, 7, 0, 0, mlh, 7, (t + 2) as u8, (t + 2) as u8);
         for t in [10, 20] {
             assert_eq!(c(t, 0), Ok(()), "0 is no modq table");
             assert_eq!(c(t, MIN_LOG_HEIGHT), Ok(()));
@@ -488,10 +511,10 @@ fn the_docs_name_the_chip_where_the_isa_and_tables_are_documented() {
     assert!(tables.contains("## `modq` — main, `col::WIDTH = 59`"), "02-tables-and-buses.md modq section");
     assert!(tables.contains("`MODQ_WIRE`"), "the bus catalogue");
     let row8 = isa.lines().find(|l| l.starts_with("| 8 | `MODQ base a1`")).unwrap();
-    assert!(row8.contains("| 168 |"), "row 8 carries MODQ_GAS");
+    assert!(row8.contains("| 193 / 193 / 264 / 304 |"), "row 8 carries the per-op MODQ weights");
     assert!(roadmap.contains("## Constraint set 9: the MODQ chip"), "05-roadmap.md MODQ section");
     assert_eq!(randprotocol_zkvm::tables::modq::col::WIDTH, 59);
-    assert_eq!(randprotocol_zkvm::tables::cpu::col::WIDTH, 283);
+    assert_eq!(randprotocol_zkvm::tables::cpu::col::WIDTH, 284);
 }
 
 /// Measurement (not a gate): tier-10 proof sizes for the roadmap's "Proof-size deltas (measured)"

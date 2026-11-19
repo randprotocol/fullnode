@@ -6058,6 +6058,7 @@ pub(crate) mod fixtures {
             max_window_heights: 0,
             engine_program_log_height: 0,
             max_pending_digests: 0,
+            state_proof_keys: Vec::new(),
             markets: vec![randprotocol_core::ledger::perps::MarketSpec {
                 id: 0,
                 symbol: "BTC-PERP".into(),
@@ -9598,7 +9599,7 @@ mod tests {
         g.gas = Some(GasConfig {
             gas_price: 200,
             byte_price: 1_600,
-            bundle_gas_limit: 20_479,
+            bundle_gas_limit: 22_527,
             metering: GasMetering::Circuit,
             dynamic: Some(DynamicGas {
                 target_block_bytes: 4096,

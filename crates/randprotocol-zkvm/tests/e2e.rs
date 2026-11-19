@@ -145,8 +145,13 @@ fn keccak_demo_proves_and_verifies_at_tier_10() {
 /// integrated `feat/cs7` tree (314 919 / 315 239 / 315 847 / 316 167 / 317 191): the LogUp blind's
 /// five columns and bus pair on every instance, the `2^7` floor on the program, input and public
 /// tables, and ZKM-1's four byte limbs on the input and public tables all widen or lengthen what
-/// every FRI query opens. `SIZE_BAND_PCT` is the tolerance around the current figure.
-const TIER_10_TEST_PROFILE_BYTES: usize = 315_847;
+/// every FRI query opens. Constraint set 11 shrank it by ~23% to **243 027**, the middle of
+/// three on `feat/cs11-integration` (242 451 / 243 027 / 243 347): the quotient committed one matrix per instance
+/// instead of one per chunk (one Merkle path per instance per query, not one per chunk), the
+/// poseidon2 table declared at `2^8` instead of `2^12`, and rate 1/4 (a FRI query's paths one level
+/// shorter) — at the same 16 Test-profile queries. `SIZE_BAND_PCT` is the tolerance around the
+/// current figure.
+const TIER_10_TEST_PROFILE_BYTES: usize = 243_027;
 
 /// Tolerance, in percent, on the size assertion in `a_keccak_free_proof_carries_no_keccak_table`.
 ///
@@ -261,7 +266,7 @@ fn enough_keccak_permutations_raise_the_declared_memory_height_past_the_floor() 
     let p = a.assemble();
     let exec = randprotocol_zkvm::emulator::execute(&p, &[], &[], Tier(10).max_cycles()).unwrap();
     assert_eq!(exec.events.iter().filter(|e| e.keccak_row.is_some()).count(), 40);
-    let t = build_traces_salted(&p, &[], &[], [0; 4], &exec, Tier(10), randprotocol_zkvm::gas::gas_max(Tier(10), 11, 0)).unwrap(); // cs8: the 40 permutations weigh 7 640 gas, past the hash-free ceiling; 11 = the height asserted below
+    let t = build_traces_salted(&p, &[], &[], [0; 4], &exec, Tier(10), randprotocol_zkvm::gas::gas_max(Tier(10), 11, 0)).unwrap(); // cs8: the 40 permutations weigh 5 320 gas (7 640 through constraint set 10), past the hash-free ceiling; 11 = the height asserted below
     let accesses: usize = exec.events.iter().map(|e| e.accesses.len() + e.keccak_accesses.len()).sum();
     assert!(((1 << 12)..1 << 13).contains(&accesses), "{accesses} accesses: past the floor, inside one more bit");
     assert_eq!(t.mem_log_height, 13, "the access count now drives the height");
@@ -473,18 +478,21 @@ fn verifier_key_is_cached_after_first_verify() {
     // cache separately and hand back two different keys.
     assert_eq!(proof.keccak_log_height, 0, "fib is keccak-free");
     assert_eq!(proof.sha256_log_height, 0, "and sha256-free");
-    let (t, plh, ilh, plub) = (proof.tier, proof.program_log_height, proof.input_log_height, proof.public_log_height);
-    let bare = m.verifier_key(t, plh, ilh, 0, 0, plub);
+    // Constraint set 11: the key is the proof's whole declared shape, the poseidon2 height with
+    // it (`VerifierKeyShape::of_proof`); the four variants below differ only in the hash tables.
+    let s = randprotocol_zkvm::machine::VerifierKeyShape::of_proof(&proof);
+    let at = |klh: u8, slh: u8| m.verifier_key_for(randprotocol_zkvm::machine::VerifierKeyShape { keccak_log_height: klh, sha256_log_height: slh, ..s });
+    let bare = at(0, 0);
     assert_eq!(m.cached_keys(), 1, "the hash-table-free key is the one `verify` already cached");
-    let with_keccak = m.verifier_key(t, plh, ilh, 5, 0, plub);
+    let with_keccak = at(5, 0);
     assert_eq!(m.cached_keys(), 2, "`keccak_log_height = 5` is a different cache key from `0`");
     assert!(!std::sync::Arc::ptr_eq(&bare, &with_keccak));
     // M4.4: `sha256_log_height` is the key's fifth component, and independent of the fourth —
     // the four combinations of "declares a keccak table" x "declares a sha256 table" are four
     // different chip sets and therefore four different `CommonData`s.
-    let with_sha256 = m.verifier_key(t, plh, ilh, 0, 6, plub);
+    let with_sha256 = at(0, 6);
     assert_eq!(m.cached_keys(), 3, "`sha256_log_height = 6` is a different cache key again");
-    let with_both = m.verifier_key(t, plh, ilh, 5, 6, plub);
+    let with_both = at(5, 6);
     assert_eq!(m.cached_keys(), 4, "and both together is a fourth");
     assert!(!std::sync::Arc::ptr_eq(&with_keccak, &with_sha256));
     assert_eq!(bare.lookups.len(), 9, "nine instances");
@@ -667,13 +675,12 @@ fn compiled_evm_erc20_transfer_binds_the_state_root_transition() {
 
     // the post-tree the host derived agrees with what the guest bound: recompute the digest from
     // the host's post root, and check no *other* root gives these words.
-    let mut h = randprotocol_zkvm::evm::HostRef;
     assert_eq!(
-        evm_core::abi::public_output(&mut h, &call.code, &call.tree.root(), &post.root(), &outcome),
+        call.output_for(&call.code, &call.tree.root(), &post.root(), &outcome),
         want
     );
     assert_ne!(
-        evm_core::abi::public_output(&mut h, &call.code, &call.tree.root(), &call.tree.root(), &outcome),
+        call.output_for(&call.code, &call.tree.root(), &call.tree.root(), &outcome),
         want,
         "the pre-root must not produce the same digest as the post-root"
     );
@@ -749,6 +756,7 @@ fn compiled_evm_storage_read_write_and_return_proves_and_verifies() {
         caller: U256::from_u32(0xcafe),
         callvalue: U256::ZERO,
         gas_limit: 100_000,
+        context: [0; 8],
         tree,
         touched: vec![U256::from_u32(1)],
     };
@@ -773,6 +781,54 @@ fn compiled_evm_storage_read_write_and_return_proves_and_verifies() {
         prove_time, t1.elapsed()
     );
     assert_eq!(proof.tier.0, 16, "one witness and 18 bytes of code fit tier 16");
+}
+
+/// **ZKVM-103 with a real proof.** A prover who holds the storage witness and not the owner's
+/// authority proves `transferOwnership` with `caller` set to the owner. The proof is a valid proof
+/// of `evm.bin` — `Machine::verify` accepts it, as it must: the execution is correct — and the
+/// chain's check of its output words against the statement for the sender it authenticated
+/// refuses it. The same proof is accepted for the owner's own statement, and for no other context.
+///
+/// One witness and sixteen bytes of code: tier 16, like the test above.
+#[test]
+fn compiled_evm_proof_for_an_unauthorised_caller_is_refused() {
+    use evm_core::u256::U256;
+    use randprotocol_zkvm::evm::{ownable_transfer, EvmStatement, ALICE};
+    use randprotocol_zkvm::tables::cpu::pv;
+    let m = Machine::new(FriProfile::Test);
+    let p = guests::compiled::evm();
+    let mallory = U256::from_u32(0x3a11);
+    let nonce = [7, 0, 0, 0, 0, 0, 0, 21];
+    let forged = ownable_transfer(ALICE, ALICE, mallory, nonce);
+    let (want, o, post) = forged.expected();
+    assert_eq!(o.status(), 1);
+
+    let (proof, exec) = m.prove_salted(&p, &forged.input_words(), &[], [3, 1, 4, 1], None).unwrap();
+    assert_eq!(exec.outputs, want);
+    assert_eq!(proof.tier.0, 16);
+    m.verify(&p.digest(), &proof).expect("the forged call is a correct execution of evm.bin");
+
+    // What the chain reads out of the verified proof: its eight output words.
+    let out: [u32; 8] = std::array::from_fn(|i| proof.public_values[pv::OUT0 + i] as u32);
+    assert_eq!(out, want);
+    let statement = |caller: U256, context: [u32; 8]| EvmStatement {
+        layout: 2,
+        codehash: randprotocol_zkvm::keccak::keccak256(&forged.code),
+        pre_root: forged.tree.root(),
+        post_root: post.root(),
+        return_data: vec![],
+        logs: vec![],
+        address: forged.address,
+        caller,
+        callvalue: U256::ZERO,
+        calldata: forged.calldata.clone(),
+        context,
+        gas_limit: forged.gas_limit as u32,
+        gas_used: o.gas_used as u32,
+    };
+    assert!(!statement(mallory, nonce).accepts(out[0], &out), "a proof for a caller who did not authorise the call was accepted");
+    assert!(statement(ALICE, nonce).accepts(out[0], &out));
+    assert!(!statement(ALICE, [8, 0, 0, 0, 0, 0, 0, 21]).accepts(out[0], &out), "a replay under another context was accepted");
 }
 
 /// `balanceOf`, `approve` and a `transfer` that exceeds the balance all run under the same guest

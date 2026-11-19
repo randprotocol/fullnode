@@ -1132,7 +1132,7 @@ fn a_mixed_hidden_bundle_proves_at_tier_14_and_verifies_only_against_its_binding
     // Constraint set 8: a bundle declares its header's ceiling, gas_max(14, 0, 0).
     // `randprotocol_core::gas::gas_max(14, 0, 0)` = 20 479: the chain's `bundle_gas_limit`.
     assert_eq!(decoded.public_values[randprotocol_zkvm::tables::cpu::pv::GAS], randprotocol_core::gas::gas_max(14, 0, 0));
-    assert_eq!(decoded.public_values[randprotocol_zkvm::tables::cpu::pv::GAS], 20_479);
+    assert_eq!(decoded.public_values[randprotocol_zkvm::tables::cpu::pv::GAS], 22_527);
     assert_eq!(ZkExecutor::new(FriProfile::Test).bundle_gas_limit(&proof).unwrap(), Some(randprotocol_core::gas::gas_max(14, 0, 0)));
 }
 
@@ -1211,9 +1211,9 @@ fn a_v3_bundle_proof_declares_the_bundle_gas_pin() {
     assert_eq!((decoded.tier, decoded.keccak_log_height, decoded.sha256_log_height), (Tier(14), 0, 0), "v3 stays at the bundle pin's header");
     assert_eq!(tier, randprotocol_core::types::BUNDLE_PROOF_TIER);
     assert_eq!(decoded.public_values[randprotocol_zkvm::tables::cpu::pv::GAS], randprotocol_core::gas::bundle_gas_limit_pin());
-    assert_eq!(randprotocol_core::gas::bundle_gas_limit_pin(), 20_479);
+    assert_eq!(randprotocol_core::gas::bundle_gas_limit_pin(), 22_527);
     let ex = ZkExecutor::new(FriProfile::Test);
-    assert_eq!(ex.bundle_gas_limit(&proof).unwrap(), Some(20_479));
+    assert_eq!(ex.bundle_gas_limit(&proof).unwrap(), Some(22_527));
     assert_eq!(ex.verify_bundle(&hc3, &proof, &BINDING_A), Ok(()));
 }
 
@@ -1254,9 +1254,9 @@ fn an_auth_proof_declares_the_auth_gas_pin() {
     assert_eq!((decoded.tier, decoded.keccak_log_height, decoded.sha256_log_height), (Tier(10), 0, 0));
     assert_eq!(auth_tier, randprotocol_core::types::AUTH_PROOF_TIER);
     assert_eq!(decoded.public_values[randprotocol_zkvm::tables::cpu::pv::GAS], randprotocol_core::gas::auth_gas_limit_pin());
-    assert_eq!(randprotocol_core::gas::auth_gas_limit_pin(), 1_279);
+    assert_eq!(randprotocol_core::gas::auth_gas_limit_pin(), 1_407);
     let ex = ZkExecutor::new(FriProfile::Test);
-    assert_eq!(ex.auth_gas_limit(&auth_proof).unwrap(), Some(1_279));
+    assert_eq!(ex.auth_gas_limit(&auth_proof).unwrap(), Some(1_407));
     assert_eq!(ex.verify_auth(&ZkExecutor::hc_auth(), &auth_proof, &BINDING_A), Ok(c_pub));
     // The auth decode is the auth guest's pinned shape: the same proof declaring another tier is
     // refused before its limit is read.

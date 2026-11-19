@@ -305,12 +305,25 @@ pub const INNER_MODQ_REFUSAL: &str = "an inner proof declares a modq table; the 
 /// covered record cannot carry the declaration past this point. Auth proofs (msauth included)
 /// are never aggregated, so a multisig spend never meets it; and a bundle declaring a modq table
 /// is refused at admission by the zkVM's exact pin, so on an honest chain no stored bundle can.
+///
+/// Constraint set 11 (ZKVM-112): and the poseidon2 table at the tier's full `t + 2`, the height
+/// every admitted bundle proof declares (the zkVM's exact pin, `check_decoded_ref`). The covered
+/// record's `DeclaredShape` has no poseidon2 field — it is consensus-visible (genesis
+/// `admitted_shapes`, stored records) and stays as it was — so [`inner_shape`] reads the height as
+/// the tier's full one, and a proof declaring another is refused here, before the rVM.
 pub fn check_inner_chip_free(proof: &randprotocol_zkvm::machine::Proof) -> Result<(), ConfidentialError> {
     if proof.modq_log_height != 0 {
         return Err(ConfidentialError::InvalidAggregateProof(INNER_MODQ_REFUSAL.into()));
     }
+    if proof.poseidon2_log_height != proof.tier.max_poseidon2_log_height() {
+        return Err(ConfidentialError::InvalidAggregateProof(INNER_POSEIDON2_REFUSAL.into()));
+    }
     Ok(())
 }
+
+/// [`check_inner_chip_free`]'s refusal for an inner proof whose poseidon2 table is not the tier's
+/// full height.
+pub const INNER_POSEIDON2_REFUSAL: &str = "an inner proof declares a poseidon2 table below its tier's full height; no covered record carries one";
 
 /// The covered-bundle record of an inner proof (spec §6.2): its `pv::NUM` public values and its
 /// declared shape, read off the header — after [`check_inner_chip_free`]. `MalformedProof` for a
@@ -348,6 +361,9 @@ fn inner_shape(shape: &DeclaredShape) -> Result<InnerShape, ConfidentialError> {
         shape.sha256_log_height,
         shape.public_log_height,
         shape.mem_log_height,
+        // Constraint set 11: a covered bundle's poseidon2 table is the tier's full `t + 2`
+        // (`check_inner_chip_free`); `DeclaredShape` does not carry it.
+        randprotocol_zkvm::machine::Tier(shape.tier as usize).max_poseidon2_log_height(),
     )
     .map_err(|e| ConfidentialError::BadDeclaredShape(format!("{e:?}")))
 }
@@ -683,6 +699,18 @@ impl ConfidentialExecutor for AggExecutor {
 
     fn set_perp_config(&self, max_tier: u8, engine_program_log_height: u8) {
         self.inner.set_perp_config(max_tier, engine_program_log_height)
+    }
+
+    fn set_perp_pinned_keys(&self, pins: &[(randprotocol_core::confidential::ProofShape, [u8; 32])]) {
+        self.inner.set_perp_pinned_keys(pins)
+    }
+
+    fn install_perp_vk(&self, blob: &[u8]) -> Result<randprotocol_core::confidential::ProofShape, String> {
+        self.inner.install_perp_vk(blob)
+    }
+
+    fn perp_pinned_keys_installed(&self) -> usize {
+        self.inner.perp_pinned_keys_installed()
     }
 
     /// The keys an `Invoke` verifies under are these too: its segment sits in the hardened
@@ -1456,14 +1484,14 @@ mod tests {
     /// tape does not decode under the new program). The production bundle shape is the fixture
     /// shape at the production profile (the heights are the trace's, not the FRI profile's), as
     /// circuits' `tests/aggregate.rs` builds it; the pin is that test's (`dc350ecf…` pre-phase-4,
-    /// `e0eede8b…` at phase 4, `8bc2cecb…` with the MODQ chip, `792a66d4…` at phase 5).
+    /// `e0eede8b…` at phase 4, `8bc2cecb…` with the MODQ chip, `792a66d4…` at phase 5, `43e02700…` at constraint set 11).
     #[test]
     fn the_production_aggregate_program_digest_is_the_phase_5_pin() {
         let (mut shape, _) = covered(0);
         shape.profile = CoreProfile::Production;
         let got = AggExecutor::new(FriProfile::Production).aggregate_program_digest(&shape).expect("the production shape builds");
         let hex: String = got.iter().map(|w| format!("{w:016x}")).collect();
-        assert_eq!(hex, "792a66d4a995c7b3874d38ecb8c971d5494b57b4cce13db11e08a4f9b2f9a982");
+        assert_eq!(hex, "43e027006f4fbf0b6e4f8ca528256d507ded54dfd99626a683560058bbfdaa5b");
     }
 
     /// Audit v3, AGG-3: the spec admits three rVM tiers (production {21, 22, 23} at constraint
@@ -1539,7 +1567,9 @@ mod tests {
     /// the proof encoding: the vk digest moved for the first time since constraint set 8
     /// (`346ee184…` → `1b0c4b00…`, circuits recursion/docs/09 §6), the fixtures were re-proved
     /// (`scripts/recursion-fixtures.sh`), and the list and its digest moved with both
-    /// (`3534960f…` → `3753f2fd…`).
+    /// (`3534960f…` → `3753f2fd…`). Constraint set 11 (Grain constants, circuits `76a48dc`)
+    /// moved the vk digest (`1b0c4b00…` → `b9046f5d…`), the re-proved fixtures' notes and their
+    /// `GAS` (20479 → 22527), and with them the list and its digest (`3753f2fd…` → `517d13e4…`).
     #[test]
     fn the_admission_recompute_reproduces_the_pinned_vectors_byte_for_byte() {
         use p3_field::PrimeField64;
@@ -1555,7 +1585,7 @@ mod tests {
         // The inner vk digest, a data-independent constant of the shape.
         assert_eq!(
             hex_words(&randprotocol_rvm::shape::inner_vk_digest(&vk.shape, &vk.key)),
-            "1b0c4b0043dd5d00d710f10048bfde989a955034d7fd52f1a85595a61339ddc7",
+            "b9046f5d0f449c0392254c27871bde6ac84987da039e662f36e9f8d1c36f32da",
             "the pinned inner_vk_digest"
         );
         // The 118-word interface list, built the way admission builds it: from the covered
@@ -1566,7 +1596,7 @@ mod tests {
         assert_eq!(hex_words(&list), INTERFACE_LIST_HEX, "the pinned 118-word interface list");
         assert_eq!(
             hex_words(&randprotocol_rvm::public_values::public_digest(&list)),
-            "3753f2fd7ba2091910f1a5eb6b722c3b55e71e7661854c058d95ed446cb186b4",
+            "517d13e4dd1435557a439c660d1264acd326c53b7965ed401e6c2aaa5740a8c0",
             "the pinned interface digest"
         );
     }
@@ -1579,37 +1609,37 @@ mod tests {
     /// `docs/02-aggregate.md`'s worked example: the 118-word interface list for the 3-proof
     /// test-profile fixture set, each word the canonical `u64` as 16 lowercase hex chars.
     const INTERFACE_LIST_HEX: &str = concat!(
-        "1b0c4b0043dd5d00d710f10048bfde989a955034d7fd52f1a85595a61339ddc7",
+        "b9046f5d0f449c0392254c27871bde6ac84987da039e662f36e9f8d1c36f32da",
         "000000000000000300000000a662000000000000a662000100000000a6620002",
         "00000000a662000300000000a662000400000000a662000500000000a6620006",
-        "00000000a66200070000000000000000000000000000000e0000000009798e88",
-        "000000001bc1014400000000c6454ed8000000006b17834200000000f8f1a540",
-        "000000005c25de80000000007983d65e00000000841b3716000000006f35274a",
-        "000000000371953700000000a8a42560000000004b291c6600000000b7c2de0e",
-        "00000000d6bf7fcf00000000182b470b00000000fb4abd6c00000000d68ddbe1",
-        "0000000012f885a60000000032d1718800000000c3bc890400000000d7286a18",
-        "0000000056171f8a00000000dc91a25d000000008f77eb5a00000000934a2759",
-        "00000000d5389ac8000000002e612784000000008639ed090000000085f58a21",
-        "000000004448d889000000006bb9c915000000000671dc2c0000000000004fff",
-        "0000000000000000000000000000000e000000006c3312a900000000bb1b0223",
-        "00000000d9e09f5b000000001d46c05b00000000d1be87c4000000007b76acd3",
-        "000000005e7267ff00000000c4731095000000006f35274a0000000003719537",
-        "00000000a8a42560000000004b291c6600000000b7c2de0e00000000d6bf7fcf",
-        "00000000182b470b00000000fb4abd6c000000004b556bca00000000341d2f5f",
-        "0000000079f436080000000091f8e29c000000001ba6f2fd00000000ad68b2ba",
-        "0000000013fa3f2300000000490af7f100000000934a275900000000d5389ac8",
-        "000000002e612784000000008639ed090000000085f58a21000000004448d889",
-        "000000006bb9c915000000000671dc2c0000000000004fff0000000000000000",
-        "000000000000000e00000000d74313f3000000004675ac4000000000f4c1f8eb",
-        "00000000a9cf0890000000005dda21530000000043e32a4d0000000002ecb55a",
-        "000000005e6e3049000000006f35274a000000000371953700000000a8a42560",
-        "000000004b291c6600000000b7c2de0e00000000d6bf7fcf00000000182b470b",
-        "00000000fb4abd6c00000000a6a7204c00000000dbb032c800000000e550ab3e",
-        "000000004cc1905e000000007a603b2a00000000379776a200000000c7d34ee3",
-        "000000003dc30f7b00000000934a275900000000d5389ac8000000002e612784",
-        "000000008639ed090000000085f58a21000000004448d889000000006bb9c915",
-        "000000000671dc2c0000000000004fff",
-    );
+        "00000000a66200070000000000000000000000000000000e000000001c009961",
+        "000000000410560c000000005316e46b00000000cff75dfa0000000089f79e36",
+        "00000000d128a172000000002b6e8d4800000000bd975baf000000000283966e",
+        "0000000099ad51c000000000433bcc1c000000004e43972300000000a43f9ad3",
+        "000000000010a0d6000000002c3eead2000000001ddc6297000000006434499d",
+        "000000006e13df0e00000000b0a7b7ee000000002447837b00000000dff7e97e",
+        "00000000be377b7c0000000003764ffa00000000ef92508a00000000ab23f918",
+        "0000000086c5d0460000000033519db9000000006a57e1fd00000000d1a96b2c",
+        "00000000201c739a00000000cd71d4f000000000c6a10aa900000000000057ff",
+        "0000000000000000000000000000000e000000004da05f810000000055d4c358",
+        "00000000675fe32b000000003cf25375000000005307861600000000fdd518b8",
+        "00000000f6c797680000000044d2742b000000000283966e0000000099ad51c0",
+        "00000000433bcc1c000000004e43972300000000a43f9ad3000000000010a0d6",
+        "000000002c3eead2000000001ddc6297000000003d8490110000000083c26598",
+        "00000000b988b32f00000000ed10338400000000decb8fd000000000606cb30d",
+        "0000000058c974a5000000008bc16f6300000000ab23f9180000000086c5d046",
+        "0000000033519db9000000006a57e1fd00000000d1a96b2c00000000201c739a",
+        "00000000cd71d4f000000000c6a10aa900000000000057ff0000000000000000",
+        "000000000000000e00000000a4252b8200000000b00aaa42000000007ad40fa0",
+        "000000002b05e3bf0000000057e6f13f000000008ab3514b000000001c2c2fd1",
+        "00000000e23d1ad3000000000283966e0000000099ad51c000000000433bcc1c",
+        "000000004e43972300000000a43f9ad3000000000010a0d6000000002c3eead2",
+        "000000001ddc62970000000053efbc590000000034256cc40000000085e2457c",
+        "000000009a88e9860000000023a1c90700000000e099522f00000000ebd342c1",
+        "00000000bac1bf0000000000ab23f9180000000086c5d0460000000033519db9",
+        "000000006a57e1fd00000000d1a96b2c00000000201c739a00000000cd71d4f0",
+        "00000000c6a10aa900000000000057ff",
+);
 
     /// An RV32 bundle proof's bytes are not an rVM aggregate proof: the answer is a named error,
     /// never a panic — even if the postcard bytes happen to decode across the two proof types.

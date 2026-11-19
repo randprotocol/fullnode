@@ -150,65 +150,75 @@ pub fn call_bytes(proof: &[u8], envelope: Option<&crate::types::CallEnvelope>) -
     proof.len() + envelope.map_or(0, |e| e.len())
 }
 
-/// Spec 2026-09-28 §3.1: what a `KECCAK` row costs in gas — its cpu row plus the 32 keccak-table
-/// rows (2 612 columns) and 100 memory rows it pulls in, ≈ 189 cycle-equivalents, rounded up.
-pub const KECCAK_GAS: u64 = 192;
-/// Its sha256 twin: one row plus 64 rows of 466 columns, ≈ 66 cycle-equivalents, rounded down
-/// to the block size.
-pub const SHA256_GAS: u64 = 64;
-/// What one `MODQ` ecall row costs (constraint set 9; circuits `gas::MODQ_GAS`): 1 024 × (59 + 16)
-/// committed cells at ≈ 460 cells per gas.
-pub const MODQ_GAS: u64 = 168;
+/// What a `KECCAK` row costs in gas (circuits `gas::KECCAK_GAS`). Constraint set 11 re-derived
+/// every weight from committed cells per row (circuits `research/docs/05-roadmap.md`, the
+/// cell-count gas model): 134, where sets 8–10 charged 192.
+pub const KECCAK_GAS: u64 = 134;
+/// Its sha256 twin (circuits `gas::SHA256_GAS`): 49 since constraint set 11, 64 before.
+pub const SHA256_GAS: u64 = 49;
+/// What a `POSEIDON2` absorb or digest-prefix row costs (circuits `gas::POSEIDON2_ABSORB_GAS`):
+/// 4 since constraint set 11 (`+3` beyond its row), 3 before.
+pub const POSEIDON2_ABSORB_GAS: u64 = 4;
+/// The heaviest `MODQ` op's weight (circuits `gas::MODQ_MAX_GAS`, `MSUB4`): what a header's
+/// ceiling allows every 1 024-row modq block. Constraint set 11 prices `MODQ` per op (NTT/INTT 193,
+/// DOT4 264, MSUB4 304) where sets 9–10 charged a flat 168; only the ceiling is mirrored here.
+pub const MODQ_MAX_GAS: u64 = 304;
 /// Spec §3.3: the default price of one gas, 10⁻⁷ RAND.
 pub const GAS_PRICE_DEFAULT: u64 = 100;
 /// Spec §3.3: the default price of one KiB of call proof and envelope, from byte 0 — a bare
 /// 1.25 MB proof is ≈ 1 000 000 units, today's `CALL_BASE` under another name.
 pub const BYTE_PRICE_DEFAULT: u64 = 800;
 
-/// The gas no run under this proof header can exceed (spec §3.2, controller ruling from the
-/// constraint-set-8 final review): the tier's cycle budget, plus the Poseidon2 absorb
-/// surcharge, plus `KECCAK_GAS − 1` for every permutation the declared keccak table could hold
-/// (one 32-row block each, `0` = no table) and `SHA256_GAS − 1` for every compression of the
-/// sha256 table (64-row blocks). Phase 0 charges exactly this; Phase 1's in-circuit meter
-/// charges a declared limit at or under it.
-///
-/// The absorb surcharge: the cpu table's gas accumulator (§4.2's `w = 1 + 2·IS_HASH_BLOCK + …`)
-/// charges `+2` on every `POSEIDON2` absorb row beyond the `+1` every row already costs. The
-/// bound on how many absorb rows a tier can hold is the Poseidon2 *table's* own capacity, not a
-/// count of cpu rows: `Tier::poseidon2_height(t) = 2^(t+2)` rows
-/// (`crates/randprotocol-zkvm/src/machine.rs`'s `Tier::for_workload`, the ZH1 note) at
-/// `poseidon2::BLOCK = 32` rows per permutation block, so a tier holds at most
-/// `2^(t+2) / 32 = 2^(t−3)` permutations — each contributing one absorb row. So the most the
-/// accumulator can run over the plain cycle count `2^t − 1` is `2 · 2^(t−3) = 2^(t−2)` — the
-/// term this ceiling was previously missing.
+/// The gas no run under this proof header can exceed (spec §3.2), with the poseidon2 table at the
+/// tier's full `2^(t+2)`: [`gas_max_declared`] at full height. What the fee rules price a call
+/// header by — a proof declaring a shorter poseidon2 table has a lower ceiling, so pricing at
+/// full height never under-charges it.
 pub fn gas_max(tier: u8, keccak_log_height: u8, sha256_log_height: u8) -> u64 {
-    let tier = tier.clamp(MIN_TIER, MAX_TIER);
-    let cycles = (1u64 << tier) - 1;
-    let absorb_surcharge = 1u64 << (tier - 2);
-    let blocks = |log_height: u8, block: u64| if log_height == 0 { 0 } else { (1u64 << log_height.min(40)) / block };
-    cycles
-        .saturating_add(absorb_surcharge)
-        .saturating_add(blocks(keccak_log_height, 32).saturating_mul(KECCAK_GAS - 1))
-        .saturating_add(blocks(sha256_log_height, 64).saturating_mul(SHA256_GAS - 1))
+    gas_max_with_modq(tier, keccak_log_height, sha256_log_height, 0)
 }
 
-/// `gas_max` with the modq table's declared height: `MODQ_GAS − 1` per 1 024-row block
-/// (constraint set 9; mirrors circuits `gas::gas_max_with_modq`). At `modq_log_height = 0` it is
-/// `gas_max` exactly.
+/// `gas_max` with the modq table's declared height, the poseidon2 table at full height (mirrors
+/// circuits `gas::gas_max_with_modq`). At `modq_log_height = 0` it is `gas_max` exactly.
 pub fn gas_max_with_modq(tier: u8, keccak_log_height: u8, sha256_log_height: u8, modq_log_height: u8) -> u64 {
-    let blocks = if modq_log_height == 0 { 0 } else { (1u64 << modq_log_height.min(40)) / 1024 };
-    gas_max(tier, keccak_log_height, sha256_log_height).saturating_add(blocks.saturating_mul(MODQ_GAS - 1))
+    gas_max_declared(tier, keccak_log_height, sha256_log_height, modq_log_height, u8::MAX)
+}
+
+/// The header's ceiling with the poseidon2 table's declared height (constraint set 11, ZKVM-112;
+/// mirrors circuits `gas::gas_max_declared`, pinned by the zkvm crate's
+/// `the_cores_gas_max_mirror_matches_the_vendored_one`). Five terms:
+///
+/// - `2^t − 1`, the tier's cycle budget;
+/// - `(POSEIDON2_ABSORB_GAS − 1) · 2^p2lh / 32`: every absorb or digest-prefix row pulls one
+///   permutation into the poseidon2 table, which holds `2^p2lh / 32` of them;
+/// - `(KECCAK_GAS − 1) · 2^klh / 32`, `(SHA256_GAS − 1) · 2^slh / 64` and
+///   `(MODQ_MAX_GAS − 1) · 2^mlh / 1024`: every hash or modq row the declared tables could hold.
+///
+/// The tier is clamped to `[MIN_TIER, MAX_TIER]`, `p2lh` to `[5, t + 2]` and every other height to
+/// 40 before a shift (the words come from an untrusted header); height `0` is no table.
+pub fn gas_max_declared(tier: u8, keccak_log_height: u8, sha256_log_height: u8, modq_log_height: u8, poseidon2_log_height: u8) -> u64 {
+    let tier = tier.clamp(MIN_TIER, MAX_TIER);
+    let cycles = (1u64 << tier) - 1;
+    let p2 = poseidon2_log_height.clamp(5, tier + 2);
+    let absorbs = (POSEIDON2_ABSORB_GAS - 1) << (p2 - 5);
+    let blocks = |log_height: u8, block: u64| if log_height == 0 { 0 } else { (1u64 << log_height.min(40)) / block };
+    cycles
+        .saturating_add(absorbs)
+        .saturating_add(blocks(keccak_log_height, 32).saturating_mul(KECCAK_GAS - 1))
+        .saturating_add(blocks(sha256_log_height, 64).saturating_mul(SHA256_GAS - 1))
+        .saturating_add(blocks(modq_log_height, 1024).saturating_mul(MODQ_MAX_GAS - 1))
 }
 
 /// The one `bundle_gas_limit` a genesis `gas` section may name (final-review I3): the bundle
-/// guest's header ceiling `gas_max(BUNDLE_PROOF_TIER, 0, 0)` = 20 479 — what every hidden-asset
-/// bundle proof declares, since a bundle is pinned to tier 14 with no hash tables.
+/// guest's header ceiling `gas_max(BUNDLE_PROOF_TIER, 0, 0)` = 22 527 since constraint set 11
+/// (20 479 through set 10) — what every hidden-asset bundle proof declares, since a bundle is
+/// pinned to tier 14 with no hash tables and its poseidon2 table at the full `2^16`.
 pub fn bundle_gas_limit_pin() -> u64 {
     gas_max(crate::types::BUNDLE_PROOF_TIER, 0, 0)
 }
 
 /// The `GAS_LIMIT` every auth proof (split authorisation) must declare on a chain with a `gas`
-/// section: the auth guest's header ceiling `gas_max(AUTH_PROOF_TIER, 0, 0)` = 1 279 — the auth
+/// section: the auth guest's header ceiling `gas_max(AUTH_PROOF_TIER, 0, 0)` = 1 407 since
+/// constraint set 11 (1 279 through set 10) — the auth
 /// proof is pinned to tier 10 with no hash tables, and the auth prover declares the ceiling
 /// (the machine's default). A fixed rule, not a genesis field: there is exactly one honest value.
 pub fn auth_gas_limit_pin() -> u64 {
@@ -216,10 +226,17 @@ pub fn auth_gas_limit_pin() -> u64 {
 }
 
 /// The `GAS_LIMIT` every multisig auth proof must declare on a chain with a `gas` section: its
-/// pinned header's ceiling `gas_max_with_modq(18, 14, 0, 16)` = 436 159 (R-gas: a function of
-/// public header words only, the same for every M).
+/// pinned header's ceiling `gas_max_declared(18, 14, 0, 16, 16)` = 355 775 since constraint set 11
+/// (436 159 through set 10, at the full poseidon2 table; R-gas: a function of public header words
+/// only, the same for every M).
 pub fn msauth_gas_limit_pin() -> u64 {
-    gas_max_with_modq(crate::types::MSAUTH_PROOF_TIER, crate::types::MSAUTH_KECCAK_LOG_HEIGHT, 0, crate::types::MSAUTH_MODQ_LOG_HEIGHT)
+    gas_max_declared(
+        crate::types::MSAUTH_PROOF_TIER,
+        crate::types::MSAUTH_KECCAK_LOG_HEIGHT,
+        0,
+        crate::types::MSAUTH_MODQ_LOG_HEIGHT,
+        crate::types::MSAUTH_POSEIDON2_LOG_HEIGHT,
+    )
 }
 
 /// A node's gas prices (spec §4.1, Phase 0): admission policy, not a ledger rule.
@@ -588,22 +605,24 @@ mod tests {
         assert_eq!(call_bytes(&[], Some(&e)), 1248);
     }
 
-    /// Spec 2026-09-28 §3.2 (controller ruling, constraint-set-8 final review): the ceiling a
-    /// proof header implies — the tier's cycle budget, plus the Poseidon2 absorb surcharge
-    /// (`2^(t−2)`: every absorb row beyond its cycle costs `+2`, bounded by the Poseidon2
-    /// table's own capacity of `2^(t−3)` permutation slots — `gas_max`'s doc comment — not a
-    /// cpu-row count), plus the weight of every permutation and compression the declared hash
-    /// tables could hold.
+    /// The ceiling a proof header implies (constraint set 11's weights) — the tier's cycle
+    /// budget, plus `3 · 2^(t−3)` for the full poseidon2 table's permutation slots, plus the
+    /// weight of every permutation and compression the declared hash tables could hold.
     #[test]
     fn gas_max_is_the_headers_ceiling() {
-        assert_eq!(gas_max(10, 0, 0), 1_279);
-        assert_eq!(gas_max(20, 0, 0), 1_310_719);
+        assert_eq!(gas_max(10, 0, 0), 1_407);
+        assert_eq!(gas_max(20, 0, 0), 1_441_791);
         // One keccak block (2^5 rows = 1 permutation) adds KECCAK_GAS − 1 beyond its cycle.
-        assert_eq!(gas_max(10, 5, 0), 1_279 + 191);
+        assert_eq!(gas_max(10, 5, 0), 1_407 + 133);
         // One sha256 block (2^6 rows = 1 compression) adds SHA256_GAS − 1.
-        assert_eq!(gas_max(10, 0, 6), 1_279 + 63);
+        assert_eq!(gas_max(10, 0, 6), 1_407 + 48);
         // The call caps: tier 14, keccak 2^12 (128 perms), sha256 2^13 (128 comps).
-        assert_eq!(gas_max(14, 12, 13), 20_479 + 128 * 191 + 128 * 63);
+        assert_eq!(gas_max(14, 12, 13), 22_527 + 128 * 133 + 128 * 48);
+        // A declared poseidon2 height: the permutation term is the declared table's.
+        assert_eq!(gas_max_declared(14, 0, 0, 0, 16), gas_max(14, 0, 0));
+        assert_eq!(gas_max_declared(14, 0, 0, 0, 12), 16_383 + 3 * 128);
+        assert_eq!(gas_max_declared(14, 0, 0, 0, 0), 16_383 + 3, "clamped up to 5");
+        assert_eq!(gas_max_declared(14, 0, 0, 0, 99), gas_max(14, 0, 0), "clamped down to t + 2");
         // Below MIN_TIER clamps up; above MAX_TIER clamps down.
         assert_eq!(gas_max(0, 0, 0), gas_max(10, 0, 0));
         assert_eq!(gas_max(99, 0, 0), gas_max(20, 0, 0));
@@ -614,11 +633,11 @@ mod tests {
     #[test]
     fn the_policy_floor_is_the_larger_of_the_two_floors() {
         let p = GasPolicy::DEFAULT;
-        // tier-10 fib-sized, 1.30 MB: bytes 1 270 KiB · 800 = 1 016 000, gas 1 279 · 100.
-        assert_eq!(p.call_floor(10, 0, 0, 1_300_000), BUNDLE_BASE + 127_900 + 1_016_000);
-        // tier 20, 1.45 MB: 1 310 719 · 100 + 1 417 KiB · 800 (1 450 000 B is 16 B into its
+        // tier-10 fib-sized, 1.30 MB: bytes 1 270 KiB · 800 = 1 016 000, gas 1 407 · 100.
+        assert_eq!(p.call_floor(10, 0, 0, 1_300_000), BUNDLE_BASE + 140_700 + 1_016_000);
+        // tier 20, 1.45 MB: 1 441 791 · 100 + 1 417 KiB · 800 (1 450 000 B is 16 B into its
         // 1 417th KiB, so the "or part of one" rule rounds up from 1 450 000 / 1024 = 1416.015625).
-        assert_eq!(p.call_floor(20, 0, 0, 1_450_000), BUNDLE_BASE + 131_071_900 + 1_133_600);
+        assert_eq!(p.call_floor(20, 0, 0, 1_450_000), BUNDLE_BASE + 144_179_100 + 1_133_600);
         // A 32 MiB proof at tier 10: the old schedule's byte term is the higher floor.
         let big = 32 << 20;
         let old = BUNDLE_BASE + call_fee(10, big);
@@ -878,7 +897,7 @@ mod gas_config_tests {
     use super::*;
 
     fn ok() -> GasConfig {
-        GasConfig { gas_price: 100, byte_price: 800, bundle_gas_limit: 20_479, metering: GasMetering::Circuit, dynamic: None }
+        GasConfig { gas_price: 100, byte_price: 800, bundle_gas_limit: 22_527, metering: GasMetering::Circuit, dynamic: None }
     }
 
     #[test]
@@ -904,8 +923,8 @@ mod gas_config_tests {
         assert!(GasConfig { gas_price: 0, ..ok() }.check(MAX_BLOCK_BYTES).unwrap_err().contains("gas_price"));
         assert!(GasConfig { byte_price: 0, ..ok() }.check(MAX_BLOCK_BYTES).unwrap_err().contains("byte_price"));
         assert!(GasConfig { bundle_gas_limit: 0, ..ok() }.check(MAX_BLOCK_BYTES).unwrap_err().contains("bundle_gas_limit"));
-        assert!(GasConfig { bundle_gas_limit: 20_478, ..ok() }.check(MAX_BLOCK_BYTES).unwrap_err().contains("20479"), "only the pin");
-        assert_eq!(bundle_gas_limit_pin(), 20_479);
+        assert!(GasConfig { bundle_gas_limit: 22_526, ..ok() }.check(MAX_BLOCK_BYTES).unwrap_err().contains("22527"), "only the pin");
+        assert_eq!(bundle_gas_limit_pin(), 22_527);
     }
 
     #[test]
@@ -991,16 +1010,17 @@ mod gas_config_tests {
         assert_eq!(next_price(100, 100, 0, 1 << 18, 1250), 100, "gas: floor holds");
     }
 
-    /// MODQ re-vendor: `gas_max_with_modq` is `gas_max` plus `MODQ_GAS − 1` per declared 1 024-row
-    /// modq block; at 0 it is `gas_max` exactly, at every tier.
+    /// `gas_max_with_modq` is `gas_max` plus `MODQ_MAX_GAS − 1` per declared 1 024-row modq block
+    /// (303 since constraint set 11, 167 before); at 0 it is `gas_max` exactly, at every tier.
     #[test]
-    fn gas_max_with_modq_adds_167_per_modq_block() {
-        assert_eq!(MODQ_GAS, 168);
+    fn gas_max_with_modq_adds_303_per_modq_block() {
+        assert_eq!(MODQ_MAX_GAS, 304);
         for t in MIN_TIER..=MAX_TIER {
             assert_eq!(gas_max_with_modq(t, 0, 0, 0), gas_max(t, 0, 0));
             assert_eq!(gas_max_with_modq(t, 14, 0, 0), gas_max(t, 14, 0));
         }
-        assert_eq!(gas_max_with_modq(18, 14, 0, 16) - gas_max(18, 14, 0), (1u64 << 16) / 1024 * 167);
-        assert_eq!(gas_max_with_modq(18, 14, 0, 10) - gas_max(18, 14, 0), 167);
+        assert_eq!(gas_max_with_modq(18, 14, 0, 16) - gas_max(18, 14, 0), (1u64 << 16) / 1024 * 303);
+        assert_eq!(gas_max_with_modq(18, 14, 0, 10) - gas_max(18, 14, 0), 303);
+        assert_eq!(msauth_gas_limit_pin(), 355_775, "gas_max_declared(18, 14, 0, 16, 16)");
     }
 }

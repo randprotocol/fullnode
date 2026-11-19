@@ -120,6 +120,9 @@ rand-node verify --datadir /root/data-<letter>-<genesis8> --mode full   # stop t
 
 On a chain whose genesis names `hc_auth_multisig`, `rand-node verify` loads the pinned msauth
 verifier key exactly as `run` does (below, "The msauth verifier key") and refuses to verify without it.
+On a chain whose genesis names `perps.state_proof_keys` (chain 22), `run` and `verify` load the
+pinned perps state-proof keys the same way (below, "The perps state-proof verifier keys") and refuse
+without them.
 
 ### Reserved peers (audit v6, NET-1)
 
@@ -531,11 +534,13 @@ A node on a chain whose genesis names `hc_auth_multisig` verifies multisig autho
   `sha256 <hex>  bytes <n>`). It ships as a release asset listed in the signed `SHA256SUMS`.
 - **The pin.** Its SHA-256 is compiled into the build (`MSAUTH_VK_SHA256_PRODUCTION`;
   `rand-node keygen-msauth-vk --print-pinned production` prints it, `--check FILE` prints a
-  file's). At circuits d217252 (constraint set 9) the production blob is 23 754 bytes with
-  SHA-256 `68facb06c7f321aaf1d4d541acf6b5c0e9d7f17788ed1c9add6c5a8a8f7acd30`; the keygen is deterministic (any host regenerates it byte for byte, ~25 s and
+  file's). At circuits 76a48dc (constraint set 11, chain 22 on) the production blob is 23 851 bytes
+  with SHA-256 `168d79a880b13b6d3e5b1f2a0f50561590712179c63189b52038cb2172a971b3` (chain 21's, set 9 at
+  circuits d217252, is 23 754 bytes, `68facb06c7f321aaf1d4d541acf6b5c0e9d7f17788ed1c9add6c5a8a8f7acd30`,
+  shipped by the v0.8.6 line); the keygen is deterministic (any host regenerates it byte for byte, ~25 s and
   ~4 GB peak on an M-series laptop). Both blobs are committed, so a release tree carries
   them: `crates/randprotocol-zkvm/keys/msauth-vk-production.bin` and, for tests,
-  `crates/randprotocol-zkvm/keys/msauth-vk-test.bin` (SHA-256 `c82250e7e7f8ca94246dc512091c1dafe402d5c0f6f4503e585d9381319443f5`). The vendored `Machine::install_verifier_key_pinned` checks it on the raw bytes before
+  `crates/randprotocol-zkvm/keys/msauth-vk-test.bin` (SHA-256 `d30472df55cea4d4d7dadae006e914482781fbaedb7b7f7445a43de7588ddb3d`). The vendored `Machine::install_verifier_key_pinned` checks it on the raw bytes before
   decoding anything: the blob is a trust root (a crafted preprocessed commitment could let a
   forged proof verify), so an unpinned file is never decoded.
 - **The location.** Beside the binary: `/usr/local/bin/msauth-vk-production.bin` on the fleet
@@ -584,6 +589,65 @@ A node on a chain whose genesis names `hc_auth_multisig` verifies multisig autho
 
   It compares against the pin of the binary being installed on that host (`rand-node.new`), not
   a pin read on the operator's machine, so a blob and a build from different commits never pair.
+
+## The perps state-proof verifier keys (CON-601, chain 22 onward)
+
+A block carrying a tier-18 perps state proof used to make every validator build that shape's
+verifier key on first sight (~1.7 GB peak with `parallel`, ~3.3–4 GB without): a 2 GB validator
+could OOM on someone else's proof. Chain 22 pins the keys instead. Validators load them from
+shipped files at startup and never build one.
+
+- **The genesis field.** `perps.state_proof_keys`, a list of up to 8
+  `{tier, program_log_height, input_log_height, public_log_height, poseidon2_log_height, sha256}`
+  (sha256 = lowercase hex of the key file's raw bytes), in strictly increasing shape order. It
+  needs `perps.engine_program_log_height` and must name only canonical state-proof shapes of the
+  chain (tier ≤ `max_tier`, program = the engine's height, input ≤ min(tier+2, 16), poseidon2 even
+  ≤ tier+2, public in 7..= what `max_window_blocks` needs). It is serde-default and omitted when
+  empty, and bound into the genesis hash only when set, so chain 21's hash does not move.
+- **The rule.** When the list is non-empty, a state proof whose declared shape is not in it is
+  refused before any key is touched, at validate and at apply (`ProofRefused`, "not one of the
+  chain's N pinned state-proof key shapes"). A pinned shape verifies only against the key loaded
+  from its file; the node never builds a pinned key. An empty list keeps chain 21's behaviour
+  (build on demand under `PERP_KEY_BUILD_GATE`).
+- **Chain 22's four.** Tier 18 over the engine's program height 14, input 16, poseidon2 20, one
+  per public height (windows of 1..=11, 12..=27, 28..=59 and 60..=64 recorded blocks). These
+  are the shapes the engine's prover makes by default on a pinned chain. `--smallest` and
+  lower tiers are refused there.
+
+  | file | sha256 | bytes |
+  |---|---|---|
+  | `perp-vk-production-t18-pg14-in16-pub7-p2h20.bin` | `4dc1f18bdd6d9104ba1622710cf2c146f71759676dbdcb70dad036152242e8b4` | 13 685 |
+  | `perp-vk-production-t18-pg14-in16-pub8-p2h20.bin` | `6392e5e9b7348f3729ba2031e0e3ec9788d6ed62a14521526482c92615f55106` | 13 685 |
+  | `perp-vk-production-t18-pg14-in16-pub9-p2h20.bin` | `c31636aa281004163e6fe0debd81854f11d7bca6c8062a91b1501c7e593e5bf0` | 13 685 |
+  | `perp-vk-production-t18-pg14-in16-pub10-p2h20.bin` | `ae3d0dc276061fd2a87b2e91b239f6dcccb746b49dedeecfdb2aab977c95c370` | 13 685 |
+
+  They are committed in `crates/randprotocol-zkvm/keys/`, and their digests are compiled in
+  (`executor::perp_vk::CHAIN22_SHA256_PRODUCTION`). `rand-node keygen-perp-vk --print-pinned
+  production` prints `<file> <sha256>` per key, `--check FILE` prints a file's sha256, and
+  `--genesis-json DIR` prints the genesis list from the files in DIR. `--profile production
+  --out-dir DIR` rebuilds them on a big host: 20.6 s and 1.74 GB peak each with `parallel` and
+  `RAYON_NUM_THREADS=16`. The output is deterministic (`cargo test -p randprotocol-zkvm --test
+  perp_vk -- --ignored`).
+- **The location.** Beside the binary: `/usr/local/bin/perp-vk-production-*.bin` on the fleet.
+  `--perps-key-dir DIR` or `RAND_PERPS_KEY_DIR` overrides it. A debug build, or
+  `RAND_PERPS_KEY_DEV_FALLBACK=1`, falls back to the source tree's `keys/`. At startup the node
+  reads every file the genesis pins, holds each to its genesis sha256 and to its shape, and
+  installs it. If a file is missing, mismatched or refused, the node does not start, and the
+  error names the path and the digest. `rand_status.perps_keys` reports `{"source":
+  "loaded"|"absent", "keys": N}`, and `rand_getPerps.state_proof_keys` serves the list.
+- **The cut.** `deploy/cut-chain22-genesis.sh` holds the files in `PERPS_KEY_DIR` (default the
+  tree's `keys/`) to the cutting `rand-node`'s own pins, writes the field with `--genesis-json`,
+  asserts it in `py_splice`, probes it in the genesis hash (without it, and with one digest
+  changed), and reads it back in `check-limits` (`rand_getPerps.state_proof_keys` and
+  `rand_status.perps_keys` = loaded, 4).
+- **The roll.** `deploy/roll-all.sh` takes `PERPS_VK_DIR`, the directory that holds the release's
+  four files. With `RELEASE_SUMS`, each file must be the one the signed `SHA256SUMS` lists. On
+  each host it holds every file the `rand-node.new` being installed pins to that pin, with
+  `sha256sum` and with `--check`, and installs them beside the binary before any restart. A
+  mismatch skips the host, binaries included. Without `PERPS_VK_DIR`, the roll is refused if
+  any host's genesis names `state_proof_keys` or cannot be read. The release workflow ships
+  the four files beside the binaries, in `SHA256SUMS` and in the build attestation, after it
+  asserts that the built `rand-node` pins each one.
 
 ## Release trust
 
@@ -1354,12 +1418,12 @@ section:
   per KiB of call proof plus input envelope. A call's floor is `BUNDLE_BASE + gas_price·GAS_LIMIT
   + byte_price·⌈bytes/1024⌉`, priced at the proof's own declared `GAS_LIMIT`, not the header's
   ceiling (`docs/fees.md` §1.1).
-- **`bundle_gas_limit`** (exactly `20479`): every bundle proof's declared `GAS_LIMIT` must equal
+- **`bundle_gas_limit`** (exactly `22527` under constraint set 11; chains 18–21 carry set 8/9's `20479`): every bundle proof's declared `GAS_LIMIT` must equal
   this exactly, or the proof is refused (`TxError::BundleGasLimit`, permanent). It must be
-  `gas_max(14, 0, 0) = 20479` for today's tier-14 hidden-asset guests (v1, v2 and chain 18's v3),
+  `gas_max(14, 0, 0) = 22527` for today's tier-14 hidden-asset guests (v1, v2 and v3),
   and genesis refuses any other value (`GasConfig::check`, `gas::bundle_gas_limit_pin`) — any
   other value would mean no real bundle could ever be admitted. On a split-authorisation chain the
-  auth proof is pinned the same way with no field of its own: `gas_max(10, 0, 0) = 1279`
+  auth proof is pinned the same way with no field of its own: `gas_max(10, 0, 0) = 1407` (set 11; `1279` before)
   (`gas::auth_gas_limit_pin`, `TxError::AuthGasLimit`, permanent).
 - **`metering`**: only `"circuit"` parses; the field exists so a later metering scheme has a name.
 - **`dynamic`** (optional, Phase 2 — absent means the two starting prices never move):
@@ -1892,8 +1956,8 @@ not move), and read back by `check-limits`.
 | `max_tier`, `max_block_inputs` | 18, 24 | the documented production sizing: durian.market's gated case `block-24-14liq` (24 inputs, a close that liquidates 14) is 212 018 cycles, inside tier 18 with 15 % headroom; 25 is refused. |
 | `max_window_blocks` | 64 | the ceiling; 64 close-only blocks do not fit tier 18 (≈ 25 k cycles a close), so `perp-prover run` halves its window until one fits. |
 | `min_deposit` | 100000000 | 1 zUSD (eight decimals). |
-| `engine_hc` | `f286a611…1573` | durian.market's pinned `artifacts/perp-engine.image.bin`; the cut runs `rand perp image-hc --image $PERP_IMAGE` and refuses any other. |
-| `genesis_root` | derived | `$PERP_PROVER genesis-state` over the market list, then `rand perp genesis-root --state`; printed as `PERPS GENESIS ROOT` for the cut record. The real cut refuses without `PERP_PROVER` (durian.market's `perp-prover`, built from the commit that pinned the image). |
+| `engine_hc` | `482215a8…5073` | durian.market's pinned `artifacts/perp-engine.image.bin` under constraint set 11 (chain 21's image, the same bytes, sha256 `77dfc228…`; chain 21 names it `f286a611…1573` under set 9); the cut runs `rand perp image-hc --image $PERP_IMAGE` and refuses any other. |
+| `genesis_root` | derived, must be `a45d8fda…98b4` | `$PERP_PROVER genesis-state` over the market list, then `rand perp genesis-root --state`; refused unless it is the recorded set-11 root `a45d8fdab8cf7dab972e76dd6a7a18d9e82fc8210afab672a161ee60021698b4` (chain 21's 26 genesis words under the Grain constants; chain 21's set-9 root `da0e3a53…` is refused); printed as `PERPS GENESIS ROOT` for the cut record. The real cut refuses without `PERP_PROVER` (durian.market's `perp-prover`, built from the commit that pinned the image). |
 
 The section is **spliced**, not passed as `rand-node genesis --perps`: the base file lists no
 token (zUSD is a bridged token and is spliced in with the bridge section), and `Genesis::validate`
@@ -1971,8 +2035,8 @@ issues at the cut: randprotocol/monorepo#15 (PST-1), #13 (PERP-6) and #12 (PERP-
 | `beacon` | `commit_delay_blocks` `256` (**owner value to confirm**, OPEN 10) + one commitment per validator (the operators') | the randomness beacon: every block opens with its proposer's hash-chain reveal; refused by the node without the window. Carried by the owner's decision of 2026-11-18 | `docs/evm-block-context.md` §11 (PR #189) |
 
 Everything else is chain 21's, asserted equal: `fees` {burn_base, burn_floor}, `perps` (BTC-PERP on
-zUSD, the pinned engine, tier 18, 24 inputs — and its `genesis_root`, re-derived by perp-prover,
-must equal chain 21's `da0e3a53…`), `multisig` create fee 1 RAND with one treasury (now 5 of 6,
+zUSD, tier 18, 24 inputs; the same engine image at its set-11 hc `482215a8…`, and its
+`genesis_root`, re-derived by perp-prover, must equal the recorded set-11 root `a45d8fda…`), `multisig` create fee 1 RAND with one treasury (now 5 of 6,
 item 3 below), `hc_auth_multisig` 9705f8e2…, 6 MiB proofs and 19 MiB blocks, and chain 20's shape
 before them.
 
@@ -2006,8 +2070,9 @@ before them.
    treasury.
 4. **Chain 21's perps exchange: carried (empty)** (decided 2026-11-19). It holds 0 collateral and 0
    RAND (`rand_getSupply.perps_collateral_held` and `perps_rand_held` `"0"`), and chain 22's engine
-   starts from `perp-prover genesis-state` over the same markets on the same engine, so the same
-   root, `da0e3a53…`, asserted equal. When the snapshot shows the exchange empty (`rand_getPerps`
+   starts from `perp-prover genesis-state` over the same markets on the same engine: chain 21's
+   genesis words, hashed under constraint set 11 to the recorded root `a45d8fda…98b4` (not chain
+   21's set-9 `da0e3a53…`), asserted equal. When the snapshot shows the exchange empty (`rand_getPerps`
    accounts, pending withdrawals and collateral; `rand_getPerpAccounts`; the two supply counters)
    the cut needs no override, and the record's `carries:` line must name perps. A non-empty
    exchange is still refused unless `PERPS_STATE_NOT_CARRIED_OK=1` and the record's `drops:`

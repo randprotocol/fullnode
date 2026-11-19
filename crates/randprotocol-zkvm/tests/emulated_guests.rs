@@ -114,6 +114,175 @@ fn compiled_evm_guest_reproduces_the_native_interpreter_on_view_approve_and_reve
     assert_ne!(want_ap, want_r);
 }
 
+/// ZKVM-103 through the committed image: `evm.bin` run with a caller who did not authorise the
+/// call produces a valid execution whose output words the chain's statement — built from the
+/// caller it authenticated — does not accept. The same call made by the owner is accepted, and
+/// the same proof replayed under another `context` is not.
+#[test]
+fn compiled_evm_guest_binds_the_caller_the_calldata_and_the_context() {
+    use randprotocol_zkvm::evm::{ownable_transfer, EvmStatement};
+    let p = guests::compiled::evm();
+    let cycles = randprotocol_zkvm::machine::Tier(16).max_cycles();
+    let mallory = U256::from_u32(0x3a11);
+    let nonce = [7, 0, 0, 0, 0, 0, 0, 21];
+
+    // Mallory holds the witness for slot 0 and runs the call as Alice, the owner.
+    let forged = ownable_transfer(ALICE, ALICE, mallory, nonce);
+    let (want, o, post) = forged.expected();
+    assert_eq!(o.status(), 1, "the forged call is a correct execution");
+    assert_ne!(post.root(), forged.tree.root(), "ownership moved");
+    let out = execute(&p, &forged.input_words(), &[], cycles).unwrap().outputs;
+    assert_eq!(out, want, "the image and the native run agree");
+
+    let statement = |caller: U256, context: [u32; 8]| EvmStatement {
+        layout: 2,
+        codehash: keccak256(&forged.code),
+        pre_root: forged.tree.root(),
+        post_root: post.root(),
+        return_data: vec![],
+        logs: vec![],
+        address: forged.address,
+        caller,
+        callvalue: U256::ZERO,
+        calldata: forged.calldata.clone(),
+        context,
+        gas_limit: forged.gas_limit as u32,
+        gas_used: o.gas_used as u32,
+    };
+    // The chain authenticated Mallory as the sender: refused.
+    assert!(!statement(mallory, nonce).accepts(1, &out), "an unauthorised caller's proof was accepted");
+    // Had Alice sent it, the same words are a proof of her call …
+    assert!(statement(ALICE, nonce).accepts(1, &out));
+    // … under that nonce only.
+    assert!(!statement(ALICE, [8, 0, 0, 0, 0, 0, 0, 21]).accepts(1, &out), "a replay under another context was accepted");
+
+    // What Mallory can prove as herself: a revert, the root where it was.
+    let honest = ownable_transfer(ALICE, mallory, mallory, nonce);
+    let (want_h, o_h, post_h) = honest.expected();
+    assert_eq!(o_h.status(), 0);
+    assert_eq!(post_h.root(), honest.tree.root());
+    assert_eq!(execute(&p, &honest.input_words(), &[], cycles).unwrap().outputs, want_h);
+}
+
+/// **ZKVM-105: two storage layouts admitted side by side.** `guests::compiled::evm_images()` is
+/// the version table: layout 1 (`evm-v1.bin`, depth 32) and layout 2 (`evm.bin`, depth 64), two
+/// programs with two `hc`s. The same call against the same storage, rooted under each layout,
+/// runs under that layout's image and its output is accepted by the statement that names that
+/// layout — and by no other: the layout word is in the digest, so neither image's proof passes
+/// for a root kept under the other layout, and an input built for one layout is not a call under
+/// the other.
+#[test]
+fn two_evm_storage_layouts_are_admitted_side_by_side() {
+    use randprotocol_zkvm::evm::{ownable_transfer, EvmStatement};
+    let cycles = randprotocol_zkvm::machine::Tier(16).max_cycles();
+    let images = guests::compiled::evm_images();
+    assert_eq!(images.iter().map(|i| (i.layout, i.depth)).collect::<Vec<_>>(), [(1, 32), (2, 64)]);
+    assert_ne!(images[0].program.digest(), images[1].program.digest(), "one hc per layout");
+    assert_eq!(images[1].program.digest(), guests::compiled::evm().digest());
+
+    let new_owner = U256::from_u32(0xb0b);
+    // The gas is the interpreter's, the same under either layout: taken from the native run.
+    let native = ownable_transfer(ALICE, ALICE, new_owner, [5; 8]);
+    let (_, o, _) = native.expected();
+    assert_eq!(o.status(), 1);
+
+    let mut outs = Vec::new();
+    let mut vectors = Vec::new();
+    for image in &images {
+        let mut call = ownable_transfer(ALICE, ALICE, new_owner, [5; 8]);
+        call.tree = call.tree.migrate(image.depth);
+        let words = call.input_words();
+        let mut post = call.tree.clone();
+        post.insert(U256::ZERO, new_owner);
+        let statement = |layout: u32| EvmStatement {
+            layout,
+            codehash: keccak256(&call.code),
+            pre_root: call.tree.root(),
+            post_root: post.root(),
+            return_data: vec![],
+            logs: vec![],
+            address: call.address,
+            caller: call.caller,
+            callvalue: U256::ZERO,
+            calldata: call.calldata.clone(),
+            context: call.context,
+            gas_limit: call.gas_limit as u32,
+            gas_used: o.gas_used as u32,
+        };
+        let out = execute(&image.program, &words, &[], cycles).unwrap().outputs;
+        assert!(statement(image.layout).accepts(1, &out), "layout {}: its own statement", image.layout);
+        assert!(!statement(3 - image.layout).accepts(1, &out), "layout {}: accepted as the other layout", image.layout);
+        outs.push(out);
+        vectors.push(words);
+    }
+    assert_ne!(outs[0], outs[1]);
+    assert_eq!(vectors[1].len() - vectors[0].len(), 256, "one witness: 32 more siblings");
+
+    // An input vector built for one layout is not a call under the other image: the layout-2
+    // image reads past the end of a layout-1 vector (no execution at all, so no proof), and the
+    // layout-1 image, given a layout-2 vector, verifies the first 32 siblings against a depth-64
+    // root and halts.
+    assert!(execute(&images[1].program, &vectors[0], &[], cycles).is_err());
+    match execute(&images[0].program, &vectors[1], &[], cycles) {
+        Ok(e) => assert_eq!(e.outputs[0], 2, "the layout-1 image ran a layout-2 vector"),
+        Err(_) => {}
+    }
+}
+
+/// **ZKVM-105: the freeze, on each layout's image.** Two slots that share layout 1's 32-bit
+/// position (a birthday pair, found in milliseconds; a partner for a *chosen* slot is ~2^32
+/// Keccaks). `a` holds a value. Under layout 1 no witness for `b` verifies, so a call that reads
+/// `b` is an exceptional halt for as long as `a` holds its value. Under layout 2 the two have
+/// different 64-bit positions and the same call reads `b` and returns zero.
+#[test]
+fn a_ground_slot_pair_freezes_under_layout_1_and_not_under_layout_2() {
+    use randprotocol_zkvm::evm::{slot_index, slot_index_at, EvmCall, SparseTree};
+    let cycles = randprotocol_zkvm::machine::Tier(16).max_cycles();
+    let s = U256::from_u32;
+    let mut seen = std::collections::HashMap::new();
+    let (a, b) = (0u32..1 << 20)
+        .find_map(|i| seen.insert(slot_index_at(&s(i), 32), i).map(|j| (s(j), s(i))))
+        .expect("a 32-bit collision among 2^20 slots");
+    assert_ne!(slot_index(&a), slot_index(&b));
+
+    // PUSH0 CALLDATALOAD SLOAD PUSH0 MSTORE PUSH1 32 PUSH0 RETURN: return storage[calldata[0..32]]
+    let read = |tree: SparseTree, slot: U256, touched: U256| EvmCall {
+        code: vec![0x5f, 0x35, 0x54, 0x5f, 0x52, 0x60, 0x20, 0x5f, 0xf3],
+        calldata: slot.to_be_bytes().to_vec(),
+        address: U256::ZERO,
+        caller: U256::ZERO,
+        callvalue: U256::ZERO,
+        gas_limit: 100_000,
+        context: [0; 8],
+        tree,
+        touched: vec![touched],
+    };
+
+    // Layout 1. The position's leaf is `a`'s. The only path to it is `a`'s witness, so the best a
+    // caller can do for `b` is that path with `b`'s slot and any claimed value: every one halts.
+    let v1 = guests::compiled::evm_v1();
+    let mut t1 = SparseTree::with_depth(32);
+    t1.insert(a, s(7));
+    let honest = read(t1.clone(), a, a).input_words();
+    assert_eq!(execute(&v1, &honest, &[], cycles).unwrap().outputs[0], 1, "a itself is readable");
+    for claimed in [U256::ZERO, s(7), s(1)] {
+        let mut w = read(t1.clone(), b, a).input_words();
+        let at = w.len() - 272;
+        w[at..at + 8].copy_from_slice(&b.0);
+        w[at + 8..at + 16].copy_from_slice(&claimed.0);
+        assert_eq!(execute(&v1, &w, &[], cycles).unwrap().outputs[0], 2, "b is readable under layout 1 claiming {claimed:?}");
+    }
+
+    // Layout 2: `b` has its own position; the call succeeds and returns zero.
+    let mut t2 = SparseTree::new();
+    t2.insert(a, s(7));
+    let call = read(t2, b, b);
+    let (want, o, _) = call.expected();
+    assert_eq!(o.status(), 1);
+    assert_eq!(&o.ret[..o.ret_len], &[0u8; 32]);
+    assert_eq!(execute(&guests::compiled::evm(), &call.input_words(), &[], cycles).unwrap().outputs, want);
+}
+
 #[test]
 fn compiled_sbpf_guest_matches_the_native_run_on_success_and_on_insufficient_funds() {
     use randprotocol_zkvm::sbpf::{deserialize_accounts, spl_transfer, TOKEN_AMOUNT_AT};
@@ -295,4 +464,76 @@ fn the_bundle_guest_digest_diverges_from_the_honest_one_when_outputs_exceed_inpu
     let v = notes::bundle_inputs(&sk, &ins, &outs, anchor, 0, 0, asset, time);
     let e = execute(&guests::bundle(), &v, &[], 1 << 22).unwrap();
     assert_ne!(e.outputs, notes::expected_bundle_outputs(&sk, &ins, &outs, anchor, 0, 0, asset, time));
+}
+
+// ---- the block context through the committed images (fullnode #168) -----------------------------
+
+/// `op`, then its word returned, as one call to the interpreter guest with no storage.
+fn block_call(op: u8) -> randprotocol_zkvm::evm::EvmCall {
+    let mut c = erc20_transfer(ALICE, BOB, U256::ZERO, &[]);
+    c.code = vec![op, 0x5f, 0x52, 0x60, 0x20, 0x5f, 0xf3];
+    c.calldata = vec![];
+    c.touched = vec![];
+    c
+}
+
+/// `evm.bin` and `evm-v1.bin` over an invoke's public segment: under a version-2 context each
+/// block-context opcode returns the word the interpreter computes natively (the eight outputs
+/// agree, the return-data hash among them); under a version-1 context each traps (status 2) with
+/// the outputs of a run with no context; `PREVRANDAO` traps without the beacon. A `Call`'s segment
+/// carries no context, so a run that reaches one of them reads past it, which the machine refuses
+/// (`ExecError::PublicIndex`: there is no proof of it), while a run that reaches none is unchanged.
+#[test]
+fn compiled_evm_reads_the_block_context_from_the_public_segment() {
+    use randprotocol_zkvm::emulator::ExecError;
+    use randprotocol_zkvm::evm::{v1_segment, BlockFacts};
+    let binding = [1, 2, 3, 4, 5, 6, 7, 8];
+    let mut r = [0u8; 32];
+    for (i, b) in r.iter_mut().enumerate() {
+        *b = 0xc3 ^ (i as u8).wrapping_mul(7);
+    }
+    let facts = BlockFacts {
+        height: 0x5_0000_0001,
+        timestamp_ms: 1_795_000_000_999,
+        chain_id: 22,
+        basefee: 0x7_0000_0009,
+        randomness: Some(r),
+    };
+    let with = facts.segment(&binding);
+    let without = BlockFacts { randomness: None, ..facts }.segment(&binding);
+    let v1 = v1_segment(&binding);
+    let (evm, evm_v1) = (guests::compiled::evm(), guests::compiled::evm_v1());
+    let cycles = 1 << 20;
+    for op in [0x32u8, 0x3a, 0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x48] {
+        let c = block_call(op);
+        let words = c.input_words();
+
+        let (want, o, _) = c.expected_on(&with);
+        assert_eq!(o.status(), 1, "{op:#04x}");
+        assert_eq!(execute(&evm, &words, &with, cycles).unwrap().outputs, want, "{op:#04x}: version 2");
+        assert_eq!(execute(&evm_v1, &words, &with, cycles).unwrap().outputs[0], 1, "{op:#04x}: layout 1");
+
+        let (want_nb, o_nb, _) = c.expected_on(&without);
+        assert_eq!(o_nb.status(), if op == 0x44 { 2 } else { 1 }, "{op:#04x}: no beacon");
+        assert_eq!(execute(&evm, &words, &without, cycles).unwrap().outputs, want_nb, "{op:#04x}: no beacon");
+
+        let (want_v1, o_v1, _) = c.expected_on(&v1);
+        assert_eq!(o_v1.status(), 2, "{op:#04x}: version 1 traps");
+        assert_eq!(want_v1, c.expected().0, "{op:#04x}: version 1 = no context");
+        assert_eq!(execute(&evm, &words, &v1, cycles).unwrap().outputs, want_v1, "{op:#04x}: version 1");
+        assert_eq!(execute(&evm_v1, &words, &v1, cycles).unwrap().outputs[0], 2, "{op:#04x}: layout 1, version 1");
+
+        // A `Call`: no context, and the run reads past the (empty) segment.
+        match execute(&evm, &words, &[], cycles) {
+            Err(ExecError::PublicIndex(8)) => {}
+            other => panic!("{op:#04x} under a Call: {:?}", other.map(|e| e.outputs)),
+        }
+    }
+    // The ERC-20 transfer reaches none of them: the same outputs over every segment, none at all
+    // included.
+    let t = erc20_transfer(ALICE, BOB, U256::from_u32(250), &[(ALICE, U256::from_u32(1000))]);
+    let (want, _, _) = t.expected();
+    for seg in [&with[..], &without[..], &v1[..], &[][..]] {
+        assert_eq!(execute(&evm, &t.input_words(), seg, cycles).unwrap().outputs, want, "{} words", seg.len());
+    }
 }

@@ -613,3 +613,82 @@ fn sponge_and_compress_rows_send_no_rb_register_read() {
         assert!(regs.iter().all(|a| a.ts != clk * 16 + 2), "row {row} still reads rb");
     }
 }
+
+// ── RVM-1001 (audit v14): the last real cpu row is a HALT ───────────────────────────────────
+// The program table's `IS_REAL` is the prover's wherever the fetch count is zero, so a prover may
+// extend it over the padding rows (whose preprocessed words are zero, i.e. `FADD r0, r0, r0`) and
+// let the cpu fetch them. Such a run cannot reach a `HALT`; the one rule that refuses it — and a
+// run that simply stops at the last instruction — is `tables/cpu.rs`'s
+// `IS_REAL·(1 − IS_REAL')·(1 − SEL_HALT) = 0`. The emulator never produces such a run
+// (`ExecError::PcOutOfRange`), so the traces are built here from a longer program's run with its
+// `HALT` row dropped, against the 16-instruction program that has none.
+
+/// Sixteen instructions and no `HALT`: twelve additions and the four published words (R5).
+fn sixteen_instructions_without_a_halt() -> Program {
+    let mut instrs: Vec<Instr> = (1..=12).map(|k| i(Op::Faddi, k as u8, 0, 100 + k)).collect();
+    for r in [1, 2, 3, 4] {
+        instrs.push(i(Op::Public, 0, r, 0));
+    }
+    assert_eq!(instrs.len(), 16);
+    prog(instrs)
+}
+
+/// The traces of a run of `p` (which has no `HALT`) that goes on through `fetched_padding` of the
+/// program table's padding rows and then just stops: the emulator runs `p` with that many zero
+/// words and a `HALT` appended, the `HALT` event is dropped, and the tables are built against `p`
+/// itself, with the program table's `IS_REAL` and fetch count extended over the padding rows the
+/// run fetched. With `keep_halt` the control: the same run with its `HALT`, against the program
+/// that has one.
+fn fell_off_traces(fetched_padding: usize, keep_halt: bool) -> (Program, randprotocol_rvm::machine::Traces) {
+    use randprotocol_rvm::machine::build_traces;
+    use randprotocol_rvm::tables::program::col as pcol;
+    let p = sixteen_instructions_without_a_halt();
+    let n = p.instrs.len();
+    let mut ran = p.clone();
+    // A padding row's four zero words decode to this instruction.
+    let zero_words = Instr::decode([F::ZERO; 4]).expect("the zero words are an instruction");
+    assert_eq!(zero_words, ir(Op::Fadd, 0, 0, 0));
+    ran.instrs.extend(std::iter::repeat(zero_words).take(fetched_padding));
+    ran.instrs.push(i(Op::Halt, 0, 0, 0));
+    let mut exec = randprotocol_rvm::emulator::execute(&ran, &[], 1000).unwrap();
+    assert_eq!(exec.events.len(), n + fetched_padding + 1);
+    if keep_halt {
+        let t = build_traces(&ran, &exec, Tier(8)).unwrap();
+        return (ran, t);
+    }
+    let halt = exec.events.pop().unwrap();
+    assert_eq!(halt.instr.op, Op::Halt);
+    assert_ne!(exec.events.last().unwrap().instr.op, Op::Halt, "the run's last row is not a HALT");
+    let mut t = build_traces(&p, &exec, Tier(8)).unwrap();
+    // `program_trace` marks only the instruction rows; the forger marks the fetched padding too
+    // (a prefix still, and `(1 − IS_REAL)·MULT = 0` holds), one fetch each.
+    assert!(n + fetched_padding < p3_matrix::Matrix::height(&t.program), "the fetched rows are inside the table");
+    for row in n..n + fetched_padding {
+        t.program.values[row * pcol::WIDTH + pcol::IS_REAL] = F::ONE;
+        t.program.values[row * pcol::WIDTH + pcol::MULT] = F::ONE;
+    }
+    (p, t)
+}
+
+#[test]
+fn a_run_that_falls_off_the_program_without_a_halt_is_refused() {
+    let m = Machine::new(FriProfile::Test);
+    // The control: the harness's run, with its HALT, is an honest proof — so what the two cases
+    // below lack is the HALT and nothing else.
+    let (ran, t) = fell_off_traces(3, true);
+    let proof = m.prove_traces(&ran, &t, Tier(8));
+    m.verify(&ran, &proof).expect("the same run with its HALT verifies");
+
+    // The run stops after the sixteenth instruction: its last real row is a PUBLIC.
+    let (p, t) = fell_off_traces(0, false);
+    let stopped_at_the_end = common::rejects(|| m.verify(&p, &m.prove_traces(&p, &t, Tier(8))));
+    // The run goes on into the program table's padding (IS_REAL extended over three padding rows,
+    // each fetched once) and stops there: the audit's case.
+    let (p, t) = fell_off_traces(3, false);
+    let stopped_in_the_padding = common::rejects(|| m.verify(&p, &m.prove_traces(&p, &t, Tier(8))));
+    assert_eq!(
+        (stopped_at_the_end, stopped_in_the_padding),
+        (true, true),
+        "refused: (a run whose last real row is its sixteenth instruction, a run that fetched padding rows and never halted)"
+    );
+}

@@ -62,6 +62,9 @@ pub const MSAUTH_PROOF_TIER: u8 = 18;
 /// floors at `M_MAX`), mirrored for `gas::msauth_gas_limit_pin`; the zkvm tests pin mirror == vendored.
 pub const MSAUTH_KECCAK_LOG_HEIGHT: u8 = 14;
 pub const MSAUTH_MODQ_LOG_HEIGHT: u8 = 16;
+/// Constraint set 11 (ZKVM-112): the multisig auth proof's declared poseidon2 height —
+/// `randprotocol_zkvm::msauth::PINNED_POSEIDON2_LOG_HEIGHT` (`tests/guest_provenance.rs` pins the pair).
+pub const MSAUTH_POSEIDON2_LOG_HEIGHT: u8 = 16;
 
 /// The one public-table height a bundle proof may declare: the transaction binding's
 /// ([`TX_BINDING_WORDS`] words) `public_log_height`, pinned by `decode_and_check` since the

@@ -10,7 +10,7 @@ name = "p3-batch-stark"
 version = "0.7.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
-description = "Batched STARK wrapper atop p3-uni-stark that reuses FRI openings across instances. RandProtocol fork: a quotient-layout switch."
+description = "Batched STARK wrapper atop p3-uni-stark that reuses FRI openings across instances. RandProtocol fork: a quotient-layout switch and a debug self-check switch."
 repository = "https://github.com/Plonky3/Plonky3"
 
 [lib]

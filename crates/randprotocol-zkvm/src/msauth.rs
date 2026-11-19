@@ -126,6 +126,7 @@ pub fn pinned_options() -> crate::machine::ProveOptions {
         min_modq_log_height: PINNED_MODQ_LOG_HEIGHT,
         min_keccak_log_height: PINNED_KECCAK_LOG_HEIGHT,
         min_mem_log_height: PINNED_MEM_LOG_HEIGHT,
+        poseidon2_log_height: Some(PINNED_POSEIDON2_LOG_HEIGHT),
         gas_limit: None,
         ..Default::default()
     }
@@ -136,6 +137,10 @@ pub const PINNED_MODQ_LOG_HEIGHT: u8 = 16;
 pub const PINNED_KECCAK_LOG_HEIGHT: u8 = 14;
 /// Memory table height (the tier's own t + 2).
 pub const PINNED_MEM_LOG_HEIGHT: u8 = 20;
+/// Constraint set 11 (ZKVM-112): the poseidon2 table's declared height — the smallest admitted
+/// tier-18 height that holds a full `M_MAX` run's permutations (2^16 of the full 2^20), so it is
+/// the same for every `M`.
+pub const PINNED_POSEIDON2_LOG_HEIGHT: u8 = 16;
 /// Program table height (the guest's word count, fixed per image), input table height (the fixed
 /// `MSAUTH_WORDS` witness) and public table height (8 binding words): not floors, but part of the
 /// pinned header all the same.
@@ -144,11 +149,12 @@ pub const PINNED_INPUT_LOG_HEIGHT: u8 = 12;
 pub const PINNED_PUBLIC_LOG_HEIGHT: u8 = 7;
 
 /// Builds the traces under `opts` and refuses unless the declared header is exactly the pinned
-/// one: tier plus all seven log heights. A hard error names the field.
+/// one: tier plus all eight log heights. A hard error names the field.
 pub fn check_pinned_shape_with(program: &crate::isa::Program, input: &[u32], binding: &[u32; 8], opts: crate::machine::ProveOptions) -> Result<(), String> {
     let exec = crate::emulator::execute(program, input, binding, MSAUTH_TIER.max_cycles()).map_err(|e| format!("execute: {e:?}"))?;
     let t = crate::machine::build_traces_salted_with(program, input, binding, [0; 4], &exec, MSAUTH_TIER, opts).map_err(|e| format!("build_traces: {e:?}"))?;
-    let fields: [(&str, u8, u8); 7] = [
+    let fields: [(&str, u8, u8); 8] = [
+        ("poseidon2_log_height", t.poseidon2_log_height, PINNED_POSEIDON2_LOG_HEIGHT),
         ("program_log_height", t.program_log_height, PINNED_PROGRAM_LOG_HEIGHT),
         ("input_log_height", t.input_log_height, PINNED_INPUT_LOG_HEIGHT),
         ("keccak_log_height", t.keccak_log_height, PINNED_KECCAK_LOG_HEIGHT),
@@ -177,10 +183,11 @@ pub fn prove_msauth(machine: &crate::machine::Machine, program: &crate::isa::Pro
     Ok(proof)
 }
 
-/// A proof's declared tier and seven log heights against the pins; the error names the field.
+/// A proof's declared tier and eight log heights against the pins; the error names the field.
 pub fn check_proof_header(proof: &crate::machine::Proof) -> Result<(), String> {
     if proof.tier != MSAUTH_TIER { return Err(format!("msauth proof header mismatch: tier = {:?}, pinned {:?}", proof.tier, MSAUTH_TIER)); }
-    let fields: [(&str, u8, u8); 7] = [
+    let fields: [(&str, u8, u8); 8] = [
+        ("poseidon2_log_height", proof.poseidon2_log_height, PINNED_POSEIDON2_LOG_HEIGHT),
         ("program_log_height", proof.program_log_height, PINNED_PROGRAM_LOG_HEIGHT),
         ("input_log_height", proof.input_log_height, PINNED_INPUT_LOG_HEIGHT),
         ("keccak_log_height", proof.keccak_log_height, PINNED_KECCAK_LOG_HEIGHT),

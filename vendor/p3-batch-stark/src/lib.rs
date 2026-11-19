@@ -27,7 +27,11 @@ pub use p3_uni_stark::{OpenedValues, VerificationError};
 pub use proof::{BatchCommitments, BatchOpenedValues, BatchProof};
 // RandProtocol patch (2026-10-04): quotient layout
 pub use layout::QuotientLayout;
-pub use prover::{StarkInstance, prove_batch, prove_batch_with_layout};
+// RandProtocol patch (2026-10-15): self-check switch (CS9-2)
+pub use prover::{
+    SelfCheck, StarkInstance, prove_batch, prove_batch_with_layout,
+    prove_batch_with_layout_and_self_check,
+};
 pub use transcript::BatchTranscript;
 pub use verifier::{
     VerifierData, commitments_with_opening_points, commitments_with_opening_points_with_layout,

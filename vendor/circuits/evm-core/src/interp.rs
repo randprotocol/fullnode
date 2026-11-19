@@ -1,6 +1,8 @@
 //! The interpreter (Task 3 of the M4.3 plan): the ERC-20 subset of the EVM — stack, memory,
 //! calldata, code, `SLOAD`/`SSTORE` over Merkle witnesses, 256-bit arithmetic, `KECCAK256`, logs,
-//! `RETURN`/`REVERT` — with the Shanghai static gas schedule and no allocation.
+//! `RETURN`/`REVERT` — with the Shanghai static gas schedule and no allocation; plus the
+//! post-Shanghai opcodes solc emits for `evmVersion` cancun, prague and osaka: `MCOPY` (EIP-5656),
+//! `TLOAD`/`TSTORE` (EIP-1153, over [`crate::transient`]) and `CLZ` (EIP-7939).
 //!
 //! Everything the run needs is a fixed-size array, sized by the plan's limits, and none of it is
 //! heap-allocated. The three big ones — the 1024-entry stack (32 KiB), 64 KiB of memory and the
@@ -12,23 +14,34 @@
 //! the decoded input plus these buffers — and `abi::run_call` is what the guest actually calls.
 //!
 //! **Out of scope traps.** Every opcode outside the plan's list — the `CALL`/`CREATE` family,
-//! precompiles, the block- and account-info opcodes, `TLOAD`/`TSTORE`, `MCOPY`, `BLOBHASH`,
-//! `RETURNDATACOPY` with a non-zero length — halts with [`Halt::Trap`], with the single exception
-//! of `0xfe`, which is [`Halt::Invalid`]. A trap is an exceptional halt: status word 2.
+//! precompiles, the account-info opcodes, `BLOCKHASH`, `SELFBALANCE`, `BLOBHASH` and
+//! `BLOBBASEFEE`, `RETURNDATACOPY` with a non-zero length — halts with [`Halt::Trap`], with the
+//! single exception of `0xfe`, which is [`Halt::Invalid`]. A trap is an exceptional halt: status
+//! word 2.
+//!
+//! **Block context** ([`crate::block`], fullnode #168). `TIMESTAMP`, `NUMBER`, `CHAINID`,
+//! `BASEFEE`, `GASPRICE`, `PREVRANDAO`, `COINBASE`, `GASLIMIT` and `ORIGIN` run under a
+//! version-2 context (an `InvokeAt`'s public segment) and trap under any other, as they always
+//! did: under a version-1 context a run is what it was, halt kind included.
 //!
 //! **Gas** is a counter with the Shanghai static schedule for the supported subset and no refunds
 //! and no warm/cold access list — `SLOAD` is always 2100 and `SSTORE` is 20 000 or 2 900 on the
-//! pre-value alone. Every exceptional halt consumes the whole limit, as the EVM does; only
+//! pre-value alone. The later opcodes cost what their EIPs say: `TLOAD`/`TSTORE` 100 each (the
+//! warm storage read), `MCOPY` 3 + 3 a word + the expansion over `max(dst, src) + len`, `CLZ` 5. Every exceptional halt consumes the whole limit, as the EVM does; only
 //! `STOP`/`RETURN`/`REVERT` leave gas on the table.
 //!
-//! **Logs keep their topics and drop their data.** The data range is still bounds-checked and paid
-//! for (8 gas a byte, plus any memory expansion), because a contract's gas must not depend on what
-//! the guest chooses to bind. The public output hashes the topics only (Task 4).
+//! **Logs keep their topics and the Keccak-256 of their data** (ZKVM-104). The data range is
+//! bounds-checked and paid for (8 gas a byte, plus any memory expansion) and then hashed where it
+//! lies in memory, so no data buffer is kept; the public output binds topics and data hash alike.
+//! The cap on one log's data is the memory's own 64 KiB — a range past it is
+//! [`Halt::OutOfBounds`], as for every other memory range.
 
 use core::cmp::min;
 
+use crate::block;
 use crate::keccak256;
 use crate::storage::{StorageError, StorageTree};
+use crate::transient::Transient;
 use crate::u256::U256;
 use crate::Host;
 
@@ -47,6 +60,10 @@ pub const MAX_RETURN_BYTES: usize = 1_024;
 pub const MAX_LOGS: usize = 8;
 /// `LOG0`–`LOG4`.
 pub const MAX_TOPICS: usize = 4;
+/// The most distinct keys one call's transient storage (`TSTORE`, EIP-1153) may hold — a fixed
+/// table, like every other working array here. One more key with a non-zero value is
+/// [`Halt::OutOfBounds`]; see [`crate::transient`].
+pub const MAX_TRANSIENT_SLOTS: usize = 16;
 
 // The Shanghai schedule, named as the yellow paper's tiers.
 const G_BASE: u64 = 2;
@@ -64,10 +81,12 @@ const G_SLOAD: u64 = 2_100;
 const G_SSTORE_SET: u64 = 20_000;
 /// Every other write. No refunds, so clearing a slot costs this too.
 const G_SSTORE_RESET: u64 = 2_900;
+/// `TLOAD`/`TSTORE` (EIP-1153): EIP-2929's warm storage read.
+const G_WARM_STORAGE_READ: u64 = 100;
 const G_LOG: u64 = 375;
 const G_LOG_TOPIC: u64 = 375;
 const G_LOG_DATA: u64 = 8;
-/// Per word of `CALLDATACOPY`/`CODECOPY`, on top of the `verylow` base.
+/// Per word of `CALLDATACOPY`/`CODECOPY`/`MCOPY`, on top of the `verylow` base.
 const G_COPY_WORD: u64 = 3;
 /// The linear term of memory expansion; the quadratic one is `w²/512`.
 const G_MEMORY: u64 = 3;
@@ -105,20 +124,25 @@ pub enum Halt {
     /// A supplied witness does not hash to the current storage root.
     BadWitness,
     /// A static capacity was exceeded: a memory range past [`MAX_MEMORY_BYTES`], return data past
-    /// [`MAX_RETURN_BYTES`], a log past [`MAX_LOGS`], or a witness past `MAX_WITNESSES`.
+    /// [`MAX_RETURN_BYTES`], a log past [`MAX_LOGS`], a witness past `MAX_WITNESSES`, or a
+    /// transient-storage key past [`MAX_TRANSIENT_SLOTS`].
     OutOfBounds,
 }
 
-/// One emitted log's topics. The data is dropped (the plan's ruling) — only the topics are bound
-/// by the public output, so only the topics are kept.
+/// One emitted log: its topics and `keccak256` of its data (ZKVM-104). The data itself is not
+/// kept — it is hashed out of memory when the log is emitted — so a log costs 164 bytes whatever
+/// it carried, and the public output binds the amount of a `Transfer` through this hash.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Log {
     pub n_topics: u8,
     pub topics: [U256; MAX_TOPICS],
+    /// `keccak256(data)`; `keccak256("")` for a log with no data.
+    pub data_hash: [u8; 32],
 }
 
 impl Log {
-    pub const EMPTY: Log = Log { n_topics: 0, topics: [U256::ZERO; MAX_TOPICS] };
+    /// An unused slot. Its `data_hash` is zero, which is no log's (not even an empty one's).
+    pub const EMPTY: Log = Log { n_topics: 0, topics: [U256::ZERO; MAX_TOPICS], data_hash: [0; 32] };
 }
 
 /// What the run produced. `ret`/`logs` are fixed-size, so `ret_len`/`n_logs` say how much of each
@@ -204,6 +228,10 @@ pub struct Interpreter<'a, H: Host> {
     ret_len: usize,
     logs: [Log; MAX_LOGS],
     n_logs: usize,
+    /// `TLOAD`/`TSTORE`'s map: empty at the start of every call (each call is a new
+    /// `Interpreter`), dropped at its end, never part of the storage tree. 1 KiB, so the
+    /// interpreter stays under 4 KiB, still nothing beside the 100 KiB `Buffers` it borrows.
+    transient: Transient,
     /// Set by `new` when the code or the calldata is above its limit, and returned by `run` before
     /// a single opcode executes. An over-long input is the prover's doing, so it has to be an
     /// exceptional halt the proof reports — never a panic, which in the guest is an abort and no
@@ -263,6 +291,7 @@ impl<'a, H: Host> Interpreter<'a, H> {
             ret_len: 0,
             logs: [Log::EMPTY; MAX_LOGS],
             n_logs: 0,
+            transient: Transient::EMPTY,
             pre_halt,
         }
     }
@@ -365,6 +394,10 @@ impl<'a, H: Host> Interpreter<'a, H> {
             0x1b => self.binary(|n, x| x.shl(n))?,
             0x1c => self.binary(|n, x| x.shr(n))?,
             0x1d => self.binary(|n, x| x.sar(n))?,
+            0x1e => {
+                let a = self.pop()?;
+                self.push(a.clz())?;
+            }
 
             // ---- keccak ----
             0x20 => {
@@ -453,6 +486,29 @@ impl<'a, H: Host> Interpreter<'a, H> {
             // Its own 2 is already charged, so this is the gas the *next* opcode may spend.
             0x5a => self.push(U256::from_u64(self.gas))?,
             0x5b => {}
+            0x5c => {
+                let key = self.pop()?;
+                self.push(self.transient.load(&key))?;
+            }
+            0x5d => {
+                let (key, value) = (self.pop()?, self.pop()?);
+                self.transient.store(&key, value).map_err(|_| Halt::OutOfBounds)?;
+            }
+            0x5e => {
+                // dst on top, then src, then len. The copy's gas is charged before either range
+                // is resolved, as `copy_to_memory` does; the expansion covers both ranges, which
+                // is the one over `max(dst, src) + len`; a zero length touches nothing.
+                let (dst, src, size) = (self.pop()?, self.pop()?, self.pop()?);
+                let len = len_arg(&size)?;
+                self.charge(G_COPY_WORD * words(len))?;
+                if len > 0 {
+                    let far = if dst.lt(&src) { src } else { dst };
+                    self.mem(&far, len)?;
+                    // Both now fit: `mem` bounded the larger offset plus `len` by the memory.
+                    let (d, s) = (dst.low_u32() as usize, src.low_u32() as usize);
+                    self.bufs.memory.copy_within(s..s + len, d);
+                }
+            }
 
             // ---- pushes, dups, swaps ----
             0x5f => self.push(U256::ZERO)?,
@@ -488,14 +544,15 @@ impl<'a, H: Host> Interpreter<'a, H> {
                 self.charge(G_LOG + G_LOG_TOPIC * n as u64)?;
                 let (offset, size) = (self.pop()?, self.pop()?);
                 let len = len_arg(&size)?;
-                // The data is dropped but still paid for and bounds-checked, so what the guest
-                // binds never changes what the bytecode costs.
+                // The data is paid for and bounds-checked, then hashed where it lies: the log
+                // keeps `keccak256(data)`, never the bytes.
                 self.charge(G_LOG_DATA * len as u64)?;
-                self.mem(&offset, len)?;
+                let start = self.mem(&offset, len)?;
                 if self.n_logs == MAX_LOGS {
                     return Err(Halt::OutOfBounds);
                 }
                 let mut log = Log::EMPTY;
+                log.data_hash = keccak256(&mut *self.h, &self.bufs.memory[start..start + len]);
                 log.n_topics = n as u8;
                 for i in 0..n {
                     log.topics[i] = self.pop()?;
@@ -518,7 +575,22 @@ impl<'a, H: Host> Interpreter<'a, H> {
             }
             0xfe => return Ok(Some(Halt::Invalid)),
 
-            _ => return Ok(Some(Halt::Trap(op))),
+            // ---- block context (`crate::block`, fullnode #168) ----
+            // Only under a version-2 context (an `InvokeAt`); under any other the opcode traps as
+            // it always did, with nothing charged first, so a version-1 run is unchanged to the
+            // halt kind. The words are read here, when the opcode runs, and never up front: a
+            // segment without a context has no word to read, and a read past it has no proof.
+            // ORIGIN is CALLER under a version-2 context (one call, no relayer), as a translation
+            // has it everywhere. Every other byte the arms above do not run traps here too
+            // (`block_word` is `None` for it). This is the default arm, not an arm of its own,
+            // because a new arm reshaped the dispatch loop's inlining (below).
+            _ => {
+                let Some(v) = block_word(&mut *self.h, op, &self.env.caller) else {
+                    return Ok(Some(Halt::Trap(op)));
+                };
+                self.charge(G_BASE)?;
+                self.push(v)?;
+            }
         }
         Ok(None)
     }
@@ -619,27 +691,30 @@ pub fn scan_jumpdests(code: &[u8], bits: &mut [u32; MAX_CODE_BYTES / 32]) {
     }
 }
 
-/// The Shanghai static gas of `op`: the part that does not depend on the operands. Opcodes whose
+/// The static gas of `op` — Shanghai's schedule, plus the EIPs' figures for `CLZ`, `TLOAD`,
+/// `TSTORE` and `MCOPY`: the part that does not depend on the operands. Opcodes whose
 /// cost is wholly dynamic (`EXP`, `KECCAK256`, `SSTORE`, `LOGn`) charge it in their own arm and are
 /// zero here, as are the free ones (`STOP`, `RETURN`, `REVERT`, `INVALID`) and every unsupported
-/// byte, which traps before its cost could matter.
+/// byte, which traps before its cost could matter. The block-context opcodes and `ORIGIN` are zero
+/// here too: each charges its `G_BASE` in the dispatch's default arm, once the context has shown
+/// it runs.
 pub const fn static_gas(op: u8) -> u64 {
     match op {
         0x5b => G_JUMPDEST,
         // base
         0x30 | 0x33 | 0x34 | 0x36 | 0x38 | 0x3d | 0x50 | 0x58 | 0x59 | 0x5a | 0x5f => G_BASE,
         // verylow: ADD/SUB, every comparison and bitwise opcode, CALLDATALOAD, MLOAD/MSTORE/
-        // MSTORE8, the copies' base, PUSHn, DUPn, SWAPn
-        0x01 | 0x03 | 0x10..=0x1d | 0x35 | 0x37 | 0x39 | 0x3e | 0x51..=0x53 | 0x60..=0x9f => {
-            G_VERYLOW
-        }
-        // low
-        0x02 | 0x04..=0x07 | 0x0b => G_LOW,
+        // MSTORE8, the copies' base (MCOPY's too), PUSHn, DUPn, SWAPn
+        0x01 | 0x03 | 0x10..=0x1d | 0x35 | 0x37 | 0x39 | 0x3e | 0x51..=0x53 | 0x5e
+        | 0x60..=0x9f => G_VERYLOW,
+        // low; CLZ is EIP-7939's 5
+        0x02 | 0x04..=0x07 | 0x0b | 0x1e => G_LOW,
         // mid
         0x08 | 0x09 | 0x56 => G_MID,
         // high
         0x57 => G_HIGH,
         0x54 => G_SLOAD,
+        0x5c | 0x5d => G_WARM_STORAGE_READ,
         _ => 0,
     }
 }
@@ -705,5 +780,22 @@ fn bool_word(b: bool) -> U256 {
         U256::ONE
     } else {
         U256::ZERO
+    }
+}
+
+/// What a block-context opcode (or `ORIGIN`, whose word is `caller`) pushes, or `None` when it
+/// traps: [`block::value`], and `None` for every byte that is not one of them. A free function
+/// over the host alone, out of line and cold, called from the dispatch's default arm: the loop
+/// passes it no reference to the interpreter, and its match keeps its shape, so its inlining is
+/// what it was before these opcodes ran. The ERC-20 transfer costs 845 cycles more (121 737
+/// against 120 892, one rematerialised constant per step). A `&mut self` method, or an arm of
+/// its own, un-inlined `U256::add`, the storage walk and others: 2 % to 10 % more.
+#[cold]
+#[inline(never)]
+fn block_word<H: Host>(h: &mut H, op: u8, caller: &U256) -> Option<U256> {
+    match op {
+        0x32 => block::is_block_context(h).then_some(*caller),
+        0x3a | 0x41..=0x46 | 0x48 => block::value(h, op),
+        _ => None,
     }
 }

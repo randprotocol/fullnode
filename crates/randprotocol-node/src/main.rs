@@ -1066,6 +1066,12 @@ enum Cmd {
         /// (~80 s, ~4 GB at production) instead of refusing to start. Never set by a deploy script.
         #[arg(long)]
         build_msauth_key: bool,
+        /// CON-601: the directory holding the pinned perps state-proof key files (read only on a
+        /// chain whose genesis lists `perps.state_proof_keys`). Default: `$RAND_PERPS_KEY_DIR`,
+        /// else this binary's own directory (`/usr/local/bin` on the fleet). A missing or unpinned
+        /// file refuses the start; a pinned key is never built.
+        #[arg(long, value_name = "DIR")]
+        perps_key_dir: Option<PathBuf>,
     },
     /// Verify the chain in a data directory without running the node.
     Verify {
@@ -1082,6 +1088,9 @@ enum Cmd {
         /// `hc_auth_multisig`; a missing or unpinned file refuses the verify — it never builds).
         #[arg(long, value_name = "PATH")]
         msauth_vk: Option<PathBuf>,
+        /// CON-601: the pinned perps state-proof key files' directory, as for `run`.
+        #[arg(long, value_name = "DIR")]
+        perps_key_dir: Option<PathBuf>,
     },
     /// Database maintenance on a stopped node's data directory.
     Db {
@@ -1235,6 +1244,34 @@ enum Cmd {
         check: Option<PathBuf>,
         #[arg(long, value_name = "PROFILE", conflicts_with_all = ["profile", "out"])]
         print_pinned: Option<String>,
+    },
+    /// CON-601: the pinned perps state-proof verifier keys. `--profile P --out-dir DIR` builds
+    /// each canonical shape's key for `--max-tier` / `--engine-program-log-height` /
+    /// `--max-window-blocks` (chain 22's 18 / 14 / 64 by default; a big host: ~3.3–4 GB a tier-18
+    /// key) and writes `DIR/perp-vk-<profile>-t…-p2h….bin`, printing `<file> sha256 <hex> bytes
+    /// <n>` per key; `--check FILE` prints a file's SHA-256; `--print-pinned P` prints this build's
+    /// chain-22 files and digests; `--genesis-json DIR` prints the `perps.state_proof_keys` list
+    /// for the files in DIR. A validator loads the files from beside its binary and never builds.
+    KeygenPerpVk {
+        #[arg(long, requires = "out_dir")]
+        profile: Option<String>,
+        #[arg(long, requires = "profile")]
+        out_dir: Option<PathBuf>,
+        #[arg(long, default_value_t = randprotocol_zkvm::executor::perp_vk::CHAIN22_MAX_TIER)]
+        max_tier: u8,
+        #[arg(long, default_value_t = randprotocol_zkvm::executor::perp_vk::CHAIN22_ENGINE_PROGRAM_LOG_HEIGHT)]
+        engine_program_log_height: u8,
+        #[arg(long, default_value_t = randprotocol_zkvm::executor::perp_vk::CHAIN22_MAX_WINDOW_BLOCKS)]
+        max_window_blocks: u64,
+        /// Only the shape with this public height (with `--out-dir`; one key per run).
+        #[arg(long)]
+        public_log_height: Option<u8>,
+        #[arg(long, conflicts_with_all = ["profile", "out_dir", "print_pinned", "genesis_json"])]
+        check: Option<PathBuf>,
+        #[arg(long, value_name = "PROFILE", conflicts_with_all = ["profile", "out_dir", "genesis_json"])]
+        print_pinned: Option<String>,
+        #[arg(long, value_name = "DIR", conflicts_with_all = ["profile", "out_dir"])]
+        genesis_json: Option<PathBuf>,
     },
     /// Benchmarks of the node's own paths; no network, no database.
     Bench {
@@ -2792,6 +2829,32 @@ async fn main() -> Result<()> {
                 anyhow::bail!("keygen-msauth-vk: give --profile P --out FILE, --check FILE or --print-pinned P");
             }
         }
+        Cmd::KeygenPerpVk { profile, out_dir, max_tier, engine_program_log_height, max_window_blocks, public_log_height, check, print_pinned, genesis_json } => {
+            use randprotocol_node::perps_key;
+            use randprotocol_zkvm::executor::perp_vk;
+            let shapes = randprotocol_core::ledger::perps::canonical_state_proof_shapes(max_tier, engine_program_log_height, max_window_blocks);
+            if let Some(p) = print_pinned {
+                let profile = randprotocol_node::msauth_key::parse_profile(&p)?;
+                for (shape, pin) in perp_vk::chain22_pins(profile) {
+                    println!("{} {pin}", perp_vk::file_name(profile, &shape));
+                }
+            } else if let Some(f) = check {
+                println!("{}", randprotocol_node::msauth_key::check_file(&f)?);
+            } else if let Some(dir) = genesis_json {
+                println!("{}", serde_json::to_string(&perps_key::genesis_json(randprotocol_zkvm::machine::FriProfile::Production, &shapes, &dir)?)?);
+            } else if let (Some(p), Some(out)) = (profile, out_dir) {
+                let profile = randprotocol_node::msauth_key::parse_profile(&p)?;
+                let shapes: Vec<_> = shapes.into_iter().filter(|s| public_log_height.is_none_or(|h| s.public_log_height == h)).collect();
+                anyhow::ensure!(!shapes.is_empty(), "keygen-perp-vk: no canonical shape has public height {public_log_height:?}");
+                let t0 = std::time::Instant::now();
+                for (name, digest, bytes) in perps_key::keygen(profile, &shapes, &out)? {
+                    println!("{name} sha256 {digest} bytes {bytes}");
+                }
+                eprintln!("wrote {} keys into {} in {:.1?}", shapes.len(), out.display(), t0.elapsed());
+            } else {
+                anyhow::bail!("keygen-perp-vk: give --profile P --out-dir DIR, --check FILE, --print-pinned P or --genesis-json DIR");
+            }
+        }
         Cmd::Keygen { out } => {
             let kp = Keypair::generate();
             // Never over an existing file (VK-7): the key at `out` may be the only copy of a seed.
@@ -3212,7 +3275,9 @@ async fn main() -> Result<()> {
             let g = Genesis::from_json(&text)?;
             refuse_test_fri_profile(&g.fri_profile, test_profile_allowed)?;
             let executor = node::executor_for_profile(&g.fri_profile)?;
-            let gs = g.build(executor.as_ref())?;
+            // Constraint set 11: a listed chain of an earlier set does not build here; refused by
+            // chain id, before anything is written.
+            let gs = constraint_set::build_genesis(&g, executor.as_ref()).map_err(|e| anyhow::anyhow!("{e:#}; refusing to init"))?;
             // Issue #166: a datadir marked for another constraint set, or a listed chain cut
             // under one, is refused before the genesis file or the database is written; a new
             // datadir gets its marker before its database.
@@ -3226,7 +3291,7 @@ async fn main() -> Result<()> {
             println!("initialised {} at genesis {} (chain id {})", datadir.display(), gs.hash(), gs.chain_id);
             println!("{}", gas_summary(gs.ledger.gas()));
         }
-        Cmd::Verify { datadir, mode, repair, msauth_vk } => {
+        Cmd::Verify { datadir, mode, repair, msauth_vk, perps_key_dir } => {
             let mode: VerifyMode = mode.parse().map_err(|e: String| anyhow::anyhow!(e))?;
             let (gs, executor) = node::load_genesis(&datadir)?;
             refuse_test_fri_profile(&gs.fri_profile, test_profile_allowed)?;
@@ -3243,6 +3308,9 @@ async fn main() -> Result<()> {
             );
             // The pinned msauth key, loaded as `run` loads it: a replay must never build it.
             randprotocol_node::msauth_key::verify_startup(&gs, msauth_vk, executor.as_ref()).map_err(|e| anyhow::anyhow!("{e:#}; refusing to verify"))?;
+            // CON-601: and the pinned perps state-proof keys, loaded as `run` loads them.
+            randprotocol_node::perps_key::startup(&gs, &randprotocol_node::perps_key::PerpsKeyOptions { dir: perps_key_dir }, executor.as_ref())
+                .map_err(|e| anyhow::anyhow!("{e:#}; refusing to verify"))?;
             let storage = Storage::open(&datadir)?;
             let check = node::verify_store(&storage, &gs, mode, executor.as_ref())?;
             match &check.problem {
@@ -3279,6 +3347,7 @@ async fn main() -> Result<()> {
         Cmd::Run {
             msauth_vk,
             build_msauth_key,
+            perps_key_dir,
             datadir,
             key,
             listen,
@@ -3394,6 +3463,7 @@ async fn main() -> Result<()> {
                 prune_history,
                 gas_policy: randprotocol_core::gas::GasPolicy::from_prices(gas_price, byte_price),
                 msauth: randprotocol_node::msauth_key::MsauthKeyOptions { path: msauth_vk, build: build_msauth_key },
+                perps_keys: randprotocol_node::perps_key::PerpsKeyOptions { dir: perps_key_dir },
             }, rpc_options, node::NetOptions {
                 reserved_peers: reserved_peer,
                 strict_gossip,
@@ -4133,6 +4203,7 @@ fn prove_tree_aggregate(
         first.sha256_log_height,
         first.public_log_height,
         first.mem_log_height,
+        first.poseidon2_log_height,
     );
     let key_inner = randprotocol_rvm::shape::InnerKey::of(profile, &shape);
     let vk = randprotocol_rvm::aggregate::InnerVerifierKey { shape, key: key_inner };
@@ -4165,6 +4236,7 @@ fn prove_aggregate(profile: FriProfile, raw_proofs: &[Vec<u8>], binding: &[u32; 
         first.sha256_log_height,
         first.public_log_height,
         first.mem_log_height,
+        first.poseidon2_log_height,
     );
     let key_inner = randprotocol_rvm::shape::InnerKey::of(profile, &shape);
     let vk = randprotocol_rvm::aggregate::InnerVerifierKey { shape, key: key_inner };
@@ -5215,6 +5287,34 @@ mod tests {
         assert!(vote_lines(&[]).is_err());
     }
 
+    /// Constraint set 11 (Grain Poseidon2 constants) moved every note commitment, Merkle root and
+    /// state root, so the committed genesis file of a chain cut under an earlier set — chains 14 to
+    /// 21 — no longer builds on this build; its live hash stays pinned in
+    /// `constraint_set::CHAIN_CONSTRAINT_SETS` (and `node::CHAINS_THIS_BUILD_CANNOT_RUN`), and the
+    /// release line of its own set (v0.8.6 for chain 21) is what reproduces it. This asserts the
+    /// refusal `init` and `run` give (`constraint_set::build_genesis`): by chain id, naming the
+    /// chain's set and this build's, before any datadir is touched.
+    fn refused_as_an_earlier_constraint_set(gen: &Genesis, set: u32) -> String {
+        let executor = node::executor_for_profile(&gen.fri_profile).unwrap();
+        let e = randprotocol_node::constraint_set::build_genesis(gen, executor.as_ref())
+            .err()
+            .unwrap_or_else(|| panic!("chain {}'s file built under constraint set 11", gen.chain_id))
+            .to_string();
+        let (chain, hash, listed) = randprotocol_node::constraint_set::CHAIN_CONSTRAINT_SETS
+            .iter()
+            .find(|(c, _, _)| *c == gen.chain_id)
+            .expect("a listed chain");
+        assert_eq!(*listed, set, "chain {chain}'s row");
+        assert!(
+            e.contains(&format!("chain {chain} (genesis {hash})"))
+                && e.contains(&format!("constraint set {set};"))
+                && e.contains("this build is constraint set 11")
+                && e.contains("does not even build"),
+            "{e}"
+        );
+        e
+    }
+
     #[test]
     fn chain_12s_genesis_file_still_builds_chain_12() {
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../deploy/genesis-chain12.json");
@@ -5227,7 +5327,9 @@ mod tests {
         );
         let executor = node::executor_for_profile(&gen.fri_profile).unwrap();
         let state = gen.build(executor.as_ref()).unwrap();
-        assert_eq!(state.hash().to_hex(), "605eb7830963833ef897455b98cd2a641aec58e0291460898a5d19ab88760ef0");
+        // Constraint set 11 moved every Poseidon2 output, the state root among them: the file (no
+        // committed notes to fail) builds, but no longer to chain 12's live hash.
+        assert_ne!(state.hash().to_hex(), "605eb7830963833ef897455b98cd2a641aec58e0291460898a5d19ab88760ef0");
         assert_eq!(state.ledger.max_program_words(), randprotocol_core::gas::MAX_PROGRAM_WORDS);
         assert_eq!(state.ledger.max_proof_bytes(), randprotocol_core::gas::MAX_PROOF_BYTES);
         assert_eq!(state.ledger.max_block_bytes(), randprotocol_core::gas::MAX_BLOCK_BYTES);
@@ -5250,13 +5352,16 @@ mod tests {
         assert!(gen.bridge.is_none() && gen.tokens.is_none());
         let executor = node::executor_for_profile(&gen.fri_profile).unwrap();
         let state = gen.build(executor.as_ref()).unwrap();
-        assert_eq!(state.hash().to_hex(), "8123ccac1883a45750e4df6964fb7cd3f0b321798cde4c0ef406a0293939ece3");
+        // Constraint set 11 moved the state root: the file builds, but not to chain 13's live hash.
+        assert_ne!(state.hash().to_hex(), "8123ccac1883a45750e4df6964fb7cd3f0b321798cde4c0ef406a0293939ece3");
         assert!(state.ledger.tokens().is_none());
-        // Since the hidden-asset bundle (H3) the file still *builds* to chain 13's hash — the hash
+        // Since the hidden-asset bundle (H3) the file still *builds* to a hash — the hash
         // commits to the file's own `hc_bundle`, not to this build's guest — but it pins the
         // retired 2-in-2-out guest, so this build refuses to run it: a chain-14 build is not a
         // chain-13 node.
-        assert_eq!(state.hc_bundle, ZkExecutor::hc_legacy_bundle(), "chain 13 pins the retired guest");
+        // The retired guest at its set-≤10 digest (constraint set 11 moved the guest's own).
+        assert_eq!(word8_to_hex(&state.hc_bundle), "4a27356f379571036025a4a8661c294b0edec2b7cf7fbfd60b472b186cbd4afb", "chain 13 pins the retired guest");
+        assert_ne!(state.hc_bundle, ZkExecutor::hc_legacy_bundle());
         assert_ne!(state.hc_bundle, ZkExecutor::hc_bundle());
         let refused = node::check_build_runs_genesis(&state, &ZkExecutor::known_hc_bundles()).unwrap_err().to_string();
         assert!(refused.contains("differs from the genesis hc_bundle"), "{refused}");
@@ -5267,36 +5372,26 @@ mod tests {
     /// `staking` section, so none of it may move its hash, its state root domain or its epoch-0
     /// set by one bit — and it still loads and builds on this build.
     #[test]
-    fn chain_14s_genesis_file_still_builds_chain_14() {
+    fn chain_14s_genesis_file_is_refused_by_this_build() {
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../deploy/genesis-chain14.json");
         let gen = Genesis::from_json(&std::fs::read_to_string(path).unwrap()).unwrap();
         assert!(gen.staking.is_none(), "chain 14 carries no staking section");
-        let executor = node::executor_for_profile(&gen.fri_profile).unwrap();
-        let state = gen.build(executor.as_ref()).unwrap();
-        assert_eq!(state.hash().to_hex(), "1cff3b7da248d93ab547aef5c05bb7d0d22da510b592dab9cf7374807de7c7ff");
-        assert!(state.ledger.staking().is_none() && state.ledger.bond_queue().is_empty());
-        // Every genesis validator's weight is its stake: no cap reached the set.
-        for v in &gen.validators {
-            assert_eq!(state.validators.get(&v.public_key.address()).unwrap().stake, v.stake);
-        }
         assert!(!gen.to_json().contains("staking"), "rewriting the file adds no section");
+        refused_as_an_earlier_constraint_set(&gen, 6);
     }
 
     /// Chain 21, the running chain (cut 2026-10-12, v0.8.0), byte for byte, after audit v10's
     /// `multisig.max_accounts` (MSA-4): the file lists none, so its hash may not move by one
     /// bit, its register is unbounded as cut, and rewriting the file adds no field.
     #[test]
-    fn chain_21s_genesis_file_still_builds_chain_21() {
+    fn chain_21s_genesis_file_is_refused_by_this_build() {
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../deploy/genesis-chain21.json");
         let gen = Genesis::from_json(&std::fs::read_to_string(path).unwrap()).unwrap();
         let m = gen.multisig.as_ref().expect("chain 21 carries the treasury");
         assert_eq!((m.accounts.len(), m.max_accounts), (1, None), "chain 21 predates max_accounts");
-        let executor = node::executor_for_profile(&gen.fri_profile).unwrap();
-        let state = gen.build(executor.as_ref()).unwrap();
-        assert_eq!(state.hash().to_hex(), "ca76c2766ed6090ac6ba5dad86b724dd5d2b80c0edfaed287cd8b129e663ca9a");
-        let reg = state.ledger.multisig().expect("the register");
-        assert_eq!((reg.len(), reg.max_accounts, reg.is_full()), (1, None, false));
         assert!(!gen.to_json().contains("max_accounts"), "rewriting the file adds no field");
+        let e = refused_as_an_earlier_constraint_set(&gen, 9);
+        assert!(e.contains("ca76c2766ed6090ac6ba5dad86b724dd5d2b80c0edfaed287cd8b129e663ca9a"), "{e}");
     }
 
     /// Chain 15, the running chain, byte for byte, after RESCAN-LEDGER-1's
@@ -5307,7 +5402,7 @@ mod tests {
     /// rewriting the file adds no field. Every later genesis-gated field is pinned against this
     /// file the way chain 14's are against its own.
     #[test]
-    fn chain_15s_genesis_file_still_builds_chain_15() {
+    fn chain_15s_genesis_file_is_refused_by_this_build() {
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../deploy/genesis-chain15.json");
         let gen = Genesis::from_json(&std::fs::read_to_string(path).unwrap()).unwrap();
         let staking = gen.staking.as_ref().expect("chain 15 carries a staking section");
@@ -5316,49 +5411,32 @@ mod tests {
         assert_eq!((bridge.guardian_set_index, bridge.burn_sequence), (Some(1), Some(7)));
         assert_eq!(bridge.min_inbound_sequence, None, "chain 15 carries no replay floor");
         assert_eq!(gen.hardening_v6, None, "chain 15 predates the v0.6 rules (ZKV-11 and the rest)");
-        let executor = node::executor_for_profile(&gen.fri_profile).unwrap();
-        let state = gen.build(executor.as_ref()).unwrap();
-        assert_eq!(state.hash().to_hex(), "cc30e0854fb25b3abcee96bb7bc206dcd6e37862f6dfe80a05b3e474c2d1b6b8");
-        let live = state.ledger.bridge().unwrap();
-        assert!(live.min_inbound_sequence.is_empty() && live.replay_floor().is_none());
-        assert!(!state.ledger.hardening_v6(), "the ledger keeps the old rules; the pool refuses as policy");
         let json = gen.to_json();
         assert!(!json.contains("faucet_minters"), "rewriting the file adds no list");
         assert!(!json.contains("min_inbound_sequence"), "rewriting the file adds no field");
         assert!(!json.contains("hardening_v6"), "nor the v0.6 switch");
-        let minters = randprotocol_node::admission::faucet_minters(&state);
-        assert_eq!(minters.len(), gen.validators.len(), "the pool admits the genesis validators");
-        assert!(gen.validators.iter().all(|v| minters.contains(&v.public_key.address())));
+        refused_as_an_earlier_constraint_set(&gen, 6);
     }
 
     /// Split authorisation's genesis `hc_auth` is hashed only when present (after
-    /// `hardening_v6`), so the committed chain-15 and chain-16 files — neither names one — still
-    /// hash to their live genesis, build ledgers without the rule, and rewrite without the field.
+    /// `hardening_v6`): the committed chain-15 and chain-16 files name none and rewrite without
+    /// the field. (That they hashed to their live genesis was checked through constraint set 10;
+    /// under set 11 neither file builds, and both are refused by chain id.)
     #[test]
     fn the_genesis_hash_is_unchanged_without_hc_auth() {
-        for (file, hash) in [
-            ("genesis-chain15.json", "cc30e0854fb25b3abcee96bb7bc206dcd6e37862f6dfe80a05b3e474c2d1b6b8"),
-            ("genesis-chain16.json", "20925ae63cfa6e6c96f3ff369486ead8ea04821fec026a55df9e2893f3d53005"),
-        ] {
+        for file in ["genesis-chain15.json", "genesis-chain16.json"] {
             let path = format!("{}/../../deploy/{file}", env!("CARGO_MANIFEST_DIR"));
             let gen = Genesis::from_json(&std::fs::read_to_string(path).unwrap()).unwrap();
             assert_eq!(gen.hc_auth, None, "{file} predates split authorisation");
-            let executor = node::executor_for_profile(&gen.fri_profile).unwrap();
-            let state = gen.build(executor.as_ref()).unwrap();
-            assert_eq!(state.hash().to_hex(), hash, "{file}");
-            assert_eq!(state.ledger.hc_auth(), None, "{file}: the ledger keeps the v1 digest");
             assert!(!gen.to_json().contains("hc_auth"), "{file}: rewriting the file adds no field");
-            // And the same file naming the auth guest is another chain.
-            // (With the chain-17 caps: a split-authorisation genesis needs block room for three
-            // proofs, which neither file has.)
-            let mut split = gen.clone();
-            split.hc_auth = Some(word8_to_hex(&ZkExecutor::hc_auth()));
-            split.max_proof_bytes = Some(4 << 20);
-            split.max_block_bytes = Some(20 << 20);
-            assert_ne!(split.build(executor.as_ref()).unwrap().hash().to_hex(), hash, "{file}");
+            // Their live hashes (cc30e085…, 20925ae6…) are set 6's and 7's: this build refuses both.
+            refused_as_an_earlier_constraint_set(&gen, if gen.chain_id == 15 { 6 } else { 7 });
         }
     }
 
+    /// (Constraint set 11: none of these files builds any more, so the refusal is by chain id —
+    /// `constraint_set::build_genesis` — before the hash-keyed guards below could see a hash.)
+    ///
     /// v0.6.1 was constraint set 7 and this build is 8: every verifier key moved, so no bundle or
     /// call proof chains 14 and 15 (constraint set 6) committed verifies on this build. Both genesis files pin guest v1, which this build
     /// still carries (a new chain may pin it), so the `hc_bundle` check alone let a v0.6.1 binary
@@ -5371,27 +5449,19 @@ mod tests {
     /// (`refuse_chains_this_build_cannot_run`).
     #[test]
     fn this_build_refuses_chains_14_to_17() {
-        for (chain, file, why) in [
-            (14, "genesis-chain14.json", "constraint set 6"),
-            (15, "genesis-chain15.json", "constraint set 6"),
-            (16, "genesis-chain16.json", "rand-txid-3, split authorisation"),
-            (17, "genesis-chain17.json", "constraint set 7"),
+        for (chain, file, set) in [
+            (14, "genesis-chain14.json", 6),
+            (15, "genesis-chain15.json", 6),
+            (16, "genesis-chain16.json", 7),
+            (17, "genesis-chain17.json", 7),
         ] {
             let path = format!("{}/../../deploy/{file}", env!("CARGO_MANIFEST_DIR"));
             let gen = Genesis::from_json(&std::fs::read_to_string(path).unwrap()).unwrap();
-            let executor = node::executor_for_profile(&gen.fri_profile).unwrap();
-            let state = gen.build(executor.as_ref()).unwrap();
-            assert_eq!(state.chain_id, chain);
-            assert!(ZkExecutor::known_hc_bundles().contains(&state.hc_bundle), "chain {chain} pins a guest this build carries");
-            let refused = node::check_build_runs_genesis(&state, &ZkExecutor::known_hc_bundles())
-                .expect_err(&format!("this build must refuse chain {chain} at run"))
-                .to_string();
-            assert!(refused.contains(why) && refused.contains(&format!("chain {chain}")), "{refused}");
-            assert!(refused.contains("constraint set 9"), "names this build's set: {refused}");
-            let at_verify = node::refuse_chains_this_build_cannot_run(&state)
-                .expect_err(&format!("this build must refuse chain {chain} at verify"))
-                .to_string();
-            assert_eq!(at_verify, refused, "run and verify give the same reason");
+            assert_eq!(gen.chain_id, chain);
+            let e = refused_as_an_earlier_constraint_set(&gen, set);
+            assert!(e.contains("Nothing was written"), "{e}");
+            // The hash-keyed guard `run` and `verify` share still lists the chain.
+            assert!(node::CHAINS_THIS_BUILD_CANNOT_RUN.iter().any(|(c, _, _)| *c == chain), "chain {chain}");
         }
     }
 
@@ -5401,12 +5471,12 @@ mod tests {
     /// blocks), chain 16's 26 validators, its bridge state (set 1, burn sequence 7, the replay
     /// floors at the snapshot's next sequences) and its zUSD, plus the RAND the operator's wallets
     /// held. `deploy/genesis-chain17.json` is committed and its hash is pinned in
-    /// `node::CHAINS_THIS_BUILD_CANNOT_RUN`: this build is constraint set 9 (the MODQ chip) and
+    /// `node::CHAINS_THIS_BUILD_CANNOT_RUN`: this build is constraint set 11 (Grain constants) and
     /// refuses to run chain 17 — it verifies none of its cs7 proofs — but still names its exact
     /// genesis hash there, so the hash assertion below reads it from that one place (chain 16's
     /// test, the same way since v0.6.3).
     #[test]
-    fn chain_17s_genesis_file_builds_chain_17() {
+    fn chain_17s_genesis_file_is_refused_by_this_build() {
         let chain_17_hash = node::CHAINS_THIS_BUILD_CANNOT_RUN
             .iter()
             .find(|(chain, _, _)| *chain == 17)
@@ -5418,29 +5488,23 @@ mod tests {
         assert_eq!(gen.chain_id, 17);
         assert_eq!(gen.consensus_domain, Some(1));
         assert_eq!(gen.hardening_v6, Some(true));
-        assert_eq!(gen.hc_bundle, word8_to_hex(&ZkExecutor::hc_hidden_bundle_v3()), "the v3 bundle guest");
-        assert_eq!(gen.hc_auth.as_deref(), Some(word8_to_hex(&ZkExecutor::hc_auth()).as_str()), "the auth guest");
+        assert_eq!(gen.hc_bundle, "60af094acfe65d85fdb18fb3d06cf9085dcf28c96e59e87f1ee527226e6e3fce", "the v3 bundle guest, at constraint set 7's digest");
+        assert_eq!(gen.hc_auth.as_deref(), Some("1e4e347f44cf86750b30a9a4bdf9ec9256efe353d4ff8017451eca7d195639c1"), "the auth guest");
         assert_eq!(gen.max_proof_bytes, Some(4 << 20), "three proofs per transaction fit a 20 MiB block");
         assert_eq!(gen.max_block_bytes, Some(20 << 20));
         assert_eq!(gen.validators.len(), 26, "chain 16's register, carried");
         assert_eq!(gen.alloc.len(), 7, "six RAND allocs (shielded-1..5, the relayer) and the zUSD note");
         let bridge = gen.bridge.as_ref().expect("the bridge section");
         assert_eq!(bridge.burn_sequence, Some(7));
-        let executor = node::executor_for_profile(&gen.fri_profile).unwrap();
-        let state = gen.build(executor.as_ref()).unwrap();
-        assert_eq!(state.hash().to_hex(), chain_17_hash, "chain 17's live genesis");
-        assert_eq!(state.ledger.hc_auth(), Some(ZkExecutor::hc_auth()), "the ledger enforces split authorisation");
-        assert!(state.ledger.gas().is_none(), "chain 17 has no gas section");
-        let refused = node::check_build_runs_genesis(&state, &ZkExecutor::known_hc_bundles())
-            .expect_err("a constraint-set-9 build must refuse chain 17")
-            .to_string();
-        assert!(refused.contains("chain 17") && refused.contains("constraint set 7") && refused.contains("constraint set 9"), "{refused}");
+        let e = refused_as_an_earlier_constraint_set(&gen, 7);
+        assert!(e.contains(chain_17_hash), "{e}");
     }
 
     /// The committed chain-18 genesis (LIVE 2026-09-29 04:56 UTC, cut by `deploy/cut-chain18-genesis.sh`
     /// from chain 17 at height 5 604 on the v0.6.7-rc1 build) builds chain 18: the hash the fleet runs,
     /// the gas section (Phase 1 prices 100/800, the bundle pin, the Phase 2 controller), the memo on,
-    /// and — since constraint set 9 (the MODQ chip) — this build refuses it, by its listed hash.
+    /// and — since constraint set 9 (the MODQ chip) — a build refuses it; under set 11 the file no
+    /// longer builds, and is refused by chain id.
     #[test]
     fn chain_18s_genesis_file_is_refused_by_this_build() {
         let chain_18_hash = "a7cb020cc99a33c83fc38cfa0ec1db357f67fbf8b6dab13ab1d9812280b4da76";
@@ -5449,8 +5513,8 @@ mod tests {
         assert_eq!(gen.chain_id, 18);
         assert_eq!(gen.consensus_domain, Some(1));
         assert_eq!(gen.hardening_v6, Some(true));
-        assert_eq!(gen.hc_bundle, word8_to_hex(&ZkExecutor::hc_hidden_bundle_v3()), "the v3 bundle guest, as chain 17");
-        assert_eq!(gen.hc_auth.as_deref(), Some(word8_to_hex(&ZkExecutor::hc_auth()).as_str()), "the auth guest");
+        assert_eq!(gen.hc_bundle, "60af094acfe65d85fdb18fb3d06cf9085dcf28c96e59e87f1ee527226e6e3fce", "the v3 bundle guest, as chain 17");
+        assert_eq!(gen.hc_auth.as_deref(), Some("1e4e347f44cf86750b30a9a4bdf9ec9256efe353d4ff8017451eca7d195639c1"), "the auth guest");
         assert_eq!(gen.max_proof_bytes, Some(4 << 20));
         assert_eq!(gen.max_block_bytes, Some(20 << 20));
         assert_eq!(gen.envelope_bytes, Some(1860), "the encrypted memo is on");
@@ -5460,25 +5524,17 @@ mod tests {
         let gas = gen.gas.as_ref().expect("the gas section");
         assert_eq!(gas.gas_price, 100);
         assert_eq!(gas.byte_price, 800);
-        assert_eq!(gas.bundle_gas_limit, randprotocol_core::gas::bundle_gas_limit_pin());
+        // Set 8's gas_max(14, 0, 0); set 11's (the pin every new chain carries) is 22 527.
         assert_eq!(gas.bundle_gas_limit, 20_479);
+        assert_ne!(gas.bundle_gas_limit, randprotocol_core::gas::bundle_gas_limit_pin());
         let dynamic = gas.dynamic.as_ref().expect("the Phase 2 controller");
         assert_eq!(dynamic.target_block_bytes, 10_485_760, "half the 20 MiB block cap");
         assert_eq!(dynamic.target_block_gas, 262_144);
         assert_eq!(dynamic.adjust_bps, 1250);
         let bridge = gen.bridge.as_ref().expect("the bridge section");
         assert_eq!(bridge.burn_sequence, Some(7));
-        let executor = node::executor_for_profile(&gen.fri_profile).unwrap();
-        let state = gen.build(executor.as_ref()).unwrap();
-        assert_eq!(state.hash().to_hex(), chain_18_hash, "chain 18's live genesis");
-        assert!(state.ledger.gas().is_some(), "the ledger prices calls and pins the bundle limit");
-        assert_eq!(state.ledger.envelope_bytes(), Some(1860));
-        let (_, hash, _) = node::CHAINS_THIS_BUILD_CANNOT_RUN.iter().find(|(c, _, _)| *c == 18).expect("listed");
-        assert_eq!(state.hash().to_hex(), *hash, "the listed hash is the committed file's");
-        let e = node::refuse_chains_this_build_cannot_run(&state).unwrap_err().to_string();
-        assert!(e.contains("constraint set 8"), "{e}");
-        let at_run = node::check_build_runs_genesis(&state, &ZkExecutor::known_hc_bundles()).expect_err("this build refuses chain 18 at run").to_string();
-        assert_eq!(at_run, e, "run and verify give the same reason");
+        let e = refused_as_an_earlier_constraint_set(&gen, 8);
+        assert!(e.contains(chain_18_hash), "{e}");
     }
 
     /// Chain 19, live 2026-10-01 03:43 UTC: a pure re-genesis of chain 18 on v0.6.7 (the
@@ -5496,21 +5552,14 @@ mod tests {
         assert!(gen.faucet && gen.bridge.is_some() && gen.testnet.is_none(), "chain 18's shape, no marker");
         assert!(gen.binding_domain.is_none() && gen.proof_window_blocks.is_none(), "no audit-v6 genesis field");
         assert_eq!(gen.envelope_bytes, Some(1860), "the encrypted memo is on");
-        assert_eq!(gen.hc_bundle, word8_to_hex(&ZkExecutor::hc_hidden_bundle_v3()), "the v3 bundle guest");
-        let executor = node::executor_for_profile(&gen.fri_profile).unwrap();
-        let state = gen.build(executor.as_ref()).unwrap();
-        assert_eq!(state.hash().to_hex(), chain_19_hash, "chain 19's live genesis");
-        let (_, hash, _) = node::CHAINS_THIS_BUILD_CANNOT_RUN.iter().find(|(c, _, _)| *c == 19).expect("listed");
-        assert_eq!(state.hash().to_hex(), *hash, "the listed hash is the committed file's");
-        let e = node::refuse_chains_this_build_cannot_run(&state).unwrap_err().to_string();
-        assert!(e.contains("constraint set 8"), "{e}");
-        let at_run = node::check_build_runs_genesis(&state, &ZkExecutor::known_hc_bundles()).expect_err("this build refuses chain 19 at run").to_string();
-        assert_eq!(at_run, e, "run and verify give the same reason");
+        assert_eq!(gen.hc_bundle, "60af094acfe65d85fdb18fb3d06cf9085dcf28c96e59e87f1ee527226e6e3fce", "the v3 bundle guest");
+        let e = refused_as_an_earlier_constraint_set(&gen, 8);
+        assert!(e.contains(chain_19_hash), "{e}");
     }
 
     /// Chain 20, live 2026-10-01 06:17 UTC on v0.6.8: chain 19's shape plus every audit-v6 genesis
     /// field at its recommended value, RPL-2's `program_state` and the zUSD bridge fees. Refused by
-    /// this build (constraint set 9), by its listed hash.
+    /// this build (constraint set 11), by chain id: the file no longer builds.
     #[test]
     fn chain_20s_genesis_file_is_refused_by_this_build() {
         let chain_20_hash = "6210cf071a390d7ac61d8cbea5dd9d139d1a493a862b54a45a498f36af2d5135";
@@ -5522,24 +5571,18 @@ mod tests {
         assert_eq!(gen.proof_window_blocks, Some(1024));
         let fees = gen.bridge.as_ref().and_then(|b| b.fees.as_ref()).expect("the zUSD bridge fees");
         assert_eq!((fees.mint_bps, fees.burn_bps), (10, 10));
-        let executor = node::executor_for_profile(&gen.fri_profile).unwrap();
-        let state = gen.build(executor.as_ref()).unwrap();
-        assert_eq!(state.hash().to_hex(), chain_20_hash, "chain 20's live genesis");
-        let (_, hash, _) = node::CHAINS_THIS_BUILD_CANNOT_RUN.iter().find(|(c, _, _)| *c == 20).expect("listed");
-        assert_eq!(state.hash().to_hex(), *hash, "the listed hash is the committed file's");
-        let e = node::refuse_chains_this_build_cannot_run(&state).unwrap_err().to_string();
-        assert!(e.contains("constraint set 8"), "{e}");
-        let at_run = node::check_build_runs_genesis(&state, &ZkExecutor::known_hc_bundles()).expect_err("this build refuses chain 20 at run").to_string();
-        assert_eq!(at_run, e, "run and verify give the same reason");
+        let e = refused_as_an_earlier_constraint_set(&gen, 8);
+        assert!(e.contains(chain_20_hash), "{e}");
     }
 
     /// Chain 21, live 2026-10-12 10:31 UTC on v0.8.0: chain 20's shape plus the `perps` section
     /// (BTC-PERP on zUSD) and `multisig`. Audit v10 added optional fields to the perps section
     /// (`bound_payouts`, `initial_collateral`, …) that the committed file does not set, so the
     /// file must still build to the hash the fleet runs on — `PerpsConfig::commit_bytes` binds
-    /// the new fields only when set — and this build must run it.
+    /// the new fields only when set — on the v0.8.6 line, which runs it. This build (constraint set
+    /// 11) refuses the file by chain id; a rewrite still adds none of the fields.
     #[test]
-    fn chain_21s_genesis_file_still_hashes_as_cut() {
+    fn chain_21s_genesis_file_rewrites_as_cut() {
         let chain_21_hash = "ca76c2766ed6090ac6ba5dad86b724dd5d2b80c0edfaed287cd8b129e663ca9a";
         let committed = concat!(env!("CARGO_MANIFEST_DIR"), "/../../deploy/genesis-chain21.json");
         let gen = Genesis::from_json(&std::fs::read_to_string(committed).unwrap()).unwrap();
@@ -5548,10 +5591,8 @@ mod tests {
         assert_eq!((perps.max_tier, perps.max_block_inputs, perps.max_window_blocks), (18, 24, 64));
         assert_eq!(perps.collateral_asset, 1, "zUSD");
         assert!(!perps.bound_payouts && perps.initial_collateral == 0, "the audit-v10 fields are unset in the file");
-        let executor = node::executor_for_profile(&gen.fri_profile).unwrap();
-        let state = gen.build(executor.as_ref()).unwrap();
-        assert_eq!(state.hash().to_hex(), chain_21_hash, "chain 21's live genesis");
-        assert!(node::refuse_chains_this_build_cannot_run(&state).is_ok(), "this build runs chain 21");
+        let e = refused_as_an_earlier_constraint_set(&gen, 9);
+        assert!(e.contains(chain_21_hash), "{e}");
         // Rewriting the file adds none of the audit-v10 fields (v0.8.0 reads its sections with
         // `deny_unknown_fields`), and the rewrite hashes as cut.
         let rewrite = gen.to_json();
@@ -5568,11 +5609,11 @@ mod tests {
         ] {
             assert!(!rewrite.contains(f), "a rewrite of chain 21's file adds `{f}`");
         }
-        let again = Genesis::from_json(&rewrite).unwrap();
-        assert_eq!(again.build(executor.as_ref()).unwrap().hash().to_hex(), chain_21_hash, "the rewrite hashes as cut");
+        // The rewrite is the same file (its hash, the cut's, is the v0.8.6 line's to reproduce).
+        assert_eq!(Genesis::from_json(&rewrite).unwrap().to_json(), rewrite, "the rewrite round-trips");
     }
 
-    /// This build is constraint set 9 (the MODQ chip; set 8, the gas meter, ran chains 18-20): every verifier key moved again, so
+    /// This build is constraint set 11 (Grain constants; 9 the MODQ chip; set 8, the gas meter, ran chains 18-20): every verifier key moved again, so
     /// no proof chain 16 (constraint set 7, v0.6.1) committed verifies here. Chain 16 pins the v2
     /// guest, which this build still carries, so the `hc_bundle` check alone would let this binary
     /// start on chain 16 — and its startup replay (or a `verify --repair`) would then refuse, and
@@ -5581,20 +5622,8 @@ mod tests {
     fn a_constraint_set_8_build_refuses_chain_16() {
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../deploy/genesis-chain16.json");
         let gen = Genesis::from_json(&std::fs::read_to_string(path).unwrap()).unwrap();
-        let executor = node::executor_for_profile(&gen.fri_profile).unwrap();
-        let state = gen.build(executor.as_ref()).unwrap();
-        assert_eq!(state.hash().to_hex(), "20925ae63cfa6e6c96f3ff369486ead8ea04821fec026a55df9e2893f3d53005");
-        let refused = node::check_build_runs_genesis(&state, &ZkExecutor::known_hc_bundles())
-            .expect_err("a constraint-set-9 build must refuse chain 16")
-            .to_string();
-        assert!(
-            refused.contains("chain 16") && refused.contains("constraint set 7") && refused.contains("constraint set 9"),
-            "{refused}"
-        );
-        assert!(refused.contains("archive"), "the message names the archive risk: {refused}");
-        // `verify` calls the same guard before it opens the datadir.
-        let verify = node::refuse_chains_this_build_cannot_run(&state).expect_err("verify refuses chain 16 too").to_string();
-        assert_eq!(verify, refused);
+        let e = refused_as_an_earlier_constraint_set(&gen, 7);
+        assert!(e.contains("20925ae63cfa6e6c96f3ff369486ead8ea04821fec026a55df9e2893f3d53005"), "{e}");
     }
 
     /// Chain 16, cut by `deploy/cut-chain16-genesis.sh` with the v0.6.1 release binary: every
@@ -5606,7 +5635,7 @@ mod tests {
     /// one place rather than duplicating the literal. `CHAIN16_GENESIS=<a dry-run cut> cargo test
     /// … --ignored` still checks the structure of any other cut (the hash assertion is skipped).
     #[test]
-    fn chain_16s_genesis_file_builds_chain_16() {
+    fn chain_16s_genesis_file_is_refused_by_this_build() {
         let chain_16_hash = node::CHAINS_THIS_BUILD_CANNOT_RUN
             .iter()
             .find(|(chain, _, _)| *chain == 16)
@@ -5632,20 +5661,15 @@ mod tests {
         let bridge = gen.bridge.as_ref().expect("chain 16 is bridged");
         let floor = bridge.min_inbound_sequence.as_ref().expect("C15-1's replay floor");
         assert!(!floor.is_empty() && floor.values().all(|&f| f > 0));
-        let executor = node::executor_for_profile(&gen.fri_profile).unwrap();
-        let state = gen.build(executor.as_ref()).unwrap();
-        if std::env::var("CHAIN16_GENESIS").is_err() {
-            assert_eq!(state.hash().to_hex(), chain_16_hash);
-        }
-        assert!(state.ledger.hardening_v6());
-        assert_eq!(state.ledger.bridge().unwrap().replay_floor(), Some(floor));
-        let pool = randprotocol_node::admission::faucet_minters(&state);
-        assert_eq!(pool.len(), minters.len(), "the pool admits the listed minters, not every genesis validator");
         // Σ carried zUSD == Σ locked: the custody chain 15 leaves behind, as notes at genesis.
         let locked: u64 = gen.tokens.as_ref().unwrap().tokens[0].backings.iter().map(|b| b.locked.unwrap_or(0)).sum();
         let notes: u64 = gen.alloc.iter().filter(|n| n.opening.as_ref().is_some_and(|o| o.asset == 1)).map(|n| n.amount).sum();
         assert!(locked > 0);
         assert_eq!(notes, locked);
+        if std::env::var("CHAIN16_GENESIS").is_err() {
+            let e = refused_as_an_earlier_constraint_set(&gen, 7);
+            assert!(e.contains(chain_16_hash), "{e}");
+        }
     }
 
     /// Chain 15's genesis custody, end to end on the real chain-14 file: chain 14's zUSD listed
@@ -5689,7 +5713,9 @@ mod tests {
                 .map(|&(chain, token, decimals, locked)| GenesisBacking { chain, token: hex32(token), decimals, locked })
                 .collect(),
         }];
-        gen.alloc.push(note);
+        // Chain 14's own notes are set 6's commitments, which do not open under constraint set
+        // 11: the new note alone, on the file's every other field.
+        gen.alloc = vec![note];
         let executor = node::executor_for_profile(&gen.fri_profile).unwrap();
         let state = gen.build(executor.as_ref()).unwrap();
         let z = state.ledger.tokens().unwrap().get(1).unwrap();
@@ -5772,11 +5798,11 @@ mod tests {
     #[test]
     fn the_bundle_gas_limit_defaults_to_the_bundle_guests_ceiling() {
         assert_eq!(bundle_gas_limit_or_default(None), randprotocol_core::gas::gas_max(14, 0, 0));
-        assert_eq!(bundle_gas_limit_or_default(None), 20_479);
+        assert_eq!(bundle_gas_limit_or_default(None), 22_527);
         // Any other value passes the flag through and is refused when the genesis is built
         // (final-review I3), which `rand-node genesis` does before it writes the file.
         assert_eq!(bundle_gas_limit_or_default(Some(7)), 7);
-        for bad in [7, 16_383, 20_478] {
+        for bad in [7, 16_383, 22_526] {
             let mut g = pinned_genesis();
             g.gas = Some(randprotocol_core::gas::GasConfig {
                 gas_price: 100,
@@ -5786,7 +5812,7 @@ mod tests {
                 dynamic: None,
             });
             let e = g.build(&ZkExecutor::new(FriProfile::Test)).expect_err("refused").to_string();
-            assert!(e.contains("bundle_gas_limit") && e.contains("20479"), "{e}");
+            assert!(e.contains("bundle_gas_limit") && e.contains("22527"), "{e}");
         }
     }
 
@@ -5838,8 +5864,8 @@ mod tests {
         assert!(section(&["--gas-price", "100", "--gas-dynamic", "1,1,1250", "--gas-byte-load", "all"]).unwrap_err().to_string().contains("only `paying`"));
         assert_eq!(parse(&[]), (None, None, None, None));
         assert_eq!(
-            parse(&["--gas-price", "100", "--byte-price", "800", "--bundle-gas-limit", "20479"]),
-            (Some(100), Some(800), Some(20_479), None)
+            parse(&["--gas-price", "100", "--byte-price", "800", "--bundle-gas-limit", "22527"]),
+            (Some(100), Some(800), Some(22_527), None)
         );
         assert_eq!(
             parse(&["--gas-price", "100", "--gas-dynamic", "10485760,262144,1250"]).3,
@@ -5859,7 +5885,7 @@ mod tests {
         with_gas.gas = Some(randprotocol_core::gas::GasConfig {
             gas_price: 100,
             byte_price: 800,
-            bundle_gas_limit: 20_479,
+            bundle_gas_limit: 22_527,
             metering: randprotocol_core::gas::GasMetering::Circuit,
             dynamic: Some(randprotocol_core::gas::DynamicGas {
                 target_block_bytes: 2_097_152,
@@ -5876,7 +5902,7 @@ mod tests {
         assert!(json.contains("\"gas_price\": \"100\""));
         assert!(json.contains("\"metering\": \"circuit\""));
         let built = with_gas.build(&ZkExecutor::new(FriProfile::Test)).unwrap();
-        assert_eq!(built.ledger.gas().unwrap().bundle_gas_limit, 20_479);
+        assert_eq!(built.ledger.gas().unwrap().bundle_gas_limit, 22_527);
         assert_ne!(built.hash(), pinned_genesis().build(&ZkExecutor::new(FriProfile::Test)).unwrap().hash());
     }
 
@@ -5887,14 +5913,14 @@ mod tests {
         assert_eq!(gas_section(None, None, None, None, DynamicExtras::default()).unwrap(), None, "no flags: no section");
         for (byte_price, bundle, dynamic, flag) in [
             (Some(800), None, None, "--byte-price"),
-            (None, Some(20_479), None, "--bundle-gas-limit"),
+            (None, Some(22_527), None, "--bundle-gas-limit"),
             (None, None, Some("10485760,262144,1250"), "--gas-dynamic"),
         ] {
             let e = gas_section(None, byte_price, bundle, dynamic, DynamicExtras::default()).expect_err(&format!("{flag} alone must be refused")).to_string();
             assert!(e.contains(flag) && e.contains("--gas-price"), "{e}");
         }
         let with = gas_section(Some(100), Some(800), None, Some("10485760,262144,1250"), DynamicExtras::default()).unwrap().unwrap();
-        assert_eq!(with.bundle_gas_limit, 20_479);
+        assert_eq!(with.bundle_gas_limit, 22_527);
         assert_eq!(with.dynamic.unwrap().target_block_bytes, 10_485_760);
     }
 
@@ -6059,7 +6085,9 @@ mod tests {
     // leaf `rand-validator-leaf-2`, every payout address in the binding, stakes at the minimum).
     // A drift here with no such change in the log is a bug, and a tag is never cut over a red run
     // of this test (docs/deploy.md, "Release rule", audit v4 PROC-3).
-    assert_eq!(state.hash().to_hex(), "69010a43a7275d1ff2c25d8b774728f4a31148968dcd186f89da16550e87ffb5");
+    // Constraint set 11 (Grain Poseidon2 constants) moved it once more, `69010a43…` → `24ad1bc2…`:
+    // the alloc commitments, the note tree's root and the guest digests are all Poseidon2.
+    assert_eq!(state.hash().to_hex(), "24ad1bc2af537f228efcd2a0d60f90c9f70225d5343521f70aa864dfa429fef8");
         // The envelope is resealed on every call and must not move the hash: only the
         // commitment and the amount are bound.
         let again = pinned_genesis().build(&ex).unwrap();
@@ -6285,7 +6313,14 @@ mod tests {
         assert!(err.contains(randprotocol_node::agg_executor::INNER_MODQ_REFUSAL), "{err}");
         let err = prove_aggregate(FriProfile::Test, &[modq.to_bytes()], &[0; 8]).unwrap_err().to_string();
         assert!(err.contains(randprotocol_node::agg_executor::INNER_MODQ_REFUSAL), "flat: {err}");
-        let (plain, _) = Machine::new(FriProfile::Test).prove(&randprotocol_zkvm::guests::fib(10), &[], &[], None).unwrap();
+        // Constraint set 11: a covered inner proof declares its tier's full poseidon2 height; a
+        // proof at the minimal height is refused by name, one at the full height decodes.
+        let (short, _) = Machine::new(FriProfile::Test).prove(&randprotocol_zkvm::guests::fib(10), &[], &[], None).unwrap();
+        assert_ne!(short.poseidon2_log_height, short.tier.max_poseidon2_log_height());
+        let err = decode_inner_proofs(&[short.to_bytes()]).err().expect("refused").to_string();
+        assert!(err.contains(randprotocol_node::agg_executor::INNER_POSEIDON2_REFUSAL), "{err}");
+        let full = ProveOptions { poseidon2_log_height: Some(Tier(10).max_poseidon2_log_height()), ..ProveOptions::default() };
+        let (plain, _) = Machine::new(FriProfile::Test).prove_with_options(&randprotocol_zkvm::guests::fib(10), &[], &[], Some(Tier(10)), full).unwrap();
         assert_eq!(decode_inner_proofs(&[plain.to_bytes()]).unwrap().len(), 1);
     }
 

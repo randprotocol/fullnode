@@ -920,6 +920,7 @@ async fn a_build_whose_bundle_guest_differs_from_genesis_refuses_to_start() {
         prune_history: None,
         gas_policy: None,
         msauth: Default::default(),
+        perps_keys: Default::default(),
     })
     .await;
     // `NodeHandle` is not `Debug`, so unwrap the error by hand rather than via `expect_err`.
@@ -2130,6 +2131,7 @@ async fn a_fresh_node_syncs_pruned_history_with_one_rvm_verify_per_sealed_window
             proof.sha256_log_height,
             proof.public_log_height,
             proof.mem_log_height,
+            proof.poseidon2_log_height,
         );
         let key_inner = randprotocol_rvm::shape::InnerKey::of(FriProfile::Test, &shape_inner);
         let vk = randprotocol_rvm::aggregate::InnerVerifierKey { shape: shape_inner, key: key_inner };
@@ -3007,7 +3009,7 @@ const CHAIN18_MAX_BLOCK_BYTES: u32 = 20 << 20;
 /// auth, call) fit a block with 1 MiB to spare, as `Genesis::validate` requires under `hc_auth`.
 const CHAIN18_MAX_PROOF_BYTES: u32 = 4 << 20;
 
-/// The cut script's `gas` section: `--gas-price 100 --byte-price 800 --bundle-gas-limit 20479
+/// The cut script's `gas` section: `--gas-price 100 --byte-price 800 --bundle-gas-limit 22527
 /// --gas-dynamic 10485760,262144,1250` (the byte target half the 20 MiB cap), the floors at the
 /// starting prices.
 fn chain18_gas() -> gas::GasConfig {
@@ -3161,7 +3163,7 @@ async fn a_chain18_genesis_prices_calls_by_their_declared_limit() {
     assert!(limits.hardening_v6, "{limits:?}");
     assert!(limits.gas_circuit, "the section meters in-circuit: {limits:?}");
     assert_eq!(limits.bundle_gas_limit, Some(pin), "rand_getLimits.bundle_gas_limit is the genesis pin");
-    assert_eq!(pin, 20_479);
+    assert_eq!(pin, 22_527);
     assert_eq!(limits.adjust_bps, Some(1250));
     assert_eq!((limits.gas_price, limits.byte_price), (Some(100), Some(800)));
     let status = n0.rpc.status().await.unwrap();
@@ -3186,7 +3188,7 @@ async fn a_chain18_genesis_prices_calls_by_their_declared_limit() {
     let auth = &tx.bundle.as_ref().unwrap().auth_proof;
     assert!(!auth.is_empty(), "a v3 transfer carries its auth proof");
     assert_eq!(declared_gas_of(auth), gas::auth_gas_limit_pin(), "and the auth proof declares exactly its pin, 1 279");
-    assert_eq!(gas::auth_gas_limit_pin(), 1_279);
+    assert_eq!(gas::auth_gas_limit_pin(), 1_407);
     for n in nodes {
         wait_for("the transfer reaches every node", Duration::from_secs(60), || n.handle.storage.tx_location(&sent.hash).unwrap().is_some()).await;
     }

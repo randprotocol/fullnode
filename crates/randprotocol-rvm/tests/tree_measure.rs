@@ -62,7 +62,7 @@ fn bundles(k0: usize, n: usize) -> Vec<Proof> {
 
 fn inner(p: &Proof) -> InnerVerifierKey {
     let shape = InnerShape::of(P, p.tier, p.program_log_height, p.input_log_height, p.keccak_log_height,
-        p.sha256_log_height, p.public_log_height, p.mem_log_height);
+        p.sha256_log_height, p.public_log_height, p.mem_log_height, p.poseidon2_log_height);
     let key = InnerKey::of(P, &shape);
     InnerVerifierKey { shape, key }
 }
@@ -116,7 +116,7 @@ fn prove_leaf(k: usize) {
 
 /// Task 0, run 1 (the 256 GB droplet).
 #[test]
-#[ignore = "tree Task 0: the production rv32n leaf at L = 2 (632 175 rows, tier 20 since phase 4; 1 171 511 rows, tier 21 after phase 3, 122-142 GB projected then at rate 1/4, docs/07 §4) — the 256 GB droplet"]
+#[ignore = "tree Task 0: the production rv32n leaf at L = 2. NOW (pins.json tree_measure, constraint set 10): 471 119 rows, tier 19, never proved — memory unmeasured and the 256 GB sizing below was priced at tier 21 (ZKVM-102). History: (632 175 rows, tier 20 since phase 4; 1 171 511 rows, tier 21 after phase 3, 122-142 GB projected then at rate 1/4, docs/07 §4) — the 256 GB droplet"]
 fn production_leaf_l2() {
     prove_leaf(0);
 }
@@ -153,7 +153,7 @@ fn production_rv32r_over_the_leaf_emulates() {
 
 /// Task 0, run 3 (the 503 GB droplet, hours): the same program proved, under the heap profiler.
 #[test]
-#[ignore = "tree Task 0: rv32r over the production leaf, proved (347 673 rows, tier 19 since phase 4; 648 910 rows, tier 20 before, 64-75 GB projected then at rate 1/4, docs/07 §4) — the 256 GB droplet"]
+#[ignore = "tree Task 0: rv32r over the production leaf, proved. NOW (pins.json tree_measure): 254 493 rows, tier 18, never proved — memory unmeasured (ZKVM-102). History: (347 673 rows, tier 19 since phase 4; 648 910 rows, tier 20 before, 64-75 GB projected then at rate 1/4, docs/07 §4) — the 256 GB droplet"]
 fn production_rv32r_over_the_leaf_proves() {
     let (vp, tape, rows, child) = rv32r_over_leaf();
     assert!(child <= STOP_CHILD_ROWS, "the stop rule holds before anything is proved");
@@ -479,7 +479,7 @@ fn env_index(var: &str, max: usize) -> usize {
 
 /// Leaves 1–3 (one per process): `TREE_LEAF=k`. Leaf 0 is Task 0's `production_leaf_l2`.
 #[test]
-#[ignore = "tree Task 2: production rv32n leaf k (TREE_LEAF=1..3), 632 175 rows tier 20 since phase 4 (1 171 511 rows tier 21 after phase 3, 122-142 GB projected then at rate 1/4, docs/07 §4) — the 256 GB droplet"]
+#[ignore = "tree Task 2: production rv32n leaf k (TREE_LEAF=1..3). NOW (pins.json tree_measure): 471 119 rows, tier 19, never proved — memory unmeasured (ZKVM-102). History: 632 175 rows tier 20 since phase 4 (1 171 511 rows tier 21 after phase 3, 122-142 GB projected then at rate 1/4, docs/07 §4) — the 256 GB droplet"]
 fn production_tree_leaf() {
     let k = env_index("TREE_LEAF", 3);
     assert!(k >= 1, "leaf 0 is Task 0's production_leaf_l2");
@@ -536,7 +536,7 @@ fn production_step_list(s_step: &RvmShape, s_root: &RvmShape, root: &randprotoco
 /// Step `TREE_STEP=k` ∈ {0, 1}: `rv32t_leaf` over leaves (2k, 2k + 1). Emulated first, against
 /// docs/08 §2's band (M5), then proved under the heap profiler.
 #[test]
-#[ignore = "tree Task 2: production rv32t_leaf step k (TREE_STEP=0|1), 695 097 rows emulated, tier 20 since phase 4 (1 294 577, tier 21 before; 122-197 GB projected then at rate 1/4, docs/07 §4) — the 256 GB droplet"]
+#[ignore = "tree Task 2: production rv32t_leaf step k (TREE_STEP=0|1). NOW (pins.json tree_measure): 508 735 rows emulated, tier 19, never proved — memory unmeasured (ZKVM-102). History: 695 097 rows emulated, tier 20 since phase 4 (1 294 577, tier 21 before; 122-197 GB projected then at rate 1/4, docs/07 §4) — the 256 GB droplet"]
 fn production_tree_step() {
     let k = env_index("TREE_STEP", 1);
     let (_vk, program, shape) = production_leaf_shape();
@@ -566,7 +566,7 @@ fn production_tree_step() {
 /// shapes and keys the node rebuilds from the heights (`TreeShapes::build`), and the production
 /// list length read off the next level, emulated at the root's shape (R3).
 #[test]
-#[ignore = "tree Task 2: production rv32t_int root over the two steps (tier 21 expected before phase 4, not re-derived; 122-197 GB projected then at rate 1/4, docs/07 §4), then verify_tree — the 256 GB droplet"]
+#[ignore = "tree Task 2: production rv32t_int root over the two steps. NOW: tier 19 expected from the emulated step (508 735 rows), not derived for the root itself, never proved (ZKVM-102). History: (tier 21 expected before phase 4, not re-derived; 122-197 GB projected then at rate 1/4, docs/07 §4), then verify_tree — the 256 GB droplet"]
 fn production_tree_root() {
     let (vk, _program, leaf_shape) = production_leaf_shape();
     let t_leaf = Arc::new(verify_rv32t(&leaf_shape, Checkpoints::Off).program);
@@ -607,7 +607,7 @@ fn production_tree_root() {
 /// (`step_digests`) and key (`step_keys`), the last entry repeating. Every digest is four canonical
 /// u64 limbs. Save the block between the `== aggregation_tree` markers as TREE.JSON.
 #[test]
-#[ignore = "tree Task 2: prints the production aggregation_tree genesis values from the cached tree (keys at tier 21: the 256 GB droplet)"]
+#[ignore = "tree Task 2: prints the production aggregation_tree genesis values from the cached tree (needs the production tree fixtures, which do not exist: ZKVM-102; the keys were sized at tier 21 for the 256 GB droplet and are tier 19 now)"]
 fn production_tree_genesis_values() {
     let (vk, program, leaf_shape) = production_leaf_shape();
     let t_leaf = Arc::new(verify_rv32t(&leaf_shape, Checkpoints::Off).program);

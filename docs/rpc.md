@@ -816,7 +816,7 @@ With a `gas` section, `gas_metering` is `"circuit"` (the in-circuit meter, §4.2
 live prices, which move per block by fullness, not the genesis snapshot this node took at
 startup; without `dynamic` they are the section's own fixed prices, which never move.
 `bundle_gas_limit` is the bundle guest's flat declared gas (genesis `gas.bundle_gas_limit`;
-`20479` on chain 18, the tier-14 hash-free ceiling `gas_max(14, 0, 0)`), `null` without a section. `adjust_bps` is the dynamic controller's per-block step size in basis
+`20479` on chains 18–21 and `22527` from chain 22 (constraint set 11), the tier-14 hash-free ceiling `gas_max(14, 0, 0)`), `null` without a section. `adjust_bps` is the dynamic controller's per-block step size in basis
 points (genesis `gas.dynamic.adjust_bps`), `null` on a chain without `dynamic` — including one
 with a `gas` section whose prices never move. `max_gas_price`/`max_byte_price` (decimal strings)
 are the ceilings the controller never lifts a price over and `byte_load` is `"paying"` when only

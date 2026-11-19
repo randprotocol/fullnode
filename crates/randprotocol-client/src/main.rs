@@ -3952,7 +3952,7 @@ mod tests {
     #[test]
     fn fee_call_without_gas_defaults_to_the_headers_ceiling_under_a_section() {
         assert_eq!(fee_call_default_gas(true, 12, None, None), Some(gas::gas_max(12, 0, 0)));
-        assert_eq!(fee_call_default_gas(true, 14, None, None), Some(20_479));
+        assert_eq!(fee_call_default_gas(true, 14, None, None), Some(22_527));
         // Heights given describe a hashing header: its ceiling, not the hash-free one.
         assert_eq!(fee_call_default_gas(true, 14, Some(12), Some(13)), Some(gas::gas_max(14, 12, 13)));
         // A tier past u8 clamps like the header rule does (gas_max clamps to 20).
@@ -3965,7 +3965,7 @@ mod tests {
     /// explicit limit is refused naming `--gas-limit max`.
     #[test]
     fn a_non_cpu_backend_declares_the_ceiling_and_refuses_an_explicit_limit() {
-        let run = executor::CallDryRun { gas: 700, tier: 10, keccak_log_height: 0, sha256_log_height: 0 };
+        let run = executor::CallDryRun { gas: 700, tier: 10, keccak_log_height: 0, sha256_log_height: 0, poseidon2_log_height: 12 };
         let l = section_limits();
         let ceiling = gas::gas_max(10, 0, 0);
         assert_eq!(resolve_gas_limit(GasArg::Default, &run, 10, Some(&l), true).unwrap(), (Some(768), 768), "CPU: the bucket");

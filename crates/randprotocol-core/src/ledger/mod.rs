@@ -6468,6 +6468,7 @@ pub(crate) mod tests {
             max_window_heights: 0,
             engine_program_log_height: 0,
             max_pending_digests: 0,
+            state_proof_keys: Vec::new(),
             markets: vec![perps::MarketSpec {
                 id: 0,
                 symbol: "X-PERP".into(),
@@ -7526,7 +7527,8 @@ pub(crate) mod tests {
         // Above both floors, so a block under target moves both prices.
         let (l, id) = ledger_with_program(|l| l.set_gas(Some(gas::GasConfig { gas_price: 200, byte_price: 1_600, ..dynamic_gas() })));
         let proof = StubExecutor::make_proof(&id, 12, [7; 8]);
-        let fee = fee_for(proof.len());
+        // Above the doubled prices' floor (constraint set 11's larger gas_max ceilings).
+        let fee = fee_for(proof.len()) + 100_000;
         let tx = call_tx(&l, 20, id, proof, fee);
         let mut expect = l.clone();
         expect.set_height(2);
@@ -7625,18 +7627,18 @@ pub(crate) mod tests {
         let (l, _) = gas_ledger();
         let ok = tx(&l, [[50; 8], [51; 8]], [[52; 8], [53; 8]]);
         assert!(l.validate(&ok, &StubExecutor).is_ok());
-        for other in [20_478u64, 20_480, 16_383, 1] {
+        for other in [20_478u64, 22_528, 16_383, 1] {
             let mut t = ok.clone();
             StubExecutor::with_bundle_gas(&mut t.bundle.as_mut().unwrap().proof, other);
             let t = StubExecutor::bound(t);
-            assert_eq!(l.validate(&t, &StubExecutor), Err(TxError::BundleGasLimit { want: 20_479, got: Some(other) }), "{other}");
+            assert_eq!(l.validate(&t, &StubExecutor), Err(TxError::BundleGasLimit { want: 22_527, got: Some(other) }), "{other}");
             // A wrong limit buys no verify.
             let exec = CountingExecutor::default();
-            assert_eq!(l.validate(&t, &exec), Err(TxError::BundleGasLimit { want: 20_479, got: Some(other) }));
+            assert_eq!(l.validate(&t, &exec), Err(TxError::BundleGasLimit { want: 22_527, got: Some(other) }));
             assert_eq!(exec.bundles(), 0, "refused before the verify");
             // And apply checks the limit as admission does.
             let mut applied = l.clone();
-            assert_eq!(applied.apply_tx(&t, &a.address(), &StubExecutor), Err(TxError::BundleGasLimit { want: 20_479, got: Some(other) }));
+            assert_eq!(applied.apply_tx(&t, &a.address(), &StubExecutor), Err(TxError::BundleGasLimit { want: 22_527, got: Some(other) }));
         }
         // An executor whose proofs carry no limit declares none, and is refused under the section.
         struct NoGas;
@@ -7706,7 +7708,7 @@ pub(crate) mod tests {
                 StubExecutor.verify_aggregate(shape, covered, proof, binding)
             }
         }
-        assert_eq!(l.validate(&ok, &NoGas), Err(TxError::BundleGasLimit { want: 20_479, got: None }));
+        assert_eq!(l.validate(&ok, &NoGas), Err(TxError::BundleGasLimit { want: 22_527, got: None }));
         // Without the section any limit is accepted (chains 16/17).
         let (plain, _) = ledger_with_program(|_| {});
         let mut t = tx(&plain, [[60; 8], [61; 8]], [[62; 8], [63; 8]]);
@@ -7731,15 +7733,15 @@ pub(crate) mod tests {
             metering: gas::GasMetering::Circuit,
             dynamic: None,
         }));
-        assert_eq!(gas::auth_gas_limit_pin(), 1_279, "(2^10 − 1) + 2^8: tier 10, no hash table");
+        assert_eq!(gas::auth_gas_limit_pin(), 1_407, "(2^10 − 1) + 3·2^7: tier 10, no hash table");
         assert_eq!(gas::auth_gas_limit_pin(), crate::confidential::STUB_AUTH_GAS_LIMIT);
         let ok = v3_tx(&l);
         assert_eq!(l.validate(&ok, &StubExecutor), Ok(()), "the ceiling passes");
-        for other in [1_278u64, 1_280, 20_479, 1] {
+        for other in [1_278u64, 1_408, 22_527, 1] {
             let mut t = ok.clone();
             StubExecutor::with_auth_gas(&mut t.bundle.as_mut().unwrap().auth_proof, other);
             let t = StubExecutor::bound(t);
-            let want = Err(TxError::AuthGasLimit { want: 1_279, got: Some(other) });
+            let want = Err(TxError::AuthGasLimit { want: 1_407, got: Some(other) });
             assert_eq!(l.validate(&t, &StubExecutor), want, "{other}");
             // A wrong limit buys no verify, of either proof.
             let exec = CountingExecutor::default();
@@ -7963,7 +7965,7 @@ pub(crate) mod tests {
         let limit = gas::gas_max(14, 0, 0);
         let proof = StubExecutor::make_proof_with_gas(&id, 14, [7; 8], limit);
         let floor = gas::circuit_call_floor(100, 800, limit, proof.len());
-        assert_eq!(floor, gas::BUNDLE_BASE + 100 * 20_479 + 800, "a stub proof is under a KiB");
+        assert_eq!(floor, gas::BUNDLE_BASE + 100 * 22_527 + 800, "a stub proof is under a KiB");
         assert!(floor > l.gas_call_floor(1, proof.len()).unwrap(), "the tier-exact floor, not the pre-verify one");
         let short = call_tx(&l, 20, id, proof.clone(), floor - 1);
         assert_eq!(l.validate(&short, &StubExecutor), Err(TxError::FeeTooLow { min: floor, fee: floor - 1 }));

@@ -125,6 +125,7 @@ async fn the_hosted_prover_answers_beside_the_node_and_its_exit_stops_the_node()
         prune_history: None,
         gas_policy: None,
         msauth: Default::default(),
+        perps_keys: Default::default(),
     })
     .await
     .expect("node starts");
@@ -202,6 +203,7 @@ async fn the_node_stops_cleanly_on_shutdown_with_its_prover() {
         prune_history: None,
         gas_policy: None,
         msauth: Default::default(),
+        perps_keys: Default::default(),
     })
     .await
     .unwrap();
