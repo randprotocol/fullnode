@@ -21,7 +21,7 @@ fn accept_all(profile: FriProfile, n: usize) -> Vec<usize> {
     for p in &proofs {
         let shape = InnerShape::of(profile, p.proof.tier, p.proof.program_log_height,
             p.proof.input_log_height, p.proof.keccak_log_height, p.proof.sha256_log_height, p.proof.public_log_height,
-            p.proof.mem_log_height);
+            p.proof.mem_log_height, p.proof.poseidon2_log_height);
         let key = InnerKey::of(profile, &shape);
         let vp = program.get_or_insert_with(|| verify_rv32(&shape, &key, Checkpoints::Off));
         assert_eq!(vp.shape, shape, "every fixture proof must share one shape");
@@ -144,7 +144,7 @@ fn refuse_all(profile: FriProfile, n: usize) {
     for (k, p) in proofs.iter().enumerate() {
         let shape = InnerShape::of(profile, p.proof.tier, p.proof.program_log_height,
             p.proof.input_log_height, p.proof.keccak_log_height, p.proof.sha256_log_height, p.proof.public_log_height,
-            p.proof.mem_log_height);
+            p.proof.mem_log_height, p.proof.poseidon2_log_height);
         let key = InnerKey::of(profile, &shape);
         let vp = verify_rv32(&shape, &key, Checkpoints::Off);
         let (seg, _) = table[k % table.len()];
@@ -183,7 +183,7 @@ fn the_cycle_budget_per_inner_proof_is_pinned() {
     let p = common::bundle_proofs(FriProfile::Production, 1).pop().unwrap();
     let shape = InnerShape::of(FriProfile::Production, p.proof.tier, p.proof.program_log_height,
         p.proof.input_log_height, p.proof.keccak_log_height, p.proof.sha256_log_height, p.proof.public_log_height,
-        p.proof.mem_log_height);
+        p.proof.mem_log_height, p.proof.poseidon2_log_height);
     let key = InnerKey::of(FriProfile::Production, &shape);
     let vp = verify_rv32(&shape, &key, Checkpoints::Off);
     let tape = WitnessTape::build(FriProfile::Production, &shape, &key, &p.proof).unwrap();
@@ -236,8 +236,11 @@ fn the_cycle_budget_per_inner_proof_is_pinned() {
     // unchanged. Still tier 19, 208 896 under the gate.
     // Phase 5 (2026-10-12, S6a/S2b/S4a/S1b) re-recorded it: 315 391 → 235 418 (profile: S6a −10 124,
     // S2b −27 120 on the profile's own measure, S4a −7 522, S1b −35 207; docs/measurements/2026-10-12-phase5-profile-*.log).
-    // Tier 18 now: 235 418 is under 2^18 − 1 = 262 143 by 26 725 rows.
-    assert_eq!(r.cpu_rows, 235_418, "phase 5's re-pin: one production inner verification, 26 725 rows under the 2^18 − 1 gate (315 391 after the MODQ chip, 315 952 after phase 4; 585 686 after phase 3, 61 399 above the 2^19 − 1 gate)");
+    // Constraint set 10 (ZKV-5): +7 rows, the three selectors the gas chain's absorb term gained: 235 418 → 235 425.
+    // Constraint set 11 (ZKVM-202): the inner cpu gained `MODQ_W` (284 columns) and its `MODQ` lookup a
+    // fourth field; one more opened main-trace column per query and the new gas-chain terms: 235 425 → 236 021 = +596.
+    // Tier 18 still: 236 021 is under 2^18 − 1 = 262 143 by 26 122 rows.
+    assert_eq!(r.cpu_rows, 238_053, "constraint set 11's re-pin: one production inner verification, 26 122 rows under the 2^18 − 1 gate (235 425 in constraint set 10; (315 391 after the MODQ chip, 315 952 after phase 4; 585 686 after phase 3, 61 399 above the 2^19 − 1 gate)");
     assert_eq!(randprotocol_rvm::machine::Tier::for_cycles(r.cpu_rows), Some(randprotocol_rvm::machine::Tier(18)),
                "tier 18: under the 2^18 − 1 gate since phase 5 (tier 19 since phase 4, tier 20 after phase 3) — docs/09 and docs/00 must move with it");
     assert!(r.cpu_rows <= (1 << 18) - 1, "above the 2^18 − 1 gate again: docs/09 and docs/00's decision paragraph must be updated");
@@ -248,12 +251,20 @@ fn the_cycle_budget_per_inner_proof_is_pinned() {
                common::committed_digest(), "src/programs/verify_rv32.digest must match a rebuild");
 }
 
+/// `src/programs/verify_rv32.digest` is the production-shape program's digest, checked in-suite
+/// (constraint set 11): the shape comes from a Test-profile fixture's declared heights, which are
+/// the production proof's, so no production proof is needed to rebuild the program.
+#[test]
+fn the_committed_digest_is_the_production_shape_rebuilt_from_test_heights() {
+    assert_eq!(common::production_digest_from_test_heights(), common::committed_digest(), "src/programs/verify_rv32.digest must match a rebuild");
+}
+
 #[test]
 fn the_committed_program_digest_is_reproducible() {
     let p = common::bundle_proofs(FriProfile::Test, 1).pop().unwrap();
     let shape = InnerShape::of(FriProfile::Test, p.proof.tier, p.proof.program_log_height,
         p.proof.input_log_height, p.proof.keccak_log_height, p.proof.sha256_log_height, p.proof.public_log_height,
-        p.proof.mem_log_height);
+        p.proof.mem_log_height, p.proof.poseidon2_log_height);
     let key = InnerKey::of(FriProfile::Test, &shape);
     let a = verify_rv32(&shape, &key, Checkpoints::Off);
     let b = verify_rv32(&shape, &key, Checkpoints::Off);
@@ -340,7 +351,7 @@ fn twin_the_post_cut_verifier_program_over_one_test_profile_proof_proves_and_ver
     let p = common::bundle_proofs(FriProfile::Test, 1).pop().unwrap();
     let shape = InnerShape::of(FriProfile::Test, p.proof.tier, p.proof.program_log_height,
         p.proof.input_log_height, p.proof.keccak_log_height, p.proof.sha256_log_height, p.proof.public_log_height,
-        p.proof.mem_log_height);
+        p.proof.mem_log_height, p.proof.poseidon2_log_height);
     let key = InnerKey::of(FriProfile::Test, &shape);
     let vp = verify_rv32(&shape, &key, Checkpoints::Off);
     let tape = WitnessTape::build(FriProfile::Test, &shape, &key, &p.proof).unwrap();
@@ -348,7 +359,7 @@ fn twin_the_post_cut_verifier_program_over_one_test_profile_proof_proves_and_ver
     let t0 = std::time::Instant::now();
     let (rvm_proof, exec) = m.prove(&vp.program, &tape.words, None).unwrap();
     let prove_s = t0.elapsed().as_secs_f64();
-    assert_eq!(exec.cpu_rows(), 104_229, "the twin proves the post-cut program as measured (after the MODQ chip (104 229): the N=1 aggregate pin 104 556 less the 327-row loop overhead; 104 150 after phase 4; 169 366 after phase 3's Cut F; 185 206 after Cut E2; 192 982 after Cut E1; 202 198 after Cut D; 230 950 after phase 2's row cuts; 461 988 at tier 19 in constraint set 8, 461 082 in constraint set 7 with VERIFIER-1, 441 643 in constraint set 6)");
+    assert_eq!(exec.cpu_rows(), 81_421, "the twin proves the post-cut program as measured (after the MODQ chip (104 229): the N=1 aggregate pin 104 556 less the 327-row loop overhead; 104 150 after phase 4; 169 366 after phase 3's Cut F; 185 206 after Cut E2; 192 982 after Cut E1; 202 198 after Cut D; 230 950 after phase 2's row cuts; 461 988 at tier 19 in constraint set 8, 461 082 in constraint set 7 with VERIFIER-1, 441 643 in constraint set 6)");
     assert_eq!(rvm_proof.tier, randprotocol_rvm::machine::Tier(18));
     let t1 = std::time::Instant::now();
     m.verify(&vp.program, &rvm_proof).unwrap();
@@ -388,7 +399,7 @@ fn exit_the_verifier_program_over_one_real_cs6_bundle_proof_proves_and_verifies_
     let p = common::bundle_proofs(FriProfile::Production, 1).pop().unwrap();
     let shape = InnerShape::of(FriProfile::Production, p.proof.tier, p.proof.program_log_height,
         p.proof.input_log_height, p.proof.keccak_log_height, p.proof.sha256_log_height, p.proof.public_log_height,
-        p.proof.mem_log_height);
+        p.proof.mem_log_height, p.proof.poseidon2_log_height);
     let key = InnerKey::of(FriProfile::Production, &shape);
     let vp = verify_rv32(&shape, &key, Checkpoints::Off);
     assert_eq!(randprotocol_rvm::programs::digest_hex(&vp.program), common::committed_digest(),
@@ -398,7 +409,7 @@ fn exit_the_verifier_program_over_one_real_cs6_bundle_proof_proves_and_verifies_
     let t0 = std::time::Instant::now();
     let (rvm_proof, exec) = m.prove(&vp.program, &tape.words, None).unwrap();
     let prove_s = t0.elapsed().as_secs_f64();
-    assert_eq!(exec.cpu_rows(), 235_418, "the exit proves the post-cut program as measured (after phase 5 (235 418), `tests/pins.json`; 315 391 after the MODQ chip; 315 952 after phase 4; 585 686 after phase 3's Cut F; 664 886 after Cut E2; 703 766 after Cut E1; 749 846 after Cut D; 893 606 after phase 2's row cuts; 2 047 268 at tier 21 in constraint set 8, 2 044 506 in constraint set 7 with VERIFIER-1, 1 968 619 in constraint set 6)");
+    assert_eq!(exec.cpu_rows(), 238_053, "the exit proves the post-cut program as measured (after constraint set 11 (236 021); after constraint set 10 (235 425); after phase 5 (235 418), `tests/pins.json`; 315 391 after the MODQ chip; 315 952 after phase 4; 585 686 after phase 3's Cut F; 664 886 after Cut E2; 703 766 after Cut E1; 749 846 after Cut D; 893 606 after phase 2's row cuts; 2 047 268 at tier 21 in constraint set 8, 2 044 506 in constraint set 7 with VERIFIER-1, 1 968 619 in constraint set 6)");
     assert_eq!(rvm_proof.tier, randprotocol_rvm::machine::Tier(18), "tier 18 since phase 5 (tier 19 since phase 4, tier 20 after phase 3)");
     let t1 = std::time::Instant::now();
     m.verify(&vp.program, &rvm_proof).unwrap();
@@ -426,7 +437,7 @@ fn a_committed_row_whose_own_slot_differs_is_refused_at_the_own_slot_step() {
     use randprotocol_rvm::witness::Segment;
     let p = common::bundle_proofs(FriProfile::Test, 1).pop().unwrap();
     let shape = InnerShape::of(FriProfile::Test, p.proof.tier, p.proof.program_log_height, p.proof.input_log_height,
-        p.proof.keccak_log_height, p.proof.sha256_log_height, p.proof.public_log_height, p.proof.mem_log_height);
+        p.proof.keccak_log_height, p.proof.sha256_log_height, p.proof.public_log_height, p.proof.mem_log_height, p.proof.poseidon2_log_height);
     let key = InnerKey::of(FriProfile::Test, &shape);
     let r = randprotocol_rvm::reference::replay(FriProfile::Test, &shape, &key, &p.proof).unwrap();
     let vp = verify_rv32(&shape, &key, Checkpoints::Off);

@@ -35,9 +35,24 @@ use crate::isa::{self, opc, Insn};
 use crate::memory::{Memory, MAX_CALL_DEPTH, STACK_FRAME};
 use crate::{elf::Program, Host};
 
-/// Solana's default compute budget, and the only clock this interpreter has: exceeding it is an
-/// exceptional halt. Per-syscall compute costs are not modelled (M4.4 plan, "Instruction meter").
+/// Solana's default compute budget per instruction, in compute units, and the only clock this
+/// interpreter has: exceeding it is an exceptional halt. An instruction costs one unit and a syscall
+/// costs what Agave charges for it on top of its own `call` ([`crate::syscalls::base_cost`] plus the
+/// length-dependent part `dispatch` charges), all against this one meter — so a program runs out
+/// here where it runs out on Solana.
 pub const MAX_INSTRUCTIONS: u64 = 200_000;
+
+/// The most bytes `sol_set_return_data` accepts (`solana_program::program::MAX_RETURN_DATA`).
+pub const MAX_RETURN_DATA: usize = 1024;
+
+/// The sysvar block a call may carry on the public tape: `Clock` (40 bytes) then `Rent` (17), each
+/// as the sysvar account's own data (bincode: little-endian integers, `f64` as its eight raw
+/// bytes). See [`crate::abi`] for where it comes from and what binds it.
+pub const SYSVAR_BYTES: usize = CLOCK_BYTES + RENT_BYTES;
+/// `Clock`: `slot`, `epoch_start_timestamp`, `epoch`, `leader_schedule_epoch`, `unix_timestamp`.
+pub const CLOCK_BYTES: usize = 40;
+/// `Rent`: `lamports_per_byte_year` (u64), `exemption_threshold` (f64), `burn_percent` (u8).
+pub const RENT_BYTES: usize = 17;
 
 /// Why a run stopped. Everything but [`Halt::Exit`] is an *exceptional* halt, which
 /// [`crate::abi::run_call`] publishes as status 2 with the post-state pinned to the pre-state.
@@ -57,7 +72,8 @@ pub enum Halt {
     UnknownSyscall(u32),
     /// The 64th nested frame.
     CallDepth,
-    /// [`MAX_INSTRUCTIONS`] executed.
+    /// More than [`MAX_INSTRUCTIONS`] compute units: the next instruction, or a syscall's charge,
+    /// does not fit.
     InstructionLimit,
     /// The ELF is not an SBPF v1 shared object this loader can load.
     BadElf,
@@ -93,7 +109,27 @@ pub struct Vm<'a, H: Host> {
     saved_fp: [u64; MAX_CALL_DEPTH],
     depth: usize,
     max_depth: usize,
+    /// Compute units consumed: one per instruction plus every syscall's charge.
     meter: u64,
+    /// Instructions executed.
+    insns: u64,
+    /// How the syscalls' charges split, as *requested* (a refused charge is counted too):
+    /// [`crate::syscalls::base_cost`] units, which a translated program pays in its block charges,
+    /// and the length-dependent rest, which `sbpf-rt` charges at run time. Measurements, read by
+    /// `sbpf2rv`'s differential tests; nothing here depends on them.
+    pub syscall_base_units: u64,
+    pub syscall_extra_units: u64,
+    /// What `sol_set_return_data` last set: `return_data[..return_len]`. Empty at entry, as Agave
+    /// resets it for every instruction.
+    pub return_data: [u8; MAX_RETURN_DATA],
+    pub return_len: usize,
+    /// The sysvar block: `sysvars[..sysvars_len]`, where `sysvars_len` is [`SYSVAR_BYTES`] or 0 (the
+    /// call carries none, and every sysvar getter halts).
+    pub sysvars: [u8; SYSVAR_BYTES],
+    pub sysvars_len: usize,
+    /// The running program's id, which `sol_get_return_data` reports as the setter's: with no CPI
+    /// the only program that can have set return data is this one.
+    pub program_id: [u8; 32],
 }
 
 impl<'a, H: Host> Vm<'a, H> {
@@ -116,12 +152,45 @@ impl<'a, H: Host> Vm<'a, H> {
             depth: 0,
             max_depth: 0,
             meter: 0,
+            insns: 0,
+            syscall_base_units: 0,
+            syscall_extra_units: 0,
+            return_data: [0; MAX_RETURN_DATA],
+            return_len: 0,
+            sysvars: [0; SYSVAR_BYTES],
+            sysvars_len: 0,
+            program_id: [0; 32],
         }
     }
 
     /// How many instructions the run executed. An `lddw` spans two slots but counts once.
     pub fn instructions_executed(&self) -> u64 {
+        self.insns
+    }
+
+    /// Compute units consumed: [`Vm::instructions_executed`] plus every syscall's charge.
+    pub fn compute_units_consumed(&self) -> u64 {
         self.meter
+    }
+
+    /// [`Vm::consume`] for the length-dependent part of a syscall's charge.
+    pub fn consume_extra(&mut self, units: u64) -> Result<(), Halt> {
+        self.syscall_extra_units = self.syscall_extra_units.saturating_add(units);
+        self.consume(units)
+    }
+
+    /// Charges `units` to the meter — a syscall's cost — or halts [`Halt::InstructionLimit`] if the
+    /// budget does not cover it, exactly `consume_checked`'s rule in Agave: a charge that would take
+    /// the total past [`MAX_INSTRUCTIONS`] fails, one that lands on it succeeds.
+    pub fn consume(&mut self, units: u64) -> Result<(), Halt> {
+        let total = self.meter.saturating_add(units);
+        if total > MAX_INSTRUCTIONS {
+            // Agave zeroes what is left of the budget when a charge fails.
+            self.meter = MAX_INSTRUCTIONS;
+            return Err(Halt::InstructionLimit);
+        }
+        self.meter = total;
+        Ok(())
     }
 
     /// The current call depth: 0 once a run has returned normally.
@@ -144,6 +213,7 @@ impl<'a, H: Host> Vm<'a, H> {
                 return Err(Halt::InstructionLimit);
             }
             self.meter += 1;
+            self.insns += 1;
             if let Some(r0) = self.step()? {
                 return Ok(r0);
             }

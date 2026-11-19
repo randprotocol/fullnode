@@ -54,6 +54,10 @@ chacha20poly1305 = "=0.11.0"
 serde = { workspace = true }
 serde_json = { workspace = true }
 postcard = { version = "1", features = ["alloc"] }
+# Constraint set 11 re-vendor (circuits ZKVM-109): research's opt-in `parallel` feature, Plonky3's
+# maybe-rayon shim with its `parallel` feature (rayon in every p3 crate that uses it). Off by
+# default; `randprotocol-rvm`'s `parallel` forwards to it, as recursion's does to research's.
+p3-maybe-rayon = { version = "=0.7.0", optional = true }
 # The GPU backend is circuits' `rand-zkvm-cuda`, taken from the public zkp-circuits repository at
 # a pinned revision — a git dependency, not a path to a sibling checkout (audit v6 PROC-2, issue
 # #109: cargo loads every path dependency's manifest, optional or not, so a sibling path made a
@@ -66,7 +70,7 @@ postcard = { version = "1", features = ["alloc"] }
 # `research/src/poseidon2_constants.rs` it `#[path]`-includes are identical between this
 # revision and `CIRCUITS_PIN`, which may be ahead of it when the pin moved for a change outside
 # the backend. It must be a commit reachable from the public repository.
-rand-zkvm-cuda = { git = "https://github.com/randprotocol/zkp-circuits", rev = "71e1a0411748cbb7ba74b204acaafe37587e613a", optional = true }
+rand-zkvm-cuda = { git = "https://github.com/randprotocol/zkp-circuits", rev = "76a48dca92a2d0382370f383d6680971db0cc574", optional = true }
 # M4.3/M4.4 (arrived with the constraint-set-6 re-vendor): the EVM and sBPF interpreter cores —
 # no_std libraries with no dependencies, compiled into the `evm`/`sbpf` guests on riscv32im and
 # run natively here. Normal dependencies, not dev-dependencies, because `src/evm.rs`/`src/sbpf.rs`
@@ -113,6 +117,9 @@ solana-sbpf = { version = "=0.11.1", default-features = false }
 # `tests/{dilithium,msauth,modq_reference}.rs`; `sha3` the independent SHAKE oracle for its sponge.
 crystals-dilithium = "=2.0.0"
 sha3 = "=0.10.9"
+# Constraint set 11 (ZKVM-111), upstream's exact pin, tests only: `tests/security.rs` checks the
+# rate-1/4 profile's proven security over the worst admitted shape with Plonky3's estimator.
+p3-security = "=0.7.0"
 
 [features]
 default = []
@@ -121,6 +128,13 @@ default = []
 # vendored. Declared so the vendored `#[cfg(feature = "cheating")]` items are known cfgs.
 # Never a node feature: `cargo tree -p randprotocol-node -e features` must not show it.
 cheating = []
+# Upstream's prototype gate (constraint set 11 re-vendor): `tables::mulmod256` (ZKVM-115) compiles
+# only under it and no machine includes it. Declared so the vendored `#[cfg(feature = "next-set")]`
+# items are known cfgs and `tests/mulmod256.rs` (below) can name it. Never a node feature.
+next-set = []
+# Research's prover on every core (ZKVM-109): the same proofs, keys and digests, a proof's bytes
+# not reproducible from a seed (`tests/parallel.rs`).
+parallel = ["dep:p3-maybe-rayon", "p3-maybe-rayon/parallel"]
 # The GPU backend's CPU-twin engines: the same Merkle/NTT code paths, no device needed.
 reference-backend = ["dep:rand-zkvm-cuda"]
 # `cuda` and `mock-cuda` are mutually exclusive: enabling both is a hard `compile_error!` in
@@ -133,3 +147,10 @@ cuda = ["dep:rand-zkvm-cuda", "rand-zkvm-cuda/cuda"]
 # enabling it would put a CUDA toolkit back in the way of a no-GPU test run. The two features
 # are siblings; either one turns on `Backend::Cuda`.
 mock-cuda = ["dep:rand-zkvm-cuda", "rand-zkvm-cuda/mock-driver"]
+
+# Upstream's: the ZKVM-115 prototype's tests need `next-set` (`cargo test --features next-set --test
+# mulmod256`); without it the target is skipped, not failed.
+[[test]]
+name = "mulmod256"
+path = "tests/mulmod256.rs"
+required-features = ["next-set"]

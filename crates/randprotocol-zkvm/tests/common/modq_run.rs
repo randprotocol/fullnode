@@ -14,16 +14,18 @@ use randprotocol_zkvm::tables::modq::{col, ModqAir, ModqEvent};
 use randprotocol_zkvm::tables::range::{range_trace, RangeAir, RangeCounts};
 use randprotocol_zkvm::tables::{bus, F};
 
-/// The cpu's side of `MODQ`: one `(CLK, BASE, A1)` lookup per real row.
+/// The cpu's side of `MODQ`: one `(CLK, BASE, A1, MODQ_W)` lookup per real row. The fourth field
+/// (constraint set 11) is the call's gas beyond its row's 1, which the cpu takes from the chip's
+/// entry: a free witness on this side, exactly as the cpu's `MODQ_W` is on a `MODQ` row.
 #[derive(Clone)]
 pub struct Asker;
-impl<Fld> BaseAir<Fld> for Asker { fn width(&self) -> usize { 4 } }
+impl<Fld> BaseAir<Fld> for Asker { fn width(&self) -> usize { 5 } }
 impl<AB: AirBuilder + InteractionBuilder> Air<AB> for Asker where AB::F: Field {
     fn eval(&self, b: &mut AB) {
         let m = b.main();
         let v = |i: usize| -> AB::Expr { m.current(i).unwrap().into() };
         b.assert_bool(v(0));
-        bus::MODQ.lookup_key(b, [v(1), v(2), v(3)], Count::bounded(v(0), 1));
+        bus::MODQ.lookup_key(b, [v(1), v(2), v(3), v(4)], Count::bounded(v(0), 1));
     }
 }
 
@@ -109,13 +111,43 @@ pub fn run_raw(trace: &RowMajorMatrix<F>, range: &RangeCounts, asks: &[(u32, u32
     run_raw_on(ModqAir, trace, range, asks, twin)
 }
 
+/// What the table's entry for `(clk, base, a1)` says the call weighs beyond its row's 1 — the
+/// linear form of rule 7 over the block's op flags, read off the first row of the block that
+/// carries the key — or, when no block does, what `a1`'s op weighs. This is the value a prover
+/// puts in the cpu's `MODQ_W` to balance the bus: the asker asks with it, so a forged block is
+/// asked for at the forged block's own price and only the chip's rules are under test.
+pub fn asked_weight(trace: &RowMajorMatrix<F>, clk: u32, base: u32, a1: u32) -> F {
+    use randprotocol_zkvm::gas::{modq_gas, modq_op, MODQ_DOT4_GAS, MODQ_INTT_GAS, MODQ_MSUB4_GAS, MODQ_NTT_GAS};
+    let w = col::WIDTH;
+    let key = [F::from_u32(clk), F::from_u32(base), F::from_u32(a1)];
+    for b in 0..trace.values.len() / w / randprotocol_zkvm::tables::modq::BLOCK {
+        let row = &trace.values[b * randprotocol_zkvm::tables::modq::BLOCK * w..][..w];
+        if row[col::IS_REAL] != F::ZERO && [row[col::CLK], row[col::BASE], row[col::A1]] == key {
+            return row[col::IS_NTT] * F::from_u64(MODQ_NTT_GAS - 1) + row[col::IS_INTT] * F::from_u64(MODQ_INTT_GAS - 1)
+                + row[col::IS_DOT] * F::from_u64(MODQ_DOT4_GAS - 1) + row[col::IS_MSUB] * F::from_u64(MODQ_MSUB4_GAS - 1);
+        }
+    }
+    F::from_u64(modq_gas(modq_op(a1)) - 1)
+}
+
 /// `run_raw` with the modq table under any `ModqSide` (`modq_harness` passes `ModqAirWithout(off)`).
 pub fn run_raw_on<S: ModqSide>(side: S, trace: &RowMajorMatrix<F>, range: &RangeCounts, asks: &[(u32, u32, u32)], twin: &RowMajorMatrix<F>) -> Result<(), VerifyError> {
-    let mut asker = F::zero_vec(asks.len().next_power_of_two().max(4) * 4);
-    for (i, &(clk, base, a1)) in asks.iter().enumerate() {
-        asker[i * 4..i * 4 + 4].copy_from_slice(&[F::ONE, F::from_u32(clk), F::from_u32(base), F::from_u32(a1)]);
+    let priced: Vec<(u32, u32, u32, F)> = asks.iter().map(|&(clk, base, a1)| (clk, base, a1, asked_weight(trace, clk, base, a1))).collect();
+    run_priced_on(side, trace, range, &priced, twin)
+}
+
+/// `run_raw` with each ask's weight given: `(clk, base, a1, weight − 1)`. What a cpu row claiming a
+/// call at a price of its choosing looks like to the chip.
+pub fn run_priced(trace: &RowMajorMatrix<F>, range: &RangeCounts, asks: &[(u32, u32, u32, F)], twin: &RowMajorMatrix<F>) -> Result<(), VerifyError> {
+    run_priced_on(ModqAir, trace, range, asks, twin)
+}
+
+pub fn run_priced_on<S: ModqSide>(side: S, trace: &RowMajorMatrix<F>, range: &RangeCounts, asks: &[(u32, u32, u32, F)], twin: &RowMajorMatrix<F>) -> Result<(), VerifyError> {
+    let mut asker = F::zero_vec(asks.len().next_power_of_two().max(4) * 5);
+    for (i, &(clk, base, a1, weight)) in asks.iter().enumerate() {
+        asker[i * 5..i * 5 + 5].copy_from_slice(&[F::ONE, F::from_u32(clk), F::from_u32(base), F::from_u32(a1), weight]);
     }
-    let asker = RowMajorMatrix::new(asker, 4);
+    let asker = RowMajorMatrix::new(asker, 5);
     let range_t = range_trace(range);
     let airs = vec![T::S(side, trace.values.len() / col::WIDTH), T::A(Asker), T::M(MemoryTwin), T::R(RangeAir)];
     let instances = vec![

@@ -38,7 +38,7 @@ use p3_batch_stark::symbolic::get_symbolic_constraints;
 use p3_commit::PolynomialSpace;
 use p3_field::{BasedVectorSpace, Field, PrimeCharacteristicRing, PrimeField64};
 use p3_lookup::{assert_uniform_tuple_width, InteractionSymbolicBuilder, Kind, LogUpGadget, Lookup};
-use randprotocol_zkvm::machine::{chips, Chip, Tier, Val};
+use randprotocol_zkvm::machine::{Chip, Val};
 
 use crate::dsl::{Array, Builder, Ext, Felt, Ptr};
 use crate::isa::{EF, F};
@@ -913,7 +913,8 @@ pub fn emit_instance<S: VerifierShape>(
 
 /// The chips this shape's instances are, in `chips()`' order — which is instance order.
 pub fn shape_airs(shape: &InnerShape) -> Vec<Chip> {
-    let airs = chips(Tier(shape.tier), shape.keccak_log_height, shape.sha256_log_height);
+    // Constraint set 11: the poseidon2 chip is built at the shape's declared height.
+    let airs = shape.key_shape().chips();
     assert_eq!(airs.len(), shape.instances(), "one chip per batch instance");
     for (i, air) in airs.iter().enumerate() {
         assert_eq!(BaseAir::<Val>::width(air), shape.widths()[i], "instance {i}'s trace width");

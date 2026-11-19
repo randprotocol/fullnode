@@ -461,7 +461,7 @@ fn declared(k: usize, opts: randprotocol_zkvm::machine::ProveOptions) -> (Vec<u8
 fn declared_t(k: usize, threshold: u32, opts: randprotocol_zkvm::machine::ProveOptions) -> (Vec<u8>, String) {
     let (p, input, e) = full_run_t(k, threshold);
     let t = randprotocol_zkvm::machine::build_traces_salted_with(&p, &input, &BINDING, [0; 4], &e, MSAUTH_TIER, opts).unwrap();
-    let h = vec![t.program_log_height, t.input_log_height, t.keccak_log_height, t.sha256_log_height, t.modq_log_height, t.public_log_height, t.mem_log_height];
+    let h = vec![t.program_log_height, t.input_log_height, t.keccak_log_height, t.sha256_log_height, t.modq_log_height, t.public_log_height, t.mem_log_height, t.poseidon2_log_height];
     (h, format!("{:?}", t.public_values[randprotocol_zkvm::tables::cpu::pv::GAS]))
 }
 
@@ -469,8 +469,8 @@ fn declared_t(k: usize, threshold: u32, opts: randprotocol_zkvm::machine::ProveO
 fn pinned_heights_are_what_a_full_run_declares() {
     let (h, _) = declared(M_MAX, Default::default());
     let o = pinned_options();
-    eprintln!("PINNED: keccak {} modq {} mem {} (all heights {h:?})", h[2], h[4], h[6]);
-    assert_eq!((o.min_keccak_log_height, o.min_modq_log_height, o.min_mem_log_height), (h[2], h[4], h[6]));
+    eprintln!("PINNED: keccak {} modq {} mem {} poseidon2 {} (all heights {h:?})", h[2], h[4], h[6], h[7]);
+    assert_eq!((o.min_keccak_log_height, o.min_modq_log_height, o.min_mem_log_height, o.poseidon2_log_height), (h[2], h[4], h[6], Some(h[7])));
     assert_eq!(o.gas_limit, None);
 }
 
@@ -489,7 +489,7 @@ fn proof_dir() -> String { std::env::var("MSAUTH_PROOF_DIR").unwrap_or_else(|_| 
 
 /// One Production proof, ONE M per process (`MSAUTH_PROVE_M`=1 or 3, default 3), so no process holds
 /// two proofs. Prints one parseable `PROOF` line and writes `msauth-proof-M<m>.json` (sha256, size,
-/// tier, the seven heights, the GAS word) for `msauth_proof_headers_match_across_m`.
+/// tier, the eight heights, the GAS word) for `msauth_proof_headers_match_across_m`.
 #[test]
 #[ignore = "MODQ Task 8: Production proof of ONE M (env MSAUTH_PROVE_M, default 3) at the pinned shape — run under /usr/bin/time -l"]
 fn msauth_proves_at_m_production() {
@@ -510,7 +510,7 @@ fn msauth_proves_at_m_production() {
     let prove = t0.elapsed();
     m.verify_public(&p.digest(), &BINDING, &proof).unwrap();
     let bytes = proof.to_bytes();
-    let heights = [proof.program_log_height, proof.input_log_height, proof.keccak_log_height, proof.sha256_log_height, proof.modq_log_height, proof.public_log_height, proof.mem_log_height];
+    let heights = [proof.program_log_height, proof.input_log_height, proof.keccak_log_height, proof.sha256_log_height, proof.modq_log_height, proof.public_log_height, proof.mem_log_height, proof.poseidon2_log_height];
     let gas = format!("{:?}", proof.public_values[pv::GAS]);
     let sha: String = Sha256::digest(&bytes).iter().map(|b| format!("{b:02x}")).collect();
     let line = format!("{{\"m\":{k},\"size\":{},\"tier\":{},\"heights\":{heights:?},\"gas\":\"{gas}\",\"sha256\":\"{sha}\",\"profile\":\"{profile:?}\",\"prove_secs\":{:.1}}}", bytes.len(), proof.tier.0, prove.as_secs_f64());

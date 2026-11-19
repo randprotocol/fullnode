@@ -210,3 +210,24 @@ fn byte_conversions_round_trip_and_pushn_right_aligns() {
     assert_eq!(U256::ZERO.bit_len(), 0);
     assert_eq!(U256::from_u32(0x100).byte_len(), 2);
 }
+
+/// `U256`'s `==` is a word-wise comparison written out (a derived one is a `memcmp` call in the
+/// guest); it must still be equality: reflexive, and false for a difference in any one limb or bit.
+#[test]
+fn equality_is_limb_by_limb() {
+    let a = U256([1, 2, 3, 4, 5, 6, 7, 8]);
+    assert!(a == a);
+    assert!(U256::ZERO == U256::ZERO && U256::ZERO.is_zero());
+    for limb in 0..8 {
+        for bit in [0, 1, 15, 31] {
+            let mut b = a;
+            b.0[limb] ^= 1 << bit;
+            assert!(a != b && b != a, "limb {limb} bit {bit}");
+            assert!(evm_core::u256::words_eq(&b.0, &b.0));
+            assert!(!evm_core::u256::words_eq(&a.0, &b.0));
+            let mut z = U256::ZERO;
+            z.0[limb] = 1 << bit;
+            assert!(!z.is_zero());
+        }
+    }
+}

@@ -12,6 +12,26 @@ stopped at v0.4 until 2026-09-30, when the entries v0.5 to v0.6.7 were written f
 
 ## Unreleased
 
+zkVM (**a chain cut: constraint set 11, for chain 22 and v0.8.7**; chain 21 stays on the set-9
+v0.8.6 line):
+
+- **Circuits re-vendored at constraint set 11** (circuits `76a48dc`, from `b3e21d9` at set 9):
+  the Grain-derived Poseidon2 round constants (every guest `hc`, note commitment, nullifier,
+  Merkle and state root and verifier key moves), a declared poseidon2 table height in the proof
+  header (`Proof::poseidon2_log_height`, an 8-component verifier-key shape), the rate-¼ quotient
+  layout (FRI blowup 2, 92 queries / 24 pow bits at Production), versioned rVM keys, and gas by
+  table cells (`KECCAK` 134, `SHA256` 49, the per-op MODQ weights, 4 per Poseidon2 absorb): the
+  tier-14 bundle ceiling `gas_max(14, 0, 0)` is **22 527** (was 20 479), the auth guest's 1 407
+  (was 1 279), msauth's 355 775 (was 436 159). New guest digests: bundle v3 `00782b22…141e`,
+  auth `8373994c…6078`, msauth `41db73c5…9cd1`; production msauth key blob 23 851 B,
+  `168d79a8…71b3`. Bundle and auth proofs declare their tier's full poseidon2 height, msauth 16.
+- **`BUILD_CONSTRAINT_SET` is 11, and chain 21 is refused.** Chain 21 joins
+  `CHAINS_THIS_BUILD_CANNOT_RUN`; because set 11 moves every Poseidon2 output, no genesis file of
+  chains 14–21 builds under it any more, so `init`, `run` and `verify` refuse them by chain id
+  (`constraint_set::build_genesis`) before touching a datadir. Chain 22's
+  `CHAIN_CONSTRAINT_SETS` row is added at its cut. The chain-22 cut script expects the set-11
+  digests and bundle limit.
+
 Core and node (**genesis-gated, on no chain** — chain 21's genesis hash, header and block bytes,
 state root, wire tags 0–45 and store rows are unchanged, pinned at values taken before the
 change):

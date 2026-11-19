@@ -57,9 +57,42 @@ pub mod compiled {
     /// interpreter has a `.rodata` (panic locations, the constants LLVM materialised), and
     /// `Program::from_flat_image` writes it into RAM with a prologue it synthesises below the text —
     /// so the data is part of the program and `hc` binds it (upstream `docs/01-isa.md`).
+    ///
+    /// This is the image for **storage layout 2** (a depth-64 storage tree, ZKVM-105);
+    /// [`evm_v1`] is layout 1's, and [`evm_images`] lists both.
     pub fn evm() -> Program {
         const BIN: &[u8] = include_bytes!("../guests-compiled/bin/evm.bin");
         Program::from_flat_image(BIN).expect("evm.bin is a committed, known-good build")
+    }
+
+    /// The EVM interpreter under **storage layout 1** (a depth-32 storage tree, 272-word
+    /// witnesses): the same source as [`evm`], built from `guests-compiled/evm-v1` against
+    /// `evm-core`'s `storage-v1` feature and committed as `guests-compiled/bin/evm-v1.bin`. For
+    /// contracts whose storage root is still under layout 1; its public output binds `layout = 1`.
+    /// Mirrored by hand from upstream's `guests::compiled` (constraint set 11 re-vendor).
+    pub fn evm_v1() -> Program {
+        const BIN: &[u8] = include_bytes!("../guests-compiled/bin/evm-v1.bin");
+        Program::from_flat_image(BIN).expect("evm-v1.bin is a committed, known-good build")
+    }
+
+    /// One admitted version of the EVM guest: the storage layout it runs and its program.
+    pub struct EvmImage {
+        /// `evm_core::storage::LAYOUT_VERSION` of the image: the first word of its `EVM_OUT`
+        /// preimage.
+        pub layout: u32,
+        /// The storage tree's depth under that layout, and so the witness length.
+        pub depth: usize,
+        pub program: Program,
+    }
+
+    /// **The program-version table for the EVM guest** (ZKVM-105): every storage layout that has
+    /// an image, newest last. Mirrored by hand from upstream (the node admits one EVM guest by
+    /// `hc` today; a contract's layout field is not built here).
+    pub fn evm_images() -> Vec<EvmImage> {
+        vec![
+            EvmImage { layout: 1, depth: crate::evm::layout_depth(1), program: evm_v1() },
+            EvmImage { layout: 2, depth: crate::evm::layout_depth(2), program: evm() },
+        ]
     }
 
     /// M4.4's exit guest: an **sBPF interpreter**, compiled from upstream `guests-compiled/sbpf`

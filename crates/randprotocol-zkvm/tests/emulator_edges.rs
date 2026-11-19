@@ -658,3 +658,44 @@ fn a_program_that_fills_its_tier_budget_exactly_still_halts() {
     assert_eq!(e.cycles(), budget);
     assert_eq!(execute(&p, &[], &[], budget - 1).unwrap_err(), ExecError::OutOfCycles(budget - 1));
 }
+
+/// ZKVM-119: `execute_traced` is `execute` with the place of a failure — the pc of the instruction
+/// that trapped, the rows recorded before it, and the addresses that led there.
+#[test]
+fn execute_traced_places_a_trap_and_is_execute_otherwise() {
+    let p = |idx: u32| program(|a| {
+        a.extend(read_input(idx));
+        a.push(mv(T0, REG_A0));
+        a.extend(write_output(0, T0));
+        a.extend(halt());
+    });
+    // A run that halts is the same run.
+    let ok = execute_traced(&p(0), &[7], &[], 100).unwrap();
+    assert_eq!(ok.outputs, execute(&p(0), &[7], &[], 100).unwrap().outputs);
+    assert_eq!(ok.cycles(), execute(&p(0), &[7], &[], 100).unwrap().cycles());
+    // A trap carries `execute`'s error, on the `ecall` that raised it.
+    let bad = p(3);
+    let t = execute_traced(&bad, &[7], &[], 100).unwrap_err();
+    assert_eq!(t.error, execute(&bad, &[7], &[], 100).unwrap_err());
+    assert_eq!(t.error, ExecError::InputIndex(3));
+    assert_eq!(bad.instr_at(t.pc), Some(Instr::Ecall));
+    assert_eq!(t.recent.last(), Some(&t.pc));
+    assert_eq!(t.recent.len(), t.cycle + 1, "one address per instruction reached, the trapping one included");
+    assert_eq!(t.recent[0], bad.base_pc);
+    assert!(t.recent.windows(2).all(|w| w[1] == w[0] + 4), "straight-line code: {:?}", t.recent);
+    // The cycle budget is placed at the instruction it ran out before.
+    let t = execute_traced(&p(0), &[7], &[], 2).unwrap_err();
+    assert_eq!((t.error, t.cycle, t.pc), (ExecError::OutOfCycles(2), 2, p(0).base_pc + 8));
+    // A jump outside the program: the bad address is the pc, and the history is capped.
+    let spin = program(|a| {
+        a.push(Instr::AluImm { op: AluOp::Add, rd: T0, rs1: T0, imm: 1 });
+        a.push(Instr::AluImm { op: AluOp::Sltu, rd: T1, rs1: T0, imm: 40 });
+        a.push(Instr::Branch { cond: BranchCond::Ne, rs1: T1, rs2: 0, imm: (-8i32) as u32 });
+        a.push(Instr::Jalr { rd: 0, rs1: 0, imm: 0x7f0 });
+    });
+    let t = execute_traced(&spin, &[], &[], 1000).unwrap_err();
+    assert_eq!(t.error, ExecError::BadPc(0x7f0));
+    assert_eq!(t.pc, 0x7f0);
+    assert_eq!(t.recent.len(), TRAP_HISTORY);
+    assert_eq!(t.recent[TRAP_HISTORY - 2], spin.base_pc + 12, "the jump is the instruction before the bad pc");
+}

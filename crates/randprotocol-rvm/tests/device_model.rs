@@ -105,6 +105,65 @@ fn the_merkle_upload_sizes_make_the_device_class() {
     }
 }
 
+/// The current production tiers (ZKVM-114). Everything above is for tiers 21 to 23 at blowup 8,
+/// where production aggregates stood when the model was written; since phase 5 and the rate-1/4
+/// profile the production N=1 aggregate is tier 18 and N=2 tier 19, at blowup 4. This is the
+/// same arithmetic for the N=1 shape: every table's committed main-trace LDE (its columns plus
+/// the hiding PCS's four random-codeword columns, at `2^(h + 1 + 2)` rows — the hiding PCS
+/// doubles the trace, and the blowup is 4), summed, against the three card classes.
+///
+/// What it does and does not say. It says the main-trace LDEs of a production N=1 aggregate are
+/// a few GiB, so the premise "traces must live on the host" (docs/03, docs/04, docs/05) no
+/// longer follows from their size. It does **not** say the whole prove fits a card: the
+/// permutation and quotient commits, the Merkle trees and the NTT working set are not in this
+/// sum, and no production N=1 proof has been measured on host or device (ZKVM-102). Heights:
+/// cpu 2^18 (235 751 rows), REG 2^19, RAM 2^21 (1 679 146 accesses), the poseidon2 table from
+/// 54 598 permutations, the reduce table from 196 960 rows, the program table from 243 398
+/// instructions — `tests/pins.json` and docs/10 §6. Widths: read off the chips.
+#[test]
+fn the_production_n1_main_trace_ldes_fit_any_card_class() {
+    use p3_air::BaseAir;
+    use randprotocol_rvm::isa::{Instr, Op, Program, F};
+    use randprotocol_rvm::machine::{chips, program_log_height, Chip};
+    use randprotocol_rvm::tables::{poseidon2::poseidon2_log_height, reduce::reduce_log_height};
+    use std::sync::Arc;
+    let toy = Arc::new(Program { instrs: vec![Instr { op: Op::Halt, rd: 0, ra: 0, b: <F as p3_field::PrimeCharacteristicRing>::ZERO }], checkpoints: vec![], reduce_layout: vec![] });
+    let reduce_h = reduce_log_height(196_960, 0);
+    let airs: Vec<Chip> = chips(&toy, Tier(18), reduce_h);
+    let names = ["program", "cpu", "reg", "ram", "poseidon2", "public", "range", "reduce"];
+    let heights: [u8; 8] = [
+        program_log_height(243_398),
+        18,
+        19,
+        21,
+        poseidon2_log_height(54_598),
+        randprotocol_rvm::machine::PUBLIC_LOG_HEIGHT,
+        randprotocol_rvm::tables::range::HEIGHT.trailing_zeros() as u8,
+        reduce_h,
+    ];
+    assert_eq!(airs.len(), names.len());
+    const LOG_BLOWUP: u32 = 2;
+    let mut total = 0usize;
+    let mut rows = Vec::new();
+    for ((name, air), h) in names.iter().zip(&airs).zip(heights) {
+        let width = BaseAir::<F>::width(air);
+        let bytes = (width + 4) * (1usize << (h as u32 + 1 + LOG_BLOWUP)) * 8;
+        total += bytes;
+        rows.push(format!("{name} {width} cols 2^{h} rows -> {:.3} GiB", bytes as f64 / GIB as f64));
+    }
+    eprintln!("DEVICE_MODEL production N=1 (tier 18, blowup 4) main-trace LDEs: {}; total {:.3} GiB ({total} B)", rows.join("; "), total as f64 / GIB as f64);
+    // The sum is under every card class by a wide margin; the widest single matrix (the RAM
+    // table's) passes the upload guard on the smallest.
+    assert_eq!(total, 6_991_992_320, "6.512 GiB: re-record with the DEVICE_MODEL line when a width or a height moves");
+    assert!(total < 24 * GIB / 2, "the main-trace LDEs no longer fit half a 24 GiB card: {total} B");
+    // And the cpu table's NTT at its LDE height 2^21 is one pass on every class.
+    let cpu_width = BaseAir::<F>::width(&airs[1]);
+    for free in [24 * GIB, 40 * GIB, 80 * GIB] {
+        assert!(max_columns(free, 1 << 21) >= cpu_width + 4, "the cpu table's {cpu_width} columns need more than one NTT pass at {free} B");
+    }
+    eprintln!("DEVICE_MODEL cpu table {cpu_width} columns; max_columns at LDE height 2^21: {} / {} / {} at 24 / 40 / 80 GiB", max_columns(24 * GIB, 1 << 21), max_columns(40 * GIB, 1 << 21), max_columns(80 * GIB, 1 << 21));
+}
+
 // ── the mock-driver anchors: the formulas above, exercised against the real engine code ──────
 #[cfg(any(feature = "cuda", feature = "mock-cuda"))]
 mod mock_driver {

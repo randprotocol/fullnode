@@ -5882,7 +5882,7 @@ pub(crate) mod tests {
         gs.ledger.set_gas(Some(GasConfig {
             gas_price: 100,
             byte_price: 800,
-            bundle_gas_limit: 20_479,
+            bundle_gas_limit: 22_527,
             metering: GasMetering::Circuit,
             dynamic: None,
         }));
@@ -5890,7 +5890,7 @@ pub(crate) mod tests {
         let v = ok(&st, "rand_getLimits", json!([])).await;
         assert_eq!(v["gas_price"], "100");
         assert_eq!(v["byte_price"], "800");
-        assert_eq!(v["bundle_gas_limit"], 20_479);
+        assert_eq!(v["bundle_gas_limit"], 22_527);
         assert_eq!(v["gas_metering"], "circuit");
         assert_eq!(v["adjust_bps"], serde_json::Value::Null, "no dynamic section");
         assert_eq!((v["max_gas_price"].clone(), v["max_byte_price"].clone(), v["byte_load"].clone()), (Value::Null, Value::Null, Value::Null));
@@ -5917,7 +5917,7 @@ pub(crate) mod tests {
         gs.ledger.set_gas(Some(GasConfig {
             gas_price: 100,
             byte_price: 800,
-            bundle_gas_limit: 20_479,
+            bundle_gas_limit: 22_527,
             metering: GasMetering::Circuit,
             dynamic: Some(DynamicGas {
                 target_block_bytes: 4_096,

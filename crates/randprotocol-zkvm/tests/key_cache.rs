@@ -16,7 +16,7 @@ fn key(m: &Machine, plh: u8) -> Arc<p3_batch_stark::CommonData<randprotocol_zkvm
     m.verifier_key(Tier(10), plh, input::input_log_height(0), 0, 0, public::MIN_LOG_HEIGHT)
 }
 fn cached(m: &Machine, plh: u8) -> bool {
-    m.has_cached_key(Tier(10), plh, input::input_log_height(0), 0, 0, public::MIN_LOG_HEIGHT)
+    m.has_cached_key(randprotocol_zkvm::machine::VerifierKeyShape::full_height(Tier(10), plh, input::input_log_height(0), 0, 0, 0, public::MIN_LOG_HEIGHT))
 }
 
 #[test]

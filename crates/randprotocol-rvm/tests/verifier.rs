@@ -28,7 +28,7 @@ fn one_test_proof() -> (common::BundleProof, InnerShape, InnerKey) {
         p.proof.input_log_height,
         p.proof.keccak_log_height,
         p.proof.sha256_log_height, p.proof.public_log_height,
-        p.proof.mem_log_height,
+        p.proof.mem_log_height, p.proof.poseidon2_log_height,
     );
     let key = InnerKey::of(FriProfile::Test, &shape);
     (p, shape, key)
@@ -190,9 +190,15 @@ fn the_opened_value_segments_are_sized_by_the_shape_alone() {
             + 2
             + 2 * aux * 2;
         // The hiding wrapper's four hidden values per opened point, for every round but the
-        // preprocessed one: `random` (one point), `main` (one or two), each quotient chunk (one),
-        // and `permutation` (two, only where there are lookups).
-        random += 1 + (1 + shape.main_next[i] as usize) + chunks + if aux > 0 { 2 } else { 0 };
+        // preprocessed one: `random` (one point), `main` (one or two), the quotient round (one per
+        // committed quotient matrix: each chunk under `PerChunk`, one per instance under
+        // `PerInstance`, constraint set 11's layout, ZKVM-111) and `permutation` (two, only where
+        // there are lookups).
+        let quotient_mats = match randprotocol_rvm::shape::VerifierShape::quotient_layout(&shape) {
+            p3_batch_stark::QuotientLayout::PerChunk => chunks,
+            p3_batch_stark::QuotientLayout::PerInstance => 1,
+        };
+        random += 1 + (1 + shape.main_next[i] as usize) + quotient_mats + if aux > 0 { 2 } else { 0 };
     }
     assert_eq!(seg(randprotocol_rvm::witness::Segment::OpenedValues), 2 * opened);
     assert_eq!(seg(randprotocol_rvm::witness::Segment::RandomOpenings), 2 * 4 * random);
@@ -738,8 +744,11 @@ fn phase_5_costs_the_measured_number_of_rows_per_inner_proof() {
     // is observed and sponged — phase 8's list is 40 words, still ten permutations); the
     // production one lives in `docs/00-recursion-vm.md` and `pins.json`. MODQ chip (2026-10-11,
     // private multisig phase 3): the inner cpu gained SYS_MODQ (283 columns), which widens every
-    // opened main-trace leaf: 11 875 → 11 894.
-    assert_eq!(exec.permutations(), 11_894, "51 transcript duplexes in phases 0–4, the rest is the query phase and phase 8's digest");
+    // opened main-trace leaf: 11 875 → 11 894. Constraint set 11 (ZKVM-202): the inner cpu gained
+    // `MODQ_W` (284 columns), the same widening once more: 11 894 → 11 911. The set-11 cut
+    // (ZKVM-111): the inner proof's quotient round is one matrix per instance at rate ¼, so the
+    // query phase hashes one quotient leaf per instance instead of one per chunk: 11 911 → 9 682.
+    assert_eq!(exec.permutations(), 9_682, "51 transcript duplexes in phases 0–4, the rest is the query phase and phase 8's digest");
 }
 
 /// Every assertion phase 5 makes is a *named* checkpoint, and the names are the interface Task 6's
@@ -797,6 +806,9 @@ fn phase_5s_assertions_are_all_named() {
 /// Off replay compiles the inner AIR and embeds its key): `759b015d…9b4e` → `ac1f08cf…d406`.
 /// Phase 5 (2026-10-12, S6a/S2b/S4a/S1b — program and tape changes of the shared pipeline) re-recorded it:
 /// `ac1f08cf…d406` → `40532641…d482`.
+/// Constraint set 10 (ZKV-5, the Off replay compiles the inner AIR): `40532641…d482` → `f351f639…2fd9`.
+/// Constraint set 11 (ZKVM-202: the inner cpu's `MODQ_W`, the `MODQ` lookup's fourth field and the gas
+/// chain's weights; an inner shape and key change): `f351f639…2fd9` → `dac80eaf…a711`.
 #[test]
 fn the_off_replay_reproduces_the_pre_liveness_program_byte_for_byte() {
     use randprotocol_rvm::dsl::Liveness;
@@ -806,13 +818,13 @@ fn the_off_replay_reproduces_the_pre_liveness_program_byte_for_byte() {
     let shape = InnerShape::of(
         FriProfile::Production,
         p.proof.tier, p.proof.program_log_height, p.proof.input_log_height, p.proof.keccak_log_height,
-        p.proof.sha256_log_height, p.proof.public_log_height, p.proof.mem_log_height,
+        p.proof.sha256_log_height, p.proof.public_log_height, p.proof.mem_log_height, p.proof.poseidon2_log_height,
     );
     let key = InnerKey::of(FriProfile::Production, &shape);
     let off = verify_rv32_with(&shape, &key, Checkpoints::Off, Liveness::Off, randprotocol_rvm::programs::Precompiles::Off);
     assert_eq!(
         randprotocol_rvm::programs::digest_hex(&off.program),
-        "40532641a13595decf6f131cfa8d5eeb7a0930ef9713c42a80da11bca20cd482",
+        "17d383dafaea59231cb62631eab778cfeb0c8d52783525222fb8411402e01989",
         "the Off replay must reproduce the pre-Task-7 stream byte for byte (plus VERIFIER-1's \
          per-round assertions, and constraint set 7's and 8's inner changes)"
     );
@@ -863,14 +875,19 @@ fn the_off_replay_reproduces_the_pre_liveness_program_byte_for_byte() {
 /// MODQ chip (2026-10-11, private multisig phase 3): the inner cpu gained SYS_MODQ (283 columns; an
 /// inner shape and key change): `1bcbcec9…1fba` → `e26f37e3…41a0`.
 /// Phase 5 (2026-10-12, S6a/S2b/S4a/S1b) re-recorded it: `e26f37e3…41a0` → `b4988faa…a69b`.
+/// Constraint set 10 (ZKV-5): the inner cpu's gas chain changed: `b4988faa…a69b` → `560784df…760c`.
+/// Constraint set 11 (ZKVM-202): the inner cpu gained `MODQ_W` and its gas chain new weights (an inner
+/// shape and key change): `560784df…760c` → `7656ec76…2253`. Then the set-11 cut itself: the Grain
+/// Poseidon2 table (ZKVM-107), the inner shape's declared poseidon2 height (ZKVM-112) and the inner
+/// machine's per-instance quotient at rate ¼ (ZKVM-111): `7656ec76…2253` → `1ee8b4e1…b230`.
 #[test]
 fn the_aggregate_program_digest_is_unchanged_by_rvm_constraint_fixes() {
     let (_p, shape, key) = one_test_proof();
     let vp = randprotocol_rvm::programs::verify_rv32n(&shape, &key, Checkpoints::Off);
     assert_eq!(
         randprotocol_rvm::programs::digest_hex(&vp.program),
-        "b4988faa0476692a20e285d920685110111d4a648d6687c6230bfceb055ea69b",
-        "the aggregate program's digest at the Test fixture shape, as re-registered for phase 5"
+        "1ee8b4e196d45a3657889b01defb189c78fed617580e65d32f38a070badcb230",
+        "the aggregate program's digest at the Test fixture shape, as re-registered for constraint set 11"
     );
 }
 
@@ -950,7 +967,7 @@ fn one_production_proof() -> (common::BundleProof, InnerShape, InnerKey) {
         p.proof.keccak_log_height,
         p.proof.sha256_log_height,
         p.proof.public_log_height,
-        p.proof.mem_log_height,
+        p.proof.mem_log_height, p.proof.poseidon2_log_height,
     );
     let key = InnerKey::of(FriProfile::Production, &shape);
     (p, shape, key)

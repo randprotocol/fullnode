@@ -152,11 +152,11 @@ fn r_bpf_64_32_turns_a_syscall_symbol_into_its_hash() {
 
     // A name the plan lists as unsupported still relocates — the loader does not decide policy —
     // and the *call* is what halts, with the hash in the error.
-    let syms = [Sym { name: "sol_keccak256", info: 0x10, value: 0 }];
+    let syms = [Sym { name: "sol_secp256k1_recover", info: 0x10, value: 0 }];
     let out = sbpf::run_elf(&mut build_elf(&text, &[], &syms, &relocs, 0), &mut []);
     assert_eq!(
         out.result,
-        Err(Halt::UnknownSyscall(syscalls::murmur3_32(b"sol_keccak256", 0)))
+        Err(Halt::UnknownSyscall(syscalls::murmur3_32(b"sol_secp256k1_recover", 0)))
     );
 }
 
@@ -416,13 +416,11 @@ fn spl_token_elf_loads_with_relocations_applied() {
         p.rodata.len() - p.text.len(),
     );
 
-    // Exactly which syscalls the committed file names, and which of them this interpreter
-    // implements. Five are implemented; `sol_set_return_data` and `sol_get_sysvar` are **not** —
-    // they reach `Halt::UnknownSyscall`, which is status 2 over the pre-state. Neither is on the
-    // `Transfer` path (`tests/e2e.rs` proves a Transfer through the whole interpreter), but both
-    // are reachable from other instructions, so this is a scope boundary rather than dead code:
-    // `sol_set_return_data` is `GetAccountDataSize`/`AmountToUiAmount`/`UiAmountToAmount` and
-    // `sol_get_sysvar` is the rent read `InitializeAccount` does. See `docs/04-guests.md`.
+    // Exactly which syscalls the committed file names — and this interpreter implements all seven
+    // (ZKVM-116 added the last two). `sol_set_return_data` is `GetAccountDataSize` /
+    // `AmountToUiAmount` / `UiAmountToAmount`, and `sol_get_sysvar` is the rent read
+    // `InitializeAccount2`/`3` do (`InitializeAccount` reads rent from its fourth account
+    // instead). `tests/sbpf_syscalls.rs` runs them; see `docs/04-guests.md`.
     let supported = syscalls::SUPPORTED;
     let referenced: [(&[u8], bool); 7] = [
         (b"sol_log_", true),
@@ -430,8 +428,8 @@ fn spl_token_elf_loads_with_relocations_applied() {
         (b"sol_memcmp_", true),
         (b"sol_memset_", true),
         (b"sol_panic_", true),
-        (b"sol_set_return_data", false),
-        (b"sol_get_sysvar", false),
+        (b"sol_set_return_data", true),
+        (b"sol_get_sysvar", true),
     ];
     for (name, want_supported) in referenced {
         let h = syscalls::murmur3_32(name, 0);

@@ -28,7 +28,7 @@
 //!
 //! | columns | what |
 //! |---|---|
-//! | `IS_REAL`, `CLK`, `BASE`, `A1` | 4 — block-constant; the `MODQ` handshake `(clk, base, a1)` |
+//! | `IS_REAL`, `CLK`, `BASE`, `A1` | 4 — block-constant; the `MODQ` handshake `(clk, base, a1, weight)` |
 //! | `IS_NTT`, `IS_INTT`, `IS_DOT`, `IS_MSUB` | 4 — block-constant one-hot op, sum `= IS_REAL` |
 //! | `OUT_BITS`, `A_BITS`, `B_BITS` | 15 — block-constant 5-bit poly offsets |
 //! | `U_L`, `V_L`, `W_L` | 9 — byte limbs of the inputs `U`, `V` and the multiplier `W` (`< 2^24`) |
@@ -81,7 +81,8 @@
 //!
 //! ## The chip's memory traffic
 //!
-//! As `sha256`: the cpu row only looks up `(CLK, BASE, A1)` on `MODQ`; this table sends every
+//! As `sha256`: the cpu row only looks up `(CLK, BASE, A1, weight)` on `MODQ` — `weight` is the
+//! call's gas beyond the row's own 1, `Σ (gas::modq_gas(op) − 1)·IS_op` (constraint set 11); this table sends every
 //! word the call reads at `ts = 4·CLK` and every word it writes at `ts = 4·CLK + 1` on `MEMORY`
 //! (rule 6), at most five sends per row, each with a 0/1 count. A transform reads on stage 0 and
 //! writes on stage 7; `DOT4` reads `V`, `W` every row and writes `O0` on `k = 3`; `MSUB4` reads `U`
@@ -337,6 +338,97 @@ pub enum Defence {
     CanonicalArgsA,
     /// Rule 1's `T·B = 0`.
     CanonicalArgsB,
+    // ---- Audit CS9-1 (2026-10-15): the lines that had no switch. ----
+    /// Rule 1's `IS_REAL ∈ {0, 1}` — the line that makes every `Count::bounded(IS_REAL, 1)` of rules
+    /// 7–8 (and the op-gated counts of rules 5–6) true to its declared bound: `p3-lookup` only sums
+    /// the declared bounds against the field order, the AIR is what enforces them per row.
+    RealBoolean,
+    /// Rule 1's booleanity of the four op flags and the fifteen poly-offset bits.
+    FlagsBoolean,
+    /// Rule 1's one-hot sum `IS_NTT + IS_INTT + IS_DOT + IS_MSUB = IS_REAL`.
+    OneHot,
+    /// Rule 1's block constancy: the 23 block-constant columns hold over every in-block transition.
+    BlockConstant,
+    /// Rule 2's `T·W = 0`: a transform row has no multiplier.
+    TransformNoW,
+    /// Rule 3's `IDX_U` identity.
+    IdxU,
+    /// Rule 3's `IDX_V` identity.
+    IdxV,
+    /// Rule 3's `ADDR_U` identity.
+    AddrU,
+    /// Rule 3's `ADDR_V` identity.
+    AddrV,
+    /// Rule 3's `ADDR_W` identity.
+    AddrW,
+    /// Rule 3's `ADDR_O0` identity.
+    AddrO0,
+    /// Rule 3's `ADDR_O1` identity.
+    AddrO1,
+    /// Rule 6's `MEMORY` send of the `U` read, with its count.
+    MemoryU,
+    /// Rule 6's `MEMORY` send of the `V` read, with its count.
+    MemoryV,
+    /// Rule 6's `MEMORY` send of the `W` read, with its count.
+    MemoryW,
+    /// Rule 6's `MEMORY` send of the `O0` write, with its count.
+    MemoryO0,
+    /// Rule 6's `MEMORY` send of the `O1` write, with its count.
+    MemoryO1,
+    /// Rule 7's `MODQ` table entry `(CLK, BASE, A1, weight)` on a real block's first row.
+    Handshake,
+    /// Rule 8's three `O0` limb lookups.
+    OutputRangeO0,
+    /// Rule 8's three `O1` limb lookups.
+    OutputRangeO1,
+    /// Rule 8's four `K0` limb lookups.
+    QuotientRangeK0,
+    /// Rule 8's four `K1` limb lookups.
+    QuotientRangeK1,
+}
+
+#[cfg_attr(not(feature = "cheating"), allow(dead_code))]
+impl Defence {
+    /// Every defence, in `eval_minus` order: the cheating suite's own list (`tests/modq_cheating.rs`
+    /// proves each one necessary; the unit test below proves each one switches something off).
+    pub const ALL: [Defence; 36] = [
+        Defence::RealBoolean,
+        Defence::FlagsBoolean,
+        Defence::OneHot,
+        Defence::A1Decomposition,
+        Defence::CanonicalArgsA,
+        Defence::CanonicalArgsB,
+        Defence::BlockConstant,
+        Defence::OutputIdentityO0,
+        Defence::OutputIdentityO1,
+        Defence::CanonicalO0,
+        Defence::CanonicalO1,
+        Defence::TransformNoW,
+        Defence::IdxU,
+        Defence::IdxV,
+        Defence::AddrU,
+        Defence::AddrV,
+        Defence::AddrW,
+        Defence::AddrO0,
+        Defence::AddrO1,
+        Defence::DotStart,
+        Defence::DotCarry,
+        Defence::MsubCarry,
+        Defence::Wire,
+        Defence::MemoryU,
+        Defence::MemoryV,
+        Defence::MemoryW,
+        Defence::MemoryO0,
+        Defence::MemoryO1,
+        Defence::Handshake,
+        Defence::InputRangeU,
+        Defence::InputRangeV,
+        Defence::InputRangeW,
+        Defence::OutputRangeO0,
+        Defence::OutputRangeO1,
+        Defence::QuotientRangeK0,
+        Defence::QuotientRangeK1,
+    ];
 }
 
 /// Cheating-suite hook (`cheating` feature only): `ModqAir` minus one [`Defence`]. `ModqAirWithout(None)` evaluates exactly
@@ -400,11 +492,20 @@ where
         let bb = compose(&v, col::B_BITS, 5, 2);
 
         // --- 1. Booleans, one-hot, the `A1` decomposition, canonical args, block constancy. --
-        b.assert_bool(is_real.clone());
-        for i in col::IS_NTT..col::BLOCK_CONSTANT {
-            b.assert_bool(v(i));
+        // `IS_REAL ∈ {0, 1}` is what makes the `Count::bounded(.., 1)` declarations below true: with
+        // the flags boolean and one-hot, `IS_REAL` could otherwise be 2 (a block that is two ops at
+        // once), doubling every count the bounds declare as at most one (`Defence::RealBoolean`).
+        if on(Defence::RealBoolean) {
+            b.assert_bool(is_real.clone());
         }
-        b.assert_eq(ntt.clone() + intt.clone() + dot.clone() + msub.clone(), is_real.clone());
+        if on(Defence::FlagsBoolean) {
+            for i in col::IS_NTT..col::BLOCK_CONSTANT {
+                b.assert_bool(v(i));
+            }
+        }
+        if on(Defence::OneHot) {
+            b.assert_eq(ntt.clone() + intt.clone() + dot.clone() + msub.clone(), is_real.clone());
+        }
         // The reserved positions of `a1` have no column, and every column here is boolean, so an
         // `a1` with a reserved bit set has no satisfying assignment.
         if on(Defence::A1Decomposition) {
@@ -424,7 +525,7 @@ where
         if on(Defence::CanonicalArgsB) {
             b.assert_zero(t.clone() * bb.clone());
         }
-        {
+        if on(Defence::BlockConstant) {
             let in_block = one.clone() - pc(pre::IS_LAST);
             let mut tr = b.when_transition();
             for i in 0..col::BLOCK_CONSTANT {
@@ -454,38 +555,54 @@ where
         if on(Defence::CanonicalO1) {
             b.assert_eq(d1, q() - one.clone() - o1.clone());
         }
-        b.assert_zero(t.clone() * w.clone());
+        if on(Defence::TransformNoW) {
+            b.assert_zero(t.clone() * w.clone());
+        }
 
         // --- 3. Indices and addresses. ------------------------------------------------------
         let (pk, pcc) = (pc(pre::PK), pc(pre::PC));
         let base = v(col::BASE);
         let poly = |i: AB::Expr| base.clone() + i * c(256);
-        b.assert_eq(v(col::IDX_U), ntt.clone() * pc(pre::JF) + intt.clone() * pc(pre::JI));
-        b.assert_eq(v(col::IDX_V), ntt.clone() * pc(pre::VF) + intt.clone() * pc(pre::VI));
+        if on(Defence::IdxU) {
+            b.assert_eq(v(col::IDX_U), ntt.clone() * pc(pre::JF) + intt.clone() * pc(pre::JI));
+        }
+        if on(Defence::IdxV) {
+            b.assert_eq(v(col::IDX_V), ntt.clone() * pc(pre::VF) + intt.clone() * pc(pre::VI));
+        }
         let (idx_u, idx_v) = (v(col::IDX_U), v(col::IDX_V));
-        b.assert_eq(
-            v(col::ADDR_U),
-            t.clone() * (poly(out.clone()) + idx_u.clone())
-                + msub.clone() * (poly(out.clone() + pk.clone()) + pcc.clone()),
-        );
-        b.assert_eq(
-            v(col::ADDR_V),
-            t.clone() * (poly(out.clone()) + idx_v.clone())
-                + dot.clone() * (poly(a.clone() + pk.clone()) + pcc.clone())
-                + msub.clone() * (poly(bb.clone() + pk.clone()) + pcc.clone()),
-        );
-        b.assert_eq(
-            v(col::ADDR_W),
-            dot.clone() * (poly(bb.clone() + pk.clone()) + pcc.clone()) + msub.clone() * (poly(a.clone()) + pcc.clone()),
-        );
-        b.assert_eq(
-            v(col::ADDR_O0),
-            t.clone() * (poly(out.clone()) + idx_u.clone()) + dot.clone() * (poly(out.clone()) + pcc.clone()),
-        );
-        b.assert_eq(
-            v(col::ADDR_O1),
-            t.clone() * (poly(out.clone()) + idx_v.clone()) + msub.clone() * (poly(out.clone() + pk) + pcc),
-        );
+        if on(Defence::AddrU) {
+            b.assert_eq(
+                v(col::ADDR_U),
+                t.clone() * (poly(out.clone()) + idx_u.clone())
+                    + msub.clone() * (poly(out.clone() + pk.clone()) + pcc.clone()),
+            );
+        }
+        if on(Defence::AddrV) {
+            b.assert_eq(
+                v(col::ADDR_V),
+                t.clone() * (poly(out.clone()) + idx_v.clone())
+                    + dot.clone() * (poly(a.clone() + pk.clone()) + pcc.clone())
+                    + msub.clone() * (poly(bb.clone() + pk.clone()) + pcc.clone()),
+            );
+        }
+        if on(Defence::AddrW) {
+            b.assert_eq(
+                v(col::ADDR_W),
+                dot.clone() * (poly(bb.clone() + pk.clone()) + pcc.clone()) + msub.clone() * (poly(a.clone()) + pcc.clone()),
+            );
+        }
+        if on(Defence::AddrO0) {
+            b.assert_eq(
+                v(col::ADDR_O0),
+                t.clone() * (poly(out.clone()) + idx_u.clone()) + dot.clone() * (poly(out.clone()) + pcc.clone()),
+            );
+        }
+        if on(Defence::AddrO1) {
+            b.assert_eq(
+                v(col::ADDR_O1),
+                t.clone() * (poly(out.clone()) + idx_v.clone()) + msub.clone() * (poly(out.clone() + pk) + pcc),
+            );
+        }
 
         // --- 4. Pointwise chaining: the `DOT4` running sum, the `MSUB4` broadcast. -----------
         let (k_first, k_last) = (pc(pre::K_FIRST), pc(pre::K_LAST));
@@ -522,13 +639,16 @@ where
         let ts_read = clk.clone() * c(4);
         let ts_write = clk.clone() * c(4) + one.clone();
         let sends = [
-            (col::ADDR_U, ts_read.clone(), u, false, t.clone() * s_first.clone() + msub.clone()),
-            (col::ADDR_V, ts_read.clone(), vv, false, t.clone() * s_first + dot.clone() + msub.clone()),
-            (col::ADDR_W, ts_read, w, false, dot.clone() + msub.clone() * k_first),
-            (col::ADDR_O0, ts_write.clone(), o0, true, t.clone() * s_last.clone() + dot * k_last),
-            (col::ADDR_O1, ts_write, o1, true, t * s_last + msub),
+            (Defence::MemoryU, col::ADDR_U, ts_read.clone(), u, false, t.clone() * s_first.clone() + msub.clone()),
+            (Defence::MemoryV, col::ADDR_V, ts_read.clone(), vv, false, t.clone() * s_first + dot.clone() + msub.clone()),
+            (Defence::MemoryW, col::ADDR_W, ts_read, w, false, dot.clone() + msub.clone() * k_first),
+            (Defence::MemoryO0, col::ADDR_O0, ts_write.clone(), o0, true, t.clone() * s_last.clone() + dot * k_last),
+            (Defence::MemoryO1, col::ADDR_O1, ts_write, o1, true, t * s_last + msub),
         ];
-        for (addr, ts, value, is_write, count) in sends {
+        for (defence, addr, ts, value, is_write, count) in sends {
+            if !on(defence) {
+                continue;
+            }
             bus::MEMORY.send(
                 b,
                 [space.clone(), v(addr), ts, value, AB::Expr::from_bool(is_write)],
@@ -537,7 +657,17 @@ where
         }
 
         // --- 7. `MODQ`: one entry per real block, on its first row. ------------------------
-        bus::MODQ.table_entry(b, [clk, base, v(col::A1)], is_real.clone() * pc(pre::IS_FIRST));
+        if on(Defence::Handshake) {
+            // Constraint set 11 (ZKVM-202): the fourth field prices the call — what the cpu's `MODQ`
+            // row weighs beyond its own 1, by op. Linear in the one-hot flags, so on a real block
+            // (rule 1: boolean flags summing to `IS_REAL = 1`, tied to `A1`'s low bits) it is
+            // exactly `gas::modq_gas(op) − 1` for the op this block performs.
+            let weight = v(col::IS_NTT) * c(crate::gas::MODQ_NTT_GAS - 1)
+                + v(col::IS_INTT) * c(crate::gas::MODQ_INTT_GAS - 1)
+                + v(col::IS_DOT) * c(crate::gas::MODQ_DOT4_GAS - 1)
+                + v(col::IS_MSUB) * c(crate::gas::MODQ_MSUB4_GAS - 1);
+            bus::MODQ.table_entry(b, [clk, base, v(col::A1), weight], is_real.clone() * pc(pre::IS_FIRST));
+        }
 
         // --- 8. `RANGE8`: the 29 limbs of every real row. ----------------------------------
         for (start, width) in LIMBS {
@@ -559,6 +689,10 @@ fn limb_group_on(start: usize, off: Option<Defence>) -> bool {
         Some(Defence::InputRangeW) => start != col::W_L,
         Some(Defence::CanonicalO0) => start != col::D0_L,
         Some(Defence::CanonicalO1) => start != col::D1_L,
+        Some(Defence::OutputRangeO0) => start != col::O0_L,
+        Some(Defence::OutputRangeO1) => start != col::O1_L,
+        Some(Defence::QuotientRangeK0) => start != col::K0_L,
+        Some(Defence::QuotientRangeK1) => start != col::K1_L,
         _ => true,
     }
 }
@@ -633,6 +767,10 @@ enum BlockLie {
     ButterflyOutput { stage: usize, delta: u32 },
     ButterflyOutputO1 { stage: usize, delta: u32 },
     ReadValue { delta: u32 },
+    ReadValueV { delta: u32 },
+    ReadValueW { delta: u32 },
+    CrossedU { stage: usize },
+    CrossedV { stage: usize },
     DotStart { coefficient: usize, delta: u32 },
     DotCarry { coefficient: usize, k: usize, delta: u32 },
     MsubBroadcast { coefficient: usize, k: usize, delta: u32 },
@@ -664,13 +802,25 @@ fn block_rows(ev: &ModqEvent, args: Args, zeta: &dyn Fn(usize) -> u32, lie: Bloc
                 let j = pair(0, 0).0;
                 cur[j] = addmod(cur[j], delta);
             }
+            if let BlockLie::ReadValueV { delta } = lie {
+                let jl = pair(0, 0).1;
+                cur[jl] = addmod(cur[jl], delta);
+            }
             // The honest stage states, for the debug cross-check below.
             let honest = (lie == BlockLie::Honest).then(|| stages(&ev.inputs[0], inverse, zeta));
             for p in 0..STAGES {
                 let mut nxt = [0u64; N];
                 let mut fired = false;
                 for bf in 0..HALF {
-                    let (j, jl, _) = pair(p, bf);
+                    let (mut j, mut jl, _) = pair(p, bf);
+                    // `CrossedU`/`CrossedV`: butterflies 0 and 1 of `stage` take each other's `U`
+                    // (`V`) wire — index, value, address and the write-back of the output — so the
+                    // stage's wire multiset is the honest one and only rule 3's index identity sees it.
+                    match lie {
+                        BlockLie::CrossedU { stage } if stage == p && bf < 2 => j = pair(p, 1 - bf).0,
+                        BlockLie::CrossedV { stage } if stage == p && bf < 2 => jl = pair(p, 1 - bf).1,
+                        _ => {}
+                    }
                     let (a0, b0, a1, b1) = if inverse {
                         let (f, zi) = intt_factors(p, bf, zeta);
                         (f, f, zi, QU - zi)
@@ -737,7 +887,10 @@ fn block_rows(ev: &ModqEvent, args: Args, zeta: &dyn Fn(usize) -> u32, lie: Bloc
             }
         }
         Op::Dot4 => {
-            assert!(matches!(lie, BlockLie::Honest | BlockLie::DotCarry { .. } | BlockLie::DotStart { .. }), "forge_block: {lie:?} on a DOT4 block");
+            assert!(
+                matches!(lie, BlockLie::Honest | BlockLie::DotCarry { .. } | BlockLie::DotStart { .. } | BlockLie::ReadValueW { .. }),
+                "forge_block: {lie:?} on a DOT4 block"
+            );
             let mut acc = 0u64; // the running sum
             for r in 0..BLOCK {
                 let (k, c) = (r & 3, r >> 2);
@@ -747,7 +900,12 @@ fn block_rows(ev: &ModqEvent, args: Args, zeta: &dyn Fn(usize) -> u32, lie: Bloc
                     BlockLie::DotStart { coefficient, delta } if coefficient == c && k == 0 => u = delta as u64 % QU,
                     _ => {}
                 }
-                let (v, w) = (ev.inputs[k][c] as u64, ev.inputs[4 + k][c] as u64);
+                let (v, mut w) = (ev.inputs[k][c] as u64, ev.inputs[4 + k][c] as u64);
+                if let BlockLie::ReadValueW { delta } = lie {
+                    if r == 0 {
+                        w = addmod(w, delta);
+                    }
+                }
                 let (o0, k0) = split(u as u128 + w as u128 * v as u128);
                 acc = o0;
                 let addr = [0, poly(args.a + k as u32, c), poly(args.b + k as u32, c), poly(args.out, c), 0];
@@ -770,6 +928,40 @@ fn block_rows(ev: &ModqEvent, args: Args, zeta: &dyn Fn(usize) -> u32, lie: Bloc
                 rows.push(Row { u, v, w, o0: 0, k0: 0, o1, k1, idx: (0, 0), addr });
             }
         }
+    }
+    rows
+}
+
+/// `Lie::TwoOps`' rows (`cheating` feature only): a block that is a `DOT4` and an `MSUB4` at once,
+/// `IS_DOT = IS_MSUB = 1` and `IS_REAL = 2`. Every row satisfies rule 2 under the summed
+/// coefficients — `O0 + q·K0 = U + W·V` and `O1 + q·K1 = U − W·V + γ` — rule 4's chaining for both
+/// ops (`U` the running sum from 0, `W` constant over a coefficient) and rule 3's summed addresses;
+/// `V` is the one input poly the unchecked emulator read. Every count both ops gate is 2 (the `V`
+/// read, the `W` read on `k = 0`, the `RANGE8` lookups, the `MODQ` entry), which `Count::bounded(.., 1)`
+/// declares impossible and only `IS_REAL ∈ {0, 1}` enforces.
+#[cfg(feature = "cheating")]
+fn two_op_rows(ev: &ModqEvent, args: Args) -> Vec<Row> {
+    assert_eq!(ev.a1 & 0xff, 2 + 3, "forge_block: TwoOps needs an a1 whose op byte is DOT4 + MSUB4 = 5");
+    let poly = |i: u32, c: usize| ev.base.wrapping_add(256 * i).wrapping_add(c as u32);
+    let mut rows = Vec::with_capacity(BLOCK);
+    let mut acc = 0u64;
+    for r in 0..BLOCK {
+        let (k, c) = (r & 3, r >> 2);
+        let u = if k == 0 { 0 } else { acc };
+        let v = ev.inputs[0][c] as u64;
+        let w = (c as u64 * 65_537 + 1) % QU;
+        let (o0, k0) = split(u as u128 + w as u128 * v as u128);
+        acc = o0;
+        let (o1, k1) = split(u as u128 + MSUB_OFFSET as u128 - w as u128 * v as u128);
+        let (kk, out, a, b) = (k as u32, args.out, args.a, args.b);
+        let addr = [
+            poly(out + kk, c),
+            poly(a + kk, c).wrapping_add(poly(b + kk, c)),
+            poly(b + kk, c).wrapping_add(poly(a, c)),
+            poly(out, c),
+            poly(out + kk, c),
+        ];
+        rows.push(Row { u, v, w, o0, k0, o1, k1, idx: (0, 0), addr });
     }
     rows
 }
@@ -861,8 +1053,47 @@ pub enum Lie {
     InputLimbCarryW { block: usize },
     /// `DOT4` row `(coefficient, 0)`: `U = delta mod q` instead of 0, the sum carrying it.
     DotStart { block: usize, coefficient: usize, delta: u32 },
-    /// Stage-0 row 0: `U += delta mod q`, a read memory never held.
+    /// Stage-0 row 0: `U += delta mod q`, a read memory never held — the memory story (`Forged::
+    /// accesses`) keeps the value memory *did* hold, so only the `U` read's `MEMORY` send tells.
     ReadValue { block: usize, delta: u32 },
+    /// `ReadValue` on `V`: stage-0 row 0's `V += delta mod q`, the story keeping memory's value.
+    ReadValueV { block: usize, delta: u32 },
+    /// `ReadValue` on `W`: a `DOT4` block's row 0 `W += delta mod q`, the story keeping memory's value.
+    ReadValueW { block: usize, delta: u32 },
+    /// An honest block whose `O0` writes the memory story never records: the results never land.
+    UnwrittenO0 { block: usize },
+    /// `UnwrittenO0` for the `O1` writes.
+    UnwrittenO1 { block: usize },
+    /// `IS_REAL = 2`, `IS_DOT = IS_MSUB = 1`: a block that is a `DOT4` and an `MSUB4` at once
+    /// (`two_op_rows`); the story asks, reads and counts twice where both ops do. Needs an event whose
+    /// `a1` op byte is `2 + 3 = 5` (`execute_unchecked_modq`; the emulator reads it as an `INTT`).
+    TwoOps { block: usize },
+    /// A poly-offset bit carried: the first `i` with `OUT_BITS[i], OUT_BITS[i + 1] = 0, 1` becomes
+    /// `2, 0`; `out` itself, and so `A1` and every address, unchanged.
+    NonBooleanBit { block: usize },
+    /// `IS_REAL = 1` with every op flag zero, on an `a1 = 0` block: a real `NTT` that does nothing
+    /// (zero rows, no reads, no writes, no wires) and still answers the cpu's `MODQ` ask.
+    OpLess { block: usize },
+    /// Rows 512.. of a pointwise block are padding: a `DOT4` that stops half-way.
+    HalfReal { block: usize },
+    /// `W_L[0] = 1` on row 0 of a transform block: a multiplier no transform row has.
+    TransformW { block: usize },
+    /// Butterflies 0 and 1 of `stage` exchange their `U` wires (index, value, address, write-back;
+    /// later stages recomputed): the stage's wire multiset is honest, only `IDX_U`'s identity is not.
+    CrossedU { block: usize, stage: usize },
+    /// `CrossedU` on the `V` wires and `IDX_V`.
+    CrossedV { block: usize, stage: usize },
+    /// `ADDR_<slot> += delta` on the block's first row that sends it (`slot`: 0 `U`, 1 `V`, 2 `W`,
+    /// 3 `O0`, 4 `O1`); the story follows the forged address.
+    WrongAddress { block: usize, slot: usize, delta: u32 },
+    /// `InputLimbCarry` on `O0_L`: the block's first row with `O0_L[1] >= 1`.
+    LimbCarryO0 { block: usize },
+    /// `InputLimbCarry` on `O1_L`.
+    LimbCarryO1 { block: usize },
+    /// `InputLimbCarry` on `K0_L`.
+    LimbCarryK0 { block: usize },
+    /// `InputLimbCarry` on `K1_L`.
+    LimbCarryK1 { block: usize },
     /// `DOT4` row `(coefficient, k)`: `U += delta mod q`, the running sum broken.
     DotCarry { block: usize, coefficient: usize, k: usize, delta: u32 },
     /// `MSUB4` row `(coefficient, k)`: `W += delta mod q`, the broadcast `ĉ` changed.
@@ -879,14 +1110,18 @@ pub enum Lie {
 }
 
 /// A forged modq trace, consistent everywhere but the lie: its `RANGE8` counts (every in-range
-/// limb of every real row; an out-of-range limb is omitted) and the `MEMORY` accesses its rows
-/// send, per block as `(CLK, accesses)`, carrying the forged values.
+/// limb of every real row, `IS_REAL` times; an out-of-range limb is omitted), the `MEMORY` accesses
+/// its rows send, per block as `(CLK, accesses)`, carrying the forged values — the prover's *memory
+/// story*, which the `ReadValue*` lies keep honest and the `Unwritten*` lies cut — and the cpu's
+/// `MODQ` asks the story needs: one per event block, `IS_REAL` of them where a lie doubles it
+/// (`TwoOps`), none for a block no event made (`RealPadding`).
 #[cfg(feature = "cheating")]
 #[doc(hidden)]
 pub struct Forged {
     pub trace: RowMajorMatrix<F>,
     pub range: RangeCounts,
     pub accesses: Vec<(u32, Vec<crate::emulator::MemAccess>)>,
+    pub asks: Vec<(u32, u32, u32)>,
 }
 
 /// Build the modq trace of `events` with `lie` planted (spec §5): `K` and `D` are recomputed on
@@ -908,6 +1143,11 @@ pub fn forge_block(events: &[ModqEvent], log_height: u8, lie: Lie) -> Forged {
     }
     let mut v = F::zero_vec(height * col::WIDTH);
     let mut scratch = RangeCounts::default();
+    let mut asks = Vec::new();
+    // The memory story's corrections: a read whose recorded value is memory's, not the row's
+    // (`(clk, addr, honest value)`), and a block's writes left out (`(block, slot)`).
+    let mut honest_read: Option<(u32, u32, u32)> = None;
+    let mut dropped_writes: Option<(usize, usize)> = None;
     for (blk, rows) in v.chunks_mut(BLOCK * col::WIDTH).enumerate() {
         let ev = match events.get(blk) {
             Some(ev) => ev,
@@ -927,6 +1167,10 @@ pub fn forge_block(events: &[ModqEvent], log_height: u8, lie: Lie) -> Forged {
             Lie::SwapUV { block, stage } if here(block) => BlockLie::SwapUV { stage },
             Lie::ButterflyOutput { block, stage, delta } if here(block) => BlockLie::ButterflyOutput { stage, delta },
             Lie::ReadValue { block, delta } if here(block) => BlockLie::ReadValue { delta },
+            Lie::ReadValueV { block, delta } if here(block) => BlockLie::ReadValueV { delta },
+            Lie::ReadValueW { block, delta } if here(block) => BlockLie::ReadValueW { delta },
+            Lie::CrossedU { block, stage } if here(block) => BlockLie::CrossedU { stage },
+            Lie::CrossedV { block, stage } if here(block) => BlockLie::CrossedV { stage },
             Lie::DotCarry { block, coefficient, k, delta } if here(block) => BlockLie::DotCarry { coefficient, k, delta },
             Lie::MsubBroadcast { block, coefficient, k, delta } if here(block) => BlockLie::MsubBroadcast { coefficient, k, delta },
             _ => BlockLie::Honest,
@@ -937,12 +1181,73 @@ pub fn forge_block(events: &[ModqEvent], log_height: u8, lie: Lie) -> Forged {
                 args.op = op;
             }
         }
-        let vals = block_rows(ev, args, zeta, block_lie);
-        write_block(rows, ev, args, &vals, &mut scratch);
+        let is_transform = matches!(args.op, Op::Ntt | Op::Intt);
+        let (j0, jl0, _) = if args.op == Op::Intt { intt_pair(0, 0) } else { ntt_pair(0, 0) };
+        match lie {
+            Lie::TwoOps { block } if here(block) => {
+                let vals = two_op_rows(ev, args);
+                write_block(rows, ev, Args { op: Op::Dot4, ..args }, &vals, &mut scratch);
+                for row in rows.chunks_mut(col::WIDTH) {
+                    row[col::IS_REAL] = F::TWO;
+                    row[col::IS_MSUB] = F::ONE;
+                }
+            }
+            Lie::OpLess { block } if here(block) => {
+                assert_eq!(ev.a1, 0, "forge_block: OpLess needs a1 = 0, or the A1 identity tells too");
+                fill_padding(rows);
+                for row in rows.chunks_mut(col::WIDTH) {
+                    row[col::IS_REAL] = F::ONE;
+                    row[col::CLK] = F::from_u32(ev.clk);
+                    row[col::BASE] = F::from_u32(ev.base);
+                    row[col::A1] = F::from_u32(ev.a1);
+                }
+            }
+            _ => {
+                let vals = block_rows(ev, args, zeta, block_lie);
+                write_block(rows, ev, args, &vals, &mut scratch);
+            }
+        }
+        match lie {
+            Lie::NonBooleanBit { block } if here(block) => {
+                let i = (0..4)
+                    .find(|&i| args.out >> i & 1 == 0 && args.out >> (i + 1) & 1 == 1)
+                    .unwrap_or_else(|| panic!("forge_block: NonBooleanBit needs an out with bits (0, 1); out = {}", args.out));
+                for row in rows.chunks_mut(col::WIDTH) {
+                    row[col::OUT_BITS + i] = F::TWO;
+                    row[col::OUT_BITS + i + 1] = F::ZERO;
+                }
+            }
+            Lie::HalfReal { block } if here(block) => {
+                assert!(!is_transform, "forge_block: HalfReal on a transform block would break a wire too");
+                let tail = &mut rows[BLOCK / 2 * col::WIDTH..];
+                tail.fill(F::ZERO);
+                fill_padding(tail);
+            }
+            Lie::TransformW { block } if here(block) => {
+                assert!(is_transform, "forge_block: TransformW needs a transform block");
+                rows[col::W_L] = F::ONE;
+            }
+            Lie::WrongAddress { block, slot, delta } if here(block) => {
+                let r = (0..BLOCK)
+                    .find(|&r| send_count(&rows[r * col::WIDTH..(r + 1) * col::WIDTH], r, slot) != 0)
+                    .unwrap_or_else(|| panic!("forge_block: {lie:?}: no row of this block sends slot {slot}"));
+                rows[r * col::WIDTH + col::ADDR_U + slot] += F::from_u32(delta);
+            }
+            Lie::ReadValue { block, .. } if here(block) => honest_read = Some((ev.clk, rows[col::ADDR_U].as_canonical_u64() as u32, ev.inputs[0][j0])),
+            Lie::ReadValueV { block, .. } if here(block) => honest_read = Some((ev.clk, rows[col::ADDR_V].as_canonical_u64() as u32, ev.inputs[0][jl0])),
+            Lie::ReadValueW { block, .. } if here(block) => honest_read = Some((ev.clk, rows[col::ADDR_W].as_canonical_u64() as u32, ev.inputs[4][0])),
+            Lie::UnwrittenO0 { block } if here(block) => dropped_writes = Some((blk, 3)),
+            Lie::UnwrittenO1 { block } if here(block) => dropped_writes = Some((blk, 4)),
+            _ => {}
+        }
         let carry = match lie {
             Lie::InputLimbCarry { block } if here(block) => Some((col::U_L, HALF)),
             Lie::InputLimbCarryV { block } if here(block) => Some((col::V_L, BLOCK)),
             Lie::InputLimbCarryW { block } if here(block) => Some((col::W_L, BLOCK)),
+            Lie::LimbCarryO0 { block } if here(block) => Some((col::O0_L, BLOCK)),
+            Lie::LimbCarryO1 { block } if here(block) => Some((col::O1_L, BLOCK)),
+            Lie::LimbCarryK0 { block } if here(block) => Some((col::K0_L, BLOCK)),
+            Lie::LimbCarryK1 { block } if here(block) => Some((col::K1_L, BLOCK)),
             _ => None,
         };
         if let Some((limb, within)) = carry {
@@ -952,20 +1257,34 @@ pub fn forge_block(events: &[ModqEvent], log_height: u8, lie: Lie) -> Forged {
             rows[r * col::WIDTH + limb] += F::from_u32(256);
             rows[r * col::WIDTH + limb + 1] -= F::ONE;
         }
+        // The cpu asks for an event's block as many times as the table claims it (`IS_REAL`).
+        if events.get(blk).is_some() {
+            for _ in 0..rows[col::IS_REAL].as_canonical_u64() {
+                asks.push((ev.clk, ev.base, ev.a1));
+            }
+        }
     }
     let trace = RowMajorMatrix::new(v, col::WIDTH);
-    Forged { range: range_counts_without(&trace, None), accesses: accesses_of(&trace), trace }
+    let mut accesses = accesses_of(&trace, dropped_writes);
+    if let Some((clk, addr, value)) = honest_read {
+        let (_, acc) = accesses.iter_mut().find(|(c, _)| *c == clk).expect("forge_block: the lying block sends");
+        let read = acc.iter_mut().find(|a| !a.is_write && a.addr == addr).expect("forge_block: the lying row reads");
+        assert_ne!(read.value, value, "forge_block: {lie:?} must change the read value");
+        read.value = value;
+    }
+    Forged { range: range_counts_without(&trace, None), accesses, asks, trace }
 }
 
 /// The `RANGE8` counts rule 8 asks for with `off` switched off: every in-range limb of every real
-/// row, limb groups `off` skips left out. A limb `>= 256` is not counted, so its lookup (if on)
-/// cannot balance.
+/// row, `IS_REAL` times (rule 8's count; 2 on a `TwoOps` block), limb groups `off` skips left out.
+/// A limb `>= 256` is not counted, so its lookup (if on) cannot balance.
 #[cfg(feature = "cheating")]
 #[doc(hidden)]
 pub fn range_counts_without(trace: &RowMajorMatrix<F>, off: Option<Defence>) -> RangeCounts {
     let mut r = RangeCounts::default();
     for row in trace.values.chunks(col::WIDTH) {
-        if row[col::IS_REAL] != F::ONE {
+        let times = row[col::IS_REAL].as_canonical_u64();
+        if times == 0 {
             continue;
         }
         for (start, width) in LIMBS {
@@ -975,7 +1294,9 @@ pub fn range_counts_without(trace: &RowMajorMatrix<F>, off: Option<Defence>) -> 
             for i in 0..width {
                 let x = row[start + i].as_canonical_u64();
                 if x < 256 {
-                    r.range8(x as u32);
+                    for _ in 0..times {
+                        r.range8(x as u32);
+                    }
                 }
             }
         }
@@ -983,34 +1304,61 @@ pub fn range_counts_without(trace: &RowMajorMatrix<F>, off: Option<Defence>) -> 
     r
 }
 
-/// The `MEMORY` sends of rule 6, read off a trace: per real block, `(CLK, reads at slot 0 then
-/// writes at slot 1)`.
+/// Rule 6's count of the `MEMORY` send in `slot` (0 `U`, 1 `V`, 2 `W`, 3 `O0`, 4 `O1`) on row `r` of
+/// a block, read off the row's flags as integers: `t·S_FIRST + msub`, `t·S_FIRST + dot + msub`,
+/// `dot + msub·K_FIRST`, `t·S_LAST + dot·K_LAST`, `t·S_LAST + msub` — 2 where a `TwoOps` block has
+/// both ops.
 #[cfg(feature = "cheating")]
-fn accesses_of(trace: &RowMajorMatrix<F>) -> Vec<(u32, Vec<crate::emulator::MemAccess>)> {
+fn send_count(row: &[F], r: usize, slot: usize) -> u64 {
+    let f = |c: usize| row[c].as_canonical_u64();
+    let (t, dot, msub) = (f(col::IS_NTT) + f(col::IS_INTT), f(col::IS_DOT), f(col::IS_MSUB));
+    let (s_first, s_last, k_first, k_last) = ((r >> 7 == 0) as u64, (r >> 7 == STAGES - 1) as u64, (r & 3 == 0) as u64, (r & 3 == 3) as u64);
+    match slot {
+        0 => t * s_first + msub,
+        1 => t * s_first + dot + msub,
+        2 => dot + msub * k_first,
+        3 => t * s_last + dot * k_last,
+        4 => t * s_last + msub,
+        _ => panic!("send_count: slot {slot}"),
+    }
+}
+
+/// The `MEMORY` sends of rule 6, read off a trace: per real block, `(CLK, reads at slot 0 then
+/// writes at slot 1)`, each as many times as `send_count` says; the writes of `dropped`'s
+/// `(block, slot)` left out (the `Unwritten*` lies' story).
+#[cfg(feature = "cheating")]
+fn accesses_of(trace: &RowMajorMatrix<F>, dropped: Option<(usize, usize)>) -> Vec<(u32, Vec<crate::emulator::MemAccess>)> {
     use crate::emulator::MemAccess;
+    const SLOTS: [(usize, usize, bool); 5] = [
+        (col::ADDR_U, col::U_L, false),
+        (col::ADDR_V, col::V_L, false),
+        (col::ADDR_W, col::W_L, false),
+        (col::ADDR_O0, col::O0_L, true),
+        (col::ADDR_O1, col::O1_L, true),
+    ];
     let mut out = Vec::new();
-    for blk in trace.values.chunks(BLOCK * col::WIDTH) {
-        if blk[col::IS_REAL] != F::ONE {
+    for (blk_i, blk) in trace.values.chunks(BLOCK * col::WIDTH).enumerate() {
+        if blk[col::IS_REAL] == F::ZERO {
             continue;
         }
         let clk = blk[col::CLK].as_canonical_u64() as u32;
         let (mut reads, mut writes) = (Vec::new(), Vec::new());
         for (r, row) in blk.chunks(col::WIDTH).enumerate() {
-            let is = |c: usize| row[c] == F::ONE;
-            let (t, dot, msub) = (is(col::IS_NTT) || is(col::IS_INTT), is(col::IS_DOT), is(col::IS_MSUB));
-            let (s_first, s_last, k_first, k_last) = (r >> 7 == 0, r >> 7 == STAGES - 1, r & 3 == 0, r & 3 == 3);
-            let acc = |addr: usize, val: usize, w: bool| MemAccess {
-                space: SPACE_RAM,
-                addr: row[addr].as_canonical_u64() as u32,
-                slot: w as u32,
-                value: limbs_value(row, val, 3) as u32,
-                is_write: w,
-            };
-            if (t && s_first) || msub { reads.push(acc(col::ADDR_U, col::U_L, false)); }
-            if (t && s_first) || dot || msub { reads.push(acc(col::ADDR_V, col::V_L, false)); }
-            if dot || (msub && k_first) { reads.push(acc(col::ADDR_W, col::W_L, false)); }
-            if (t && s_last) || (dot && k_last) { writes.push(acc(col::ADDR_O0, col::O0_L, true)); }
-            if (t && s_last) || msub { writes.push(acc(col::ADDR_O1, col::O1_L, true)); }
+            for (slot, (addr, val, w)) in SLOTS.iter().enumerate() {
+                if dropped == Some((blk_i, slot)) {
+                    continue;
+                }
+                for _ in 0..send_count(row, r, slot) {
+                    let a = MemAccess {
+                        space: SPACE_RAM,
+                        addr: row[*addr].as_canonical_u64() as u32,
+                        slot: *w as u32,
+                        value: limbs_value(row, *val, 3) as u32,
+                        is_write: *w,
+                    };
+                    if *w { writes.push(a) } else { reads.push(a) }
+                }
+            }
         }
         reads.extend(writes);
         out.push((clk, reads));
@@ -1072,23 +1420,26 @@ mod tests {
     fn modq_air_without_none_is_modq_air() {
         let full = symbolic(&ModqAir);
         assert_eq!(symbolic(&ModqAirWithout(None)), full);
-        for d in [
-            Defence::OutputIdentityO0,
-            Defence::OutputIdentityO1,
-            Defence::CanonicalO0,
-            Defence::CanonicalO1,
-            Defence::InputRangeU,
-            Defence::InputRangeV,
-            Defence::InputRangeW,
-            Defence::Wire,
-            Defence::DotStart,
-            Defence::DotCarry,
-            Defence::MsubCarry,
-            Defence::A1Decomposition,
-            Defence::CanonicalArgsA,
-            Defence::CanonicalArgsB,
-        ] {
-            assert_ne!(symbolic(&ModqAirWithout(Some(d))), full, "{d:?} must switch something off");
+        let mut seen = std::collections::BTreeSet::new();
+        for d in Defence::ALL {
+            let without = symbolic(&ModqAirWithout(Some(d)));
+            assert_ne!(without, full, "{d:?} must switch something off");
+            assert!(seen.insert(without), "{d:?} switches off exactly what another defence does");
         }
+    }
+
+    /// Audit CS9-1: the production AIR's shape, pinned — 62 constraints (47 in rule 1: `IS_REAL`,
+    /// 19 flags, one-hot, `A1`, `T·A`, `T·B`, 23 block-constant transitions; 5 in rule 2; 7 in rule
+    /// 3; 3 in rule 4) of degree at most 3, and 39 bus messages (4 wires, 5 memory sends, the `MODQ`
+    /// entry, 29 `RANGE8` lookups). The `on(Defence::…)` switches are all-on in `ModqAir`, so
+    /// wrapping a line in one changes nothing here — this is what keeps the verifier key where it is.
+    #[test]
+    fn modq_air_pins_its_constraint_count_and_degree() {
+        let mut sb = InteractionSymbolicBuilder::<Val, Challenge>::new(AirLayout::from_air::<Val>(&ModqAir));
+        ModqAir.eval(&mut sb);
+        let constraints = sb.base_constraints();
+        assert_eq!(constraints.len(), 62);
+        assert_eq!(constraints.iter().map(|c| c.degree_multiple()).max(), Some(3));
+        assert_eq!(sb.global_interactions().len(), 39);
     }
 }

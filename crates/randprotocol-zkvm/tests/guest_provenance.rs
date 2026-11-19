@@ -135,65 +135,75 @@ fn the_manifest_names_the_circuits_commit_ci_pins() {
     assert_eq!(named, pinned, "PROVENANCE.md and ci.yml's CIRCUITS_PIN name different circuits commits");
 }
 
+// ── The guests' digests: constraint set 11 moved every one ───────────────────────────────────────
+//
+// A guest's `hc` is a Poseidon2 digest of its program, and constraint set 11 (circuits 76a48dc)
+// replaced the Poseidon2 round constants (Grain), so every guest this source assembles has a new
+// `hc` while its instruction stream is byte for byte what it was. The genesis files of chains
+// 14–21 (cut under sets 6–9) keep naming the old digests — those chains are run by the set-9
+// release line (v0.8.6), which this build refuses (`constraint_set::build_genesis`) — and a cut
+// from chain 22 on names these. Both columns are pinned: a source change that moves a current
+// digest fails here, and so does an edit to a committed genesis file.
+
+/// Through constraint set 10: the digests chains 14–21's genesis files name.
+const SET_10_HC_BUNDLE_V1: &str = "83d3a3704a1fcdb9bae7136c0a947ffa34bd53f055388395ed705fe8cacd0ef8";
+const SET_10_HC_BUNDLE_V2: &str = "651043e2ff2fef28df2d8edbdbbc387668577af72dcc584ee7d850e093a2839b";
+const SET_10_HC_BUNDLE_V3: &str = "60af094acfe65d85fdb18fb3d06cf9085dcf28c96e59e87f1ee527226e6e3fce";
+const SET_10_HC_AUTH: &str = "1e4e347f44cf86750b30a9a4bdf9ec9256efe353d4ff8017451eca7d195639c1";
+const SET_10_HC_AUTH_MULTISIG: &str = "9705f8e2f1bc8561848b29cb8efd57c37e3e39788fa58a5f03304d8019668247";
+const SET_10_HC_LEGACY_BUNDLE: &str = "4a27356f379571036025a4a8661c294b0edec2b7cf7fbfd60b472b186cbd4afb";
+
+/// Constraint set 11: what this source assembles (chain 22's cut names v3, auth and msauth).
+const HC_BUNDLE_V1: &str = "71eedbfb5977995ffcb8a2adbf9776e77c8a457888afa2f9c76ffd288d8fee70";
+const HC_BUNDLE_V2: &str = "3aff63618cadf9771dd2bd2ca8c87d0bb725c56fdf9bed6a266d8ea8f6546046";
+const HC_BUNDLE_V3: &str = "00782b22b1efdf6bbc4d9001b27baa28c03e75732090c6ccd494ddd1365c141e";
+const HC_AUTH: &str = "8373994c200819c899236f822f0315efea213b3506a1df0785544a6c90a46078";
+const HC_LEGACY_BUNDLE: &str = "6e968302c051ad991ccc3b432397434ed39a3fa4d6a01000d2ea3e2c9762dc1d";
+
 /// The guest the chain runs is not a vendored binary: it is `guests::bundle_hidden()`, assembled
-/// from this crate's source. Its `hc` is what chain 14's genesis pins; a source change that moves
-/// it has to fail here, not at a node's first block.
+/// from this crate's source. Chain 14's genesis pins its set-6 digest; this source's is set 11's.
 #[test]
 fn the_chain_14_bundle_guest_is_the_genesis_pin() {
     let genesis = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../deploy/genesis-chain14.json")).unwrap();
     let genesis: serde_json::Value = serde_json::from_str(&genesis).unwrap();
-    let pin = "83d3a3704a1fcdb9bae7136c0a947ffa34bd53f055388395ed705fe8cacd0ef8";
-    assert_eq!(word8_to_hex(&ZkExecutor::hc_bundle()), pin, "guests::bundle_hidden() no longer assembles to chain 14's hc_bundle");
-    assert_eq!(genesis["hc_bundle"].as_str().unwrap(), pin, "deploy/genesis-chain14.json's hc_bundle");
+    assert_eq!(word8_to_hex(&ZkExecutor::hc_bundle()), HC_BUNDLE_V1, "guests::bundle_hidden() no longer assembles to its set-11 digest");
+    assert_eq!(genesis["hc_bundle"].as_str().unwrap(), SET_10_HC_BUNDLE_V1, "deploy/genesis-chain14.json's hc_bundle");
 }
 
-/// The branch-free hidden guest (`guests::bundle_hidden_v2()`, INT-2 / GV-1) assembles to one
-/// fixed digest, pinned here so that a source change moving it fails in this crate rather than
-/// at the first block of the chain whose genesis names it. No genesis in the repository names it
-/// yet: it takes effect at the cut whose `hc_bundle` is this value. v1's pin (above) is unmoved
-/// by its arrival — the two guests share one assembler function and v1's instruction stream is
-/// byte-for-byte what it was.
+/// The branch-free hidden guest (`guests::bundle_hidden_v2()`, INT-2 / GV-1), pinned so a source
+/// change moving it fails here. v1 and v2 share one assembler function.
 #[test]
 fn the_branch_free_bundle_guest_is_pinned() {
-    let v2 = "651043e2ff2fef28df2d8edbdbbc387668577af72dcc584ee7d850e093a2839b";
-    assert_eq!(word8_to_hex(&ZkExecutor::hc_hidden_bundle_v2()), v2, "guests::bundle_hidden_v2() no longer assembles to its pinned digest");
-    assert_eq!(word8_to_hex(&ZkExecutor::hc_hidden_bundle()), "83d3a3704a1fcdb9bae7136c0a947ffa34bd53f055388395ed705fe8cacd0ef8");
-    assert_eq!(ZkExecutor::known_hc_bundles().map(|h| word8_to_hex(&h))[..2], ["83d3a3704a1fcdb9bae7136c0a947ffa34bd53f055388395ed705fe8cacd0ef8", v2]);
+    assert_eq!(word8_to_hex(&ZkExecutor::hc_hidden_bundle_v2()), HC_BUNDLE_V2, "guests::bundle_hidden_v2() no longer assembles to its pinned digest");
+    assert_eq!(word8_to_hex(&ZkExecutor::hc_hidden_bundle()), HC_BUNDLE_V1);
+    assert_eq!(ZkExecutor::known_hc_bundles().map(|h| word8_to_hex(&h))[..2], [HC_BUNDLE_V1, HC_BUNDLE_V2]);
 }
 
-/// Bundle guest v3 (`guests::bundle_hidden_v3()`, delegated proving Phase 2: `nk` and `salt` in,
-/// `c = H(AUTH, nk, salt)` in the digest) assembles to one fixed digest, pinned like v2's. No
-/// genesis names it yet. v1's and v2's pins (above) are unmoved by its arrival: the three share
-/// one assembler function, and v1/v2 keep their RAM layout (`HIDDEN_LAYOUT_V1`) and instruction
-/// stream byte for byte.
+/// Bundle guest v3 (`guests::bundle_hidden_v3()`, split authorisation), pinned like v2's. The
+/// value chain 22's genesis carries as `hc_bundle` (`deploy/cut-chain22-genesis.sh`'s
+/// `EXPECT_HC_BUNDLE`).
 #[test]
 fn the_split_authorisation_bundle_guest_is_pinned() {
-    let v3 = "60af094acfe65d85fdb18fb3d06cf9085dcf28c96e59e87f1ee527226e6e3fce";
-    assert_eq!(word8_to_hex(&ZkExecutor::hc_hidden_bundle_v3()), v3, "guests::bundle_hidden_v3() no longer assembles to its pinned digest");
+    assert_eq!(word8_to_hex(&ZkExecutor::hc_hidden_bundle_v3()), HC_BUNDLE_V3, "guests::bundle_hidden_v3() no longer assembles to its pinned digest");
     assert_eq!(
         ZkExecutor::known_hc_bundles().map(|h| word8_to_hex(&h)),
-        [
-            "83d3a3704a1fcdb9bae7136c0a947ffa34bd53f055388395ed705fe8cacd0ef8".to_string(),
-            "651043e2ff2fef28df2d8edbdbbc387668577af72dcc584ee7d850e093a2839b".to_string(),
-            v3.to_string(),
-        ]
+        [HC_BUNDLE_V1.to_string(), HC_BUNDLE_V2.to_string(), HC_BUNDLE_V3.to_string()]
     );
+    let cut = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../deploy/cut-chain22-genesis.sh")).unwrap();
+    assert!(cut.contains(&format!("EXPECT_HC_BUNDLE=${{EXPECT_HC_BUNDLE:-{HC_BUNDLE_V3}}}")), "the chain-22 cut expects this hc_bundle");
 }
 
-/// The auth guest (`guests::auth()`, delegated proving Phase 2: `sk` and `salt` in,
-/// `c = H(AUTH, nk, salt)` out, the transaction binding as its public segment, proved locally at
-/// `AUTH_TIER`) assembles to one fixed digest — the
-/// value a genesis carries as `hc_auth` beside a v3 `hc_bundle`. Pinned like the bundle guests, so
-/// a source change that moves it fails here rather than at the first block of the chain whose
-/// genesis names it. No genesis in the repository names it yet.
+/// The auth guest (`guests::auth()`, split authorisation): the value a genesis carries as
+/// `hc_auth` beside a v3 `hc_bundle`.
 #[test]
 fn the_auth_guest_is_pinned() {
-    let auth = "1e4e347f44cf86750b30a9a4bdf9ec9256efe353d4ff8017451eca7d195639c1";
-    assert_eq!(word8_to_hex(&ZkExecutor::hc_auth()), auth, "the auth guest no longer assembles to its pinned digest");
+    assert_eq!(word8_to_hex(&ZkExecutor::hc_auth()), HC_AUTH, "the auth guest no longer assembles to its pinned digest");
     assert!(
-        !ZkExecutor::known_hc_bundles().map(|h| word8_to_hex(&h)).contains(&auth.to_string()),
+        !ZkExecutor::known_hc_bundles().map(|h| word8_to_hex(&h)).contains(&HC_AUTH.to_string()),
         "the auth guest's digest must not be a bundle guest's"
     );
+    let cut = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../deploy/cut-chain22-genesis.sh")).unwrap();
+    assert!(cut.contains(&format!("EXPECT_HC_AUTH=${{EXPECT_HC_AUTH:-{HC_AUTH}}}")), "the chain-22 cut expects this hc_auth");
 }
 
 /// The docs name the pinned multisig auth guest and its tier, as they do hc_auth.
@@ -209,21 +219,21 @@ fn the_docs_name_the_multisig_auth_guest() {
     assert!(shielded.contains(&hc) && shielded.contains("tier 18"), "docs/shielded.md names the guest's digest and tier");
 }
 
-/// ZKG-2: the pin above, for every genesis file the repository carries — chain 15 included, which
-/// the chain-14-only test never read. A chain from 14 on pins the hidden-asset guest
-/// (`guests::bundle_hidden()`); chains 6–13 pin the retired 2-in-2-out guest, which still
-/// assembles from this crate's source (`ZkExecutor::legacy_bundle_program`). A file whose
-/// `hc_bundle` is neither is a genesis this build could not have cut. Chains 14 and 15 pin v1
-/// exactly; a later file may name v1 or the branch-free v2 (`bundle_hidden_v2()`), and from chain
-/// 17 on the split-authorisation v3 (`bundle_hidden_v3()`) — whose file must then name this
-/// source's auth guest as `hc_auth` too (and a file naming `hc_auth` must pin v3).
+/// ZKG-2: every genesis file the repository carries names a bundle guest this repository can
+/// account for. Chains 6–13 pin the retired 2-in-2-out guest, 14 and 15 v1, from 16 v1 or the
+/// branch-free v2, from 17 the split-authorisation v3 with `hc_auth` — at their own constraint
+/// set's digests (set 10's and earlier, the `SET_10_*` column) through chain 21, and at this
+/// source's (set 11) from chain 22 on. `hc_auth` and v3 come as a pair.
 #[test]
 fn every_genesis_files_bundle_guest_is_the_one_this_source_assembles() {
-    let hidden = word8_to_hex(&ZkExecutor::hc_bundle());
-    let branch_free = word8_to_hex(&ZkExecutor::hc_hidden_bundle_v2());
-    let legacy = word8_to_hex(&ZkExecutor::hc_legacy_bundle());
-    let split = word8_to_hex(&ZkExecutor::hc_hidden_bundle_v3());
-    let auth = word8_to_hex(&ZkExecutor::hc_auth());
+    let current = (
+        word8_to_hex(&ZkExecutor::hc_bundle()),
+        word8_to_hex(&ZkExecutor::hc_hidden_bundle_v2()),
+        word8_to_hex(&ZkExecutor::hc_legacy_bundle()),
+        word8_to_hex(&ZkExecutor::hc_hidden_bundle_v3()),
+        word8_to_hex(&ZkExecutor::hc_auth()),
+    );
+    assert_eq!(current, (HC_BUNDLE_V1.into(), HC_BUNDLE_V2.into(), HC_LEGACY_BUNDLE.into(), HC_BUNDLE_V3.into(), HC_AUTH.into()));
     let deploy = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../deploy");
     let mut checked = BTreeSet::new();
     for entry in std::fs::read_dir(&deploy).unwrap() {
@@ -236,23 +246,23 @@ fn every_genesis_files_bundle_guest_is_the_one_this_source_assembles() {
         let Some(pin) = genesis.get("hc_bundle").and_then(|v| v.as_str()) else {
             continue;
         };
+        let (v1, v2, legacy, v3, auth) = if chain <= 21 {
+            (SET_10_HC_BUNDLE_V1, SET_10_HC_BUNDLE_V2, SET_10_HC_LEGACY_BUNDLE, SET_10_HC_BUNDLE_V3, SET_10_HC_AUTH)
+        } else {
+            (HC_BUNDLE_V1, HC_BUNDLE_V2, HC_LEGACY_BUNDLE, HC_BUNDLE_V3, HC_AUTH)
+        };
         let hc_auth = genesis.get("hc_auth").and_then(|v| v.as_str());
-        assert_eq!(hc_auth.is_some(), pin == split, "{name}: hc_auth and bundle guest v3 come as a pair");
-        if chain >= 17 && pin == split {
-            assert_eq!(hc_auth, Some(auth.as_str()), "{name}'s hc_auth is not auth()'s digest");
-            checked.insert(chain);
-            continue;
+        assert_eq!(hc_auth.is_some(), pin == v3, "{name}: hc_auth and bundle guest v3 come as a pair");
+        if chain >= 17 && pin == v3 {
+            assert_eq!(hc_auth, Some(auth), "{name}'s hc_auth is not auth()'s digest");
+        } else if !(chain >= 16 && pin == v2) {
+            let (want, guest) = if chain >= 14 { (v1, "bundle_hidden") } else { (legacy, "the retired bundle") };
+            assert_eq!(pin, want, "{name}'s hc_bundle is not {guest}()'s digest");
         }
-        if chain >= 16 && pin == branch_free {
-            checked.insert(chain);
-            continue;
-        }
-        let (want, guest) = if chain >= 14 { (&hidden, "bundle_hidden") } else { (&legacy, "the retired bundle") };
-        assert_eq!(pin, want.as_str(), "{name}'s hc_bundle is not {guest}()'s digest");
         checked.insert(chain);
     }
     assert!(checked.contains(&14) && checked.contains(&15), "chains 14 and 15 must be among the files checked: {checked:?}");
-    assert!(checked.contains(&17), "chain 17 (the first v3 + hc_auth genesis) must be among the files checked: {checked:?}");
+    assert!(checked.contains(&17) && checked.contains(&21), "chains 17 and 21 must be among the files checked: {checked:?}");
 }
 
 // ── vendor/circuits: the two interpreter cores (audit v6 PROC-2, issue #109) ────────────────────
@@ -337,7 +347,7 @@ fn the_cuda_backend_is_one_git_revision_in_both_manifests() {
     assert!(!zkvm.contains("path ="), "a path dependency outside the repository again: {zkvm}");
 }
 
-/// Private multisig phase 4: the re-vendor brought the MODQ chip (syscall 8, `MODQ_GAS`), the
+/// Private multisig phase 4: the re-vendor brought the MODQ chip (syscall 8, `MODQ_MAX_GAS` since set 11), the
 /// `msauth` host model and the compiled `msauth` guest, and the guest is in the manifest.
 #[test]
 fn the_msauth_guest_and_the_modq_chip_are_vendored() {
@@ -346,28 +356,39 @@ fn the_msauth_guest_and_the_modq_chip_are_vendored() {
         assert!(manifest.iter().any(|(_, p)| p == path), "{path} is not in SHA256SUMS");
     }
     assert_eq!(randprotocol_zkvm::isa::SYS_MODQ, 8);
-    assert_eq!(randprotocol_zkvm::gas::MODQ_GAS, 168);
+    assert_eq!(randprotocol_zkvm::gas::MODQ_MAX_GAS, 304, "constraint set 11 prices MODQ per op; MSUB4 is the heaviest");
     assert_eq!(randprotocol_zkvm::msauth::MSAUTH_WORDS, 17 + randprotocol_zkvm::msauth::M_MAX * 967);
     assert!(!randprotocol_zkvm::guests::compiled::msauth().words.is_empty());
     // Its tags are node-local and sit beside auth.rs's: AUTH is the same 65.
     assert_eq!(randprotocol_zkvm::msauth::AUTH, randprotocol_zkvm::auth::AUTH_DOMAIN);
 }
 
-/// No guest program moved: every digest pin above is unchanged by the MODQ re-vendor (only
-/// verifier keys moved), and the msauth guest is none of them.
+/// Constraint set 11 moved every guest's digest (Grain constants): none of the set-10 digests the
+/// committed genesis files name is one this source assembles, and the msauth guest is none of the
+/// bundle or auth guests.
 #[test]
-fn the_modq_re_vendor_moved_no_guest_program() {
+fn constraint_set_11_moved_every_guest_program() {
     let msauth = randprotocol_zkvm::guests::compiled::msauth().digest();
-    assert_eq!(word8_to_hex(&ZkExecutor::hc_auth()), "1e4e347f44cf86750b30a9a4bdf9ec9256efe353d4ff8017451eca7d195639c1");
-    assert_eq!(word8_to_hex(&ZkExecutor::hc_hidden_bundle_v3()), "60af094acfe65d85fdb18fb3d06cf9085dcf28c96e59e87f1ee527226e6e3fce");
+    for (now, then) in [
+        (HC_BUNDLE_V1, SET_10_HC_BUNDLE_V1),
+        (HC_BUNDLE_V2, SET_10_HC_BUNDLE_V2),
+        (HC_BUNDLE_V3, SET_10_HC_BUNDLE_V3),
+        (HC_AUTH, SET_10_HC_AUTH),
+        (MSAUTH_HC, SET_10_HC_AUTH_MULTISIG),
+        (HC_LEGACY_BUNDLE, SET_10_HC_LEGACY_BUNDLE),
+    ] {
+        assert_ne!(now, then);
+    }
+    assert_eq!(randprotocol_zkvm::machine::CONSTRAINT_SET, 11);
     assert!(!ZkExecutor::known_hc_bundles().contains(&msauth) && msauth != ZkExecutor::hc_auth());
 }
 
 /// The multisig auth guest (`guests::compiled::msauth()`, private multisig phase 4) is the value a
-/// genesis carries as `hc_auth_multisig`. Its digest is that of circuits Task 8's `msauth.bin`
-/// (c55cfa1; the vendored file's sha256 is the manifest's), pinned so a re-vendor that moves it
-/// fails here, not at a chain's first block.
-const MSAUTH_HC: &str = "9705f8e2f1bc8561848b29cb8efd57c37e3e39788fa58a5f03304d8019668247";
+/// genesis carries as `hc_auth_multisig`: the digest of the vendored `msauth.bin` (the file's
+/// sha256 is the manifest's) under constraint set 11's Poseidon2 (chain 21's, set 9, is
+/// `SET_10_HC_AUTH_MULTISIG`), pinned so a re-vendor that moves it fails here, not at a chain's
+/// first block.
+const MSAUTH_HC: &str = "41db73c507ab1f24ebe76d9c425b42a08ed9a02b4b1284d410502729ce6b9cd1";
 
 #[test]
 fn the_multisig_auth_guest_is_pinned() {

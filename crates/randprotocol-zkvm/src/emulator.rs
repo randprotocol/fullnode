@@ -177,7 +177,45 @@ pub const KECCAK_PTR_LIMIT: u32 = 0x3000_0000 - KECCAK_WORDS;
 pub const SHA256_PTR_LIMIT: u32 = 0x3000_0000 - SHA256_WORDS;
 
 pub fn execute(program: &Program, inputs: &[u32], public: &[u32], max_cycles: usize) -> Result<Execution, ExecError> {
-    execute_inner(program, inputs, public, max_cycles, false)
+    execute_inner(program, inputs, public, max_cycles, false, &mut TrapSite::default())
+}
+
+/// How many instruction addresses a [`Trap`] remembers.
+pub const TRAP_HISTORY: usize = 32;
+
+/// Where an execution stopped with an [`ExecError`] (ZKVM-119): what [`execute`] returns plus the
+/// place. Host-side tooling only — nothing the prover or the constraints read.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Trap {
+    pub error: ExecError,
+    /// The address of the instruction that was being fetched or executed. For `OutOfCycles` it is
+    /// the instruction the budget ran out before; for a syscall's own refusal, the `ecall`.
+    pub pc: u32,
+    /// Rows recorded before that instruction (the cycle count so far).
+    pub cycle: usize,
+    /// The addresses of the last instructions reached, oldest first and ending with `pc` — at most
+    /// [`TRAP_HISTORY`] of them.
+    pub recent: Vec<u32>,
+}
+
+/// [`execute`], returning a [`Trap`] — the error and where it happened — instead of the bare error.
+/// The same run in every other respect: `execute_traced(..).map_err(|t| t.error)` is `execute`.
+pub fn execute_traced(program: &Program, inputs: &[u32], public: &[u32], max_cycles: usize) -> Result<Execution, Trap> {
+    let mut site = TrapSite::default();
+    execute_inner(program, inputs, public, max_cycles, false, &mut site).map_err(|error| {
+        let n = site.seen.min(TRAP_HISTORY);
+        let recent = (0..n).map(|k| site.ring[(site.seen - n + k) % TRAP_HISTORY]).collect();
+        Trap { error, pc: site.pc, cycle: site.cycle, recent }
+    })
+}
+
+/// What `execute_inner` notes at the top of every instruction so that a failure can be placed.
+#[derive(Default)]
+struct TrapSite {
+    pc: u32,
+    cycle: usize,
+    ring: [u32; TRAP_HISTORY],
+    seen: usize,
 }
 
 /// Cheating-suite hook (spec §5; `cheating` feature only): `execute` with `SYS_MODQ` through `modq::call_unchecked` — no
@@ -186,10 +224,10 @@ pub fn execute(program: &Program, inputs: &[u32], public: &[u32], max_cycles: us
 #[cfg(feature = "cheating")]
 #[doc(hidden)]
 pub fn execute_unchecked_modq(program: &Program, inputs: &[u32], public: &[u32], max_cycles: usize) -> Result<Execution, ExecError> {
-    execute_inner(program, inputs, public, max_cycles, true)
+    execute_inner(program, inputs, public, max_cycles, true, &mut TrapSite::default())
 }
 
-fn execute_inner(program: &Program, inputs: &[u32], public: &[u32], max_cycles: usize, unchecked_modq: bool) -> Result<Execution, ExecError> {
+fn execute_inner(program: &Program, inputs: &[u32], public: &[u32], max_cycles: usize, unchecked_modq: bool, site: &mut TrapSite) -> Result<Execution, ExecError> {
     let mut regs = [0u32; 32];
     let mut ram: HashMap<u32, u32> = HashMap::new(); // word address -> value; unwritten reads are 0
     let mut outputs = [0u32; NUM_OUTPUTS];
@@ -201,6 +239,11 @@ fn execute_inner(program: &Program, inputs: &[u32], public: &[u32], max_cycles: 
     // budget are tracked independently of the loop that fetches/decodes instructions.
     let mut clk: u32 = 0;
     loop {
+        // ZKVM-119: where a failure below happened. Bookkeeping only; nothing reads it on success.
+        site.pc = pc;
+        site.cycle = events.len();
+        site.ring[site.seen % TRAP_HISTORY] = pc;
+        site.seen += 1;
         if events.len() >= max_cycles { return Err(ExecError::OutOfCycles(max_cycles)); }
         let instr = program.instr_at(pc).ok_or(ExecError::BadPc(pc))?;
         let dec = instr.decoded();

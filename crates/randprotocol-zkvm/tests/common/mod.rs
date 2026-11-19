@@ -31,11 +31,13 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 /// constraint. Its full form is
 /// `"constraints not satisfied on row {row_index}: failed constraints = {rendered}"` —
 /// the `panic!` at the end of the row loop in
-/// `~/.cargo/registry/src/index.crates.io-*/p3-batch-stark-0.7.0/src/check_constraints.rs`
-/// (line 132 in that release). Matching the fixed prefix is what separates "the constraint
+/// `vendor/p3-batch-stark/src/check_constraints.rs` (the crates.io 0.7.0 file, unchanged by the
+/// fork; line 132 in that release). Matching the fixed prefix is what separates "the constraint
 /// system caught this" from any other unwind. This check runs *per AIR instance*, using only
 /// that instance's own trace, so it only catches a violation that's local to one table's own
-/// row constraints (e.g. the range table's `mp·(1 − is_pow2) = 0`).
+/// row constraints (e.g. the range table's `mp·(1 − is_pow2) = 0`). It runs only when the
+/// prover enforces its self-check — every honest path does; `Machine::prove_traces_without_self_check`
+/// (`tests/modq_cheating.rs`) turns it off so a forgery reaches `verify` and is refused there.
 pub const CONSTRAINT_PANIC: &str = "constraints not satisfied on row";
 
 /// The panic `p3-lookup`'s debug bus-balance checker

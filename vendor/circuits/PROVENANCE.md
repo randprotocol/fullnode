@@ -12,14 +12,14 @@ lock is the one cargo reads) and `target/`; the manifests are verbatim, their `[
 included, which is why the root `Cargo.toml` lists all three paths under `[workspace] exclude`. The
 copies are byte-identical to this circuits commit:
 
-circuits: b3e21d9ea16225452bcd03a94317cb61e1705979
+circuits: 76a48dca92a2d0382370f383d6680971db0cc574
 
-(Circuits main, the rVM phase-5 merge (`recursion/docs/10-phase5-n2-tier19.md`: the production
-N=2 aggregate in tier 19; `recursion/` alone moved). `research/`, `guests-compiled/` and these
-three crates are byte-identical to d217252 (constraint set 9: rVM phase 4, the MODQ chip, the
-`dilithium-verify` and `msauth` guests, the `dilithium-core` crate), and `rand-zkvm-cuda/` and
-`research/src/poseidon2_constants.rs` are byte-identical at 71e1a04, the pushed commit both
-rand-zkvm-cuda revs name.)
+(Circuits main at constraint set 11: Grain-derived Poseidon2 round constants, the declared
+poseidon2 table height (an eighth verifier-key component), the per-instance quotient layout at
+rate ¼, versioned rVM keys and cell-count gas weights. Every Poseidon2 output moved with it, so
+every guest's `hc`. `guests-compiled/` gained `evm-v1.bin` (EVM output layout 1) beside
+`evm.bin` (layout 2), and `sbpf.bin` moved (the sysvar block). `rand-zkvm-cuda/` and
+`research/src/poseidon2_constants.rs` are this commit's too: both rand-zkvm-cuda revs name it.)
 
 That is the commit `.github/workflows/ci.yml` checks out as `CIRCUITS_PIN`, and the commit
 `crates/randprotocol-zkvm/guests-compiled/PROVENANCE.md` names;

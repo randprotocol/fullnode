@@ -1566,10 +1566,10 @@ mod tests {
             // Spec 2026-09-26 §2.4: an envelope's length against the genesis constant.
             TxError::EnvelopeSize { expected: 1860, got: 1348 },
             // Spec 2026-09-28 §4.3: the proof's own declared limit against a genesis constant.
-            TxError::BundleGasLimit { want: 20_479, got: Some(20_480) },
-            TxError::BundleGasLimit { want: 20_479, got: None },
-            TxError::AuthGasLimit { want: 1_279, got: Some(1_280) },
-            TxError::AuthGasLimit { want: 1_279, got: None },
+            TxError::BundleGasLimit { want: 22_527, got: Some(22_528) },
+            TxError::BundleGasLimit { want: 22_527, got: None },
+            TxError::AuthGasLimit { want: 1_407, got: Some(1_408) },
+            TxError::AuthGasLimit { want: 1_407, got: None },
             TxError::TransactionTooLarge { size: 9_000_000, max: 4 << 20 },
             TxError::DuplicateNullifierInBundle,
             TxError::WrongChain { expected: 7, actual: 8 },

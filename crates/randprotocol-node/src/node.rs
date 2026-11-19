@@ -172,7 +172,8 @@ pub fn load_genesis(datadir: &std::path::Path) -> Result<(GenesisState, Arc<dyn 
     let text = std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
     let genesis = Genesis::from_json(&text)?;
     let executor = executor_for_profile(&genesis.fri_profile)?;
-    let gs = genesis.build(executor.as_ref())?;
+    // Constraint set 11: a listed chain of an earlier set does not build here; refused by chain id.
+    let gs = crate::constraint_set::build_genesis(&genesis, executor.as_ref())?;
     // Private multisig (plan Task 3): the executor's msauth path opens only for a genesis naming
     // `hc_auth_multisig`. On every other chain a multisig-`hc` verify is refused before any
     // decode, so no auth proof can make this node build the ~4 GB msauth key. Here, on the bare
@@ -2483,7 +2484,13 @@ fn close_batch_coverage(storage: &Storage, batch: &mut Vec<CommittedBlock>, limi
 /// - **Chains 18, 19 and 20** (v0.6.5–v0.7.x) commit proofs under constraint set 8. Constraint set
 ///   9 (the MODQ chip, private multisig phase 4) moved every verifier key and the proof encoding
 ///   (`Proof::modq_log_height`), so this build verifies none of their proofs.
-pub const CHAINS_THIS_BUILD_CANNOT_RUN: [(u64, &str, &str); 7] = [
+/// - **Chain 21** (v0.8.0–v0.8.6) commits proofs under constraint set 9. Constraint set 11 (circuits
+///   76a48dc: the Grain Poseidon2 round constants, a proof-declared poseidon2 height, the
+///   per-instance quotient layout at rate 1/4, the cell-count gas weights) moved every Poseidon2
+///   output — every guest `hc`, note commitment, nullifier, Merkle root and verifier key — and the
+///   proof encoding (`Proof::poseidon2_log_height`), so this build verifies none of chain 21's
+///   proofs and cannot even rebuild its genesis notes. Set 10 (ZKV-5) ran on no chain.
+pub const CHAINS_THIS_BUILD_CANNOT_RUN: [(u64, &str, &str); 8] = [
     (14, "1cff3b7da248d93ab547aef5c05bb7d0d22da510b592dab9cf7374807de7c7ff", CONSTRAINT_SET_6_REASON),
     (15, "cc30e0854fb25b3abcee96bb7bc206dcd6e37862f6dfe80a05b3e474c2d1b6b8", CONSTRAINT_SET_6_REASON),
     (16, "20925ae63cfa6e6c96f3ff369486ead8ea04821fec026a55df9e2893f3d53005", SPLIT_AUTH_REASON),
@@ -2491,17 +2498,20 @@ pub const CHAINS_THIS_BUILD_CANNOT_RUN: [(u64, &str, &str); 7] = [
     (18, "a7cb020cc99a33c83fc38cfa0ec1db357f67fbf8b6dab13ab1d9812280b4da76", CONSTRAINT_SET_8_REASON),
     (19, "a3defc937d561d4beb1df9a08c9cb87a3dc32dadbfc2d1814ab6f627b0a2228a", CONSTRAINT_SET_8_REASON),
     (20, "6210cf071a390d7ac61d8cbea5dd9d139d1a493a862b54a45a498f36af2d5135", CONSTRAINT_SET_8_REASON),
+    (21, "ca76c2766ed6090ac6ba5dad86b724dd5d2b80c0edfaed287cd8b129e663ca9a", CONSTRAINT_SET_9_REASON),
 ];
 
-/// The constraint set this build proves and verifies under: 9, the MODQ chip (private multisig
-/// phase 4; set 8, the gas meter, ran chains 18-20).
+/// The constraint set this build proves and verifies under: 11 — the Grain Poseidon2 constants,
+/// the proof-declared poseidon2 height, the per-instance quotient layout at rate 1/4 and the
+/// cell-count gas weights (circuits 76a48dc; chain 22 onward). Set 9, the MODQ chip, ran chain 21;
+/// set 8, the gas meter, chains 18-20; set 10 (ZKV-5) ran on no chain.
 ///
 /// A literal on purpose, held to the vendored zkVM's `CONSTRAINT_SET` by the assertion below
 /// (issue #166): a re-vendor that moves the zkVM's set stops the build here until this number is
 /// moved by hand. Moving it is a chain cut — every chain `constraint_set::CHAIN_CONSTRAINT_SETS`
 /// lists under the old set (the running one included) is refused from then on, so it goes in with
 /// the new chain's row there and never in a roll onto an existing chain.
-pub const BUILD_CONSTRAINT_SET: u32 = 9;
+pub const BUILD_CONSTRAINT_SET: u32 = 11;
 
 const _: () = assert!(
     BUILD_CONSTRAINT_SET == randprotocol_zkvm::machine::CONSTRAINT_SET,
@@ -2510,22 +2520,28 @@ const _: () = assert!(
 );
 
 const CONSTRAINT_SET_6_REASON: &str = "its proofs were made under constraint set 6; this build is constraint \
-     set 9 (v0.8.0 and later) and verifies none of them, so its startup replay would refuse the chain's own \
+     set 11 (v0.8.7 and later) and verifies none of them, so its startup replay would refuse the chain's own \
      history and a `verify --repair` would truncate it — on an archive node, the only full copy. Run the \
      chain's own release (v0.6 or earlier), never this one";
 
-const SPLIT_AUTH_REASON: &str = "its proofs were made under constraint set 7 and this build is constraint set 9, \
+const SPLIT_AUTH_REASON: &str = "its proofs were made under constraint set 7 and this build is constraint set 11, \
      and this build changes the bundle wire and every transaction id (rand-txid-3, split authorisation): a \
      `verify --repair` would truncate the chain's history — on an archive node, the only full copy. Use the \
      v0.6.1/v0.6.2 release for chain 16";
 
 const CONSTRAINT_SET_7_REASON: &str = "its proofs were made under constraint set 7; this build is constraint \
-     set 9 (v0.8.0 and later) and verifies none of them, so its startup replay would refuse the chain's own \
+     set 11 (v0.8.7 and later) and verifies none of them, so its startup replay would refuse the chain's own \
      history and a `verify --repair` would truncate it. Use the v0.6.3 release for chain 17";
 
 const CONSTRAINT_SET_8_REASON: &str = "its proofs were made under constraint set 8; this build is constraint \
-     set 9 (the MODQ chip, v0.8.0 and later) and verifies none of them, so its startup replay would refuse the \
+     set 11 (v0.8.7 and later) and verifies none of them, so its startup replay would refuse the \
      chain's own history and a `verify --repair` would truncate it. Use the v0.7.x release for chains 18-20";
+
+const CONSTRAINT_SET_9_REASON: &str = "its proofs were made under constraint set 9 (the MODQ chip); this build is \
+     constraint set 11 (the Grain Poseidon2 constants, v0.8.7 and later), under which every guest hc, note \
+     commitment, nullifier and verifier key moved, so it verifies none of them and its startup replay would \
+     refuse the chain's own history and a `verify --repair` would truncate it. Use the v0.8.6 release (or a \
+     later v0.8.x built for constraint set 9) for chain 21";
 
 /// Refuse a genesis in [`CHAINS_THIS_BUILD_CANNOT_RUN`]: `run` (through
 /// [`check_build_runs_genesis`]) and `verify` both call it before touching the datadir's blocks,
@@ -6059,12 +6075,13 @@ pub fn faucet_mint_tx(
 mod tests {
     use super::*;
 
-    /// Constraint set 9 (the MODQ chip): every verifier key and the proof encoding moved, so this
-    /// build verifies none of chain 18's, 19's or 20's proofs and must refuse their genesis before
-    /// touching a datadir.
+    /// Constraint set 9 (the MODQ chip) moved every verifier key and the proof encoding, so a
+    /// set-9-or-later build verifies none of chain 18's, 19's or 20's proofs and must refuse their
+    /// genesis before touching a datadir; constraint set 11 (Grain Poseidon2 constants) refuses
+    /// chain 21 the same way (`this_build_refuses_chain_21`).
     #[test]
     fn this_build_refuses_chains_18_to_20() {
-        assert_eq!(BUILD_CONSTRAINT_SET, 9);
+        assert_eq!(BUILD_CONSTRAINT_SET, 11);
         // Issue #166: the build's number is the vendored zkVM's (also a compile-time assertion
         // beside the constant, so a mismatch does not get as far as this test).
         assert_eq!(BUILD_CONSTRAINT_SET, randprotocol_zkvm::machine::CONSTRAINT_SET);
@@ -6077,6 +6094,23 @@ mod tests {
             assert_eq!(row.1, hash, "chain {chain}");
             assert!(row.2.contains("constraint set 8") && row.2.contains("v0.7"), "chain {chain}: {}", row.2);
         }
+    }
+    /// Constraint set 11 (Grain Poseidon2 constants): chain 21 (set 9) is listed, and its genesis
+    /// file — whose note commitments are set 9's Poseidon2 — is refused by chain id before any
+    /// datadir is touched, since under set 11 it does not even build.
+    #[test]
+    fn this_build_refuses_chain_21() {
+        let row = CHAINS_THIS_BUILD_CANNOT_RUN.iter().find(|(c, _, _)| *c == 21).expect("chain 21 listed");
+        assert_eq!(row.1, "ca76c2766ed6090ac6ba5dad86b724dd5d2b80c0edfaed287cd8b129e663ca9a");
+        assert!(row.2.contains("constraint set 9") && row.2.contains("v0.8.6"), "{}", row.2);
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../deploy/genesis-chain21.json");
+        let file = randprotocol_core::genesis::Genesis::from_json(&std::fs::read_to_string(path).unwrap()).unwrap();
+        let executor = executor_for_profile(&file.fri_profile).unwrap();
+        let Err(e) = crate::constraint_set::build_genesis(&file, executor.as_ref()) else {
+            panic!("chain 21's file built under constraint set 11")
+        };
+        let e = e.to_string();
+        assert!(e.contains("chain 21") && e.contains("constraint set 9") && e.contains("does not even build"), "{e}");
     }
     use crate::storage::fixtures::{alloc_note, bundle_fee, bundle_tx, genesis_of, key, make_block_voted};
     use randprotocol_core::confidential::StubExecutor;
@@ -6293,6 +6327,8 @@ mod tests {
     /// beacon existed (`9d9e8473`), where these values were taken. A change here is a consensus
     /// change for chain 21.
     #[test]
+    #[ignore = "chain 21 is constraint set 9: its genesis file does not build under this set-11 build \
+                (this_build_refuses_chain_21); the v0.8.6 line runs this pin"]
     fn chain_21_is_byte_for_byte_what_it_was_before_the_beacon() {
         use randprotocol_core::types::{Block, BlockHeader, QuorumCertificate};
         const PINS: [&str; 8] = [
@@ -6345,6 +6381,8 @@ mod tests {
     /// and writes the checkpoint, the second skips and starts (the snapshot comparison is on the
     /// reloaded ledger, not the raw load), and a tampered snapshot is still refused.
     #[test]
+    #[ignore = "chain 21 is constraint set 9: its genesis file does not build under this set-11 build \
+                (this_build_refuses_chain_21); the v0.8.6 line runs this pin"]
     fn chain_21_restarts_from_its_checkpoint_and_refuses_a_tampered_snapshot() {
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../deploy/genesis-chain21.json");
         let file = randprotocol_core::genesis::Genesis::from_json(&std::fs::read_to_string(path).unwrap()).unwrap();
@@ -8041,7 +8079,7 @@ mod tests {
         gs.ledger.set_gas(Some(gas::GasConfig {
             gas_price: 100,
             byte_price: 800,
-            bundle_gas_limit: 20_479,
+            bundle_gas_limit: 22_527,
             metering: gas::GasMetering::Circuit,
             dynamic: None,
         }));
@@ -8051,7 +8089,7 @@ mod tests {
         let g = reloaded.gas().expect("restored from the genesis state");
         assert_eq!(g.gas_price, 100);
         assert_eq!(g.byte_price, 800);
-        assert_eq!(g.bundle_gas_limit, 20_479);
+        assert_eq!(g.bundle_gas_limit, 22_527);
     }
 
     /// Issue #118: genesis `proof_window_blocks` survives a restart. `load_ledger` comes back at
@@ -8945,6 +8983,7 @@ mod tests {
             keccak_log_height: 1,
             sha256_log_height: 1,
             public_log_height: 1,
+            poseidon2_log_height: 1,
         };
         let (now, later) = split_at_tier_cap(vec![shape(18), shape(14), shape(20), shape(16)], 16);
         assert_eq!((now, later), (vec![shape(14), shape(16)], vec![shape(18), shape(20)]));

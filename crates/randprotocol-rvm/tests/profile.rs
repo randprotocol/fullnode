@@ -26,7 +26,7 @@ fn profile(profile: FriProfile) {
         p.proof.keccak_log_height,
         p.proof.sha256_log_height,
         p.proof.public_log_height,
-        p.proof.mem_log_height,
+        p.proof.mem_log_height, p.proof.poseidon2_log_height,
     );
     let key = InnerKey::of(profile, &shape);
     let vp = verify_rv32(&shape, &key, Checkpoints::Off);

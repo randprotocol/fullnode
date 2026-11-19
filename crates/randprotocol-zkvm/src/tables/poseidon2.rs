@@ -161,7 +161,13 @@ pub fn cube<E: Clone + core::ops::Mul<Output = E>>(x: E) -> E {
 /// table out the way p3 does and that `mds_light`/`internal_matmul`/`cube` compute the exact
 /// same permutation p3_poseidon2 does.
 pub fn permute_scalar(state: [F; 8]) -> [F; 8] {
-    let rc = round_constants();
+    permute_scalar_with(round_constants(), state)
+}
+
+/// [`permute_scalar`] over a caller's round constants: the same linear layers and S-box, so a
+/// table (`poseidon2_grain`'s derivation) can be checked against p3's permutation built from it
+/// without going through the table this chip commits to.
+pub fn permute_scalar_with(rc: &RoundConstants, state: [F; 8]) -> [F; 8] {
     let sbox_all = |s: [F; 8], round: [F; 8]| -> [F; 8] {
         core::array::from_fn(|i| {
             let p = s[i] + round[i];

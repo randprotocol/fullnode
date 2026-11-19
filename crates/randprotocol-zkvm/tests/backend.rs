@@ -63,7 +63,19 @@ fn backend_proof_has_the_same_shape_as_a_cpu_proof() {
     let (a, _) = m.prove_with(backend(), &p, &[], &[], None).unwrap();
     let (b, _) = m.prove(&p, &[], &[], None).unwrap();
     assert_eq!(a.tier, b.tier);
-    assert_eq!(a.public_values, b.public_values);
+    // Every public value but the eight of `H_IN`: `prove_with` and `prove` each draw their own
+    // input salt, so that commitment differs between the two proofs by construction (M4.1), and
+    // comparing it made this test unpassable (ZKVM-118). The salted words must differ; the rest —
+    // entry pc, tier, outputs, `hc`, `H_PUB`, gas — must agree.
+    use randprotocol_zkvm::tables::cpu::pv;
+    let salted = pv::IN0..pv::IN0 + 8;
+    assert_eq!(a.public_values.len(), b.public_values.len());
+    for (i, (x, y)) in a.public_values.iter().zip(&b.public_values).enumerate() {
+        if !salted.contains(&i) {
+            assert_eq!(x, y, "public value {i}");
+        }
+    }
+    assert_ne!(a.public_values[salted.clone()], b.public_values[salted], "two proving calls shared an H_IN salt");
     assert_eq!(a.batch.degree_bits, b.batch.degree_bits);
 
     // The commitment set: which optional commitments are present is fixed by the batch shape

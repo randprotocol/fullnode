@@ -442,6 +442,11 @@ pub enum RowError {
     Time,
     /// The row claims the party was sender/receiver but the note does not name the party's address.
     Party,
+    /// A `Received` or `Sent` row whose envelope does not open to the row's note under the
+    /// party's key — the receiver part for `Received`, the sender (`ovk`) part for `Sent`. The
+    /// note may well name the party's address: anyone can write an address into a note, but only
+    /// an envelope sealed to the party (or by it) opens under its key.
+    Envelope,
     /// A `Sent` row whose nullifier or spent commitment does not match the chain.
     Nullifier,
     /// The row's role is not one this disclosure can produce.
@@ -454,6 +459,11 @@ pub enum RowError {
 /// Checks `row` against the chain using nothing but `d` — the same key the row was
 /// produced with — so a third party handed the disclosure and the rows can confirm every
 /// row independently of whoever produced them.
+///
+/// A party's `Received` row verifies only if the envelope's receiver part opens under the
+/// party's key to the row's note and that note's owner is the party's address; a `Sent` row only
+/// if the sender (`ovk`) part opens to it and the note's creator is the party's address. (The
+/// receiver part is tried at KEM key version 0, as `scan` does.)
 pub fn verify_row(ledger: &Ledger, d: &Disclosure, row: &Row) -> Result<(), RowError> {
     // The three chain-side facts a row is checked against, read from whichever sequence and
     // slot the row names. Everything below is identical for both sources — a bundle row is the
@@ -481,11 +491,19 @@ pub fn verify_row(ledger: &Ledger, d: &Disclosure, row: &Row) -> Result<(), RowE
             if *tx != row.tx { return Err(RowError::Scope); }
             if envelope.open_with_tx_key(cm_out, key).as_ref() != Some(n) { return Err(RowError::Commitment); }
         }
+        // A party row is checked the way `scan` produced it, and against the note besides
+        // (audit v14, VK-1001): the envelope's part for that role must open, under the party's
+        // key, to exactly the row's note — *and* the note must name the party's address in that
+        // role. Either alone is not enough. A note can name anyone as owner or creator; and an
+        // envelope can be sealed to the party, or sealed with its `ovk` by anyone who holds the
+        // viewing key, around a note that is somebody else's.
         (Disclosure::Party(vk), Role::Received) => {
             if n.pk != vk.pk() { return Err(RowError::Party); }
+            if envelope.open_as_receiver(cm_out, vk).map(|(_, note)| note).as_ref() != Some(n) { return Err(RowError::Envelope); }
         }
         (Disclosure::Party(vk), Role::Sent) => {
             if n.from != vk.pk() { return Err(RowError::Party); }
+            if envelope.open_as_sender(cm_out, vk).map(|(_, note)| note).as_ref() != Some(n) { return Err(RowError::Envelope); }
             match (nf, row.spent) {
                 // A mint: created from nothing, so there is no nullifier to check.
                 (None, None) => {}

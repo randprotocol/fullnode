@@ -264,9 +264,10 @@ pub mod col {
     /// every row that is not a `JALR`. Appended at the end of the column list.
     pub const JALR_B0: usize = SYS_HASH_LEN + 1;
     /// Constraint set 8 (fullnode spec 2026-09-28 §4.2): the gas accumulated *through* this row —
-    /// `1` on row 0 (always a digest row, weight 1), then on every real row the previous row's
-    /// `GAS` plus this row's weight `1 + 2·IS_HASH + 191·SYS_KECCAK + 63·SYS_SHA256 + 167·SYS_MODQ`
-    /// (`gas::row_gas`'s constants). Read once, on the `HALT` row, against `pv::GAS`; unconstrained
+    /// `POSEIDON2_ABSORB_GAS` (4) on row 0 (always a digest row, one permutation; constraint set 10,
+    /// ZKV-5), then on every real row the previous row's
+    /// `GAS` plus this row's weight `1 + 3·(IS_HASH + IS_DIGEST + IS_INDIGEST + IS_PUBDIGEST) + 133·SYS_KECCAK + 48·SYS_SHA256 + MODQ_W`
+    /// (`gas::row_gas`'s constants, at constraint set 11's weights; `MODQ_W` is a `MODQ` row's per-op term). Read once, on the `HALT` row, against `pv::GAS`; unconstrained
     /// on padding rows (the fill copies the halt row's value forward). Appended at the end of the
     /// column list.
     pub const GAS: usize = JALR_B0 + 1;
@@ -279,10 +280,19 @@ pub mod col {
     /// `HASH_PTR`/`HP0..3`/`HP3_HI` columns exactly as a sha256 row's pointer is, and `a1` (in
     /// `MEM_VAL`, the register read every ecall row makes) is the op word. The whole call — its
     /// 1 024-row block and its memory traffic — belongs to the modq chip, which this row claims
-    /// once on `bus::MODQ` as `(CLK, HASH_PTR, MEM_VAL)` with a 0/1 count, so `CLK` is unique per
+    /// once on `bus::MODQ` as `(CLK, HASH_PTR, MEM_VAL, MODQ_W)` with a 0/1 count, so `CLK` is unique per
     /// real block. Appended at the end of the column list, like every column since M4.2.
     pub const SYS_MODQ: usize = GD0 + 4;
-    pub const WIDTH: usize = SYS_MODQ + 1;
+    /// Constraint set 11 (ZKVM-202): what a `MODQ` row weighs beyond its own 1 — `gas::modq_gas(op) − 1`
+    /// for the op its `a1` names — and zero on every other row. The cpu row holds `a1` whole (in
+    /// `MEM_VAL`) and cannot tell the op; the modq chip, which decomposes `a1` into its one-hot op
+    /// flags, supplies the weight as the fourth field of its `MODQ` table entry, and this row's
+    /// lookup takes it from there. So the value here is the chip's for this very `(CLK, BASE, a1)`,
+    /// and the gas chain adds the column as it stands: a linear term, the transition stays degree 2.
+    /// Not in `SELECTORS` (it is not boolean); `(1 − SYS_MODQ)·MODQ_W = 0` zeroes it on every
+    /// row that is not a `MODQ` row, padding rows included.
+    pub const MODQ_W: usize = SYS_MODQ + 1;
+    pub const WIDTH: usize = MODQ_W + 1;
     /// Columns that must be zero on padding rows.
     pub const SELECTORS: [usize; 32] = [
         IS_ALU, IS_IMM, IS_BRANCH, IS_LB, IS_LH, IS_LW, IS_SB, IS_SH, IS_SW, SIGNED,
@@ -368,8 +378,9 @@ where
             // as it flowed directly before M3.4.
             f.assert_one(v(IS_DIGEST));
             f.assert_eq(v(PC), pvs[pv::PC_ENTRY].clone());
-            // Constraint set 8: row 0 is a digest row, and a digest row weighs 1 (`gas::gas_of`).
-            f.assert_one(v(GAS));
+            // Constraint set 10 (ZKV-5): row 0 is a digest row, and a digest row is one permutation,
+            // so it weighs an absorb row (`gas::gas_of`).
+            f.assert_eq(v(GAS), AB::Expr::from_u64(crate::gas::POSEIDON2_ABSORB_GAS));
         }
         b.when_last_row().assert_zero(v(IS_REAL));
         {
@@ -384,14 +395,19 @@ where
             // instruction row) it never returns to 1.
             t.assert_zero((one.clone() - v(IS_DIGEST)) * n(IS_DIGEST));
             // Constraint set 8: the gas chain. The next row's weight is a constant per row kind
-            // (`gas::row_gas`'s, the same constants), so this is degree 2: `n(IS_REAL)` times a
-            // form linear in next-row selectors. No transition into a padding row is charged.
+            // (`gas::row_gas`'s, the same constants) — or, for a `MODQ` row since constraint set 11,
+            // the per-op weight the modq chip put in `MODQ_W` — so this is degree 2: `n(IS_REAL)`
+            // times a form linear in next-row columns. No transition into a padding row is charged.
+            // Constraint set 10 (ZKV-5): the three digest selectors take `IS_HASH`'s weight; the four
+            // are pairwise exclusive (below), so a row carries that term at most once.
             let w_next = one.clone()
-                + AB::Expr::from_u64(crate::gas::POSEIDON2_ABSORB_GAS - 1) * n(IS_HASH)
+                + AB::Expr::from_u64(crate::gas::POSEIDON2_ABSORB_GAS - 1) * (n(IS_HASH) + n(IS_DIGEST) + n(IS_INDIGEST) + n(IS_PUBDIGEST))
                 + AB::Expr::from_u64(crate::gas::KECCAK_GAS - 1) * n(SYS_KECCAK)
                 + AB::Expr::from_u64(crate::gas::SHA256_GAS - 1) * n(SYS_SHA256)
-                // Private multisig phase 3: `SYS_SHA256`'s twin, at `MODQ_GAS − 1`.
-                + AB::Expr::from_u64(crate::gas::MODQ_GAS - 1) * n(SYS_MODQ);
+                // Constraint set 11 (ZKVM-202): a `MODQ` row's `gas::modq_gas(op) − 1`, zero on every
+                // other row (the pin beside the `MODQ` lookup below). Row 0 is a digest row, never
+                // a `MODQ` row, so every `MODQ` row is some transition's next row and is charged.
+                + n(MODQ_W);
             t.assert_zero(n(IS_REAL) * (n(GAS) - v(GAS) - w_next));
         }
 
@@ -950,7 +966,14 @@ where
             );
             // The chip's side: one `IS_REAL·IS_FIRST` entry per real 1 024-row block, keyed by
             // `(clk, base, a1)`. A 0/1 count on a boolean selector, so one claim per ecall row.
-            bus::MODQ.lookup_key(b, [v(CLK), v(HASH_PTR), v(MEM_VAL)], Count::bounded(v(SYS_MODQ), 1));
+            // Constraint set 11 (ZKVM-202): the fourth field is the row's weight. The chip's entry
+            // for `(clk, base, a1)` carries `Σ (gas::modq_gas(op) − 1)·IS_op` over its one-hot op
+            // flags, which its `A1` identity ties to this same `a1`; `CLK` is unique per cpu row, so
+            // the lookup leaves `MODQ_W` exactly one value — the price of the op the chip performs
+            // for this row. Off a `MODQ` row nothing looks it up, so it is pinned to zero there
+            // (a free value would be a free credit or debit on the gas chain).
+            bus::MODQ.lookup_key(b, [v(CLK), v(HASH_PTR), v(MEM_VAL), v(MODQ_W)], Count::bounded(v(SYS_MODQ), 1));
+            b.assert_zero((one.clone() - v(SYS_MODQ)) * v(MODQ_W));
         }
         {
             let mut t = b.when_transition();
@@ -1779,7 +1802,7 @@ fn fill_public_digest_rows(v: &mut [F], offset: usize, base_pc: u32, public: &[u
 /// per-cycle rows, which now start `digest_rows` rows later (`CLK` shifted the same amount).
 ///
 /// Constraint set 8: `gas_limit` is the proof's declared `pv::GAS`. The fill keeps the running
-/// gas (`+1` per digest row, `gas::row_gas` per event row) in `GAS` on every real row, and on the
+/// gas (`gas::POSEIDON2_ABSORB_GAS` per digest-prefix row, `gas::row_gas` per event row) in `GAS` on every real row, and on the
 /// `HALT` row writes the byte limbs of `gas_limit − gas` into `GD0..3` (each `RANGE8`-counted).
 /// Padding rows carry the halt row's `GAS` forward (deterministic; the AIR leaves it free there)
 /// and zero limbs. Panics if `gas_limit` is below the run's gas or `2^32` or more above it —
@@ -1799,10 +1822,10 @@ pub fn cpu_trace(program: &Program, inputs: &[u32], public: &[u32], salt: [u32; 
     fill_digest_rows(&mut v, program, range);
     fill_input_digest_rows(&mut v, digest_rows, program.base_pc, salt, inputs, range);
     fill_public_digest_rows(&mut v, digest_rows + input_digest_rows, program.base_pc, public, range);
-    // Constraint set 8: the digest prefix rows weigh 1 each (`gas::gas_of`).
+    // Constraint set 10 (ZKV-5): the digest prefix rows weigh an absorb row each (`gas::gas_of`).
     let mut gas: u64 = 0;
     for i in 0..offset {
-        gas += 1;
+        gas += crate::gas::POSEIDON2_ABSORB_GAS;
         v[i * WIDTH + GAS] = F::from_u64(gas);
     }
     let mut written = [0u32; NUM_OUTPUTS];
@@ -1905,8 +1928,11 @@ pub fn cpu_trace(program: &Program, inputs: &[u32], public: &[u32], salt: [u32; 
             // Private multisig phase 3: the `Sha256` arm below, for `SYS_MODQ` — the arena base
             // in `HASH_PTR` with its bounded byte decomposition. `a1` needs nothing here: it is
             // already `MEM_VAL`, the register read every ecall row fills.
-            Some(Syscall::Modq { base, .. }) => {
+            Some(Syscall::Modq { base, a1 }) => {
                 r[SYS_MODQ] = F::ONE;
+                // Constraint set 11: the op's weight beyond the row's own 1, as the chip's `MODQ`
+                // entry states it and `gas::row_gas` charges it.
+                r[MODQ_W] = F::from_u64(crate::gas::modq_gas(crate::gas::modq_op(a1)) - 1);
                 r[HASH_PTR] = F::from_u32(base);
                 let hpl = limbs(base);
                 for k in 0..4 { r[HP0 + k] = hpl[k]; range.range8((base >> (8 * k)) & 0xff); }

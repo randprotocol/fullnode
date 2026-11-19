@@ -1,4 +1,4 @@
-//! Verifier-key blobs (`Machine::export_verifier_key_with_modq` / `Machine::install_verifier_key`):
+//! Verifier-key blobs (`Machine::export_verifier_key` / `Machine::install_verifier_key`):
 //! a key built on one machine, shipped as bytes and installed on another without a build. The
 //! fullnode's reason is the tier-18 `msauth` key (~80 s, ~4 GB to build on a 4 GB validator).
 //! Everything here is the Test profile at tier 10 with one modq block, except the `#[ignore]`d
@@ -45,9 +45,15 @@ fn one_block_proof(m: &Machine) -> ([u32; 8], Proof) {
     (p.digest(), proof)
 }
 
+/// `one_block_proof`'s shape: tier 10, the modq table at one block, the poseidon2 table at the
+/// floor (constraint set 11 declares it; the run makes a handful of permutations).
+fn one_block_shape() -> VerifierKeyShape {
+    VerifierKeyShape { tier: Tier(10), program_log_height: 7, input_log_height: 7, keccak_log_height: 0, sha256_log_height: 0, modq_log_height: 10, public_log_height: 7, poseidon2_log_height: 8 }
+}
+
 fn export_for(m: &Machine, proof: &Proof) -> VerifierKeyBlob {
     let s = VerifierKeyShape::of_proof(proof);
-    m.export_verifier_key_with_modq(s.tier, s.program_log_height, s.input_log_height, s.keccak_log_height, s.sha256_log_height, s.modq_log_height, s.public_log_height)
+    m.export_verifier_key(s)
 }
 
 #[test]
@@ -68,9 +74,9 @@ fn a_blob_round_trips_and_the_installing_machine_builds_nothing() {
     longer.push(0);
     assert!(matches!(VerifierKeyBlob::from_bytes(&longer), Err(InstallKeyError::Decode(_))));
     println!(
-        "KEY-BLOB: profile=Test shape=tier{}/p{}/i{}/k{}/s{}/m{}/pub{} bytes={} sha256={}",
+        "KEY-BLOB: profile=Test shape=tier{}/p{}/i{}/k{}/s{}/m{}/pub{}/p2{} bytes={} sha256={}",
         blob.shape.tier.0, blob.shape.program_log_height, blob.shape.input_log_height, blob.shape.keccak_log_height,
-        blob.shape.sha256_log_height, blob.shape.modq_log_height, blob.shape.public_log_height,
+        blob.shape.sha256_log_height, blob.shape.modq_log_height, blob.shape.public_log_height, blob.shape.poseidon2_log_height,
         bytes.len(), hex(&Sha256::digest(&bytes)),
     );
 
@@ -83,7 +89,7 @@ fn a_blob_round_trips_and_the_installing_machine_builds_nothing() {
     // The installed key equals a fresh build's, on a separate machine that really builds it.
     let c = Machine::new(FriProfile::Test);
     let s = VerifierKeyShape::of_proof(&proof);
-    let key = |m: &Machine| m.verifier_key_with_modq(s.tier, s.program_log_height, s.input_log_height, s.keccak_log_height, s.sha256_log_height, s.modq_log_height, s.public_log_height);
+    let key = |m: &Machine| m.verifier_key_for(s);
     assert_same_key(&key(&b), &key(&c));
     assert_eq!(c.key_builds(), 1, "c built its own");
     assert_eq!(b.key_builds(), 0);
@@ -93,7 +99,7 @@ fn a_blob_round_trips_and_the_installing_machine_builds_nothing() {
 #[test]
 fn the_pinned_install_hashes_raw_bytes_before_decoding() {
     let a = Machine::new(FriProfile::Test);
-    let blob = a.export_verifier_key_with_modq(Tier(10), 7, 7, 0, 0, 10, 7);
+    let blob = a.export_verifier_key(one_block_shape());
     let bytes = blob.to_bytes();
     let pin: [u8; 32] = Sha256::digest(&bytes).into();
     assert_eq!(randprotocol_zkvm::sha256::sha256(&bytes), pin, "the crate's sha256 is SHA-256");
@@ -115,7 +121,7 @@ fn the_pinned_install_hashes_raw_bytes_before_decoding() {
 #[test]
 fn a_tampered_lookup_multiplicity_is_refused_on_install() {
     let a = Machine::new(FriProfile::Test);
-    let blob = a.export_verifier_key_with_modq(Tier(10), 7, 7, 0, 0, 10, 7);
+    let blob = a.export_verifier_key(one_block_shape());
     let (pre, mut lookups): Wire = postcard::from_bytes(&blob.common).unwrap();
     // Round-trip check of the structural decode itself.
     assert_eq!(postcard::to_allocvec(&(&pre, &lookups)).unwrap(), blob.common);
@@ -157,7 +163,7 @@ fn a_tampered_commitment_fails_an_honest_proof() {
 #[test]
 fn a_blob_of_another_profile_format_or_constraint_set_is_refused() {
     let a = Machine::new(FriProfile::Test);
-    let blob = a.export_verifier_key_with_modq(Tier(10), 7, 7, 0, 0, 10, 7);
+    let blob = a.export_verifier_key(one_block_shape());
     let b = Machine::new(FriProfile::Test);
 
     let mut x = blob.clone();
@@ -192,7 +198,7 @@ fn a_blob_of_another_profile_format_or_constraint_set_is_refused() {
 #[test]
 fn a_filled_slot_is_never_replaced() {
     let a = Machine::new(FriProfile::Test);
-    let blob = a.export_verifier_key_with_modq(Tier(10), 7, 7, 0, 0, 10, 7);
+    let blob = a.export_verifier_key(one_block_shape());
     // A structurally valid key with a different commitment (the first tampered byte that decodes).
     let forged = (1..=16)
         .map(|at| { let mut f = blob.clone(); f.common[at] ^= 1; f })
@@ -209,7 +215,7 @@ fn a_filled_slot_is_never_replaced() {
     b.install_verifier_key(&blob).unwrap();
     b.install_verifier_key(&blob).unwrap();
     assert_eq!(b.install_verifier_key(&forged), Err(InstallKeyError::SlotFilled));
-    assert_eq!(b.export_verifier_key_with_modq(Tier(10), 7, 7, 0, 0, 10, 7), blob, "the slot still holds the original");
+    assert_eq!(b.export_verifier_key(one_block_shape()), blob, "the slot still holds the original");
     assert_eq!(b.key_builds(), 0);
 }
 
@@ -219,7 +225,7 @@ fn a_proof_of_another_shape_still_builds_its_own_key() {
     let (hc, proof) = one_block_proof(&a);
     // A key for a different shape (one more program row) is installed; the proof's shape misses.
     let s = VerifierKeyShape::of_proof(&proof);
-    let blob = a.export_verifier_key_with_modq(s.tier, s.program_log_height + 1, s.input_log_height, s.keccak_log_height, s.sha256_log_height, s.modq_log_height, s.public_log_height);
+    let blob = a.export_verifier_key(VerifierKeyShape { program_log_height: s.program_log_height + 1, ..s });
     let b = Machine::new(FriProfile::Test);
     b.install_verifier_key(&blob).unwrap();
     b.verify(&hc, &proof).unwrap();
@@ -237,15 +243,15 @@ fn export_the_production_msauth_key() {
     use randprotocol_zkvm::msauth::*;
     let m = Machine::new(FriProfile::Production);
     let t0 = std::time::Instant::now();
-    let blob = m.export_verifier_key_with_modq(MSAUTH_TIER, PINNED_PROGRAM_LOG_HEIGHT, PINNED_INPUT_LOG_HEIGHT, PINNED_KECCAK_LOG_HEIGHT, 0, PINNED_MODQ_LOG_HEIGHT, PINNED_PUBLIC_LOG_HEIGHT);
+    let blob = m.export_verifier_key(VerifierKeyShape { tier: MSAUTH_TIER, program_log_height: PINNED_PROGRAM_LOG_HEIGHT, input_log_height: PINNED_INPUT_LOG_HEIGHT, keccak_log_height: PINNED_KECCAK_LOG_HEIGHT, sha256_log_height: 0, modq_log_height: PINNED_MODQ_LOG_HEIGHT, public_log_height: PINNED_PUBLIC_LOG_HEIGHT, poseidon2_log_height: PINNED_POSEIDON2_LOG_HEIGHT });
     let wall = t0.elapsed();
     let bytes = blob.to_bytes();
     let out = format!("{}/../target/msauth-tier18-production.vkblob", env!("CARGO_MANIFEST_DIR"));
     let _ = std::fs::write(&out, &bytes);
     println!(
-        "KEY-BLOB: profile=Production shape=tier{}/p{}/i{}/k{}/s0/m{}/pub{} (mem {}) bytes={} build_wall={:.1}s sha256={} file={out}",
+        "KEY-BLOB: profile=Production shape=tier{}/p{}/i{}/k{}/s0/m{}/pub{}/p2{} (mem {}) bytes={} build_wall={:.1}s sha256={} file={out}",
         MSAUTH_TIER.0, PINNED_PROGRAM_LOG_HEIGHT, PINNED_INPUT_LOG_HEIGHT, PINNED_KECCAK_LOG_HEIGHT, PINNED_MODQ_LOG_HEIGHT,
-        PINNED_PUBLIC_LOG_HEIGHT, PINNED_MEM_LOG_HEIGHT, bytes.len(), wall.as_secs_f64(), hex(&Sha256::digest(&bytes)),
+        PINNED_PUBLIC_LOG_HEIGHT, PINNED_POSEIDON2_LOG_HEIGHT, PINNED_MEM_LOG_HEIGHT, bytes.len(), wall.as_secs_f64(), hex(&Sha256::digest(&bytes)),
     );
     let fresh = Machine::new(FriProfile::Production);
     fresh.install_verifier_key_pinned(&bytes, &Sha256::digest(&bytes).into()).unwrap();

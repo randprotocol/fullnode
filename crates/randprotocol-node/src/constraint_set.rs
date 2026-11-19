@@ -23,7 +23,8 @@
 
 use crate::node::BUILD_CONSTRAINT_SET;
 use anyhow::{anyhow, bail, Context, Result};
-use randprotocol_core::genesis::GenesisState;
+use randprotocol_core::confidential::ConfidentialExecutor;
+use randprotocol_core::genesis::{Genesis, GenesisState};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -31,7 +32,7 @@ use std::path::{Path, PathBuf};
 pub const MARKER_FILE: &str = "constraint-set";
 
 /// Every public chain since 14 by genesis hash, with the constraint set its proofs were made
-/// under (`node::CHAINS_THIS_BUILD_CANNOT_RUN` holds the same hashes for 14-20, each with its
+/// under (`node::CHAINS_THIS_BUILD_CANNOT_RUN` holds the same hashes for 14-21, each with its
 /// reason). **A chain cut adds its row here**, and a constraint-set bump needs no other edit to
 /// refuse the chains before it: every row whose set is not [`BUILD_CONSTRAINT_SET`] is refused.
 ///
@@ -93,6 +94,34 @@ fn refuse_listed_under(genesis_hash: &str, build: u32) -> Result<()> {
              datadir"
         ),
         _ => Ok(()),
+    }
+}
+
+/// `genesis.build(executor)`, the guard's refusal in place of the build's own error when the file
+/// names a listed chain of another constraint set.
+///
+/// Constraint set 11 replaced the Poseidon2 round constants (Grain), which moves every note
+/// commitment, Merkle root and state root, so a genesis file cut under an earlier set no longer
+/// *builds* under this one: its allocation notes' openings fail their commitments
+/// (`NoteCommitmentMismatch`) and its genesis hash — which covers the state root — cannot even be
+/// computed. The hash-keyed refusals ([`refuse_a_listed_chain_of_another_set`],
+/// `node::CHAINS_THIS_BUILD_CANNOT_RUN`) then never see a hash. So a build failure on a file whose
+/// `chain_id` is a listed chain of another set is reported as that chain's refusal, naming both
+/// sets, with the build's error appended; any other failure is the build's error. Nothing is read
+/// from or written to the datadir before this runs.
+pub fn build_genesis(genesis: &Genesis, executor: &dyn ConfidentialExecutor) -> Result<GenesisState> {
+    genesis.build(executor).map_err(|e| unbuildable_under(genesis.chain_id, BUILD_CONSTRAINT_SET, &e.to_string()))
+}
+
+fn unbuildable_under(chain_id: u64, build: u32, error: &str) -> anyhow::Error {
+    match CHAIN_CONSTRAINT_SETS.iter().find(|(c, _, set)| *c == chain_id && *set != build) {
+        Some((chain, hash, set)) => anyhow!(
+            "this genesis file names chain {chain} (genesis {hash}), whose proofs were made under constraint set {set}; \
+             this build is constraint set {build}, under which the file does not even build ({error}), and it verifies \
+             none of the chain's proofs. Nothing was written. Run the release built for constraint set {set} on this \
+             datadir"
+        ),
+        None => anyhow!("{error}"),
     }
 }
 
@@ -228,13 +257,31 @@ mod tests {
         out
     }
 
-    /// Chain 21 is the running chain and was cut under this build's set: the row is pinned here as
-    /// well as in the table, so moving it is a two-place edit, and this build runs it.
+    /// Chain 21 was cut under constraint set 9 and this build is 11 (chain 22's): the row is
+    /// pinned here as well as in the table, and this build refuses chain 21, naming both sets.
     #[test]
-    fn chain_21_is_listed_under_constraint_set_9_and_this_build_runs_it() {
+    fn chain_21_is_listed_under_constraint_set_9_and_this_set_11_build_refuses_it() {
         assert_eq!(listed(CHAIN_21), Some((21, 9)));
-        assert_eq!(BUILD_CONSTRAINT_SET, 9, "a bump refuses chain 21: do it at a chain cut, with the new chain's row");
-        refuse_listed_under(CHAIN_21, BUILD_CONSTRAINT_SET).unwrap();
+        assert_eq!(BUILD_CONSTRAINT_SET, 11, "set 11 is chain 22's; chain 22's row follows its cut");
+        let e = refuse_listed_under(CHAIN_21, BUILD_CONSTRAINT_SET).unwrap_err().to_string();
+        assert!(e.contains("chain 21") && e.contains("constraint set 9") && e.contains("constraint set 11"), "{e}");
+        refuse_listed_under(CHAIN_21, 9).unwrap();
+    }
+
+    /// Constraint set 11 moved every Poseidon2 output, so chain 21's committed genesis file does not
+    /// build under this build at all; `build_genesis` reports that as chain 21's refusal (both sets
+    /// named), and a failure on an unlisted chain id stays the build's own error.
+    #[test]
+    fn a_listed_chain_of_an_earlier_set_whose_file_no_longer_builds_is_refused_by_chain_id() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../deploy/genesis-chain21.json");
+        let file = Genesis::from_json(&std::fs::read_to_string(path).unwrap()).unwrap();
+        let executor = crate::node::executor_for_profile(&file.fri_profile).unwrap();
+        let e = build_genesis(&file, executor.as_ref()).expect_err("a set-9 genesis does not build under set 11").to_string();
+        assert!(e.contains("chain 21") && e.contains(CHAIN_21) && e.contains("constraint set 9") && e.contains("constraint set 11"), "{e}");
+        assert!(e.contains("Nothing was written"), "{e}");
+        let other = unbuildable_under(999, BUILD_CONSTRAINT_SET, "boom").to_string();
+        assert_eq!(other, "boom");
+        assert_eq!(unbuildable_under(21, 9, "boom").to_string(), "boom", "a set-9 build gets the build's own error");
     }
 
     /// The table and the refuse-list cannot drift: every chain `CHAINS_THIS_BUILD_CANNOT_RUN`
@@ -281,7 +328,10 @@ mod tests {
     }
 
     /// `deploy/genesis-chain<N>.json`, N ≥ 14, built by the loader `run` uses (`Genesis::from_json`,
-    /// the file's own executor, `build`): chain id and genesis hash.
+    /// the file's own executor, `build`): chain id and genesis hash. Constraint set 11 moved every
+    /// Poseidon2 output, so the files of chains cut under earlier sets do not build here
+    /// ([`build_genesis`]); for those the hash is the row's own, and this checks instead that the
+    /// file names that chain and does not build (the refusal above).
     fn committed_genesis_files() -> Vec<(u64, String)> {
         let deploy = concat!(env!("CARGO_MANIFEST_DIR"), "/../../deploy");
         let mut out = Vec::new();
@@ -296,9 +346,18 @@ mod tests {
             let file = randprotocol_core::genesis::Genesis::from_json(&std::fs::read_to_string(&path).unwrap())
                 .unwrap_or_else(|e| panic!("{name}: {e}"));
             let executor = crate::node::executor_for_profile(&file.fri_profile).unwrap();
-            let gs = file.build(executor.as_ref()).unwrap_or_else(|e| panic!("{name}: {e}"));
-            assert_eq!(gs.chain_id, n, "{name}");
-            out.push((n, gs.hash().to_hex()));
+            assert_eq!(file.chain_id, n, "{name}");
+            match file.build(executor.as_ref()) {
+                Ok(gs) => out.push((n, gs.hash().to_hex())),
+                Err(e) => {
+                    let (_, hash, set) = CHAIN_CONSTRAINT_SETS
+                        .iter()
+                        .find(|(c, _, _)| *c == n)
+                        .unwrap_or_else(|| panic!("{name} does not build ({e}) and names no listed chain"));
+                    assert!(*set < BUILD_CONSTRAINT_SET, "{name} is listed under this build's set {set} and does not build: {e}");
+                    out.push((n, hash.to_string()));
+                }
+            }
         }
         out.sort();
         out
@@ -328,12 +387,12 @@ mod tests {
         }
         let chain_21 = files.iter().find(|(c, _)| *c == 21).expect("deploy/genesis-chain21.json");
         assert_eq!(chain_21.1, CHAIN_21);
-        assert_eq!(listed(&chain_21.1), Some((21, BUILD_CONSTRAINT_SET)), "the running chain is this build's set");
+        assert_eq!(listed(&chain_21.1), Some((21, 9)), "chain 21 is constraint set 9; this build (11) is chain 22's");
     }
 
-    /// The accident the issue describes: a re-vendored build (constraint set 10) on a chain-21
-    /// datadir that predates the marker. The table refuses it, naming the chain and both
-    /// numbers, and the datadir is byte-identical afterwards.
+    /// The accident the issue describes: a re-vendored build (constraint set 10 here, 11 for
+    /// this build) on a chain-21 datadir that predates the marker. The table refuses it, naming
+    /// the chain and both numbers, and the datadir is byte-identical afterwards.
     #[test]
     fn a_constraint_set_10_build_refuses_an_unmarked_chain_21_datadir_and_writes_nothing() {
         let dir = tempfile::tempdir().unwrap();
@@ -347,6 +406,10 @@ mod tests {
         // The same datadir under this build: bound, and entitled to its marker.
         assert_eq!(bind_under(dir.path(), CHAIN_21, 9).unwrap(), Binding::Unmarked);
         assert_eq!(tree(dir.path()), before, "bind never writes");
+        // And this build's own set.
+        let e = bind_under(dir.path(), CHAIN_21, BUILD_CONSTRAINT_SET).unwrap_err().to_string();
+        assert!(e.contains("chain 21") && e.contains("constraint set 9") && e.contains("constraint set 11"), "{e}");
+        assert_eq!(tree(dir.path()), before);
     }
 
     /// A marker of another set refuses whatever the genesis is, names both numbers and the file,

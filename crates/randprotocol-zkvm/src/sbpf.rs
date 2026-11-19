@@ -49,6 +49,12 @@ impl sbpf_core::Host for HostRef {
         let digest = sponge_hash(&words[..n]);
         words[..8].copy_from_slice(&digest);
     }
+
+    fn keccak_f(&mut self, state: &mut [u32; 50]) {
+        let mut lanes = crate::keccak::words_to_state(state);
+        crate::keccak::keccak_f(&mut lanes);
+        *state = crate::keccak::state_to_words(&lanes);
+    }
 }
 
 // ---- a minimal sBPF assembler, for the hand-written test programs ------------------------------
@@ -308,15 +314,108 @@ fn accounts_span(input: &[u8]) -> usize {
 pub struct SbpfCall {
     pub elf: Vec<u8>,
     pub input: Vec<u8>,
+    /// The sysvar block the chain supplies on the public tape ([`sysvar_block`]): Clock then Rent.
+    /// `None` carries none, and a program that asks for a sysvar halts.
+    pub sysvars: Option<[u8; SYSVAR_BYTES]>,
+}
+
+/// Bytes in the sysvar block: Clock's 40 and Rent's 17.
+pub const SYSVAR_BYTES: usize = sbpf_core::interp::SYSVAR_BYTES;
+
+/// The `Clock` sysvar's fields, in its account data's order.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Clock {
+    pub slot: u64,
+    pub epoch_start_timestamp: i64,
+    pub epoch: u64,
+    pub leader_schedule_epoch: u64,
+    pub unix_timestamp: i64,
+}
+
+/// The `Rent` sysvar's fields, in its account data's order.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct Rent {
+    pub lamports_per_byte_year: u64,
+    pub exemption_threshold: f64,
+    pub burn_percent: u8,
+}
+
+/// Solana's default rent (`Rent::default()`): 3 480 lamports per byte-year, two years to be
+/// exempt, 50 % burnt.
+pub const DEFAULT_RENT: Rent =
+    Rent { lamports_per_byte_year: 3_480, exemption_threshold: 2.0, burn_percent: 50 };
+
+impl Rent {
+    /// The `Rent` sysvar account's data: bincode of the three fields, 17 bytes.
+    pub fn account_data(&self) -> [u8; 17] {
+        let mut b = [0u8; 17];
+        b[..8].copy_from_slice(&self.lamports_per_byte_year.to_le_bytes());
+        b[8..16].copy_from_slice(&self.exemption_threshold.to_le_bytes());
+        b[16] = self.burn_percent;
+        b
+    }
+
+    /// `Rent::minimum_balance(data_len)`: what an account of `data_len` bytes must hold to be
+    /// rent-exempt (128 bytes of account metadata are charged too).
+    pub fn minimum_balance(&self, data_len: usize) -> u64 {
+        (((128 + data_len as u64) * self.lamports_per_byte_year) as f64 * self.exemption_threshold)
+            as u64
+    }
+}
+
+impl Clock {
+    /// The `Clock` sysvar account's data: five little-endian 8-byte integers.
+    pub fn account_data(&self) -> [u8; 40] {
+        let mut b = [0u8; 40];
+        b[..8].copy_from_slice(&self.slot.to_le_bytes());
+        b[8..16].copy_from_slice(&self.epoch_start_timestamp.to_le_bytes());
+        b[16..24].copy_from_slice(&self.epoch.to_le_bytes());
+        b[24..32].copy_from_slice(&self.leader_schedule_epoch.to_le_bytes());
+        b[32..].copy_from_slice(&self.unix_timestamp.to_le_bytes());
+        b
+    }
+}
+
+/// The sysvar block of the public tape: `clock`'s account data then `rent`'s.
+pub fn sysvar_block(clock: &Clock, rent: &Rent) -> [u8; SYSVAR_BYTES] {
+    let mut b = [0u8; SYSVAR_BYTES];
+    b[..40].copy_from_slice(&clock.account_data());
+    b[40..].copy_from_slice(&rent.account_data());
+    b
 }
 
 impl SbpfCall {
-    /// The **public** input vector: `[n_elf, elf bytes…]`, the byte string four per word
-    /// little-endian and zero-padded. The ELF is public by construction — the chain publishes the
-    /// program it means to run, and `H_PUB` over these words is what binds it
-    /// (`Machine::verify_public`), which is why the guest no longer hashes the ELF itself.
+    /// The **public** input vector: `[n_elf, elf bytes…, n_sysvars, sysvar bytes…]`, each byte
+    /// string four per word little-endian and zero-padded. The ELF is public by construction — the
+    /// chain publishes the program it means to run, and `H_PUB` over these words is what binds it
+    /// (`Machine::verify_public`), which is why the guest no longer hashes the ELF itself. The
+    /// sysvars are public for the same reason: they are the chain's own clock and rent, and
+    /// `H_PUB` is what stops a prover choosing them.
     pub fn public_words(&self) -> Vec<u32> {
-        pack_bytes(&self.elf)
+        let mut w = pack_bytes(&self.elf);
+        w.extend(self.sysvar_words());
+        w
+    }
+
+    /// The **public** input vector of an `sbpf2rv`-translated image of this call's program:
+    /// `[n_sysvars, sysvar bytes…]` and nothing else. The image carries the whole program — code,
+    /// addresses and read-only data (`sbpf_core::baked`) — so there is no ELF for the tape to
+    /// carry; `hc` binds the program, and `H_PUB` the sysvars.
+    pub fn translated_public_words(&self) -> Vec<u32> {
+        self.sysvar_words()
+    }
+
+    /// The sysvar block's words alone: `[n_sysvars, sysvar bytes…]` — one zero word if the call
+    /// carries none.
+    pub fn sysvar_words(&self) -> Vec<u32> {
+        pack_bytes(self.sysvars.as_ref().map_or(&[], |b| &b[..]))
+    }
+
+    /// What the run left as return data (`sol_set_return_data`), whatever its status. The public
+    /// output binds it only for status 1.
+    pub fn return_data(&self) -> Vec<u8> {
+        let (_, _, ws) = self.run_natively();
+        ws.return_data[..ws.return_len].to_vec()
     }
 
     /// The **private** input vector: `[n_input, input bytes…]`, the serialized instruction only —
@@ -359,6 +458,12 @@ impl SbpfCall {
         );
         (out, result, ws)
     }
+}
+
+/// `return_hash`: `sha256` of a run's return data, as the public output's preimage carries it.
+/// `return_hash_of(&[])` is what a run that set none — or did not return success — binds.
+pub fn return_hash_of(data: &[u8]) -> [u8; 32] {
+    sha256::sha256(data)
 }
 
 /// A byte string as an input vector: its length, then its bytes four per word little-endian and
@@ -597,6 +702,7 @@ pub fn spl_transfer(amount: u64) -> SbpfCall {
     SbpfCall {
         elf: SPL_TOKEN_ELF.to_vec(),
         input: serialize_aligned(&accounts, &data, &SPL_TOKEN_ID),
+        sysvars: None,
     }
 }
 
@@ -604,3 +710,186 @@ pub fn spl_transfer(amount: u64) -> SbpfCall {
 pub const SPL_TRANSFER_SOURCE_BALANCE: u64 = 1_000_000;
 /// The destination token account's balance in [`spl_transfer`]'s fixture.
 pub const SPL_TRANSFER_DEST_BALANCE: u64 = 7;
+
+// ---- ZKVM-116: SPL Token instructions that need return data or the Rent sysvar -----------------
+
+/// `Sysvar1111111111111111111111111111111111111`, the owner of every sysvar account.
+pub const SYSVAR_OWNER_ID: [u8; 32] = [
+    6, 167, 213, 23, 24, 117, 247, 41, 199, 61, 147, 64, 143, 33, 97, 32, 6, 126, 216, 140, 118,
+    224, 140, 40, 127, 193, 148, 96, 0, 0, 0, 0,
+];
+/// `TokenInstruction::InitializeAccount`'s discriminant (the Rent sysvar is its fourth account).
+pub const INITIALIZE_ACCOUNT_TAG: u8 = 1;
+/// `TokenInstruction::InitializeAccount3`'s discriminant (the owner is in the instruction data and
+/// rent comes from `Rent::get()`, i.e. the `sol_get_sysvar` syscall).
+pub const INITIALIZE_ACCOUNT3_TAG: u8 = 18;
+/// `TokenInstruction::GetAccountDataSize`'s discriminant (the answer is return data).
+pub const GET_ACCOUNT_DATA_SIZE_TAG: u8 = 21;
+/// `TokenInstruction::AmountToUiAmount`'s discriminant (the answer is return data).
+pub const AMOUNT_TO_UI_AMOUNT_TAG: u8 = 23;
+
+/// The clock every fixture below carries. No SPL Token instruction reads it; it is there so the
+/// sysvar block is a whole one.
+pub const FIXTURE_CLOCK: Clock = Clock {
+    slot: 250_000_123,
+    epoch_start_timestamp: 1_760_000_000,
+    epoch: 578,
+    leader_schedule_epoch: 579,
+    unix_timestamp: 1_760_086_400,
+};
+
+fn fixture_mint() -> Account {
+    Account {
+        key: key(1),
+        owner: SPL_TOKEN_ID,
+        lamports: 1_461_600,
+        data: mint_data(Some(key(2)), 1_000_007, 6),
+        is_signer: false,
+        is_writable: false,
+        executable: false,
+        rent_epoch: u64::MAX,
+    }
+}
+
+/// An uninitialized token account: 165 zero bytes owned by the token program, holding `lamports`.
+fn blank_token_account(lamports: u64) -> Account {
+    Account {
+        key: key(5),
+        owner: SPL_TOKEN_ID,
+        lamports,
+        data: vec![0u8; TOKEN_ACCOUNT_LEN],
+        is_signer: false,
+        is_writable: true,
+        executable: false,
+        rent_epoch: u64::MAX,
+    }
+}
+
+/// SPL Token `InitializeAccount`: `[account (writable), mint, owner, Rent sysvar account]`. The
+/// program reads rent from the fourth account's data (`Rent::from_account_info`), so this one
+/// needs no syscall — the account, like every account, is bound by `input_hash`. `lamports` is the
+/// new account's balance: below `rent.minimum_balance(165)` the program answers
+/// `TokenError::NotRentExempt`.
+pub fn spl_initialize_account(lamports: u64, rent: &Rent) -> SbpfCall {
+    let accounts = [
+        blank_token_account(lamports),
+        fixture_mint(),
+        Account {
+            key: key(2),
+            owner: [0u8; 32],
+            lamports: 1_000_000_000,
+            data: Vec::new(),
+            is_signer: false,
+            is_writable: false,
+            executable: false,
+            rent_epoch: u64::MAX,
+        },
+        Account {
+            key: sbpf_core::syscalls::RENT_ID,
+            owner: SYSVAR_OWNER_ID,
+            lamports: 1_009_200,
+            data: rent.account_data().to_vec(),
+            is_signer: false,
+            is_writable: false,
+            executable: false,
+            rent_epoch: u64::MAX,
+        },
+    ];
+    SbpfCall {
+        elf: SPL_TOKEN_ELF.to_vec(),
+        input: serialize_aligned(&accounts, &[INITIALIZE_ACCOUNT_TAG], &SPL_TOKEN_ID),
+        sysvars: Some(sysvar_block(&FIXTURE_CLOCK, rent)),
+    }
+}
+
+/// SPL Token `InitializeAccount3`: `[account (writable), mint]`, the owner in the instruction
+/// data. Rent comes from `Rent::get()`, which this ELF makes through `sol_get_sysvar` — so the
+/// answer depends on the **public tape's** sysvar block (`sysvars`), and with `None` the run halts.
+pub fn spl_initialize_account3(lamports: u64, sysvars: Option<[u8; SYSVAR_BYTES]>) -> SbpfCall {
+    let accounts = [blank_token_account(lamports), fixture_mint()];
+    let mut data = vec![INITIALIZE_ACCOUNT3_TAG];
+    data.extend_from_slice(&key(2));
+    SbpfCall {
+        elf: SPL_TOKEN_ELF.to_vec(),
+        input: serialize_aligned(&accounts, &data, &SPL_TOKEN_ID),
+        sysvars,
+    }
+}
+
+/// The owner [`spl_initialize_account`] and [`spl_initialize_account3`] give the new account, and
+/// the mint they name.
+pub fn spl_initialize_account_owner_and_mint() -> ([u8; 32], [u8; 32]) {
+    (key(2), key(1))
+}
+
+/// SPL Token `GetAccountDataSize`: `[mint]`. Changes nothing; returns `Account::LEN` (165) as eight
+/// little-endian bytes of return data.
+pub fn spl_get_account_data_size() -> SbpfCall {
+    SbpfCall {
+        elf: SPL_TOKEN_ELF.to_vec(),
+        input: serialize_aligned(&[fixture_mint()], &[GET_ACCOUNT_DATA_SIZE_TAG], &SPL_TOKEN_ID),
+        sysvars: Some(sysvar_block(&FIXTURE_CLOCK, &DEFAULT_RENT)),
+    }
+}
+
+/// SPL Token `AmountToUiAmount`: `[mint]` (6 decimals in the fixture). Returns the amount as a
+/// decimal string of return data.
+pub fn spl_amount_to_ui_amount(amount: u64) -> SbpfCall {
+    let mut data = vec![AMOUNT_TO_UI_AMOUNT_TAG];
+    data.extend_from_slice(&amount.to_le_bytes());
+    SbpfCall {
+        elf: SPL_TOKEN_ELF.to_vec(),
+        input: serialize_aligned(&[fixture_mint()], &data, &SPL_TOKEN_ID),
+        sysvars: Some(sysvar_block(&FIXTURE_CLOCK, &DEFAULT_RENT)),
+    }
+}
+
+/// How one call's compute units split, measured on the interpreter natively.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Measurement {
+    pub result: Result<u64, Halt>,
+    /// sBPF instructions executed.
+    pub instructions: u64,
+    /// Compute units consumed: the instructions plus every syscall's charge.
+    pub compute_units: u64,
+    /// The syscalls' fixed charges (`syscalls::base_cost`), which a translated program pays in its
+    /// block charges.
+    pub syscall_base_units: u64,
+    /// The syscalls' length-dependent charges, which `sbpf-rt` charges at run time.
+    pub syscall_extra_units: u64,
+}
+
+/// Runs `call`'s program over its instruction region with its sysvars, as `run_call` does after
+/// decoding, and reports the meter. Panics on an ELF that does not load.
+pub fn measure(call: &SbpfCall) -> Measurement {
+    let mut elf = call.elf.clone();
+    let p = sbpf_core::elf::load(&mut elf).expect("a loadable ELF");
+    let mut input = call.input.clone();
+    let id = sbpf_core::abi::program_id(&input);
+    let mut stack = vec![0u8; STACK_BYTES].into_boxed_slice();
+    let mut heap = vec![0u8; HEAP_BYTES].into_boxed_slice();
+    let mut h = HostRef;
+    let mem = Memory {
+        text: p.text,
+        text_va: p.text_va,
+        rodata: p.rodata,
+        rodata_base: p.rodata_va,
+        stack: (&mut stack[..]).try_into().unwrap(),
+        heap: (&mut heap[..]).try_into().unwrap(),
+        input: &mut input,
+    };
+    let mut vm = Vm::new(&mut h, &p, mem);
+    if let Some(block) = &call.sysvars {
+        vm.sysvars = *block;
+        vm.sysvars_len = SYSVAR_BYTES;
+    }
+    vm.program_id = id;
+    let result = vm.run();
+    Measurement {
+        result,
+        instructions: vm.instructions_executed(),
+        compute_units: vm.compute_units_consumed(),
+        syscall_base_units: vm.syscall_base_units,
+        syscall_extra_units: vm.syscall_extra_units,
+    }
+}

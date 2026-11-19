@@ -463,7 +463,7 @@ fn cpu_trace_mirrors_events_and_pads() {
     // Constraint set 8: `GAS` accumulates through every real row and ends, on the `HALT` row, at
     // exactly `gas::gas_of` — the limit passed above, so the halt row's `GD0..3` slack is zero.
     let gas = randprotocol_zkvm::gas::gas_of(&p, &[], &[], &e.events);
-    assert_eq!(t.values[cpu::col::GAS], F::ONE, "row 0 is a digest row, weight 1");
+    assert_eq!(t.values[cpu::col::GAS], F::from_u64(randprotocol_zkvm::gas::POSEIDON2_ABSORB_GAS), "row 0 is a digest row, one permutation (ZKV-5)");
     assert_eq!(t.values[last_real * w + cpu::col::GAS], F::from_u64(gas));
     for k in 0..4 { assert_eq!(t.values[last_real * w + cpu::col::GD0 + k], F::ZERO); }
     // Padding rows are all-zero except the `written` accumulators, which must carry the

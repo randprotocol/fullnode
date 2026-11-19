@@ -8,7 +8,9 @@
 //! wrong by hand (`SDIV`/`SMOD` truncation, `SAR`'s sign fill, `BYTE`/`SIGNEXTEND` index
 //! direction, the shifts at counts ≥ 256).
 
-use evm_core::interp::{Buffers, Env, Halt, Interpreter, Outcome, MAX_CALLDATA_BYTES, MAX_CODE_BYTES};
+use evm_core::interp::{
+    Buffers, Env, Halt, Interpreter, Outcome, MAX_CALLDATA_BYTES, MAX_CODE_BYTES, MAX_TRANSIENT_SLOTS,
+};
 use evm_core::storage::StorageTree;
 use evm_core::u256::U256;
 use randprotocol_zkvm::evm::{empty_root, HostRef, SparseTree};
@@ -43,7 +45,7 @@ fn run_with(code: &[u8], calldata: &[u8], tree: &SparseTree, slots: &[U256]) -> 
             evm_core::storage::Witness {
                 slot: w.slot,
                 value: w.value,
-                siblings: w.siblings,
+                siblings: w.siblings.try_into().unwrap(),
                 verified: false,
             },
         )
@@ -123,7 +125,8 @@ fn stack_limits_out_of_gas_invalid_and_traps() {
     assert_eq!(run(&[0xfe], &[]).halt, Halt::Invalid);
     assert_eq!(run(&[0x42], &[]).halt, Halt::Trap(0x42)); // TIMESTAMP is out of scope
     assert_eq!(run(&[0xf1], &[]).halt, Halt::Trap(0xf1)); // CALL
-    assert_eq!(run(&[0x5e], &[]).halt, Halt::Trap(0x5e)); // MCOPY
+    assert_eq!(run(&[0x49], &[]).halt, Halt::Trap(0x49)); // BLOBHASH
+    assert_eq!(run(&[0x4a], &[]).halt, Halt::Trap(0x4a)); // BLOBBASEFEE
     let mut h = HostRef;
     let mut st = StorageTree::new(empty_root());
     let mut e = env();
@@ -400,6 +403,7 @@ fn exactly_the_planned_opcodes_are_supported() {
         0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, // arithmetic
         0x10, 0x11, 0x12, 0x13, 0x14, 0x15, // comparison
         0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, // bitwise
+        0x1e, // CLZ (EIP-7939, Osaka)
         0x20, // KECCAK256
         0x30, 0x33, 0x34, // ADDRESS, CALLER, CALLVALUE
         0x35, 0x36, 0x37, // CALLDATALOAD, CALLDATASIZE, CALLDATACOPY
@@ -408,6 +412,8 @@ fn exactly_the_planned_opcodes_are_supported() {
         0x50, 0x51, 0x52, 0x53, // POP, MLOAD, MSTORE, MSTORE8
         0x54, 0x55, // SLOAD, SSTORE
         0x56, 0x57, 0x58, 0x59, 0x5a, 0x5b, // JUMP, JUMPI, PC, MSIZE, GAS, JUMPDEST
+        0x5c, 0x5d, // TLOAD, TSTORE (EIP-1153, Cancun)
+        0x5e, // MCOPY (EIP-5656, Cancun)
         0xa0, 0xa1, 0xa2, 0xa3, 0xa4, // LOG0–LOG4
         0xf3, 0xfd, // RETURN, REVERT
     ];
@@ -425,6 +431,240 @@ fn exactly_the_planned_opcodes_are_supported() {
             assert_eq!(halt, Halt::Trap(op), "opcode {op:#04x} is out of scope but does not trap");
         }
     }
+}
+
+// ---- the post-Shanghai opcodes: CLZ (Osaka), TLOAD/TSTORE and MCOPY (Cancun) ----------------
+
+/// `PUSH32 v`.
+fn push32(v: &U256) -> Vec<u8> {
+    let mut out = vec![0x7f];
+    out.extend_from_slice(&v.to_be_bytes());
+    out
+}
+
+/// EIP-7939's `CLZ`: the leading zero bits of the 256-bit word, 256 for zero, at the static 5.
+#[test]
+fn clz_counts_the_leading_zero_bits() {
+    let pow = |k: u32| U256::ONE.shl(&U256::from_u32(k));
+    let cases: [(U256, u32); 9] = [
+        (U256::ZERO, 256),
+        (U256::ONE, 255),
+        (U256::from_u32(0x80), 248),
+        (U256::from_u32(0xffff_ffff), 224),
+        (pow(32), 223),
+        (pow(128).sub(&U256::ONE), 128),
+        (pow(254), 1),
+        (pow(255), 0),
+        (U256::MAX, 0),
+    ];
+    for (v, want) in cases {
+        let mut c = push32(&v);
+        c.push(0x1e);
+        c.extend(ret_top());
+        let o = run(&c, &[]);
+        assert_eq!(o.halt, Halt::Return, "{v:?}");
+        assert_eq!(ret_u256(&o), U256::from_u32(want), "CLZ({v:?})");
+        // PUSH32 CLZ(5) PUSH0 MSTORE(3 + mem 3) PUSH1 PUSH0 RETURN
+        assert_eq!(o.gas_used, 3 + 5 + 2 + 3 + 3 + 3 + 2, "{v:?}");
+        let theirs = revm_run_spec(&c, &[], revm::primitives::hardfork::SpecId::OSAKA);
+        assert_eq!((theirs.status, &theirs.ret[..], theirs.gas_used), (1, &o.ret[..32], o.gas_used));
+    }
+    // An empty stack underflows.
+    assert_eq!(run(&[0x1e], &[]).halt, Halt::StackUnderflow);
+}
+
+/// `MSTORE(0, 0x0102…20)`, then `MCOPY(dst, src, len)`, then `RETURN(0, 32)`.
+fn mcopy_over_ramp(dst: u8, src: u8, len: u8) -> Vec<u8> {
+    let mut ramp = [0u8; 32];
+    for (i, b) in ramp.iter_mut().enumerate() {
+        *b = i as u8 + 1;
+    }
+    let mut c = push32(&U256::from_be_bytes(&ramp));
+    c.extend([0x5f, 0x52]);
+    c.extend([0x60, len, 0x60, src, 0x60, dst, 0x5e]);
+    c.extend([0x60, 0x20, 0x5f, 0xf3]);
+    c
+}
+
+/// EIP-5656's `MCOPY`: `dst`, `src`, `len` popped with `dst` on top; overlapping ranges copy as
+/// `memmove` does, in either direction; 3 static, 3 a word, and the expansion over
+/// `max(dst, src) + len`.
+#[test]
+fn mcopy_is_memmove_with_the_copy_gas_and_the_expansion_over_both_ranges() {
+    let ramp: Vec<u8> = (1..=32).collect();
+    // Forward overlap: [1, 9) <- [0, 8).
+    let o = run(&mcopy_over_ramp(1, 0, 8), &[]);
+    assert_eq!(o.halt, Halt::Return);
+    let mut want = ramp.clone();
+    want.copy_within(0..8, 1);
+    assert_eq!(&o.ret[..32], &want[..], "forward overlap");
+    assert_eq!(&want[..10], &[1, 1, 2, 3, 4, 5, 6, 7, 8, 10]);
+    // Backward overlap: [0, 8) <- [1, 9).
+    let o = run(&mcopy_over_ramp(0, 1, 8), &[]);
+    let mut want = ramp.clone();
+    want.copy_within(1..9, 0);
+    assert_eq!(&o.ret[..32], &want[..], "backward overlap");
+    assert_eq!(&want[..9], &[2, 3, 4, 5, 6, 7, 8, 9, 9]);
+    // In place, and a copy whose source runs past what was written (zeros come with it).
+    let o = run(&mcopy_over_ramp(5, 5, 20), &[]);
+    assert_eq!(&o.ret[..32], &ramp[..]);
+    let o = run(&mcopy_over_ramp(0, 16, 32), &[]);
+    let mut want = ramp[16..].to_vec();
+    want.extend([0u8; 16]);
+    assert_eq!(&o.ret[..32], &want[..]);
+    for (d, s, l) in [(1, 0, 8), (0, 1, 8), (5, 5, 20), (0, 16, 32), (0x40, 0, 33), (0, 0x40, 1), (7, 3, 0)] {
+        let c = mcopy_over_ramp(d, s, l);
+        let ours = run(&c, &[]);
+        let theirs = revm_run_spec(&c, &[], revm::primitives::hardfork::SpecId::OSAKA);
+        assert_eq!(ours.status(), theirs.status, "({d}, {s}, {l})");
+        assert_eq!(&ours.ret[..ours.ret_len], &theirs.ret[..], "({d}, {s}, {l})");
+        assert_eq!(ours.gas_used, theirs.gas_used, "gas ({d}, {s}, {l})");
+    }
+    // The gas by hand: one word written, then MCOPY(0x40, 0, 33) — two words copied and the
+    // memory grown from 1 word to 4 (max(0x40, 0) + 33 = 97 bytes).
+    // PUSH32 PUSH0 MSTORE(3 + 3) PUSH1 PUSH0 PUSH1 MCOPY(3 + 3·2 + (12 − 3)) STOP
+    let mut c = push32(&U256::ONE);
+    c.extend([0x5f, 0x52, 0x60, 33, 0x5f, 0x60, 0x40, 0x5e, 0x59, 0x00]);
+    let o = run(&c[..c.len() - 2], &[]);
+    assert_eq!(o.halt, Halt::Stop);
+    assert_eq!(o.gas_used, 3 + 2 + 6 + 3 + 2 + 3 + (3 + 6 + 9));
+    // ... and MSIZE after it is the four words.
+    let mut c2 = c[..c.len() - 1].to_vec();
+    c2.extend(ret_top());
+    assert_eq!(ret_u256(&run(&c2, &[])), U256::from_u32(128));
+    // The expansion covers the source range too: MCOPY(0, 0x40, 1) grows memory to 0x41 bytes.
+    let c3 = [0x60, 0x01, 0x60, 0x40, 0x5f, 0x5e, 0x59, 0x5f, 0x52, 0x60, 0x20, 0x5f, 0xf3];
+    assert_eq!(ret_u256(&run(&c3, &[])), U256::from_u32(96));
+    // A zero length touches nothing and pays only the static 3, whatever the offsets.
+    let mut z = vec![0x5f];
+    z.extend(push32(&U256::MAX));
+    z.extend(push32(&U256::MAX));
+    z.extend([0x5e, 0x59, 0x5f, 0x52, 0x60, 0x20, 0x5f, 0xf3]);
+    let o = run(&z, &[]);
+    assert_eq!(o.halt, Halt::Return);
+    assert_eq!(ret_u256(&o), U256::ZERO, "MSIZE after a zero-length MCOPY");
+    // A length past the memory, or a range ending past it, is the capacity halt.
+    let mut big = push32(&U256::from_u32(65_537));
+    big.extend([0x5f, 0x5f, 0x5e, 0x00]);
+    assert_eq!(run(&big, &[]).halt, Halt::OutOfBounds);
+    let past = [0x60, 0x01, 0x5f, 0x62, 0x01, 0x00, 0x00, 0x5e, 0x00]; // MCOPY(0x10000, 0, 1)
+    assert_eq!(run(&past, &[]).halt, Halt::OutOfBounds);
+    let past_src = [0x60, 0x01, 0x62, 0x01, 0x00, 0x00, 0x5f, 0x5e, 0x00]; // MCOPY(0, 0x10000, 1)
+    assert_eq!(run(&past_src, &[]).halt, Halt::OutOfBounds);
+    assert_eq!(run(&[0x5f, 0x5f, 0x5e], &[]).halt, Halt::StackUnderflow);
+}
+
+/// EIP-1153's transient storage: `TSTORE`/`TLOAD` at 100 each over a key→value map of its own,
+/// empty at the start of every call, never read from or written to the storage tree — so no
+/// witness is needed and the root does not move.
+#[test]
+fn tload_and_tstore_are_a_separate_map_that_starts_empty() {
+    // TSTORE(1, 42); TLOAD(1) + TLOAD(2), returned.
+    let c = [0x60, 42, 0x60, 0x01, 0x5d, 0x60, 0x01, 0x5c, 0x60, 0x02, 0x5c, 0x01, 0x5f, 0x52, 0x60, 0x20, 0x5f, 0xf3];
+    let t = SparseTree::new();
+    let (o, root) = run_with(&c, &[], &t, &[]);
+    assert_eq!(o.halt, Halt::Return);
+    assert_eq!(ret_u256(&o), U256::from_u32(42));
+    assert_eq!(root, t.root(), "transient storage never reaches the storage tree");
+    // PUSH1 PUSH1 TSTORE PUSH1 TLOAD PUSH1 TLOAD ADD PUSH0 MSTORE(3 + 3) PUSH1 PUSH0 RETURN
+    assert_eq!(o.gas_used, 3 + 3 + 100 + 3 + 100 + 3 + 100 + 3 + 2 + 6 + 3 + 2);
+    // A storage slot of the same number is untouched by it: SLOAD(1) after TSTORE(1, 42) reads
+    // the tree's value (here 7, witnessed).
+    let mut t7 = SparseTree::new();
+    t7.insert(U256::ONE, U256::from_u32(7));
+    let c = [0x60, 42, 0x60, 0x01, 0x5d, 0x60, 0x01, 0x54, 0x5f, 0x52, 0x60, 0x20, 0x5f, 0xf3];
+    let (o, root) = run_with(&c, &[], &t7, &[U256::ONE]);
+    assert_eq!(ret_u256(&o), U256::from_u32(7));
+    assert_eq!(root, t7.root());
+    // Each call starts empty: the same Buffers, a second call, TLOAD(1) is 0.
+    let mut h = HostRef;
+    let mut b = Box::new(Buffers::ZERO);
+    let mut st = StorageTree::new(empty_root());
+    let set = [0x60, 42, 0x60, 0x01, 0x5d, 0x00];
+    assert_eq!(Interpreter::new(&mut h, &set, &[], env(), &mut st, &mut b).run().halt, Halt::Stop);
+    let mut get = vec![0x60, 0x01, 0x5c];
+    get.extend(ret_top());
+    let o = Interpreter::new(&mut h, &get, &[], env(), &mut st, &mut b).run();
+    assert_eq!(ret_u256(&o), U256::ZERO);
+    // The last store wins, and storing zero reads back as zero.
+    let c = [0x60, 1, 0x60, 9, 0x5d, 0x60, 2, 0x60, 9, 0x5d, 0x60, 9, 0x5c, 0x5f, 0x52, 0x60, 0x20, 0x5f, 0xf3];
+    assert_eq!(ret_u256(&run(&c, &[])), U256::from_u32(2));
+    let c = [0x60, 1, 0x60, 9, 0x5d, 0x5f, 0x60, 9, 0x5d, 0x60, 9, 0x5c, 0x5f, 0x52, 0x60, 0x20, 0x5f, 0xf3];
+    assert_eq!(ret_u256(&run(&c, &[])), U256::ZERO);
+    // Underflow.
+    assert_eq!(run(&[0x5c], &[]).halt, Halt::StackUnderflow);
+    assert_eq!(run(&[0x5f, 0x5d], &[]).halt, Halt::StackUnderflow);
+    // Gas against revm (whose bare host has an empty transient map: TLOAD of a key never stored).
+    let c = [0x60, 42, 0x61, 0x77, 0x77, 0x5d, 0x60, 0x01, 0x5c, 0x5f, 0x52, 0x60, 0x20, 0x5f, 0xf3];
+    let ours = run(&c, &[]);
+    let theirs = revm_run_spec(&c, &[], revm::primitives::hardfork::SpecId::OSAKA);
+    assert_eq!((ours.status(), ours.gas_used), (theirs.status, theirs.gas_used));
+    assert_eq!(&ours.ret[..32], &theirs.ret[..]);
+}
+
+/// The map is a fixed table of [`MAX_TRANSIENT_SLOTS`] keys: one more distinct key with a non-zero
+/// value is the capacity halt (`OutOfBounds`), while overwriting a key it holds, or storing zero
+/// under a key it does not (which reads back as zero either way), still succeeds when it is full.
+#[test]
+fn transient_storage_is_bounded_and_full_is_the_capacity_halt() {
+    // TSTORE(k, 1) for k = 1..=n, then `tail`.
+    let fill = |n: usize, tail: &[u8]| {
+        let mut c = Vec::new();
+        for k in 1..=n {
+            c.extend([0x60, 0x01, 0x61, (k >> 8) as u8, k as u8, 0x5d]);
+        }
+        c.extend_from_slice(tail);
+        c
+    };
+    assert_eq!(run(&fill(MAX_TRANSIENT_SLOTS, &[0x00]), &[]).halt, Halt::Stop);
+    assert_eq!(run(&fill(MAX_TRANSIENT_SLOTS + 1, &[0x00]), &[]).halt, Halt::OutOfBounds);
+    // Full, then: overwrite key 1 with 5; store zero under a new key; read both back, summed.
+    let tail = [
+        0x60, 0x05, 0x60, 0x01, 0x5d, // TSTORE(1, 5)
+        0x5f, 0x61, 0x10, 0x00, 0x5d, // TSTORE(0x1000, 0)
+        0x60, 0x01, 0x5c, 0x61, 0x10, 0x00, 0x5c, 0x01, // TLOAD(1) + TLOAD(0x1000)
+        0x5f, 0x52, 0x60, 0x20, 0x5f, 0xf3,
+    ];
+    let o = run(&fill(MAX_TRANSIENT_SLOTS, &tail), &[]);
+    assert_eq!(o.halt, Halt::Return);
+    assert_eq!(ret_u256(&o), U256::from_u32(5));
+}
+
+/// A fourth differential shape, at Osaka: small-operand programs over `CLZ`, `MCOPY` and `TLOAD`
+/// mixed with the memory opcodes, so `MCOPY`'s overlap, its expansion over both ranges and its
+/// interplay with `MSIZE`/`MLOAD` meet revm's. `TSTORE` writes only key 0x7777, which nothing
+/// loads — revm's bare host keeps no transient map, so a load of a stored key cannot be compared;
+/// the hand-written tests above pin that.
+#[test]
+fn random_cancun_and_osaka_programs_agree_with_revm() {
+    use rand::{RngExt, SeedableRng};
+    let mut rng = rand::rngs::StdRng::seed_from_u64(5656);
+    let mut returned = 0;
+    for _ in 0..400 {
+        let mut code = Vec::new();
+        for _ in 0..rng.random_range(4..14) {
+            code.extend([0x60, rng.random_range(0..96u8)]);
+            code.extend([0x60, rng.random_range(0..96u8)]);
+            code.extend([0x60, rng.random_range(0..96u8)]);
+            const OPS: &[u8] = &[0x5e, 0x5e, 0x5e, 0x1e, 0x1e, 0x5c, 0x5d, 0x51, 0x52, 0x53, 0x59, 0x80, 0x90, 0x50, 0x01];
+            let op = OPS[rng.random_range(0..OPS.len())];
+            if op == 0x5d {
+                code.extend([0x61, 0x77, 0x77]);
+            }
+            code.push(op);
+        }
+        code.extend([0x59]);
+        code.extend(ret_top());
+        let ours = run(&code, &[]);
+        let theirs = revm_run_spec(&code, &[], revm::primitives::hardfork::SpecId::OSAKA);
+        assert_eq!(ours.status(), theirs.status, "code {}", hex::encode(&code));
+        if ours.halt == Halt::Return {
+            assert_eq!(&ours.ret[..ours.ret_len], &theirs.ret[..], "code {}", hex::encode(&code));
+            assert_eq!(ours.gas_used, theirs.gas_used, "gas, code {}", hex::encode(&code));
+            returned += 1;
+        }
+    }
+    assert!(returned > 300, "only {returned} of 400 programs returned");
 }
 
 #[test]
@@ -565,6 +805,13 @@ struct RevmOutcome {
 /// `InstructionResult` is mapped to a status exactly as `Outcome::status` does: `Stop`/`Return` →
 /// 1, `Revert` → 0, everything else → 2.
 fn revm_run(code: &[u8], calldata: &[u8]) -> RevmOutcome {
+    revm_run_spec(code, calldata, revm::primitives::hardfork::SpecId::SHANGHAI)
+}
+
+/// [`revm_run`] at a chosen spec: the Cancun and Osaka opcodes (`MCOPY`, `TLOAD`/`TSTORE`, `CLZ`)
+/// are `NotActivated` under Shanghai, so their differentials run at `OSAKA`, whose gas for every
+/// older opcode the interpreter implements is Shanghai's.
+fn revm_run_spec(code: &[u8], calldata: &[u8], spec: revm::primitives::hardfork::SpecId) -> RevmOutcome {
     use revm::bytecode::Bytecode;
     use revm::context_interface::host::DummyHost;
     use revm::interpreter::instructions::gas_table_spec;
@@ -573,9 +820,8 @@ fn revm_run(code: &[u8], calldata: &[u8]) -> RevmOutcome {
         instruction_table, CallInput, InputsImpl, InstructionResult, Interpreter as RevmInterp,
         InterpreterAction, SharedMemory,
     };
-    use revm::primitives::{hardfork::SpecId, Address, Bytes, U256 as RU256};
+    use revm::primitives::{Address, Bytes, U256 as RU256};
 
-    const SPEC: SpecId = SpecId::SHANGHAI;
     let e = env();
     let addr = |v: &U256| Address::from_slice(&v.to_be_bytes()[12..]);
     let inputs = InputsImpl {
@@ -591,12 +837,12 @@ fn revm_run(code: &[u8], calldata: &[u8]) -> RevmOutcome {
         ExtBytecode::new(Bytecode::new_raw(Bytes::from(code.to_vec()))),
         inputs,
         false,
-        SPEC,
+        spec,
         e.gas_limit,
     );
-    let mut host = DummyHost::new(SPEC);
+    let mut host = DummyHost::new(spec);
     let table = instruction_table::<EthInterpreter, DummyHost>();
-    let gas = gas_table_spec(SPEC);
+    let gas = gas_table_spec(spec);
     let InterpreterAction::Return(r) = interp.run_plain(&table, &gas, &mut host) else {
         panic!("the differential programs make no calls, so the action is always Return");
     };

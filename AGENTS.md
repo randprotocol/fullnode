@@ -6,6 +6,42 @@ invariants, and known traps.
 
 ## Project memory (state as of 2026-11-08)
 
+### Constraint set 11 re-vendored (issue #166 step 7; 2026-11-20, branch `feat/cs11-revendor`, PR open, NOT merged)
+
+`CIRCUITS_PIN` **`76a48dca`** (circuits main, "Constraint set 11: Grain constants, declared
+poseidon2 height, quotient layout, versioned rVM key"; was `b3e21d9`, set 9), synced with
+`deploy/sync-zkvm.sh`; seven guests (evm-v1 added). **A chain cut: chain 22 on, never a roll onto
+chain 21.** What moved, and where it lives:
+
+- **Guest digests** (`crates/randprotocol-zkvm/tests/guest_provenance.rs`, both columns pinned —
+  `SET_10_*` for the committed chains 14–21 files, the set-11 ones for this source): bundle v1
+  `71eedbfb…ee70`, v2 `3aff6361…6046`, v3 `00782b22…141e`, auth `8373994c…6078`, msauth
+  (`MSAUTH_HC`) `41db73c5…9cd1`; the retired legacy guest `6e968302…dc1d` (files carry `4a27356f…`).
+  `deploy/cut-chain22-genesis.sh`'s `EXPECT_HC_BUNDLE`, `EXPECT_HC_AUTH`,
+  `HC_AUTH_MULTISIG_DECIDED` and `BUNDLE_GAS_LIMIT` (22527) moved with them; chain 21's file is
+  asserted at its set-9 values.
+- **Gas** (`randprotocol-core/src/gas.rs`, mirrored against the vendored zkVM in the executor's
+  gas test): `gas_max_declared(t, k, s, m, p2)`; bundle 22 527, auth 1 407, msauth 355 775
+  (`MSAUTH_POSEIDON2_LOG_HEIGHT` 16). Fee pricing of a call still uses the full-height ceiling (an
+  over-charge, never an under-charge).
+- **Proof header**: `poseidon2_log_height` in `ProofShape`, `MsauthShape`, `CallDryRun` and the
+  aggregate path; bundle/auth inner proofs, the canonical perp state proof and the inner proofs
+  an aggregate covers must declare the full height (`Tier::max_poseidon2_log_height()`), msauth 16.
+- **msauth key blobs**: production 23 851 B `168d79a8…71b3` (reproduced by `keygen-msauth-vk` on
+  the build droplet), test `d30472df…db3d`.
+- **Recursion fixtures** Test-0..2 re-proved (`scripts/recursion-fixtures.sh` against circuits
+  `76a48dc`, 135 s each on the 16-vCPU droplet) and re-pinned; the msig signer-check fixtures
+  regenerated (the policy id is a Poseidon2 digest).
+- **The guard**: `BUILD_CONSTRAINT_SET` 11; chain 21 in `CHAINS_THIS_BUILD_CANNOT_RUN`. No chain
+  14–21 genesis file builds under set 11 (`NoteCommitmentMismatch` / the bundle-limit check), so
+  `constraint_set::build_genesis` refuses them by chain id; the chain-14..21 "builds to its hash"
+  tests are refusal tests now, and `node::tests::chain_21_*` are `#[ignore]`d (the v0.8.6 line
+  runs them). **Chain 22's `CHAIN_CONSTRAINT_SETS` row is owed at the cut** (no genesis yet).
+- **Owed downstream**: durian must rebuild against set 11 and re-pin the perp engine (its image's
+  hc moves; `perps.engine_hc`, `genesis_root` and `ENGINE_HC_DECIDED` in the cut script are still
+  chain 21's); wallet and randscan WASM; bridge commitments. A later circuits PR (EVM block
+  context / PREVRANDAO) moves the evm guest's hc again: one more `CIRCUITS_PIN` step.
+
 ### The chain-22 treasury is 5 of 6 with its RAND carried; perps carried empty (2026-11-19, branch `feat/chain22-treasury-carry`; deploy only)
 
 Owner's decisions of 2026-11-19 in `deploy/cut-chain22-genesis.sh` (OPEN 1–4 of its header;

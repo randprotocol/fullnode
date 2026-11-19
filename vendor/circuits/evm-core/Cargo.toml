@@ -12,6 +12,11 @@ license = "GPL-3.0-only"
 # runtime calls. Off by default so the interpreter's guest (`guests-compiled/evm`) builds to the
 # pinned `bin/evm.bin`; `evm2rv` shims and research's host tests turn it on.
 ffi = []
+# `storage-v1`: storage layout 1 — a depth-32 tree, the leaf position the top 32 bits of
+# `keccak256(slot)` (`storage::LAYOUT_VERSION`). Off by default: layout 2 (depth 64) is what
+# `bin/evm.bin` and every `evm2rv` translation build. `guests-compiled/evm-v1` turns it on to build
+# `bin/evm-v1.bin`, the image for contracts whose storage is still rooted under layout 1.
+storage-v1 = []
 
 # Its own workspace root, like guests-compiled/keccak256: research/ depends on it by path as a
 # dev-dependency (host tests), guests-compiled/evm depends on it by path (the target build).

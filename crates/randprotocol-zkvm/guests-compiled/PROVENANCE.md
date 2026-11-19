@@ -5,14 +5,14 @@ same path under `guests-compiled/` in the public circuits repository
 (<https://github.com/randprotocol/zkp-circuits>). Nothing here is built or edited in this
 repository. The copies are byte-identical to this circuits commit:
 
-circuits: b3e21d9ea16225452bcd03a94317cb61e1705979
+circuits: 76a48dca92a2d0382370f383d6680971db0cc574
 
-(Circuits main, the rVM phase-5 merge (`recursion/docs/10-phase5-n2-tier19.md`: the production
-N=2 aggregate in tier 19; `recursion/` alone moved). `research/`, `guests-compiled/` and these
-three crates are byte-identical to d217252 (constraint set 9: rVM phase 4, the MODQ chip, the
-`dilithium-verify` and `msauth` guests, the `dilithium-core` crate), and `rand-zkvm-cuda/` and
-`research/src/poseidon2_constants.rs` are byte-identical at 71e1a04, the pushed commit both
-rand-zkvm-cuda revs name.)
+(Circuits main at constraint set 11: Grain-derived Poseidon2 round constants, the declared
+poseidon2 table height (an eighth verifier-key component), the per-instance quotient layout at
+rate ¼, versioned rVM keys and cell-count gas weights. Every Poseidon2 output moved with it, so
+every guest's `hc`. `guests-compiled/` gained `evm-v1.bin` (EVM output layout 1) beside
+`evm.bin` (layout 2), and `sbpf.bin` moved (the sysvar block). `rand-zkvm-cuda/` and
+`research/src/poseidon2_constants.rs` are this commit's too: both rand-zkvm-cuda revs name it.)
 
 That is the commit `.github/workflows/ci.yml` checks out as `CIRCUITS_PIN`; `tests/guest_provenance.rs`
 refuses a manifest whose commit differs from it.
@@ -24,7 +24,7 @@ checks it from this directory). Three things check the files against it, and aga
   `SHA256SUMS` line, no file here is missing from the manifest, each `bin/<guest>.bin.sha256` names
   the same digest, and the chain-14 bundle guest's `hc` is still the genesis pin (below).
 - CI's `guest-provenance` job: compares each copy byte for byte with circuits at `CIRCUITS_PIN`,
-  runs circuits' rebuild gate (the six guests from source), and recompiles `erc20.runtime.hex`
+  runs circuits' rebuild gate (the seven guests from source), and recompiles `erc20.runtime.hex`
   with the pinned `solc`.
 - By hand, anyone: the commands in the table.
 

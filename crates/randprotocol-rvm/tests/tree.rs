@@ -31,23 +31,58 @@ fn tree_file(name: &str) -> std::path::PathBuf {
     common::cache_dir().join("tree").join(format!("{name}.rvmproof"))
 }
 
-/// The cached proof `name` if it decodes and verifies at `n`, else `prove()`'s, verified and
-/// stored: the bundle-fixture cache's discipline (`common::load_cached`), one level up.
-fn load_or_prove(name: &str, program: &Program, n: u64, may_prove: bool, prove: impl FnOnce() -> Proof) -> Proof {
-    let m = Machine::new(P);
-    if let Some(p) = std::fs::read(tree_file(name)).ok().and_then(|b| postcard::from_bytes::<Proof>(&b).ok()) {
-        if m.verify_n(program, &p, n).is_ok() {
-            return p;
+/// Why a cached tree proof cannot be used. The three cases are different findings: a missing
+/// file is a box that never received the fixtures; an undecodable or refused one is a fixture
+/// that predates a change to the proof format, the machine or the program it was proved for.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum FixtureGap {
+    Missing(std::path::PathBuf),
+    Undecodable(std::path::PathBuf),
+    Refused(std::path::PathBuf, String),
+}
+
+impl std::fmt::Display for FixtureGap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FixtureGap::Missing(p) => write!(f, "{} is missing", p.display()),
+            FixtureGap::Undecodable(p) => write!(f, "{} is stale: it does not decode as a current rVM proof", p.display()),
+            FixtureGap::Refused(p, e) => write!(f, "{} is stale: the current machine refuses it for the current program ({e})", p.display()),
         }
     }
-    assert!(may_prove, "{} is missing or stale: run `cargo test --release --test tree generate_test_tree_fixtures \
-        -- --ignored --nocapture` on a host with the docs/08 §5 memory and copy tree/ into $RECURSION_FIXTURES", tree_file(name).display());
+}
+
+/// How to get the fixtures, appended to every skip and every refusal.
+const REGEN: &str = "regenerate with `recursion/scripts/regen-tree-fixtures.sh` on a host with the docs/08 §5 memory \
+    (about 34 GB), then copy `tree/` into $RECURSION_FIXTURES; `tests/tree-fixtures.status` says what else is stale";
+
+/// The cached proof `name`, if it is there, decodes, and verifies at `n` for `program`.
+fn try_load(name: &str, program: &Program, n: u64) -> Result<Proof, FixtureGap> {
+    let path = tree_file(name);
+    let bytes = std::fs::read(&path).map_err(|_| FixtureGap::Missing(path.clone()))?;
+    let proof = postcard::from_bytes::<Proof>(&bytes).map_err(|_| FixtureGap::Undecodable(path.clone()))?;
+    match Machine::new(P).verify_n(program, &proof, n) {
+        Ok(()) => Ok(proof),
+        Err(e) => Err(FixtureGap::Refused(path, format!("{e:?}"))),
+    }
+}
+
+/// The cached proof `name` if it decodes and verifies at `n`, else — when `may_prove` — `prove()`'s,
+/// verified and stored: the bundle-fixture cache's discipline (`common::load_cached`), one level
+/// up. When proving is not allowed the gap is returned, named, for the caller to skip or refuse on.
+fn load_or_prove(name: &str, program: &Program, n: u64, may_prove: bool, prove: impl FnOnce() -> Proof) -> Result<Proof, FixtureGap> {
+    let gap = match try_load(name, program, n) {
+        Ok(p) => return Ok(p),
+        Err(gap) => gap,
+    };
+    if !may_prove {
+        return Err(gap);
+    }
     let p = prove();
-    m.verify_n(program, &p, n).expect("a freshly proved tree proof verifies");
+    Machine::new(P).verify_n(program, &p, n).expect("a freshly proved tree proof verifies");
     let path = tree_file(name);
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     std::fs::write(&path, p.to_bytes()).unwrap();
-    p
+    Ok(p)
 }
 
 /// Four test-profile leaves, `rv32n` over bundle fixture k = 0..3 each (L = 1; 88 486 rows since phase 5, 169 640 before the Merkle spans,
@@ -67,7 +102,7 @@ fn leaves() -> &'static Leaves {
         let bundles: Vec<BundleProof> = common::bundle_proofs(P, 4).into_iter().map(|b| b.proof).collect();
         let p = &bundles[0];
         let shape = InnerShape::of(P, p.tier, p.program_log_height, p.input_log_height, p.keccak_log_height,
-            p.sha256_log_height, p.public_log_height, p.mem_log_height);
+            p.sha256_log_height, p.public_log_height, p.mem_log_height, p.poseidon2_log_height);
         let key = InnerKey::of(P, &shape);
         let inner = InnerVerifierKey { shape, key };
         let program = Arc::new(aggregate_program(&inner));
@@ -78,6 +113,7 @@ fn leaves() -> &'static Leaves {
                         .expect("a test leaf proves")
                         .proof
                 })
+                .expect("a leaf may always be proved here")
             })
             .collect();
         let shape = RvmShape::of_proof(P, &program, &proofs[0]);
@@ -132,7 +168,9 @@ fn the_tree_step_builds_under_the_replays_loop_invariant() {
     // tree Task R): the child's Merkle paths are one level shorter (was bf80794d…ff4d5389).
     // Phase 4 (2026-10-09, the Merkle spans) re-recorded it: 2c586636… → d8d558ee….
     // Phase 5 (2026-10-12, S6a/S2b/S4a/S1b) re-recorded it: d8d558ee… → af535052….
-    assert_eq!(randprotocol_rvm::programs::digest_hex(&a), "af535052d2df18b5e313a6f0c2e412456d059d5f602d569989ad1b2b69e90cac", "rv32t_leaf's digest at the test leaf shape");
+    // The constraint-set-11 cut (Grain Poseidon2 table, rVM key Set(11), the leaf shape the new
+    // inner shape gives) re-recorded it: af535052… → 8cdb1485….
+    assert_eq!(randprotocol_rvm::programs::digest_hex(&a), "8cdb1485574ce25a19843cb2709d3aff114626df419065e0ee4341efdfecc269", "rv32t_leaf's digest at the test leaf shape");
 }
 
 /// The program reads the child shape's words and never its committed program: a child program
@@ -324,35 +362,104 @@ struct TestTree {
     s_foreign: RvmShape,
 }
 
-fn test_tree() -> &'static TestTree {
-    static T: OnceLock<TestTree> = OnceLock::new();
+/// The step and root fixtures the in-suite run may not prove (R7).
+const STEP_FIXTURES: [&str; 3] = ["Test-step-0", "Test-step-1", "Test-root"];
+
+fn test_tree_result() -> &'static Result<TestTree, FixtureGap> {
+    static T: OnceLock<Result<TestTree, FixtureGap>> = OnceLock::new();
     T.get_or_init(|| {
-        let l = leaves();
         let may = ALLOW_STEP_PROVING.load(Ordering::SeqCst);
+        // Before anything else: a box without the step fixtures must not prove four tier-18
+        // leaves (and the four bundle proofs under them) only to find out it cannot go on.
+        if !may {
+            if let Some(name) = STEP_FIXTURES.iter().find(|n| !tree_file(n).exists()) {
+                return Err(FixtureGap::Missing(tree_file(name)));
+            }
+        }
+        let l = leaves();
         let m = Machine::new(P);
         let prove_step = |child: &RvmShape, program: &Program, a: &Proof, b: &Proof| -> Proof {
             let tape = WitnessTape::build_tree_step(P, child, [a, b], B).unwrap();
             m.prove(program, &tape.words, None).expect("a test tree step proves").0
         };
         let t_leaf = Arc::new(rv32t_leaf(&l.shape, Checkpoints::Off).program);
-        let steps: Vec<Proof> = (0..2)
-            .map(|k| load_or_prove(&format!("Test-step-{k}"), &t_leaf, 2, may, || {
-                prove_step(&l.shape, &t_leaf, &l.proofs[2 * k], &l.proofs[2 * k + 1])
-            }))
-            .collect();
+        let mut steps: Vec<Proof> = Vec::new();
+        for k in 0..2 {
+            steps.push(load_or_prove(&format!("Test-step-{k}"), &t_leaf, 2, may, || prove_step(&l.shape, &t_leaf, &l.proofs[2 * k], &l.proofs[2 * k + 1]))?);
+        }
         let s_step = RvmShape::of_proof(P, &t_leaf, &steps[0]);
         assert!(s_step.matches(&steps[1]), "both level-1 steps declare one shape");
         let t_int = Arc::new(rv32t_int(&s_step, Checkpoints::Off).program);
-        let root = load_or_prove("Test-root", &t_int, 2, may, || prove_step(&s_step, &t_int, &steps[0], &steps[1]));
+        let root = load_or_prove("Test-root", &t_int, 2, may, || prove_step(&s_step, &t_int, &steps[0], &steps[1]))?;
         let s_root = RvmShape::of_proof(P, &t_int, &root);
         let fprog = Arc::new(foreign_leaf_program(&l.program));
         let foreign = load_or_prove("Test-foreign-0", &fprog, 1, true, || {
             let tape = WitnessTape::build_n(P, &l.inner.shape, &l.inner.key, std::slice::from_ref(&l.bundles[0]), B).unwrap();
             m.prove(&fprog, &tape.words, None).expect("the foreign leaf proves").0
-        });
+        })?;
         let s_foreign = RvmShape::of_proof(P, &fprog, &foreign);
-        TestTree { t_leaf, steps, s_step, t_int, root, s_root, foreign, s_foreign }
+        Ok(TestTree { t_leaf, steps, s_step, t_int, root, s_root, foreign, s_foreign })
     })
+}
+
+/// The test tree, or a panic naming the fixture that is missing or stale. For the generator,
+/// which may prove, and for helpers called only after [`tree_or_skip`] has answered.
+fn test_tree() -> &'static TestTree {
+    match test_tree_result() {
+        Ok(t) => t,
+        Err(gap) => panic!("{gap}: {REGEN}"),
+    }
+}
+
+/// The environment variable that turns a skipped tree test into a failed one: set by
+/// `scripts/regen-tree-fixtures.sh`'s check pass and by any host that is meant to hold the
+/// fixtures, so "the tree suite passed" there cannot mean "the tree suite was skipped".
+const REQUIRE_ENV: &str = "RECURSION_REQUIRE_TREE_FIXTURES";
+
+/// The test tree for a fixture-gated test, or `None` after printing why the test is skipped.
+///
+/// The twelve tests that call this were red on every box without current fixtures ("rvmproof is
+/// missing or stale"), which made the suite's exit status useless there and hid whatever else
+/// broke. They now skip, loudly and with the reason, unless `RECURSION_REQUIRE_TREE_FIXTURES`
+/// is set — then the gap is a failure, as before. A skip is not a pass: the line below is the
+/// record, `tests/tree_status.rs` keeps the declared state honest in CI, and the count of
+/// skipped tests is printed by `the_fixture_gated_tests_report_their_state`.
+fn tree_or_skip(test: &str) -> Option<&'static TestTree> {
+    match test_tree_result() {
+        Ok(t) => Some(t),
+        Err(gap) => {
+            if std::env::var_os(REQUIRE_ENV).is_some() {
+                panic!("{test}: {gap}: {REGEN} ({REQUIRE_ENV} is set, so this is a failure, not a skip)");
+            }
+            eprintln!("TREE-FIXTURES SKIPPED {test}: {gap}: {REGEN}");
+            None
+        }
+    }
+}
+
+/// One line saying which way this run went, so a log shows it without counting skips.
+#[test]
+fn the_fixture_gated_tests_report_their_state() {
+    // Existence only: this test must stay cheap on a box without fixtures.
+    let missing: Vec<&str> = STEP_FIXTURES.iter().copied().filter(|n| !tree_file(n).exists()).collect();
+    let required = std::env::var_os(REQUIRE_ENV).is_some();
+    if missing.is_empty() {
+        eprintln!("TREE-FIXTURES present under {}: the {GATED} fixture-gated tests run (and fail if a fixture is stale and {REQUIRE_ENV} is set, skip otherwise)", common::cache_dir().join("tree").display());
+    } else {
+        eprintln!("TREE-FIXTURES ABSENT ({missing:?} under {}): the {GATED} fixture-gated tests in tests/tree.rs are SKIPPED, not passed: {REGEN}", common::cache_dir().join("tree").display());
+        assert!(!required, "{REQUIRE_ENV} is set and the tree fixtures {missing:?} are absent");
+    }
+}
+
+/// The number of tests in this file that call [`tree_or_skip`]; `the_gated_count_is_the_number_of_gated_tests`
+/// holds it to the source.
+const GATED: usize = 12;
+
+#[test]
+fn the_gated_count_is_the_number_of_gated_tests() {
+    let src = include_str!("tree.rs");
+    let needle = ["tree_or_skip", "(\""].concat();
+    assert_eq!(src.matches(&needle).count(), GATED, "update GATED (and docs/08 §5) when a fixture-gated test is added or removed");
 }
 
 fn u64s(v: &[F]) -> Vec<u64> {
@@ -380,7 +487,8 @@ fn generate_test_tree_fixtures() {
 /// emulated, are pinned.
 #[test]
 fn the_test_tree_proves_and_every_level_publishes_the_host_digest() {
-    let (l, t) = (leaves(), test_tree());
+    let Some(t) = tree_or_skip("the_test_tree_proves_and_every_level_publishes_the_host_digest") else { return };
+    let l = leaves();
     let vk_leaf = inner_vk_digest(&l.shape, &l.key);
     let vk_t_leaf = inner_vk_digest(&t.s_step, &RvmKey::of(P, &t.s_step));
     for k in 0..2 {
@@ -418,7 +526,7 @@ fn emulated_shape(program: &Arc<Program>, exec: &Execution) -> RvmShape {
 #[test]
 fn the_interior_step_verifies_its_own_output_at_the_test_profile() {
     use randprotocol_rvm::tables::reduce::program_rows;
-    let t = test_tree();
+    let Some(t) = tree_or_skip("the_interior_step_verifies_its_own_output_at_the_test_profile") else { return };
     let (per_leaf, per_int) = (program_rows(&t.t_leaf), program_rows(&t.t_int));
     eprintln!("TREE_TEST_R3 reduce rows per child: rv32t_leaf {per_leaf} (x2 = {}), rv32t_int {per_int} (x2 = {}); \
         S_T {:?} root {:?}", 2 * per_leaf, 2 * per_int, t.s_step.header_words(), t.s_root.header_words());
@@ -458,7 +566,7 @@ fn the_interior_step_verifies_its_own_output_at_the_test_profile() {
 /// level 3 → level 2, and `T_FIX_TEST`, `vk_fix` and `step_fix_cpu_rows` are dropped.
 #[test]
 fn the_step_program_at_the_roots_shape_is_rv32t_int_the_fixed_point() {
-    let t = test_tree();
+    let Some(t) = tree_or_skip("the_step_program_at_the_roots_shape_is_rv32t_int_the_fixed_point") else { return };
     let int_run = emulate_step(&t.s_step, &t.t_int, &t.steps[0], &t.steps[1], B).expect("rv32t_int accepts the steps");
     assert_eq!(emulated_shape(&t.t_int, &int_run).header_words(), t.s_root.header_words(),
         "the emulated shape method reproduces the proved root's");
@@ -484,7 +592,8 @@ fn the_step_program_at_the_roots_shape_is_rv32t_int_the_fixed_point() {
 /// digests equal the honest leaf's (the same run), so `vk_c` is the only difference.
 #[test]
 fn a_foreign_program_child_pair_passes_in_program_and_fails_the_root_recompute() {
-    let (l, t) = (leaves(), test_tree());
+    let Some(t) = tree_or_skip("a_foreign_program_child_pair_passes_in_program_and_fails_the_root_recompute") else { return };
+    let l = leaves();
     assert!(t.s_foreign.same_step_words(&l.shape));
     assert_eq!(t.foreign.public_values, l.proofs[0].public_values, "the same run publishes the same digest");
     let step = rv32t_leaf(&l.shape, Checkpoints::Off).program;
@@ -501,13 +610,13 @@ fn a_foreign_program_child_pair_passes_in_program_and_fails_the_root_recompute()
 /// Phase 5 (2026-10-12, S6a/S2b/S4a/S1b) re-recorded `T_LEAF_TEST`: d8d558ee… → af535052… (the same
 /// digest `the_tree_step_builds_under_the_replays_loop_invariant` pins, measured there without
 /// fixtures). `T_INT_TEST` below is NOT re-recorded: it needs the fixture-gated `test_tree()`.
-const T_LEAF_TEST: &str = "af535052d2df18b5e313a6f0c2e412456d059d5f602d569989ad1b2b69e90cac";
+const T_LEAF_TEST: &str = "8cdb1485574ce25a19843cb2709d3aff114626df419065e0ee4341efdfecc269";
 /// Phase 4 (2026-10-09, the Merkle spans) re-recorded `T_INT_TEST`: 04b16771… → a222637e….
-const T_INT_TEST: &str = "a222637e1eb9333b16b820bbacceaac9ea0e5d4cebfc5379d170796a2ac6dc62";
+const T_INT_TEST: &str = "28306b7542ec7beea9c6fde0865a0393d61f8c73669e00ef53c3043d7a822ceb";
 
 #[test]
 fn the_test_tree_program_digests_are_pinned() {
-    let t = test_tree();
+    let Some(t) = tree_or_skip("the_test_tree_program_digests_are_pinned") else { return };
     let (a, b) = (randprotocol_rvm::programs::digest_hex(&t.t_leaf), randprotocol_rvm::programs::digest_hex(&t.t_int));
     eprintln!("TREE_TEST_DIGESTS t_leaf {a} t_int {b}");
     assert_ne!(a, b, "two programs");
@@ -553,7 +662,8 @@ fn copy(p: &Proof) -> Proof {
 /// covered bundles' `OUT0..7` in cover order.
 #[test]
 fn verify_tree_accepts_the_test_tree() {
-    let (l, t) = (leaves(), test_tree());
+    let Some(t) = tree_or_skip("verify_tree_accepts_the_test_tree") else { return };
+    let l = leaves();
     let outs = verify_tree(&Machine::new(P), &t.t_int, &t.root, &l.inner, &covered(4), B, 1, 2, &test_keys())
         .expect("the depth-2 test tree verifies");
     assert_eq!(outs.len(), 4);
@@ -573,7 +683,8 @@ fn verify_tree_accepts_the_test_tree() {
 /// recomputed under another level's key, and the root verified as the wrong program.
 #[test]
 fn verify_tree_names_every_refusal() {
-    let (l, t) = (leaves(), test_tree());
+    let Some(t) = tree_or_skip("verify_tree_names_every_refusal") else { return };
+    let l = leaves();
     let m = Machine::new(P);
     let k = test_keys();
     let c4 = covered(4);
@@ -686,7 +797,8 @@ fn verify_tree_selects_the_per_level_key_with_the_last_entry_repeating() {
 /// tail of the pinned list leaves `verify_tree`'s recompute, and its acceptance, unchanged.
 #[test]
 fn an_unused_trailing_key_leaves_the_test_roots_digest_unchanged() {
-    let (l, t) = (leaves(), test_tree());
+    let Some(t) = tree_or_skip("an_unused_trailing_key_leaves_the_test_roots_digest_unchanged") else { return };
+    let l = leaves();
     let k = test_keys();
     let honest = tree_root_digest(&l.inner, &covered(4), B, 1, 2, &k).unwrap();
     let junk = [F::from_u64(424242); 4];
@@ -704,7 +816,8 @@ fn an_unused_trailing_key_leaves_the_test_roots_digest_unchanged() {
 /// the list that is not a fixed point is now `[S_T]` alone.
 #[test]
 fn the_tree_shapes_rebuild_the_test_tree_programs_and_keys() {
-    let (l, t) = (leaves(), test_tree());
+    let Some(t) = tree_or_skip("the_tree_shapes_rebuild_the_test_tree_programs_and_keys") else { return };
+    let l = leaves();
     let h_leaf = RvmHeights::of_proof(&l.proofs[0]);
     assert_eq!(h_leaf, l.shape.heights());
     assert_eq!(RvmShape::try_of_heights(P, &l.program, h_leaf).unwrap(), l.shape, "the heights round-trip");
@@ -745,7 +858,8 @@ fn the_tree_shapes_rebuild_the_test_tree_programs_and_keys() {
 /// (the measurement run, as `pins.json`); every later run is a diff against it.
 #[test]
 fn the_test_tree_genesis_section_prints_as_the_nodes_tree_config() {
-    let (l, t) = (leaves(), test_tree());
+    let Some(t) = tree_or_skip("the_test_tree_genesis_section_prints_as_the_nodes_tree_config") else { return };
+    let l = leaves();
     let (h_leaf, h_t, h_root) = (RvmHeights::of_proof(&l.proofs[0]), RvmHeights::of_proof(&t.steps[0]), RvmHeights::of_proof(&t.root));
     let s = TreeShapes::build(P, &l.inner, h_leaf, &[h_t, h_root]).unwrap();
     let k = s.keys();
@@ -769,7 +883,8 @@ fn the_test_tree_genesis_section_prints_as_the_nodes_tree_config() {
 /// refused at level 2 (was `[S_T, S_root]`, refused at level 3).
 #[test]
 fn aggregate_tree_refuses_a_bad_layout_and_a_depth_past_a_non_fixed_list_before_proving() {
-    let (l, t) = (leaves(), test_tree());
+    let Some(t) = tree_or_skip("aggregate_tree_refuses_a_bad_layout_and_a_depth_past_a_non_fixed_list_before_proving") else { return };
+    let l = leaves();
     let m = Machine::new(P);
     let s = TreeShapes::build(P, &l.inner, RvmHeights::of_proof(&l.proofs[0]), &[RvmHeights::of_proof(&t.steps[0])]).unwrap();
     assert!(!s.fixed_point(), "[S_T] alone is not a fixed point");
@@ -795,7 +910,8 @@ fn aggregate_tree_refuses_a_bad_layout_and_a_depth_past_a_non_fixed_list_before_
 /// step's emulated public values, which `verify_tree` reads before `verify_n`.
 #[test]
 fn a_foreign_program_child_pair_is_refused_by_verify_tree_at_the_root_digest() {
-    let (l, t) = (leaves(), test_tree());
+    let Some(t) = tree_or_skip("a_foreign_program_child_pair_is_refused_by_verify_tree_at_the_root_digest") else { return };
+    let l = leaves();
     let exec = emulate_step(&t.s_foreign, &t.t_leaf, &t.foreign, &t.foreign, B).expect("accepted in-program");
     let mut presented = copy(&t.steps[0]);
     presented.public_values = u64s(&exec.public);

@@ -311,3 +311,33 @@ fn a_jalr_with_a_nonzero_funct3_is_refused() {
     cur[program::col::BIT0 + 12] = Val::ONE;
     assert!(!holds(&cur), "a funct3 = 1 JALR decodes as VALID in-circuit");
 }
+
+/// ZKVM-108 (monorepo issue 61), **open — fails by design**: the program commitment a proof
+/// publishes is `hc` itself, unsalted (`hash::program_digest`; `pv::HC0..7`). Two proofs of one
+/// program therefore publish the same eight words, which links them to each other and — for any
+/// program whose code is known — names the program: an observer hashes each candidate and
+/// compares, as the last assertion does.
+///
+/// The next set's rule (`docs/03-privacy.md`, "A hiding program commitment (ZKVM-108)"): the
+/// slots carry `hc' = program_commitment::salted(hc, salt)` with a fresh salt per proof, and the
+/// proof shows `hc` is a leaf of the chain's admitted-programs root. When that lands this test
+/// loses its `#[ignore]`, and `verify` takes the root, not `hc`.
+#[test]
+#[ignore = "ZKVM-108, open: hc is published unsalted, so two proofs of one program publish the same commitment; closes with the next constraint set"]
+fn two_proofs_of_one_program_publish_different_program_commitments() {
+    use randprotocol_zkvm::machine::{FriProfile, Machine};
+    let m = Machine::new(FriProfile::Test);
+    let p = randprotocol_zkvm::guests::fib(10);
+    let (a, _) = m.prove(&p, &[], &[], None).unwrap();
+    let (b, _) = m.prove(&p, &[], &[], None).unwrap();
+    m.verify(&p.digest(), &a).unwrap();
+    m.verify(&p.digest(), &b).unwrap();
+    let slots = |proof: &randprotocol_zkvm::machine::Proof| proof.public_values[cpu::pv::HC0..cpu::pv::HC0 + 8].to_vec();
+    eprintln!("program commitment slots, proof a: {:x?}\nprogram commitment slots, proof b: {:x?}", slots(&a), slots(&b));
+    // The two proofs are different proofs (fresh blinding and input salt) …
+    assert_ne!(a.public_values[cpu::pv::IN0..cpu::pv::IN0 + 8], b.public_values[cpu::pv::IN0..cpu::pv::IN0 + 8], "H_IN is salted per proof");
+    // … but their program commitments are equal, and equal to what anyone computes from the code.
+    let candidate: Vec<u64> = p.digest().iter().map(|w| *w as u64).collect();
+    assert_ne!(slots(&a), candidate, "the published commitment is the bare program digest: the program is enumerable");
+    assert_ne!(slots(&a), slots(&b), "two proofs of one program publish the same commitment: they are linkable");
+}

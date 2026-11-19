@@ -4982,7 +4982,7 @@ mod tests {
         g.gas = Some(gas::GasConfig {
             gas_price: 100,
             byte_price: 800,
-            bundle_gas_limit: 20_479,
+            bundle_gas_limit: 22_527,
             metering: gas::GasMetering::Circuit,
             dynamic: None,
         });
@@ -5014,7 +5014,7 @@ mod tests {
         let ok = gas::GasConfig {
             gas_price: 100,
             byte_price: 800,
-            bundle_gas_limit: 20_479,
+            bundle_gas_limit: 22_527,
             metering: gas::GasMetering::Circuit,
             dynamic: None,
         };
@@ -5059,14 +5059,14 @@ mod tests {
         let fixed = gas::GasConfig {
             gas_price: 0x0102,
             byte_price: 0x0304,
-            bundle_gas_limit: 20_479,
+            bundle_gas_limit: 22_527,
             metering: gas::GasMetering::Circuit,
             dynamic: None,
         };
         let mut want = b"gas".to_vec();
         want.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0x01, 0x02]);
         want.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0x03, 0x04]);
-        want.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0x4f, 0xff]); // 20 479
+        want.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0x57, 0xff]); // 22 527
         want.extend_from_slice(b"circuit");
         assert_eq!(gas_commit(&fixed), want);
 
@@ -5155,7 +5155,7 @@ mod tests {
         g.gas = Some(gas::GasConfig {
             gas_price: 100,
             byte_price: 800,
-            bundle_gas_limit: 20_479,
+            bundle_gas_limit: 22_527,
             metering: gas::GasMetering::Circuit,
             dynamic: Some(gas::DynamicGas {
                 target_block_bytes: 2 << 20,
@@ -5184,7 +5184,7 @@ mod tests {
     #[test]
     fn the_bundle_gas_limit_must_be_the_bundle_guests_ceiling() {
         let pin = gas::gas_max(crate::types::BUNDLE_PROOF_TIER, 0, 0);
-        assert_eq!(pin, 20_479);
+        assert_eq!(pin, 22_527);
         let with = |limit: u64| {
             let mut g = genesis(1);
             g.gas = Some(gas::GasConfig {
@@ -5198,7 +5198,7 @@ mod tests {
         };
         for bad in [7, pin - 1, pin + 1, gas::gas_max(12, 0, 0)] {
             let e = with(bad).expect_err(&format!("bundle_gas_limit {bad} must be refused")).to_string();
-            assert!(e.contains("bundle_gas_limit") && e.contains("20479"), "{e}");
+            assert!(e.contains("bundle_gas_limit") && e.contains("22527"), "{e}");
         }
         assert!(with(pin).is_ok());
     }
@@ -5224,7 +5224,7 @@ mod tests {
         let fixed = gas::GasConfig {
             gas_price: 100,
             byte_price: 800,
-            bundle_gas_limit: 20_479,
+            bundle_gas_limit: 22_527,
             metering: gas::GasMetering::Circuit,
             dynamic: None,
         };
@@ -5718,7 +5718,15 @@ mod tests {
                 continue;
             };
             seen += 1;
-            assert!(g.validate().is_ok(), "{name}: {:?}", g.validate().err());
+            // Chains 18 to 21 pin constraint set 8/9's bundle ceiling gas_max(14, 0, 0) = 20 479;
+            // constraint set 11 moved it to 22 527, so this build refuses their gas section
+            // (and does not run those chains: the node refuses them by chain id).
+            if g.chain_id <= 21 && g.gas.as_ref().is_some_and(|gas| gas.bundle_gas_limit == 20_479) {
+                let e = g.validate().expect_err("set 8/9's bundle_gas_limit is refused").to_string();
+                assert!(e.contains("bundle_gas_limit 20479 must be 22527"), "{name}: {e}");
+            } else {
+                assert!(g.validate().is_ok(), "{name}: {:?}", g.validate().err());
+            }
             // A chain cut on a build with the marker (chain 20 on) says it; every grandfathered
             // chain was cut before it existed and does not.
             if g.testnet == Some(true) {

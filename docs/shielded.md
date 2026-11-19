@@ -123,8 +123,10 @@ real, see "What the proofs leak today" below.)
 
 Spec `docs/superpowers/specs/2026-09-28-delegated-proving-design.md` §4. A genesis cut with
 `rand-node genesis --bundle-guest v3 --auth-guest` pins bundle guest v3 as `hc_bundle`
-(`60af094acfe65d85fdb18fb3d06cf9085dcf28c96e59e87f1ee527226e6e3fce`) and the auth guest as
-`hc_auth` (`1e4e347f44cf86750b30a9a4bdf9ec9256efe353d4ff8017451eca7d195639c1`); the two come as a
+(`00782b22b1efdf6bbc4d9001b27baa28c03e75732090c6ccd494ddd1365c141e` under constraint set 11; chains
+17–21, set ≤ 9: `60af094acfe65d85fdb18fb3d06cf9085dcf28c96e59e87f1ee527226e6e3fce`) and the auth guest as
+`hc_auth` (`8373994c200819c899236f822f0315efea213b3506a1df0785544a6c90a46078`; chains 17–21:
+`1e4e347f44cf86750b30a9a4bdf9ec9256efe353d4ff8017451eca7d195639c1`); the two come as a
 pair, both ways. Every bundle on such a chain carries two proofs:
 
 ```
@@ -187,7 +189,8 @@ Specs: `docs/superpowers/specs/2026-10-11-private-multisig-design.md` (the guest
 `docs/superpowers/specs/2026-10-11-private-multisig-phase4-design.md` (this node's side). A genesis
 cut with `rand-node genesis --auth-multisig-guest` (beside `--bundle-guest v3 --auth-guest`) pins a
 second auth guest as `hc_auth_multisig`:
-**`9705f8e2f1bc8561848b29cb8efd57c37e3e39788fa58a5f03304d8019668247`**, **tier 18**
+**`41db73c507ab1f24ebe76d9c425b42a08ed9a02b4b1284d410502729ce6b9cd1`**, **tier 18** (constraint set 11;
+chain 21's, set 9, is `9705f8e2f1bc8561848b29cb8efd57c37e3e39788fa58a5f03304d8019668247`)
 (`ZkExecutor::hc_auth_multisig()`, pinned as `MSAUTH_HC` in
 `crates/randprotocol-zkvm/tests/guest_provenance.rs`, which also checks this page names it). The field needs `hc_auth` and must differ from it, and
 at the Production profile `Genesis::validate` requires `max_proof_bytes ≥ 4 MiB`
@@ -219,7 +222,7 @@ declares, and pins each shape exactly before any verifier key is built:
 | `modq_log_height` | 0 | 16 (the MODQ chip, constraint set 9: `docs/zkvm.md`) |
 | `public_log_height` | `public_log_height(8)` | 7 |
 | `mem_log_height` | ranged (`non_canonical`) | 20, **exact** |
-| `pv::GAS` under a `gas` section | `gas_max(10,0,0)` = 1 279 | 436 159 (`msauth_gas_limit_pin()`, the header ceiling) |
+| `pv::GAS` under a `gas` section | `gas_max(10,0,0)` = 1 407 (set 11; 1 279 through set 10) | 355 775 (`msauth_gas_limit_pin()`, the header ceiling at poseidon2 height 16; 436 159 through set 10) |
 
 Every height that could vary with the number of signatures is floored at `M_MAX`'s value and
 compared exactly, so a 1-of-N spend pays and looks like a 3-of-N one: the proof does not tell M.

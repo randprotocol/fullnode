@@ -21,7 +21,7 @@ fn shape_and_key(p: &Proof) -> (InnerShape, InnerKey) {
         p.keccak_log_height,
         p.sha256_log_height,
         p.public_log_height,
-        p.mem_log_height,
+        p.mem_log_height, p.poseidon2_log_height,
     );
     let key = InnerKey::of(FriProfile::Test, &shape);
     (shape, key)
@@ -149,7 +149,7 @@ fn wrong_shape_proof_is_refused() {
         p.proof.keccak_log_height,
         p.proof.sha256_log_height,
         p.proof.public_log_height,
-        p.proof.mem_log_height,
+        p.proof.mem_log_height, p.proof.poseidon2_log_height,
     );
     let wrong_key = InnerKey::of(FriProfile::Test, &wrong_shape);
     let err = WitnessTape::build_n(

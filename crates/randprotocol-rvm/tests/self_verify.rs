@@ -142,8 +142,11 @@ fn the_self_program_digest_is_deterministic_and_distinct() {
     // Phase 4 (2026-10-09, the Merkle spans) re-recorded it: b42ae772… → 515fc2a1….
     // Phase 5 (2026-10-12, S6a/S2b/S4a/S1b) re-recorded it: 515fc2a1… → 890d66fc… (the shared
     // pipeline's assertions, sponges, tape tails and query-index bits changed).
+    // Constraint set 11 re-recorded it: 890d66fc… → f5647ab0… (the Grain Poseidon2 table, ZKVM-107,
+    // moves every digest; the inner shape's poseidon2 height word and the RV32 machine's
+    // per-instance quotient, ZKVM-112/111, move the program).
     let hex: String = d1.iter().map(|w| format!("{:016x}", p3_field::PrimeField64::as_canonical_u64(w))).collect();
-    assert_eq!(hex, "890d66fc75b37ef4b49fbdcecd104c43ebd33a23a2fca1468397d5e1b401b6e5",
+    assert_eq!(hex, "f5647ab026e69cba41564c30fc051ef896669f8a679546c41a76aa30dc7d40a5",
                "the self-verifier's digest at the toy fixture shape");
 
     // And it is not the single-proof RV32-machine verifier's digest for the same profile: build
@@ -157,7 +160,7 @@ fn the_self_program_digest_is_deterministic_and_distinct() {
         p.proof.keccak_log_height,
         p.proof.sha256_log_height,
         p.proof.public_log_height,
-        p.proof.mem_log_height,
+        p.proof.mem_log_height, p.proof.poseidon2_log_height,
     );
     let rv32_key = InnerKey::of(FriProfile::Test, &rv32_shape);
     let rv32_digest = verify_rv32(&rv32_shape, &rv32_key, Checkpoints::Off).program.digest();

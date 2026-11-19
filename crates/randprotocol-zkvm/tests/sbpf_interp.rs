@@ -424,9 +424,9 @@ fn syscalls_by_hash() {
     ]);
     assert_eq!(r0(&p), Err(Halt::Trap("sol_panic_")));
 
-    // An unsupported name (here `sol_keccak256`, which the plan lists as trapping) and a hash
-    // belonging to nothing at all are both `UnknownSyscall`.
-    let h = sbpf_core::syscalls::murmur3_32(b"sol_keccak256", 0);
+    // An unsupported name (here `sol_secp256k1_recover`) and a hash belonging to nothing at all are
+    // both `UnknownSyscall`.
+    let h = sbpf_core::syscalls::murmur3_32(b"sol_secp256k1_recover", 0);
     let p = asm(&[insn(opc::CALL_IMM, 0, 1, 0, h as i32), exit()]);
     assert_eq!(r0(&p), Err(Halt::UnknownSyscall(h)));
     let p = asm(&[insn(opc::CALL_IMM, 0, 1, 0, 1), exit()]);
@@ -712,20 +712,22 @@ fn every_supported_syscall_dispatches() {
     // implementation. The call may still fault on the zero arguments it is given (`sol_memcmp_`
     // writes its result through r4, which is 0 and in no region) or deliberately abort — what it
     // may never be is `UnknownSyscall`.
-    assert_eq!(sbpf_core::syscalls::SUPPORTED.len(), 12);
+    assert_eq!(sbpf_core::syscalls::SUPPORTED.len(), 18);
     for &(hash, name) in sbpf_core::syscalls::SUPPORTED {
         assert_eq!(hash, sbpf_core::syscalls::murmur3_32(name.as_bytes(), 0), "{name}");
         let p = asm(&[insn(opc::CALL_IMM, 0, 1, 0, hash as i32), exit()]);
         assert_ne!(r0(&p), Err(Halt::UnknownSyscall(hash)), "{name} does not dispatch");
     }
-    // And the names the plan rules out of scope do not secretly dispatch.
+    // And the names still out of scope (ZKVM-116's later steps) do not secretly dispatch.
     for name in [
-        &b"sol_keccak256"[..],
-        b"sol_secp256k1_recover",
+        &b"sol_secp256k1_recover"[..],
+        b"sol_curve_validate_point",
         b"sol_invoke_signed_rust",
+        b"sol_invoke_signed_c",
         b"sol_create_program_address",
         b"sol_try_find_program_address",
-        b"sol_get_clock_sysvar",
+        b"sol_get_epoch_schedule_sysvar",
+        b"sol_get_stack_height",
     ] {
         let h = sbpf_core::syscalls::murmur3_32(name, 0);
         let p = asm(&[insn(opc::CALL_IMM, 0, 1, 0, h as i32), exit()]);

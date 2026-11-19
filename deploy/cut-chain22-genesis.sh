@@ -227,7 +227,7 @@
 #     inputs, 64 blocks, min deposit 1 zUSD — and its genesis_root, re-derived by perp-prover, must
 #     equal chain 21's da0e3a53…); `multisig` create_fee 1 RAND and one treasury (now 5 of 6, new
 #     signers, the balance carried — OPEN 3);
-#     hc_auth_multisig 9705f8e2… (the file's last field) with 6 MiB proofs and 19 MiB blocks (still
+#     hc_auth_multisig (the file's last field; constraint set 11's 41db73c5…, not chain 21's 9705f8e2…) with 6 MiB proofs and 19 MiB blocks (still
 #     pending the measured production msauth proof, MSA-1/2); and chain 20's shape before it
 #     (testnet, binding_domain 1, proof_window_blocks 1024, the gas section with ceilings and the
 #     paying byte load, bridge.rotation, bridge.fees 10/10 bps to the fingerprinted recipient,
@@ -394,11 +394,12 @@ WALLETS_DIRS=${WALLETS_DIRS:-$HOME/.rand-chain17/alloc-wallets $HOME/.rand-chain
 REQUIRED_WALLETS=${REQUIRED_WALLETS:-relayer}      # `balances`: <name>.key.json that must be under WALLETS_DIRS before the scan (the relayer's link went missing once)
 BALANCES_RESCAN=${BALANCES_RESCAN:-1}              # `balances`: `rand sync --rescan` (from leaf 0) — never trust a laptop note store
 RELAYER_DONE_DIR=${RELAYER_DONE_DIR:-}             # optional: a copy of the relayer's done/ (done/<chain>/<seq>; the relayer runs on rand-relayer-1), a floor cross-check
-EXPECT_HC_BUNDLE=${EXPECT_HC_BUNDLE:-60af094acfe65d85fdb18fb3d06cf9085dcf28c96e59e87f1ee527226e6e3fce}   # bundle guest v3, chain 21's
-EXPECT_HC_AUTH=${EXPECT_HC_AUTH:-1e4e347f44cf86750b30a9a4bdf9ec9256efe353d4ff8017451eca7d195639c1}     # the auth guest, chain 21's
-# private multisig's auth guest (MSAUTH_HC), chain 21's hc_auth_multisig: `rand-node genesis
+EXPECT_HC_BUNDLE=${EXPECT_HC_BUNDLE:-00782b22b1efdf6bbc4d9001b27baa28c03e75732090c6ccd494ddd1365c141e}   # bundle guest v3 under constraint set 11 (chain 21's, set 9: 60af094a…)
+EXPECT_HC_AUTH=${EXPECT_HC_AUTH:-8373994c200819c899236f822f0315efea213b3506a1df0785544a6c90a46078}     # the auth guest under constraint set 11 (chain 21's, set 9: 1e4e347f…)
+# private multisig's auth guest (MSAUTH_HC) under constraint set 11 (chain 21's hc_auth_multisig, set 9,
+# is 9705f8e2…): `rand-node genesis
 # --auth-multisig-guest` writes the build's own; any other expected value is refused below.
-HC_AUTH_MULTISIG_DECIDED=9705f8e2f1bc8561848b29cb8efd57c37e3e39788fa58a5f03304d8019668247
+HC_AUTH_MULTISIG_DECIDED=41db73c507ab1f24ebe76d9c425b42a08ed9a02b4b1284d410502729ce6b9cd1
 EXPECT_HC_AUTH_MULTISIG=${EXPECT_HC_AUTH_MULTISIG:-$HC_AUTH_MULTISIG_DECIDED}
 
 # ── the limits: chain 21's, asserted equal to its genesis unless LIMITS_CHANGED=1: 6 MiB proofs and
@@ -467,7 +468,7 @@ SOL_PROGRAM=${SOL_PROGRAM:-FGA3kY3RjfDKjUszJESMYtYXAbsnkFhhoxM3Mb34vycu}
 # ── gas: chain 21's section (its POOL-2 ceilings and paying byte load included), asserted equal ─
 GAS_PRICE=${GAS_PRICE:-100}
 BYTE_PRICE=${BYTE_PRICE:-800}
-BUNDLE_GAS_LIMIT=${BUNDLE_GAS_LIMIT:-20479}                  # gas_max(14, 0, 0), every bundle proof's declared limit
+BUNDLE_GAS_LIMIT=${BUNDLE_GAS_LIMIT:-22527}                  # gas_max(14, 0, 0), every bundle proof's declared limit
 GAS_DYNAMIC=${GAS_DYNAMIC:-$((MAX_BLOCK_BYTES / 2)),262144,1250}
 MAX_GAS_PRICE=${MAX_GAS_PRICE:-10000}                        # 100× the start (docs/deploy.md, POOL-2)
 MAX_BYTE_PRICE=${MAX_BYTE_PRICE:-80000}                      # 100× the start
@@ -572,7 +573,7 @@ AUDIT_V10_SKIPPED=
 BLOCK_CONTEXT_SKIPPED_FROM_ENV=${BLOCK_CONTEXT_SKIPPED:-}
 BLOCK_CONTEXT_SKIPPED=
 [ "$EXPECT_HC_AUTH_MULTISIG" = "$HC_AUTH_MULTISIG_DECIDED" ] || {
-  echo "cut-chain22: EXPECT_HC_AUTH_MULTISIG=$EXPECT_HC_AUTH_MULTISIG is not chain 21's multisig auth guest ($HC_AUTH_MULTISIG_DECIDED, MSAUTH_HC) — another guest edits this script and docs/deploy.md together" >&2; exit 1; }
+  echo "cut-chain22: EXPECT_HC_AUTH_MULTISIG=$EXPECT_HC_AUTH_MULTISIG is not constraint set 11's multisig auth guest ($HC_AUTH_MULTISIG_DECIDED, MSAUTH_HC) — another guest edits this script and docs/deploy.md together" >&2; exit 1; }
 [ "$EXPECT_ENGINE_HC" = "$ENGINE_HC_DECIDED" ] || {
   echo "cut-chain22: EXPECT_ENGINE_HC=$EXPECT_ENGINE_HC is not the decided engine ($ENGINE_HC_DECIDED, durian.market's pinned image) — another engine edits this script and docs/deploy.md together" >&2; exit 1; }
 [ "$EXPECT_ENGINE_PROGRAM_LOG_HEIGHT" = "$ENGINE_PROGRAM_LOG_HEIGHT_DECIDED" ] || {
@@ -1554,8 +1555,11 @@ g = {k: g[k] for k in order if k in g}
 need(g["chain_id"] == int(E["CHAIN_ID"]) == 22, f"chain_id is {g['chain_id']}")
 need(g.get("hardening_v6") is True, "hardening_v6 is not true — --hardening-v6 did not take")
 need(g["hc_bundle"] == E["HC_REPORTED"], "hc_bundle is not what this rand-node reports")
-need(g["hc_bundle"] == g21["hc_bundle"] == E["EXPECT_HC_BUNDLE"], f"hc_bundle {g['hc_bundle']} is not chain 21's bundle guest v3")
-need(g.get("hc_auth") == g21.get("hc_auth") == E["EXPECT_HC_AUTH"], f"hc_auth {g.get('hc_auth')} is not chain 21's auth guest")
+# Constraint set 11 moved every guest digest (Grain constants): chain 22 names set 11's, chain 21 set 9's.
+need(g["hc_bundle"] == E["EXPECT_HC_BUNDLE"] == "00782b22b1efdf6bbc4d9001b27baa28c03e75732090c6ccd494ddd1365c141e" and g21["hc_bundle"] == "60af094acfe65d85fdb18fb3d06cf9085dcf28c96e59e87f1ee527226e6e3fce",
+     f"hc_bundle {g['hc_bundle']} is not constraint set 11's bundle guest v3")
+need(g.get("hc_auth") == E["EXPECT_HC_AUTH"] == "8373994c200819c899236f822f0315efea213b3506a1df0785544a6c90a46078" and g21.get("hc_auth") == "1e4e347f44cf86750b30a9a4bdf9ec9256efe353d4ff8017451eca7d195639c1",
+     f"hc_auth {g.get('hc_auth')} is not constraint set 11's auth guest")
 need(g["faucet"] is True and g["confidential"] is True and g["fri_profile"] == "production", "faucet/confidential/fri_profile wrong")
 need("aggregation" not in g, "an aggregation section is present — none belongs in chain 22")
 need("vesting" not in g, "a vesting section is present — none belongs in chain 22")
@@ -1684,9 +1688,9 @@ else:
     need(type(cap) is int and str(cap) == E.get("MULTISIG_MAX_ACCOUNTS") and cap >= len(accts),
          f"multisig.max_accounts is {cap!r}, not MULTISIG_MAX_ACCOUNTS {E.get('MULTISIG_MAX_ACCOUNTS')!r} (≥ {len(accts)}, the seeded treasury counts; OPEN 2)")
     need(list(ms) == ["create_fee", "accounts", "max_accounts"], f"the multisig section lists {list(ms)}, not MultisigConfig's order")
-# ── chain 21's hc_auth_multisig (private multisig), on the finished file ──────────────────────────
-need(E["EXPECT_HC_AUTH_MULTISIG"] == "9705f8e2f1bc8561848b29cb8efd57c37e3e39788fa58a5f03304d8019668247" == g21["hc_auth_multisig"],
-     f"EXPECT_HC_AUTH_MULTISIG is {E['EXPECT_HC_AUTH_MULTISIG']}, not chain 21's multisig auth guest (MSAUTH_HC)")
+# ── hc_auth_multisig (private multisig) under constraint set 11, on the finished file ──────────────────────────
+need(E["EXPECT_HC_AUTH_MULTISIG"] == "41db73c507ab1f24ebe76d9c425b42a08ed9a02b4b1284d410502729ce6b9cd1" and g21["hc_auth_multisig"] == "9705f8e2f1bc8561848b29cb8efd57c37e3e39788fa58a5f03304d8019668247",
+     f"EXPECT_HC_AUTH_MULTISIG is {E['EXPECT_HC_AUTH_MULTISIG']}, not constraint set 11's multisig auth guest (MSAUTH_HC)")
 need("hc_auth_multisig" in g, "no hc_auth_multisig — --auth-multisig-guest did not take")
 need(bool(g.get("hc_auth")), "hc_auth_multisig needs hc_auth (the multisig auth guest authorises bundle guest v3's spends)")
 need(g["hc_auth_multisig"].lower() != str(g.get("hc_auth")).lower(), "hc_auth_multisig must differ from hc_auth")
@@ -1748,7 +1752,7 @@ need(g.get("gas") is not None, "the gas section is missing — --gas-price did n
 gas = g["gas"]
 need(int(gas["gas_price"]) == int(E["GAS_PRICE"]) and int(gas["byte_price"]) == int(E["BYTE_PRICE"]),
      f"gas prices are {gas['gas_price']}/{gas['byte_price']}, expected {E['GAS_PRICE']}/{E['BYTE_PRICE']}")
-need(int(gas["bundle_gas_limit"]) == int(E["BUNDLE_GAS_LIMIT"]) == 20479, f"bundle_gas_limit is {gas['bundle_gas_limit']}, not gas_max(14, 0, 0) = 20479")
+need(int(gas["bundle_gas_limit"]) == int(E["BUNDLE_GAS_LIMIT"]) == 22527, f"bundle_gas_limit is {gas['bundle_gas_limit']}, not gas_max(14, 0, 0) = 22527 (constraint set 11)")
 need(gas.get("metering") == "circuit", f"gas.metering is {gas.get('metering')!r}")
 need(gas.get("dynamic") is not None, "gas.dynamic is missing — --gas-dynamic did not take (Phase 2 is off)")
 dyn = gas["dynamic"]
@@ -1763,9 +1767,12 @@ need(str(dyn.get("max_gas_price")) == E["MAX_GAS_PRICE"] == "10000", f"gas.dynam
 need(str(dyn.get("max_byte_price")) == E["MAX_BYTE_PRICE"] == "80000", f"gas.dynamic.max_byte_price is {dyn.get('max_byte_price')!r}, not \"80000\" — --max-byte-price did not take")
 need(dyn.get("byte_load") == E["GAS_BYTE_LOAD"] == "paying", f"gas.dynamic.byte_load is {dyn.get('byte_load')!r}, not \"paying\" — --gas-byte-load paying did not take")
 # chain 21's section but for the byte target, which follows chain 22's max_block_bytes (half of it,
-# asserted above): 9961472 at the 19 MiB both chains decide.
+# asserted above): 9961472 at the 19 MiB both chains decide; and the bundle limit, which constraint
+# set 11 moved from chain 21's 20479 to 22527 (asserted above).
 want_gas_section = copy.deepcopy(g21["gas"])
 want_gas_section["dynamic"]["target_block_bytes"] = g["max_block_bytes"] // 2
+need(int(g21["gas"]["bundle_gas_limit"]) == 20479, f"chain 21's bundle_gas_limit is {g21['gas']['bundle_gas_limit']}, not set 9's 20479")
+want_gas_section["bundle_gas_limit"] = 22527
 need(gas == want_gas_section or E.get("GAS_CHANGED"), f"the gas section {gas} is not chain 21's {want_gas_section} (GAS_CHANGED=1 if intended)")
 # the staking section
 st = g["staking"]
@@ -1830,7 +1837,9 @@ need(g["max_block_bytes"] >= 3 * g["max_proof_bytes"] + 1048576,
 # program_state are compared on their own lines below, the new fields taken out.
 # `validators`: chain 21's genesis list without archive2 (owner, 2026-11-19), asserted above
 # against the register and in py_validators against chain 21's genesis, key by key, in order.
-excused = {"chain_id", "timestamp_ms", "alloc", "bridge", "tokens", "staking", "gas", "perps", "multisig", "program_state", "beacon", "validators"}
+# The guest digests are excused too: constraint set 11 moved them (asserted at set 11's values above).
+excused = {"chain_id", "timestamp_ms", "alloc", "bridge", "tokens", "staking", "gas", "perps", "multisig", "program_state", "beacon", "validators",
+           "hc_bundle", "hc_auth", "hc_auth_multisig"}
 if E.get("LIMITS_CHANGED"):
     excused |= {"max_program_words", "max_proof_bytes", "max_block_bytes", "max_call_envelope_bytes", "max_program_public_words"}
 moved = sorted(k for k in set(g) | set(g21) if k not in excused and g.get(k) != g21.get(k))
@@ -2105,7 +2114,7 @@ want("max_gas_price", L.get("max_gas_price"), "10000")
 want("max_byte_price", L.get("max_byte_price"), "80000")
 want("byte_load", L.get("byte_load"), "paying")
 want("gas_metering", L.get("gas_metering"), "circuit")
-want("bundle_gas_limit", L.get("bundle_gas_limit"), 20479)
+want("bundle_gas_limit", L.get("bundle_gas_limit"), 22527)
 want("adjust_bps", L.get("adjust_bps"), 1250)
 want("envelope_bytes", L.get("envelope_bytes"), 1860)
 want("hardening_v6", L.get("hardening_v6"), True)
@@ -2520,11 +2529,11 @@ import json, os
 E = os.environ
 g = json.load(open(E["OUT"]))
 g21 = json.load(open(E["CHAIN21_GENESIS"]))
-assert g["chain_id"] == 22 and g["hc_auth"] == g21["hc_auth"] and g["hc_bundle"] == g21["hc_bundle"]
+assert g["chain_id"] == 22 and g["hc_auth"] == "8373994c200819c899236f822f0315efea213b3506a1df0785544a6c90a46078" != g21["hc_auth"] and g["hc_bundle"] == "00782b22b1efdf6bbc4d9001b27baa28c03e75732090c6ccd494ddd1365c141e" != g21["hc_bundle"]
 assert list(g) == list(g21) + ["beacon"], "every key chain 21 has, in chain 21's order — and the beacon, last"
 assert g["beacon"] == json.load(open(E["TMP"] + "/beacon.json")) and len(g["beacon"]["commitments"]) == 25 and g["beacon"]["commit_delay_blocks"] == 256
 assert g["fees"] == g21["fees"] == {"burn_base": True, "burn_floor": True}
-assert g["hc_auth_multisig"] == g21["hc_auth_multisig"] == "9705f8e2f1bc8561848b29cb8efd57c37e3e39788fa58a5f03304d8019668247" != g["hc_auth"]
+assert g["hc_auth_multisig"] == "41db73c507ab1f24ebe76d9c425b42a08ed9a02b4b1284d410502729ce6b9cd1" != g21["hc_auth_multisig"] == "9705f8e2f1bc8561848b29cb8efd57c37e3e39788fa58a5f03304d8019668247" and g["hc_auth_multisig"] != g["hc_auth"]
 p = g["perps"]
 assert list(p) == ["collateral_asset", "max_tier", "max_window_blocks", "max_block_inputs", "min_deposit", "engine_hc", "genesis_root", "markets",
                    "bound_payouts", "sparse_windows", "max_window_heights", "engine_program_log_height", "max_pending_digests"], list(p)
@@ -2545,7 +2554,7 @@ assert list(g["program_state"]) == ["cell_fee", "refuse_panics", "reference_bloc
 assert g["tokens"] == {**g21["tokens"], "incremental_root": True}
 assert g["testnet"] is True and g["binding_domain"] == 1 and g["proof_window_blocks"] == 1024
 assert (g["max_proof_bytes"], g["max_block_bytes"]) == (g21["max_proof_bytes"], g21["max_block_bytes"]) == (6291456, 19922944)
-assert g["gas"] == g21["gas"] and g["gas"]["dynamic"]["target_block_bytes"] == 9961472 and g["gas"]["dynamic"]["byte_load"] == "paying"
+assert g["gas"] == {**g21["gas"], "bundle_gas_limit": 22527} and g21["gas"]["bundle_gas_limit"] == 20479 and g["gas"]["dynamic"]["target_block_bytes"] == 9961472 and g["gas"]["dynamic"]["byte_load"] == "paying"
 assert g["bridge"]["rotation"] == g21["bridge"]["rotation"] == {"delay_secs": 86400, "needs_possession": True}
 assert g["bridge"]["fees"] == g21["bridge"]["fees"] and g["bridge"]["fees"]["mint_bps"] == g["bridge"]["fees"]["burn_bps"] == 10
 assert list(g["bridge"]) == list(g21["bridge"])
@@ -2894,7 +2903,7 @@ d["supply"]["total_supply"] = str(2**66); json.dump(d, open(sys.argv[4], "w"))' 
   refuse "hc_auth_multisig absent"                 "$B" 'del d["hc_auth_multisig"]' "--auth-multisig-guest did not take"
   refuse "hc_auth_multisig not this build's"       "$B" 'd["hc_auth_multisig"] = "cd" * 32' "is not this build's multisig auth guest"
   refuse "hc_auth_multisig equal to hc_auth"       "$B" 'd["hc_auth_multisig"] = d["hc_auth"]' "must differ from hc_auth"
-  refuse "hc_auth missing beside hc_auth_multisig" "$B" 'del d["hc_auth"]' "is not chain 21's auth guest"
+  refuse "hc_auth missing beside hc_auth_multisig" "$B" 'del d["hc_auth"]' "is not constraint set 11's auth guest"
   refuse "max_proof_bytes under 4 MiB"             "$B" 'd["max_proof_bytes"] = 4194303' "cannot hold a multisig auth proof"
   refuse "hc_auth_multisig not what the node wrote" "$S" 'pass' "is not what this rand-node wrote" HC_AUTH_MULTISIG_REPORTED="$(printf 'cd%.0s' $(seq 32))"
   # the treasury file itself (py_treasury), each refusal before a section is written
@@ -2999,7 +3008,7 @@ d["supply"]["total_supply"] = str(2**66); json.dump(d, open(sys.argv[4], "w"))' 
   elif grep -qF "sealed in the legacy format" "$ST/log"; then ok "a legacy (1 348-B) zUSD note — $(grep -o 'cut-chain22: .*' "$ST/log" | tail -1 | cut -c1-110)"
   else bad "a legacy (1 348-B) zUSD note — wrong refusal: $(tail -1 "$ST/log")"; fi
   mv "$TN.orig" "$TN"
-  refuse "hc_auth not chain 21's"            "$G" 'd["hc_auth"] = "cd" * 32' "is not chain 21's auth guest"
+  refuse "hc_auth not set 11's"              "$G" 'd["hc_auth"] = "cd" * 32' "is not constraint set 11's auth guest"
   # the bridge: emitters, floors, custody
   refuse "a snapshot read at other emitters" "$S" 'd["source"]["emitters"]["2"] = "00" * 31 + "01"' "other emitters than this cut lists"
   refuse "a guardian rotation on chain 21"   "$S" 'd["bridge"]["guardian_set_index"] = 2' "BRIDGE_ROTATED=1"
@@ -3070,7 +3079,7 @@ json.dump({"rand_getGenesisHash": "ab" * 32,
            "rand_status": {"chain_id": 22, "hc_bundle": g["hc_bundle"], "hc_auth": g["hc_auth"], "hc_auth_multisig": g["hc_auth_multisig"], "fri_profile": "production"},
            "rand_getLimits": {"proof_window_blocks": 1024, "binding_domain": 1, "testnet": True, "admission_by_vote": True, "slashing": None,
                               "max_gas_price": d["max_gas_price"], "max_byte_price": d["max_byte_price"], "byte_load": "paying",
-                              "gas_metering": "circuit", "bundle_gas_limit": 20479, "adjust_bps": 1250, "envelope_bytes": 1860,
+                              "gas_metering": "circuit", "bundle_gas_limit": 22527, "adjust_bps": 1250, "envelope_bytes": 1860,
                               "hardening_v6": True, "hc_auth": g["hc_auth"], "max_proof_bytes": g["max_proof_bytes"], "max_block_bytes": g["max_block_bytes"],
                               "hc_auth_multisig": g["hc_auth_multisig"],
                               "program_state": pl,
@@ -3209,8 +3218,11 @@ json.dump(a, open(p,'w'))" "$ST/answers.json"
   if [ "$(deploy/check-constraint-set.sh --chain "$CHAIN_ID" --genesis-hash "$AB" --print-row 2>/dev/null)" = "$WANT_ROW" ] && [[ "$N" =~ ^[0-9]+$ ]]; then
     ok "check-constraint-set.sh --print-row prints the row alone: $WANT_ROW"
   else bad "--print-row printed '$(deploy/check-constraint-set.sh --chain "$CHAIN_ID" --genesis-hash "$AB" --print-row 2>&1 | tail -1)', not '$WANT_ROW'"; fi
-  if deploy/check-constraint-set.sh --chain 21 --genesis-hash "$CHAIN21_HASH" --binary-set "$N" >"$ST/log" 2>&1 && grep -q 'chain 21, .* — the row is there' "$ST/log"; then
-    ok "the committed table holds chain 21's row at this tree's constraint set $N"
+  # Constraint set 11 is chain 22's alone: chain 21's row stays at set 9, and this tree's set-$N
+  # build is refused it (check-constraint-set.sh wants the row at the tree's set and finds 9).
+  if grep -qF "    (21, \"$CHAIN21_HASH\", 9)," "$CS" && ! deploy/check-constraint-set.sh --chain 21 --genesis-hash "$CHAIN21_HASH" --binary-set "$N" >"$ST/log" 2>&1 \
+     && grep -qF "found for chain 21 or that hash: 21 $CHAIN21_HASH 9" "$ST/log"; then
+    ok "the committed table holds chain 21's row at constraint set 9, and this tree (set $N) is not chain 21's"
   else bad "chain 21's row in the committed table: $(tail -1 "$ST/log")"; fi
   if row_check "$ST/cs-row.rs" --binary-set "$N"; then ok "a table with chain $CHAIN_ID's row at set $N is accepted"; else bad "a table with the row: $(tail -2 "$ST/log")"; fi
   for c in "none:a table without chain $CHAIN_ID's row" "wrongset:the row under another constraint set ($((N - 1)))" "otherhash:a chain-$CHAIN_ID row with another genesis hash" \
@@ -3296,7 +3308,7 @@ json.dump(a, open(p,'w'))" "$ST/answers.json"
   bash_refuses "BEACON_COMMIT_DELAY_BLOCKS=1048577" "is outside 1..=1048576" BEACON_COMMIT_DELAY_BLOCKS=1048577 --
   bash_refuses "BEACON_COMMIT_DELAY_BLOCKS empty" "is outside 1..=1048576" BEACON_COMMIT_DELAY_BLOCKS= --
   bash_refuses "an EXPECT_ENGINE_PROGRAM_LOG_HEIGHT off the pin" "is not the pinned engine's program height" EXPECT_ENGINE_PROGRAM_LOG_HEIGHT=15 --
-  bash_refuses "an EXPECT_HC_AUTH_MULTISIG off chain 21's guest" "is not chain 21's multisig auth guest" EXPECT_HC_AUTH_MULTISIG="$(printf 'cd%.0s' $(seq 32))" --
+  bash_refuses "an EXPECT_HC_AUTH_MULTISIG off chain 21's guest" "is not constraint set 11's multisig auth guest" EXPECT_HC_AUTH_MULTISIG="$(printf 'cd%.0s' $(seq 32))" --
   bash_refuses "an EXPECT_ENGINE_HC off the decided engine" "is not the decided engine" EXPECT_ENGINE_HC="$(printf 'cd%.0s' $(seq 32))" --
   # A genesis dir holding chain 21's committed file and not chain 22's (once chain 22 is cut,
   # deploy/ holds genesis-chain22.json and `refuse_reused_chain_id 22` would fire first).
@@ -3993,7 +4005,7 @@ cut-chain22: CONSTRAINT-SET ROW — OPEN (issue #166): add this line to CHAIN_CO
     $CS_ROW
 cut-chain22: before each validator's node starts, ON ITS HOST: deploy/check-beacon-seed.sh --genesis $OUT --datadir <datadir> --key <node key> (its beacon.seed.json opens its genesis commitment); after the start, the same with --rpc 127.0.0.1:8545
 cut-chain22: after launch: NODE=… $0 check-limits <first node's RPC> $OUT   (before the first bundle, deposit and state proof)
-cut-chain22: operations: msauth-vk-production.bin (sha256 68facb06…cd30) beside rand-node on every chain-22 node; NTP on every validator (perps block time is consensus input); a perp-view service and a prover host (~22 GB a proof) whose perp-prover builds sparse jobs (durian 28cebfb+); token collateral is outside the supply audit (M6).
+cut-chain22: operations: msauth-vk-production.bin (sha256 168d79a8…71b3, constraint set 11) beside rand-node on every chain-22 node; NTP on every validator (perps block time is consensus input); a perp-view service and a prover host (~22 GB a proof) whose perp-prover builds sparse jobs (durian 28cebfb+); token collateral is outside the supply audit (M6).
 
 ⚠  Stamped $AGE s ago; the chain's clock starts there. Launch within MINUTES, or delete $OUT and re-cut.
 EOF

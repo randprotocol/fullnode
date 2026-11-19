@@ -11,27 +11,49 @@
 //!
 //! ```text
 //! [n_code, code…, n_calldata, calldata…, address(8), caller(8), callvalue(8), gas_limit(1),
-//!  pre_root(8), n_witnesses(1), witness…]        witness = [slot(8), value(8), sibling_0(8), …, sibling_31(8)]   (272 words)
+//!  context(8), pre_root(8), n_witnesses(1), witness…]   witness = [slot(8), value(8), sibling_0(8), …, sibling_63(8)]   (528 words; 272, 32 siblings, in storage layout 1)
 //! ```
+//!
+//! `context` is eight words the guest never interprets: it carries them from the input into the
+//! public output, so the chain that consumes the proof can put its replay protection there (a
+//! transaction hash, a nonce and chain id, a nullifier) and have the proof bound to it.
 //!
 //! # The public output
 //!
 //! `out0 = status` (1 success, 0 revert, 2 exceptional halt) and `out1..out7` = words 0..6 of
 //!
 //! ```text
-//! hash(EVM_OUT, [codehash(8) ‖ pre_root(8) ‖ post_root(8) ‖ return_hash(8) ‖ logs_hash(8)])
+//! hash(EVM_OUT, [layout(1) ‖ codehash(8) ‖ pre_root(8) ‖ post_root(8) ‖ return_hash(8)
+//!                ‖ logs_hash(8) ‖ address(8) ‖ caller(8) ‖ callvalue(8) ‖ calldata_hash(8)
+//!                ‖ context(8) ‖ gas_limit(1) ‖ gas_used(1)])
 //! ```
 //!
-//! — 40 words through the domain-tagged Poseidon2 sponge, a 224-bit binding of the contract, both
-//! state roots, the return data and the logs. `codehash = keccak256(runtime bytecode)`,
-//! `return_hash = keccak256(return data)`,
-//! `logs_hash = keccak256(be32(n_logs) ‖ per log: be32(n_topics) ‖ topics as 32 big-endian bytes)`,
-//! each 32-byte hash packed into eight words as `word[i] = LE(bytes[4i..4i+4])`.
+//! — 83 words through the domain-tagged Poseidon2 sponge. `layout` is
+//! [`LAYOUT_VERSION`](crate::storage::LAYOUT_VERSION), the storage layout both roots are under
+//! (ZKVM-105): two images that differ in layout can be admitted side by side and neither's proof
+//! passes for the other's roots. The rest is a 224-bit binding of the contract, both
+//! state roots, the return data, the logs, **who called what with which arguments** (ZKVM-103)
+//! and what it cost (ZKVM-104). `codehash = keccak256(runtime bytecode)`,
+//! `return_hash = keccak256(return data)`, `calldata_hash = keccak256(calldata)`,
+//! `logs_hash = keccak256(be32(n_logs) ‖ per log: be32(n_topics) ‖ topics as 32 big-endian bytes
+//! ‖ keccak256(data))`, each 32-byte hash packed into eight words as
+//! `word[i] = LE(bytes[4i..4i+4])`; `address`, `caller` and `callvalue` are their eight
+//! little-endian limbs, as in the input.
+//!
+//! **Authorisation.** The call's `caller`, `address`, `callvalue`, calldata, `gas_limit` and
+//! `context` are private inputs a prover is free to choose, so the guest cannot decide whether
+//! the caller agreed to the call. What it does is put all six into the digest, so a verifier that
+//! recomputes the digest from the call *it* authorised (the spender its transaction authenticates,
+//! the calldata that spender signed, its own nonce in `context`) accepts only a proof of exactly
+//! that call. A proof made for any other caller, contract address, value, calldata, gas limit or
+//! context has a different digest. The price is that those six are known to the verifier.
 //!
 //! A status other than 1 binds `post_root = pre_root` and an **empty** log set, and a status of 2
-//! binds empty return data as well — [`public_output`] is the one place that rule lives. The
-//! interpreter's own [`Outcome`] still carries the logs a reverted run emitted (plan Ruling 3), so
-//! a host test can see what the bytecode did; nothing but this module decides what is *bound*.
+//! binds empty return data as well — [`public_output`] is the one place that rule lives. The call
+//! fields and the gas are bound whatever the status (`gas_used` is the whole limit on a status of
+//! 2). The interpreter's own [`Outcome`] still carries the logs a reverted run emitted (plan
+//! Ruling 3), so a host test can see what the bytecode did; nothing but this module decides what
+//! is *bound*.
 //!
 //! # The guest pattern
 //!
@@ -61,16 +83,19 @@ use crate::interp::{
     Buffers, Env, Halt, Interpreter, Log, Outcome, MAX_CALLDATA_BYTES, MAX_CODE_BYTES, MAX_LOGS,
     MAX_RETURN_BYTES, MAX_TOPICS,
 };
-use crate::storage::{StorageError, StorageTree, Witness, EVM_OUT_DOMAIN, MAX_WITNESSES};
+use crate::storage::{
+    StorageError, StorageTree, EVM_OUT_DOMAIN, LAYOUT_VERSION, MAX_WITNESSES,
+};
 use crate::u256::U256;
-use crate::{dhash, keccak256, Host};
+use crate::{keccak256, Host};
 
-/// Words in the public-output digest's preimage: five 8-word hashes and roots.
-const OUT_WORDS: usize = 40;
+/// Words in the public-output digest's preimage: the layout version, ten 8-word hashes, roots and
+/// call fields, then `gas_limit` and `gas_used`.
+pub const OUT_WORDS: usize = 83;
 
-/// The most bytes [`logs_hash`] hashes: `be32(n_logs)` plus, per log, `be32(n_topics)` and four
-/// 32-byte topics.
-const LOGS_MAX_BYTES: usize = 4 + MAX_LOGS * (4 + MAX_TOPICS * 32);
+/// The most bytes [`logs_hash`] hashes: `be32(n_logs)` plus, per log, `be32(n_topics)`, four
+/// 32-byte topics and the 32-byte data hash.
+const LOGS_MAX_BYTES: usize = 4 + MAX_LOGS * (4 + MAX_TOPICS * 32 + 32);
 
 /// Why an input vector is not a call. Every one of these is status 2 with the canonical malformed
 /// output ([`run_call`]); none of them is a panic, because every length involved is
@@ -86,7 +111,7 @@ pub enum ParseError {
     /// `n_witnesses` above [`MAX_WITNESSES`].
     TooManyWitnesses,
     /// Two witnesses claim one leaf position (`StorageError::DuplicateIndex`): the same slot
-    /// twice, or two slots ground into one 32-bit index. `storage`'s module doc says why this has
+    /// twice, or two slots ground into one index. `storage`'s module doc says why this has
     /// to be refused here rather than tolerated.
     DuplicateWitnessIndex,
 }
@@ -194,6 +219,8 @@ pub struct CallInput {
     pub calldata: [u8; MAX_CALLDATA_BYTES],
     pub calldata_len: usize,
     pub env: Env,
+    /// The eight words the consuming chain binds its replay protection to; opaque to the guest.
+    pub context: [u32; 8],
     pub pre_root: [u32; 8],
     pub storage: StorageTree,
 }
@@ -211,6 +238,7 @@ impl CallInput {
             callvalue: U256::ZERO,
             gas_limit: 0,
         },
+        context: [0; 8],
         pre_root: [0; 8],
         storage: StorageTree::ZERO,
     };
@@ -254,6 +282,7 @@ pub fn decode_input<H: Host, F: FnMut(u32) -> u32>(
         callvalue: c.u256(),
         gas_limit: c.word() as u64,
     };
+    dst.context = c.word8();
     dst.pre_root = c.word8();
     let n = c.word() as usize;
     if n > MAX_WITNESSES {
@@ -261,15 +290,10 @@ pub fn decode_input<H: Host, F: FnMut(u32) -> u32>(
     }
     dst.storage.reset(dst.pre_root);
     for _ in 0..n {
-        let w = Witness {
-            slot: c.u256(),
-            value: c.u256(),
-            siblings: core::array::from_fn(|_| c.word8()),
-            verified: false,
-        };
-        // `n <= MAX_WITNESSES` was checked above, so `TooMany` cannot happen; the reachable
-        // rejection is a second witness at a leaf position already taken.
-        match dst.storage.push(h, w) {
+        // Read into place (`read_witness`): `n <= MAX_WITNESSES` was checked above, so `TooMany`
+        // cannot happen; the reachable rejection is a second witness at a leaf position already
+        // taken.
+        match dst.storage.read_witness(h, || c.word()) {
             Ok(()) => {}
             Err(StorageError::DuplicateIndex) => return Err(ParseError::DuplicateWitnessIndex),
             Err(_) => return Err(ParseError::TooManyWitnesses),
@@ -290,8 +314,9 @@ pub fn hash_words(h: &[u8; 32]) -> [u32; 8] {
     core::array::from_fn(|i| u32::from_le_bytes([h[4 * i], h[4 * i + 1], h[4 * i + 2], h[4 * i + 3]]))
 }
 
-/// `keccak256(be32(n_logs) ‖ per log: be32(n_topics) ‖ topics as 32 big-endian bytes each)` — the
-/// data of a log is dropped (the plan's ruling), only its topics are bound.
+/// `keccak256(be32(n_logs) ‖ per log: be32(n_topics) ‖ topics as 32 big-endian bytes each ‖
+/// keccak256(data))` — a log's topics and, through its hash, its data (ZKVM-104: the amount of a
+/// `Transfer` is data, not a topic).
 ///
 /// **An outcome that is not a success hashes the empty log set** (`be32(0)`), whatever the
 /// interpreter recorded: a reverted or halted call changes nothing, so it publishes nothing. The
@@ -299,50 +324,129 @@ pub fn hash_words(h: &[u8; 32]) -> [u32; 8] {
 /// they are dropped.
 pub fn logs_hash<H: Host>(h: &mut H, o: &Outcome) -> [u8; 32] {
     let n = if o.status() == 1 { o.n_logs } else { 0 };
-    let mut msg = [0u8; LOGS_MAX_BYTES];
+    // The message is at most `LOGS_MAX_BYTES` (1 316) and usually far less — 4 bytes for no logs,
+    // 136 for one `Transfer` — so the buffer is sized by the bound but only the bytes written are
+    // ever initialised or read. Zeroing all of it first was a `memset` call of about 1 000 guest
+    // cycles on every call, logs or none (ZKVM-117).
+    let mut buf = core::mem::MaybeUninit::<[u8; LOGS_MAX_BYTES]>::uninit();
+    let base = buf.as_mut_ptr() as *mut u8;
     let mut p = 0;
-    msg[p..p + 4].copy_from_slice(&(n as u32).to_be_bytes());
-    p += 4;
+    let mut put = |bytes: &[u8]| {
+        debug_assert!(p + bytes.len() <= LOGS_MAX_BYTES);
+        // SAFETY: `p + bytes.len() <= LOGS_MAX_BYTES` — the count is 4 bytes, and each of the at
+        // most `MAX_LOGS` logs (`take(n)`, `n <= o.logs.len()`) writes 4 bytes, at most
+        // `MAX_TOPICS` 32-byte topics (`take` over a `MAX_TOPICS` array) and 32 bytes, which is
+        // `LOGS_MAX_BYTES` exactly — so the destination is inside `buf`; `bytes` is a live slice
+        // that cannot overlap the local `buf`.
+        unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), base.add(p), bytes.len()) };
+        p += bytes.len();
+    };
+    put(&(n as u32).to_be_bytes());
     for log in o.logs.iter().take(n) {
-        msg[p..p + 4].copy_from_slice(&(log.n_topics as u32).to_be_bytes());
-        p += 4;
-        for topic in log.topics.iter().take(log.n_topics as usize) {
-            msg[p..p + 32].copy_from_slice(&topic.to_be_bytes());
-            p += 32;
+        let topics = (log.n_topics as usize).min(MAX_TOPICS);
+        put(&(topics as u32).to_be_bytes());
+        for topic in log.topics.iter().take(topics) {
+            put(&topic.to_be_bytes());
         }
+        put(&log.data_hash);
     }
-    keccak256(h, &msg[..p])
+    // SAFETY: the first `p` bytes of `buf` were written by `put` above, contiguously from 0.
+    let msg = unsafe { core::slice::from_raw_parts(base as *const u8, p) };
+    keccak256(h, msg)
+}
+
+/// The call a public output is about: everything the digest binds that is not the run's own
+/// [`Outcome`]. A verifier builds one from what it authorised and holds; the guest builds one from
+/// its decoded input.
+#[derive(Clone, Copy)]
+pub struct Statement<'a> {
+    pub code: &'a [u8],
+    /// `hash_words(keccak256(code))` when whoever builds the statement already knows it, so that
+    /// [`public_output`] does not hash `code` again; `None` hashes it. The interpreter's guest
+    /// always passes `None`. A translated contract's shim passes the hash its translator baked
+    /// into the image, and only once its code guard has shown the input's code to be the code
+    /// that hash is of (ZKVM-117: hashing 1 296 bytes of ERC-20 code in the guest is ten
+    /// permutations and about 7 000 cycles). A wrong value here is a wrong digest: this is the
+    /// image's own claim about its code, bound by `hc` like the rest of the image.
+    pub codehash: Option<[u32; 8]>,
+    pub calldata: &'a [u8],
+    /// `address`, `caller`, `callvalue` and `gas_limit` — all four are bound.
+    pub env: &'a Env,
+    pub context: &'a [u32; 8],
+    pub pre_root: &'a [u32; 8],
+    /// Ignored unless the outcome is a success.
+    pub post_root: &'a [u32; 8],
 }
 
 /// The eight public output words: `out[0] = status`, `out[1..8]` = words 0..6 of
-/// `hash(EVM_OUT, [codehash ‖ pre_root ‖ post_root ‖ return_hash ‖ logs_hash])`.
+/// `hash(EVM_OUT, [layout ‖ codehash ‖ pre_root ‖ post_root ‖ return_hash ‖ logs_hash ‖ address ‖
+/// caller ‖ callvalue ‖ calldata_hash ‖ context ‖ gas_limit ‖ gas_used])`.
 ///
 /// The **one** place the status rules are applied, so no caller can publish a digest that claims a
 /// state change a failed call did not make: a status other than 1 binds `post_root = pre_root` (the
-/// `post_root` argument is then ignored, and [`run_call`] simply hands over whatever root the run
+/// `post_root` field is then ignored, and [`run_call`] simply hands over whatever root the run
 /// left behind) and an empty log set; a status of 2 binds empty return data as well, a status of 0
-/// the revert data.
-pub fn public_output<H: Host>(
-    h: &mut H,
-    code: &[u8],
-    pre_root: &[u32; 8],
-    post_root: &[u32; 8],
-    o: &Outcome,
-) -> [u32; 8] {
+/// the revert data. The call fields and the gas are bound as they are, whatever the status.
+pub fn public_output<H: Host>(h: &mut H, s: &Statement<'_>, o: &Outcome) -> [u32; 8] {
     let status = o.status();
-    let post = if status == 1 { post_root } else { pre_root };
+    let post = if status == 1 { s.post_root } else { s.pre_root };
     let ret: &[u8] = if status == 2 { &[] } else { &o.ret[..o.ret_len] };
-    let mut msg = [0u32; OUT_WORDS];
-    msg[0..8].copy_from_slice(&hash_words(&keccak256(h, code)));
-    msg[8..16].copy_from_slice(pre_root);
-    msg[16..24].copy_from_slice(post);
-    msg[24..32].copy_from_slice(&hash_words(&keccak256(h, ret)));
-    msg[32..40].copy_from_slice(&hash_words(&logs_hash(h, o)));
-    let d = dhash(h, EVM_OUT_DOMAIN, &msg);
+    // The preimage is built in the buffer it is hashed in, behind its domain word (`dhash` would
+    // copy all 83 words once more).
+    let mut msg = [0u32; 1 + OUT_WORDS];
+    msg[0] = EVM_OUT_DOMAIN;
+    msg[1] = LAYOUT_VERSION;
+    let codehash = match s.codehash {
+        Some(known) => known,
+        None => hash_words(&keccak256(h, s.code)),
+    };
+    msg[2..10].copy_from_slice(&codehash);
+    msg[10..18].copy_from_slice(s.pre_root);
+    msg[18..26].copy_from_slice(post);
+    msg[26..34].copy_from_slice(&hash_words(&keccak256(h, ret)));
+    msg[34..42].copy_from_slice(&hash_words(&logs_hash(h, o)));
+    msg[42..50].copy_from_slice(&s.env.address.0);
+    msg[50..58].copy_from_slice(&s.env.caller.0);
+    msg[58..66].copy_from_slice(&s.env.callvalue.0);
+    msg[66..74].copy_from_slice(&hash_words(&keccak256(h, s.calldata)));
+    msg[74..82].copy_from_slice(s.context);
+    // One word each: the input's `gas_limit` is one word, and `gas_used` never exceeds it.
+    msg[82] = s.env.gas_limit as u32;
+    msg[83] = o.gas_used as u32;
+    h.poseidon2(&mut msg, 1 + OUT_WORDS);
+    let d = &msg;
     let mut out = [0u32; 8];
     out[0] = status;
     out[1..8].copy_from_slice(&d[..7]);
     out
+}
+
+/// The canonical malformed statement: no code, no calldata, a zero environment, context and roots.
+/// With an [`Outcome`] of status 2 and no gas used it gives the one output every vector that does
+/// not parse produces.
+const NO_ENV: Env =
+    Env { address: U256::ZERO, caller: U256::ZERO, callvalue: U256::ZERO, gas_limit: 0 };
+const NO_CALL: Statement<'static> = Statement {
+    code: &[],
+    codehash: None,
+    calldata: &[],
+    env: &NO_ENV,
+    context: &[0; 8],
+    pre_root: &[0; 8],
+    post_root: &[0; 8],
+};
+
+/// The [`Statement`] of a decoded call, with `post_root` as the root the run left behind.
+fn statement<'a>(i: &'a CallInput, post_root: &'a [u32; 8]) -> Statement<'a> {
+    Statement {
+        code: &i.code[..i.code_len],
+        codehash: None,
+        calldata: &i.calldata[..i.calldata_len],
+        env: &i.env,
+        context: &i.context,
+        pre_root: &i.pre_root,
+        post_root,
+    }
 }
 
 /// The whole guest: decode the input vector, run the call, produce the eight public output words.
@@ -371,8 +475,8 @@ pub fn run_call_with<H: Host, F: FnMut(u32) -> u32>(
     let mut c = InputCursor::new(read, len);
     if decode_input(h, &mut w.input, &mut c).is_err() {
         // A vector that does not parse is not a call, so there is nothing to bind: the output is
-        // the one canonical malformed value — status 2 over no code, a zero pre-root and post-root,
-        // no return data and no logs. A verifier recomputing the digest from the contract and root
+        // the one canonical malformed value — status 2 over no code, no calldata, a zero
+        // environment, context, pre-root and post-root, no return data, no logs and no gas. A verifier recomputing the digest from the contract and root
         // it meant to run gets something else and rejects the proof, which is the right answer to a
         // prover-supplied vector that is not even well formed (as against a well-formed call that
         // halts, whose status-2 output a chain can accept as "nothing happened").
@@ -384,7 +488,7 @@ pub fn run_call_with<H: Host, F: FnMut(u32) -> u32>(
             logs: [Log::EMPTY; MAX_LOGS],
             n_logs: 0,
         };
-        let out = public_output(h, &[], &[0; 8], &[0; 8], &o);
+        let out = public_output(h, &NO_CALL, &o);
         return (out, o);
     }
     let i = &mut w.input;
@@ -401,7 +505,8 @@ pub fn run_call_with<H: Host, F: FnMut(u32) -> u32>(
     // exceptional halt binds the *pre*-state root instead, however far the tree moved before the
     // failure — `public_output` is the single place that rule is applied, so the root handed over
     // here is simply whatever the run left behind.
-    let out = public_output(h, &i.code[..i.code_len], &i.pre_root, &i.storage.root(), &o);
+    let post = i.storage.root();
+    let out = public_output(h, &statement(i, &post), &o);
     (out, o)
 }
 
@@ -416,7 +521,8 @@ pub fn run_call_with<H: Host, F: FnMut(u32) -> u32>(
 // The executor path takes the interpreter's input vector exactly — no extra words. The environment
 // values the interpreter lacks are not inputs at all: a `READ_INPUT` word is bound only to the
 // salted `H_IN`, which a verifier cannot open, so it cannot carry a chain fact (a timestamp, a
-// chain id) a prover could not forge. `evm2rv` bakes `CHAINID` into the translated code (bound by
+// chain id) a prover could not forge unless the public output binds it, as it does the call's own
+// fields. `evm2rv` bakes `CHAINID` into the translated code (bound by
 // the image hash), reads `ORIGIN` as `CALLER`, and traps on the rest as the interpreter does.
 
 /// What runs the decoded call in place of the interpreter: given the host, the code, the calldata,
@@ -445,6 +551,26 @@ pub fn run_call_with_executor<H: Host, F: FnMut(u32) -> u32>(
     len: u32,
     exec: Executor<'_, H>,
 ) -> ([u32; 8], Outcome) {
+    run_call_with_executor_and_codehash(h, w, read, len, exec, &mut || None)
+}
+
+/// Asked once, after the executor has returned: the code hash, if the executor already knows it
+/// (`Statement::codehash`), or `None` to have the harness hash the input's code.
+pub type KnownCodehash<'a> = &'a mut dyn FnMut() -> Option<[u32; 8]>;
+
+/// [`run_call_with_executor`] for an executor that may already know `keccak256` of the code it
+/// ran: `known` is asked after `exec` returns and its answer, if any, goes into the public output
+/// in place of a hash of the input's code. The answer must be the hash of the vector's code — a
+/// translated contract's shim returns its baked hash only when its code guard passed, and `None`
+/// (hash the input's code, as the interpreter does) when it refused the code.
+pub fn run_call_with_executor_and_codehash<H: Host, F: FnMut(u32) -> u32>(
+    h: &mut H,
+    w: &mut Workspace,
+    read: F,
+    len: u32,
+    exec: Executor<'_, H>,
+    known: KnownCodehash<'_>,
+) -> ([u32; 8], Outcome) {
     let mut c = InputCursor::new(read, len);
     if decode_input(h, &mut w.input, &mut c).is_err() {
         return malformed(h);
@@ -458,7 +584,10 @@ pub fn run_call_with_executor<H: Host, F: FnMut(u32) -> u32>(
         &mut i.storage,
         &mut w.bufs,
     );
-    let out = public_output(h, &i.code[..i.code_len], &i.pre_root, &i.storage.root(), &o);
+    let post = i.storage.root();
+    let mut st = statement(i, &post);
+    st.codehash = known();
+    let out = public_output(h, &st, &o);
     (out, o)
 }
 
@@ -474,6 +603,6 @@ fn malformed<H: Host>(h: &mut H) -> ([u32; 8], Outcome) {
         logs: [Log::EMPTY; MAX_LOGS],
         n_logs: 0,
     };
-    let out = public_output(h, &[], &[0; 8], &[0; 8], &o);
+    let out = public_output(h, &NO_CALL, &o);
     (out, o)
 }

@@ -69,7 +69,7 @@ fn the_msauth_shape_is_the_vendored_pinned_one() {
     assert_eq!(s.keccak_log_height, randprotocol_core::types::MSAUTH_KECCAK_LOG_HEIGHT, "core's mirror");
     assert_eq!(s.modq_log_height, randprotocol_core::types::MSAUTH_MODQ_LOG_HEIGHT, "core's mirror");
     // R-gas: the header ceiling, a function of public header words only.
-    assert_eq!(randprotocol_core::gas::msauth_gas_limit_pin(), 436_159);
+    assert_eq!(randprotocol_core::gas::msauth_gas_limit_pin(), 355_775);
     assert_eq!(
         randprotocol_core::gas::msauth_gas_limit_pin(),
         randprotocol_zkvm::gas::gas_max_with_modq(randprotocol_zkvm::machine::Tier(MSAUTH_TIER), s.keccak_log_height, 0, s.modq_log_height),

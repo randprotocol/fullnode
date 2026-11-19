@@ -5,25 +5,36 @@
 //!
 //! # The two input vectors
 //!
-//! The ELF is **public** and the instruction is **private**, so the call arrives on two tapes —
-//! `READ_PUBLIC` word indices and `READ_INPUT` word indices — each byte string packed four per
-//! word little-endian and zero-padded:
+//! The ELF and the sysvars are **public** and the instruction is **private**, so the call arrives
+//! on two tapes — `READ_PUBLIC` word indices and `READ_INPUT` word indices — each byte string
+//! packed four per word little-endian and zero-padded:
 //!
 //! ```text
-//! public:  [n_elf, elf bytes…]
+//! public:  [n_elf, elf bytes…, n_sysvars, sysvar bytes…]
 //! private: [n_input, input bytes…]
 //! ```
+//!
+//! `n_sysvars` is 0 (the call carries no sysvars: every sysvar getter halts) or
+//! [`SYSVAR_BYTES`] = 57, and then the bytes are `Clock`'s 40 followed by `Rent`'s 17, each the
+//! sysvar account's own data. Any other length is refused ([`ParseError::SysvarsMalformed`]). They
+//! are on the public tape and nowhere else because they are chain facts: `H_PUB` binds every word
+//! of that tape and the chain checks it against the ELF it published **and its own clock and
+//! rent**, so a prover cannot choose them. A sysvar read from the private tape would be a value
+//! the prover picked and nothing bound.
 //!
 //! # The public output
 //!
 //! `out0 = status` and `out1..out7` = words 0..6 of
 //!
 //! ```text
-//! hash(SBPF_OUT, [input_hash(8) ‖ output_hash(8)])
+//! hash(SBPF_OUT, [input_hash(8) ‖ output_hash(8) ‖ return_hash(8)])
 //! ```
 //!
-//! — 16 words through the domain-tagged Poseidon2 sponge, a 224-bit binding of the instruction the
-//! program was given and the state it left behind. **There is no `program_hash`**: the ELF is in
+//! — 24 words through the domain-tagged Poseidon2 sponge, a 224-bit binding of the instruction the
+//! program was given, the state it left behind and the data it returned. `return_hash` is
+//! `sha256` of what `sol_set_return_data` last set (the empty string if nothing was, or if the
+//! status is not 1): a program such as SPL Token's `GetAccountDataSize` changes no account and
+//! answers only there, so without it the proof would say nothing about the answer. **There is no `program_hash`**: the ELF is in
 //! the public segment, so the proof's unsalted `H_PUB` already binds it word for word and the chain
 //! checks that digest against the ELF it published (`Machine::verify_public`) — hashing the ELF a
 //! second time in-circuit bought nothing and cost 1 698 SHA-256 compressions.
@@ -79,9 +90,9 @@
 //! ```
 
 use crate::elf;
-use crate::interp::{Halt, Vm};
+use crate::interp::{Halt, Vm, MAX_RETURN_DATA, SYSVAR_BYTES};
 use crate::memory::{Memory, HEAP_BYTES, STACK_BYTES};
-use crate::{dhash, hash_words, Host, Sha256};
+use crate::{dhash, hash_words, sha256, Host, Sha256};
 
 /// The largest ELF the public vector may carry (the plan's number).
 pub const MAX_ELF_BYTES: usize = 262_144;
@@ -112,8 +123,14 @@ pub const MAX_PERMITTED_DATA_INCREASE: usize = 10_240;
 /// The marker byte of an account that is not a duplicate of an earlier one.
 const NON_DUP_MARKER: u8 = 0xff;
 
-/// Words in the public-output digest's preimage: two eight-word SHA-256 digests.
-const OUT_WORDS: usize = 16;
+/// `sha256("")`: the `return_hash` of a run that set no return data, or whose status is not 1.
+pub const EMPTY_RETURN_HASH: [u8; 32] = [
+    0xe3, 0xb0, 0xc4, 0x42, 0x98, 0xfc, 0x1c, 0x14, 0x9a, 0xfb, 0xf4, 0xc8, 0x99, 0x6f, 0xb9, 0x24,
+    0x27, 0xae, 0x41, 0xe4, 0x64, 0x9b, 0x93, 0x4c, 0xa4, 0x95, 0x99, 0x1b, 0x78, 0x52, 0xb8, 0x55,
+];
+
+/// Words in the public-output digest's preimage: three eight-word SHA-256 digests.
+const OUT_WORDS: usize = 24;
 
 /// Why a pair of input vectors is not a call. Every one of these is status 2 with the canonical
 /// malformed output ([`run_call_with`]); none is a panic, because every length involved is
@@ -133,6 +150,9 @@ pub enum ParseError {
     /// that is not exactly `instruction_data_len ‖ instruction data ‖ program_id`. See
     /// [`check_region`].
     MalformedRegion,
+    /// The public vector's sysvar block is neither absent (length 0) nor exactly [`SYSVAR_BYTES`]
+    /// long.
+    SysvarsMalformed,
 }
 
 /// Reads one input vector through a `read(idx) -> u32` closure, so the same code runs on the host
@@ -208,6 +228,10 @@ pub struct CallInput {
     pub elf_len: usize,
     pub input: [u8; MAX_INPUT_BYTES],
     pub input_len: usize,
+    /// The sysvar block from the public tape: `sysvars[..sysvars_len]`, with `sysvars_len` either
+    /// 0 or [`SYSVAR_BYTES`].
+    pub sysvars: [u8; SYSVAR_BYTES],
+    pub sysvars_len: usize,
 }
 
 impl CallInput {
@@ -217,6 +241,8 @@ impl CallInput {
         elf_len: 0,
         input: [0; MAX_INPUT_BYTES],
         input_len: 0,
+        sysvars: [0; SYSVAR_BYTES],
+        sysvars_len: 0,
     };
 }
 
@@ -228,15 +254,24 @@ pub struct Workspace {
     pub input: CallInput,
     pub stack: [u8; STACK_BYTES],
     pub heap: [u8; HEAP_BYTES],
+    /// What the run left as return data: `return_data[..return_len]`, whatever its status (the
+    /// public output binds it only for status 1).
+    pub return_data: [u8; MAX_RETURN_DATA],
+    pub return_len: usize,
 }
 
 impl Workspace {
-    pub const ZERO: Workspace =
-        Workspace { input: CallInput::ZERO, stack: [0; STACK_BYTES], heap: [0; HEAP_BYTES] };
+    pub const ZERO: Workspace = Workspace {
+        input: CallInput::ZERO,
+        stack: [0; STACK_BYTES],
+        heap: [0; HEAP_BYTES],
+        return_data: [0; MAX_RETURN_DATA],
+        return_len: 0,
+    };
 }
 
-/// Decodes the two input vectors into `dst`, in place — the ELF from the **public** cursor, the
-/// serialized instruction from the **private** one.
+/// Decodes the two input vectors into `dst`, in place — the ELF and then the sysvar block from the
+/// **public** cursor, the serialized instruction from the **private** one.
 ///
 /// Refuses, rather than trusting, everything either layout leaves to the prover: either length
 /// above its cap, and a vector that ends before its layout does. Checked once at the end, as
@@ -251,7 +286,9 @@ pub fn decode_input<FP: FnMut(u32) -> u32, FS: FnMut(u32) -> u32>(
 ) -> Result<(), ParseError> {
     dst.elf_len = 0;
     dst.input_len = 0;
+    dst.sysvars_len = 0;
     dst.elf_len = elf_c.bytes(&mut dst.elf).ok_or(ParseError::ElfTooLong)?;
+    dst.sysvars_len = read_sysvars(&mut dst.sysvars, elf_c)?;
     dst.input_len = in_c.bytes(&mut dst.input).ok_or(ParseError::InputTooLong)?;
     if elf_c.truncated() || in_c.truncated() {
         return Err(ParseError::Truncated);
@@ -259,6 +296,32 @@ pub fn decode_input<FP: FnMut(u32) -> u32, FS: FnMut(u32) -> u32>(
     // Refuse, rather than hash around, a region that is not the canonical aligned encoding: see
     // [`check_region`] for why every byte of it has to be either hashed or pinned to zero.
     check_region(&dst.input[..dst.input_len])
+}
+
+/// The sysvar block, next on the public cursor: a length word that is 0 or [`SYSVAR_BYTES`], then
+/// that many bytes, four per word little-endian (the last word's spare bytes ignored). Returns the
+/// length.
+///
+/// Not [`InputCursor::bytes`]: that is the ELF's reader, and a second call site keeps the compiler
+/// from inlining it into `decode_input`, which costs the ELF's 27 000 words about four cycles each.
+pub fn read_sysvars<F: FnMut(u32) -> u32>(
+    dst: &mut [u8; SYSVAR_BYTES],
+    c: &mut InputCursor<F>,
+) -> Result<usize, ParseError> {
+    let n = c.word() as usize;
+    if n == 0 {
+        return Ok(0);
+    }
+    if n != SYSVAR_BYTES {
+        return Err(ParseError::SysvarsMalformed);
+    }
+    for chunk in dst.chunks_mut(4) {
+        let w = c.word().to_le_bytes();
+        for (b, v) in chunk.iter_mut().zip(w) {
+            *b = v;
+        }
+    }
+    Ok(n)
 }
 
 /// One account entry's offsets inside the serialized region, as [`AccountWalk`] resolves them: a
@@ -676,7 +739,7 @@ fn read_u64(b: &[u8], off: usize) -> Option<u64> {
 }
 
 /// The eight public output words: `out[0] = status`, `out[1..8]` = words 0..6 of
-/// `hash(SBPF_OUT, [input_hash ‖ output_hash])`.
+/// `hash(SBPF_OUT, [input_hash ‖ output_hash ‖ return_hash])`.
 ///
 /// There is no `program_hash` in the preimage: the ELF is read from the public segment, so `H_PUB`
 /// binds it and the chain checks that against the ELF it published.
@@ -685,15 +748,28 @@ pub fn public_output<H: Host>(
     status: u32,
     input_hash: &[u8; 32],
     output_hash: &[u8; 32],
+    return_hash: &[u8; 32],
 ) -> [u32; 8] {
     let mut msg = [0u32; OUT_WORDS];
     msg[0..8].copy_from_slice(&hash_words(input_hash));
     msg[8..16].copy_from_slice(&hash_words(output_hash));
+    msg[16..24].copy_from_slice(&hash_words(return_hash));
     let d = dhash(h, SBPF_OUT_DOMAIN, &msg);
     let mut out = [0u32; 8];
     out[0] = status;
     out[1..8].copy_from_slice(&d[..7]);
     out
+}
+
+/// What a run sees beyond its memory, and where it leaves its return data: the sysvar block
+/// (`sysvars`, empty or [`SYSVAR_BYTES`] long), the program's own id, and the buffer and length
+/// `sol_set_return_data` writes. [`run_call_with`] fills a [`Vm`] from it; a translated program's
+/// executor points `sbpf-rt` at it.
+pub struct CallEnv<'a> {
+    pub sysvars: &'a [u8],
+    pub program_id: &'a [u8; 32],
+    pub return_data: &'a mut [u8; MAX_RETURN_DATA],
+    pub return_len: &'a mut usize,
 }
 
 /// The whole guest: decode the public and private input vectors, load the ELF, run it, produce the
@@ -710,10 +786,33 @@ pub fn run_call<H: Host, FP: FnMut(u32) -> u32, FS: FnMut(u32) -> u32>(
     run_call_with(h, ws, read_public, n_public, read_private, n_private).0
 }
 
+/// Runs the interpreter over `mem` with `env`'s sysvars and program id, and leaves the return data
+/// in `env` — the executor [`run_call_with`] uses.
+pub fn interpret<H: Host>(
+    h: &mut H,
+    program: &elf::Program<'_>,
+    mem: Memory<'_>,
+    env: &mut CallEnv<'_>,
+) -> Result<u64, Halt> {
+    let mut vm = Vm::new(h, program, mem);
+    if let Some(dst) = vm.sysvars.get_mut(..env.sysvars.len()) {
+        dst.copy_from_slice(env.sysvars);
+        vm.sysvars_len = env.sysvars.len();
+    }
+    vm.program_id = *env.program_id;
+    let result = vm.run();
+    let n = vm.return_len;
+    if let (Some(dst), Some(src)) = (env.return_data.get_mut(..n), vm.return_data.get(..n)) {
+        dst.copy_from_slice(src);
+        *env.return_len = n;
+    }
+    result
+}
+
 /// [`run_call`] plus the interpreter's own outcome — what a host test needs to check the output
 /// against its own idea of the call (`rand_zkvm::sbpf::SbpfCall::expected`). The post-state of the
-/// accounts is left in `ws.input.input[..input_len]`, so a caller can deserialize it. The guest
-/// uses [`run_call`].
+/// accounts is left in `ws.input.input[..input_len]` and the return data in
+/// `ws.return_data[..return_len]`, so a caller can read both. The guest uses [`run_call`].
 pub fn run_call_with<H: Host, FP: FnMut(u32) -> u32, FS: FnMut(u32) -> u32>(
     h: &mut H,
     ws: &mut Workspace,
@@ -725,27 +824,48 @@ pub fn run_call_with<H: Host, FP: FnMut(u32) -> u32, FS: FnMut(u32) -> u32>(
     let mut elf_c = InputCursor::new(read_public, n_public);
     let mut in_c = InputCursor::new(read_private, n_private);
     if decode_input(&mut ws.input, &mut elf_c, &mut in_c).is_err() {
-        // A vector that does not parse — or an instruction region that is not the canonical
-        // aligned encoding ([`check_region`]) — is not a call, so there is nothing to bind: the
-        // output is the one canonical malformed value, status 2 over two all-zero digests. A
-        // verifier recomputing the digest from the instruction it meant to run gets something else
-        // and rejects the proof, which is the right answer to a prover-supplied vector that is not
-        // even well formed.
-        let z = [0u8; 32];
-        return (public_output(h, 2, &z, &z), Err(Halt::BadElf));
+        return (malformed_output(h), Err(Halt::BadElf));
     }
-    // Now split the workspace into its fields: the ELF buffer is borrowed by the loaded program for
+    run_decoded(h, ws, interpret)
+}
+
+/// The output of a pair of vectors that is not a call. A vector that does not parse — or an
+/// instruction region that is not the canonical aligned encoding ([`check_region`]), or a sysvar
+/// block of the wrong length — is not a call, so there is nothing to bind: the output is the one
+/// canonical malformed value, status 2 over three all-zero digests. A verifier recomputing the
+/// digest from the instruction it meant to run gets something else and rejects the proof, which is
+/// the right answer to a prover-supplied vector that is not even well formed.
+pub fn malformed_output<H: Host>(h: &mut H) -> [u32; 8] {
+    let z = [0u8; 32];
+    public_output(h, 2, &z, &z, &z)
+}
+
+/// Everything after decoding, over a workspace [`decode_input`] (or a translated image's own
+/// decoder) has filled: the two pre-run digests, the zeroed stack and heap, the load, the run
+/// through `exec`, the status mapping and the public output.
+pub fn run_decoded<H: Host, X>(h: &mut H, ws: &mut Workspace, exec: X) -> ([u32; 8], Result<u64, Halt>)
+where
+    X: FnOnce(&mut H, &elf::Program<'_>, Memory<'_>, &mut CallEnv<'_>) -> Result<u64, Halt>,
+{
+    // Split the workspace into its fields: the ELF buffer is borrowed by the loaded program for
     // as long as the run lasts, while the instruction region, the stack and the heap are the memory
     // it runs over.
-    let Workspace { input: CallInput { elf, elf_len, input, input_len }, stack, heap } = ws;
+    let Workspace {
+        input: CallInput { elf, elf_len, input, input_len, sysvars, sysvars_len },
+        stack,
+        heap,
+        return_data,
+        return_len,
+    } = ws;
     let elf_len = *elf_len;
     let input_len = *input_len;
+    *return_len = 0;
 
     // No `program_hash`: the ELF came from the public segment, so `H_PUB` binds it (and the chain
     // checks `H_PUB` against the ELF it published) — hashing 108 600 bytes again in-circuit was
     // 1 698 of the guest's 2 368 SHA-256 compressions and bought nothing.
-    let input_hash =
-        canonical_input_hash(h, &input[..input_len], &program_id(&input[..input_len]));
+    let id = program_id(&input[..input_len]);
+    let input_hash = canonical_input_hash(h, &input[..input_len], &id);
     // The pre-state digest, taken before a single instruction runs: this is what a status of 0 or 2
     // binds, so a run that changed accounts and then failed publishes no change at all.
     let pre_output = output_hash(h, &input[..input_len]);
@@ -771,8 +891,13 @@ pub fn run_call_with<H: Host, FP: FnMut(u32) -> u32, FS: FnMut(u32) -> u32>(
                 heap,
                 input: &mut input[..input_len],
             };
-            let mut vm = Vm::new(h, &program, mem);
-            vm.run()
+            let mut env = CallEnv {
+                sysvars: sysvars.get(..*sysvars_len).unwrap_or(&[]),
+                program_id: &id,
+                return_data,
+                return_len,
+            };
+            exec(h, &program, mem, &mut env)
         }
         Err(e) => Err(e),
     };
@@ -782,22 +907,27 @@ pub fn run_call_with<H: Host, FP: FnMut(u32) -> u32, FS: FnMut(u32) -> u32>(
         Ok(_) => 0,
         Err(_) => 2,
     };
-    let post_output =
-        if status == 1 { output_hash(h, &input[..input_len]) } else { pre_output };
-    (public_output(h, status, &input_hash, &post_output), result)
+    // A status other than 1 binds the pre-state and no return data: nothing happened.
+    let (post_output, returned): ([u8; 32], &[u8]) = if status == 1 {
+        (output_hash(h, &input[..input_len]), return_data.get(..*return_len).unwrap_or(&[]))
+    } else {
+        (pre_output, &[])
+    };
+    // Nearly every call returns nothing, and `sha256("")` is a constant: no compression for it.
+    let return_hash = if returned.is_empty() { EMPTY_RETURN_HASH } else { sha256(h, returned) };
+    (public_output(h, status, &input_hash, &post_output, &return_hash), result)
 }
 
-/// What runs the loaded program over the interpreter's memory: `Vm::run` for the interpreter, a
-/// translated program's entry point for `sbpf2rv`. Gets the loaded program (text, rodata, entry)
-/// and the memory it runs over; returns what `Vm::run` returns.
-pub type Executor<'a, H> = &'a mut dyn FnMut(&mut H, &elf::Program<'_>, Memory<'_>) -> Result<u64, Halt>;
+/// What runs the loaded program over the interpreter's memory: [`interpret`] for the interpreter, a
+/// translated program's entry point for `sbpf2rv`. Gets the loaded program (text, rodata, entry),
+/// the memory it runs over and the [`CallEnv`]; returns what `Vm::run` returns.
+pub type Executor<'a, H> =
+    &'a mut dyn FnMut(&mut H, &elf::Program<'_>, Memory<'_>, &mut CallEnv<'_>) -> Result<u64, Halt>;
 
 /// [`run_call_with`], but the thing that runs the loaded program over the interpreter's `Memory` is
 /// supplied by the caller instead of being `Vm::run` — the hook a translated `sbpf2rv` program's
-/// entry point uses to run over this same harness (decode, the two digests, the stack/heap zeroing,
-/// the status mapping) without going through the interpreter at all. The guest keeps using
-/// [`run_call`]/[`run_call_with`], and their body is untouched and duplicated below rather than
-/// factored through this function, so the pinned `sbpf` guest image cannot move by adding this.
+/// entry point uses to run over this same harness (decode, the three digests, the stack/heap
+/// zeroing, the status mapping) without going through the interpreter at all.
 pub fn run_call_with_executor<H: Host, FP: FnMut(u32) -> u32, FS: FnMut(u32) -> u32>(
     h: &mut H,
     ws: &mut Workspace,
@@ -810,44 +940,7 @@ pub fn run_call_with_executor<H: Host, FP: FnMut(u32) -> u32, FS: FnMut(u32) -> 
     let mut elf_c = InputCursor::new(read_public, n_public);
     let mut in_c = InputCursor::new(read_private, n_private);
     if decode_input(&mut ws.input, &mut elf_c, &mut in_c).is_err() {
-        // Same malformed-vector answer as `run_call_with`: status 2, both digests zero, nothing to
-        // bind.
-        let z = [0u8; 32];
-        return (public_output(h, 2, &z, &z), Err(Halt::BadElf));
+        return (malformed_output(h), Err(Halt::BadElf));
     }
-    let Workspace { input: CallInput { elf, elf_len, input, input_len }, stack, heap } = ws;
-    let elf_len = *elf_len;
-    let input_len = *input_len;
-
-    let input_hash =
-        canonical_input_hash(h, &input[..input_len], &program_id(&input[..input_len]));
-    let pre_output = output_hash(h, &input[..input_len]);
-
-    stack.fill(0);
-    heap.fill(0);
-
-    let result = match elf::load(&mut elf[..elf_len]) {
-        Ok(program) => {
-            let mem = Memory {
-                text: program.text,
-                text_va: program.text_va,
-                rodata: program.rodata,
-                rodata_base: program.rodata_va,
-                stack,
-                heap,
-                input: &mut input[..input_len],
-            };
-            exec(h, &program, mem)
-        }
-        Err(e) => Err(e),
-    };
-
-    let status = match result {
-        Ok(0) => 1,
-        Ok(_) => 0,
-        Err(_) => 2,
-    };
-    let post_output =
-        if status == 1 { output_hash(h, &input[..input_len]) } else { pre_output };
-    (public_output(h, status, &input_hash, &post_output), result)
+    run_decoded(h, ws, |h, p, mem, env| exec(h, p, mem, env))
 }

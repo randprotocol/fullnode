@@ -256,11 +256,13 @@ rsync -a --delete --exclude target --exclude .git --exclude Cargo.lock --exclude
       --exclude address.rs --exclude arx.rs --exclude call_envelope.rs --exclude hidden.rs --exclude auth.rs \
       --exclude perps.rs \
       --exclude lib.rs --exclude main.rs "$SRC/src/" "$DST/src/"
+# Tests: the node-side suites above are this side's. `agents_counts.rs` (constraint set 11) counts
+# circuits' own `research/AGENTS.md`, which is not vendored, so it is not copied either.
 rsync -a --delete --exclude executor.rs --exclude shielded.rs --exclude call_envelope.rs \
       --exclude viewing.rs --exclude bundle.rs --exclude hidden_bundle.rs \
       --exclude hidden_cheating.rs --exclude hidden_trace_forgery.rs --exclude guest_provenance.rs --exclude 'auth*.rs' --exclude evm_rt.rs --exclude sbpf_rt.rs \
       --exclude perps_vectors.rs --exclude modq_cheating.rs \
-      --exclude counter_rng.rs --exclude prover_data_cache.rs --exclude decode_memo.rs \
+      --exclude counter_rng.rs --exclude decode_memo.rs --exclude agents_counts.rs \
       "$SRC/tests/" "$DST/tests/"
 [ -f "$DST/src/guests.rs" ] || cp "$SRC/src/guests.rs" "$DST/src/guests.rs"
 # M4.1/M4.2: vendor the compiled guest binaries the vendored `tests/e2e.rs` and the local
@@ -272,7 +274,10 @@ rsync -a --delete --exclude executor.rs --exclude shielded.rs --exclude call_env
 # not inside it, so `$SRC/../guests-compiled` — fail loudly rather than leaving a stale/missing
 # binary that only shows up as a runtime `include_bytes!` compile error far from this script.
 mkdir -p "$DST/guests-compiled/bin" "$DST/guests-compiled/evm/contracts" "$DST/guests-compiled/sbpf/programs"
-for GUEST in fib keccak256 evm sbpf dilithium-verify msauth; do
+# Constraint set 11 (circuits 76a48dc) adds a seventh: `evm-v1.bin`, the EVM guest under storage
+# layout 1 (ZKVM-105), which research's `guests::compiled::evm_images()` `include_bytes!`s beside
+# `evm.bin`.
+for GUEST in fib keccak256 evm evm-v1 sbpf dilithium-verify msauth; do
   BIN_SRC="$SRC/../guests-compiled/bin/$GUEST.bin"
   if [ ! -f "$BIN_SRC" ]; then
     echo "sync-zkvm.sh: expected compiled guest binary at $BIN_SRC — not found" >&2
@@ -435,19 +440,26 @@ grep -q 'pub fn verifier_key(&self, tier: Tier, program_log_height: u8, input_lo
 # node's pool, deciding whether a state proof would cost a key build) runs exactly verify's
 # prefix and cannot drift from it. `verify` then calls it first. Asserts its anchors and aborts
 # the sync when upstream's `verify` moved.
+# Constraint set 11 (circuits 76a48dc): `verify` delegates to `verify_under(hc, proof, layout)`
+# (ZKVM-111's layout test hook), whose prefix ends at the shape's chips — the shape now carries the
+# declared poseidon2 height (ZKVM-112), so the prefix binds `shape` and the body rebinds it.
 python3 - "$DST/src/machine.rs" <<'PY'
 import sys; p=sys.argv[1]; s=open(p).read()
 if "pub fn check_pre_key" in s:
     sys.exit(0)
-head = "    pub fn verify(&self, hc: &[u32; 8], proof: &Proof) -> Result<(), VerifyError> {\n"
+head = "    fn verify_under(&self, hc: &[u32; 8], proof: &Proof, layout: p3_batch_stark::QuotientLayout) -> Result<(), VerifyError> {\n"
 start = head + "        check_public_values(hc, proof)?;\n"
-end = "        let airs = chips_with_modq(proof.tier, proof.keccak_log_height, proof.sha256_log_height, proof.modq_log_height);\n"
-assert start in s, "machine.rs: Machine::verify's opening no longer matches the check_pre_key anchor"
+end = "        let airs = shape.chips();\n"
+assert start in s, "machine.rs: Machine::verify_under's opening no longer matches the check_pre_key anchor"
+assert s.count(start) == 1
 a = s.index(start) + len(head)
 b = s.index(end, a)
 prefix = s[a:b]
-assert "verifier_key_with_modq" not in prefix, "check_pre_key prefix would include the key build"
-s = s[:a] + "        self.check_pre_key(hc, proof)?;\n" + s[b:]
+assert "self.verifier_key" not in prefix, "check_pre_key prefix would include the key build"
+assert "let shape = VerifierKeyShape::of_proof(proof);\n" in prefix, "check_pre_key prefix lost its shape binding"
+s = s[:a] + "        self.check_pre_key(hc, proof)?;\n        let shape = VerifierKeyShape::of_proof(proof);\n" + s[b:]
+head = "    pub fn verify(&self, hc: &[u32; 8], proof: &Proof) -> Result<(), VerifyError> {\n"
+assert s.count(head) == 1, "machine.rs: Machine::verify's signature moved (check_pre_key placement)"
 fn = (
     "    /// Every refusal [`Self::verify`] makes before it builds or looks up a verifier key — the\n"
     "    /// public values against `hc`, the declared shape, the pc window, the commit PoW witnesses\n"
@@ -481,23 +493,25 @@ def rep(old, new):
     global s
     assert s.count(old) == 1, "machine.rs: the key-build gate anchor moved: " + old[:60]
     s = s.replace(old, new)
-rep("pub struct Machine { pub config: Config, pub profile: FriProfile, keys: Mutex<KeyCache>, key_builds: std::sync::atomic::AtomicUsize }\n",
-    "pub struct Machine { pub config: Config, pub profile: FriProfile, keys: Mutex<KeyCache>, key_builds: std::sync::atomic::AtomicUsize, build_gate: std::sync::OnceLock<KeyBuildGate> }\n\n"
+# Constraint set 11 (circuits 76a48dc): the struct gained ZKVM-110's prover-key cache and the key
+# build moved into `verifier_key_for(shape)` (every `verifier_key*` entry point calls it).
+rep("pub struct Machine { pub config: Config, pub profile: FriProfile, keys: Mutex<KeyCache>, key_builds: std::sync::atomic::AtomicUsize, prover_keys: Mutex<ByteLru<ProverKey, ProverData<Config>>>, prover_key_builds: std::sync::atomic::AtomicUsize }\n",
+    "pub struct Machine { pub config: Config, pub profile: FriProfile, keys: Mutex<KeyCache>, key_builds: std::sync::atomic::AtomicUsize, prover_keys: Mutex<ByteLru<ProverKey, ProverData<Config>>>, prover_key_builds: std::sync::atomic::AtomicUsize, build_gate: std::sync::OnceLock<KeyBuildGate> }\n\n"
     "/// A wrapper every verifier-key build of a machine runs inside ([`Machine::set_key_build_gate`]):\n"
     "/// called with the build, it must run it exactly once (fullnode CON-60 holds it to one build at\n"
     "/// a time across its state-proof machines).\n"
     "pub type KeyBuildGate = Arc<dyn Fn(&mut dyn FnMut()) + Send + Sync>;\n")
-rep("            key_builds: std::sync::atomic::AtomicUsize::new(0),\n        }\n    }\n",
-    "            key_builds: std::sync::atomic::AtomicUsize::new(0),\n            build_gate: std::sync::OnceLock::new(),\n        }\n    }\n\n"
+rep("            prover_key_builds: std::sync::atomic::AtomicUsize::new(0),\n        }\n    }\n",
+    "            prover_key_builds: std::sync::atomic::AtomicUsize::new(0),\n            build_gate: std::sync::OnceLock::new(),\n        }\n    }\n\n"
     "    /// Run every later verifier-key build of this machine inside `gate` (set once; a second call\n"
     "    /// is ignored). Only builds: a cached key is returned without it.\n"
     "    pub fn set_key_build_gate(&self, gate: KeyBuildGate) { let _ = self.build_gate.set(gate); }\n")
 old = ("            self.key_builds.fetch_add(1, std::sync::atomic::Ordering::SeqCst);\n"
-       "            Arc::new(ProverData::from_airs_and_degrees(&key_config(self.profile), &chips_with_modq(tier, keccak_log_height, sha256_log_height, modq_log_height), &self.log_ext_degrees_with_modq(tier, program_log_height, input_log_height, keccak_log_height, sha256_log_height, modq_log_height, public_log_height, mem_log_height)).common)\n")
+       "            Arc::new(ProverData::from_airs_and_degrees(&key_config(self.profile), &shape.chips(), &self.log_ext_degrees_for(shape, mem_log_height)).common)\n")
 new = ("            let mut built = None;\n"
        "            let mut build = || {\n"
        "                self.key_builds.fetch_add(1, std::sync::atomic::Ordering::SeqCst);\n"
-       "                built = Some(Arc::new(ProverData::from_airs_and_degrees(&key_config(self.profile), &chips_with_modq(tier, keccak_log_height, sha256_log_height, modq_log_height), &self.log_ext_degrees_with_modq(tier, program_log_height, input_log_height, keccak_log_height, sha256_log_height, modq_log_height, public_log_height, mem_log_height)).common));\n"
+       "                built = Some(Arc::new(ProverData::from_airs_and_degrees(&key_config(self.profile), &shape.chips(), &self.log_ext_degrees_for(shape, mem_log_height)).common));\n"
        "            };\n"
        "            match self.build_gate.get() { Some(gate) => gate(&mut build), None => build() }\n"
        "            built.expect(\"a key-build gate runs the build\")\n")
@@ -512,23 +526,25 @@ grep -q 'pub fn set_key_build_gate' "$DST/src/machine.rs" && grep -q 'match self
 # `keep_perp_key`, which runs on the node loop, cannot rebuild a key evicted between its check
 # and its export. Placed in front of `install_verifier_key`'s doc comment; aborts the sync when
 # that anchor moved.
+# Constraint set 11 (circuits 76a48dc): a key's shape is a `VerifierKeyShape` with the declared
+# poseidon2 height (ZKVM-112), and upstream's export is `export_verifier_key(shape)`, so the cached
+# export takes the shape too.
 python3 - "$DST/src/machine.rs" <<'PY'
 import sys; p=sys.argv[1]; s=open(p).read()
-if "pub fn export_cached_verifier_key_with_modq" in s:
+if "pub fn export_cached_verifier_key" in s:
     sys.exit(0)
 anchor = "    /// Installs `blob`'s key into the cache slot for `blob.shape` without building it, so\n"
 assert s.count(anchor) == 1, "machine.rs: install_verifier_key's doc comment moved (export_cached anchor)"
+assert "    pub fn export_verifier_key(&self, shape: VerifierKeyShape) -> VerifierKeyBlob {\n" in s, "machine.rs: export_verifier_key(shape) moved (export_cached anchor)"
 fn = (
-    "    /// [`Self::export_verifier_key_with_modq`] for a key that is built and cached now, and\n"
-    "    /// `None` otherwise: never a build (fullnode CON-60's keep, which runs on the node loop).\n"
-    "    #[allow(clippy::too_many_arguments)]\n"
-    "    pub fn export_cached_verifier_key_with_modq(&self, tier: Tier, program_log_height: u8, input_log_height: u8, keccak_log_height: u8, sha256_log_height: u8, modq_log_height: u8, public_log_height: u8) -> Option<VerifierKeyBlob> {\n"
-    "        let key = (tier.0, program_log_height, input_log_height, keccak_log_height, sha256_log_height, modq_log_height, public_log_height);\n"
-    "        let common = self.keys.lock().unwrap().map.get(&key).and_then(|(slot, _, _)| slot.get().cloned())?;\n"
+    "    /// [`Self::export_verifier_key`] for a key that is built and cached now, and `None`\n"
+    "    /// otherwise: never a build (fullnode CON-60's keep, which runs on the node loop).\n"
+    "    pub fn export_cached_verifier_key(&self, shape: VerifierKeyShape) -> Option<VerifierKeyBlob> {\n"
+    "        let common = self.keys.lock().unwrap().map.get(&shape.key()).and_then(|(slot, _, _)| slot.get().cloned())?;\n"
     "        Some(VerifierKeyBlob {\n"
     "            format_version: VERIFIER_KEY_BLOB_FORMAT,\n"
     "            profile: self.profile,\n"
-    "            shape: VerifierKeyShape { tier, program_log_height, input_log_height, keccak_log_height, sha256_log_height, modq_log_height, public_log_height },\n"
+    "            shape,\n"
     "            constraint_set: CONSTRAINT_SET,\n"
     "            common: common_to_bytes(&common),\n"
     "        })\n"
@@ -537,7 +553,7 @@ fn = (
 s = s.replace(anchor, fn + anchor)
 open(p, "w").write(s)
 PY
-grep -q 'pub fn export_cached_verifier_key_with_modq' "$DST/src/machine.rs" \
+grep -q 'pub fn export_cached_verifier_key(' "$DST/src/machine.rs" \
   && echo "anchors: export_cached ok" \
   || { echo "sync-zkvm.sh: install_verifier_key moved; update the export_cached patch" >&2; exit 1; }
 # Fullnode #151 (v0.8.3): the prover's random columns and Merkle salts are counter-mode streams
@@ -548,9 +564,78 @@ grep -q 'pub fn export_cached_verifier_key_with_modq' "$DST/src/machine.rs" \
 # the per-proof preprocessed rebuild back (and not compile: `HidingFriPcs` needs `SaltRng:
 # CounterModeRng`). So the sync stops until circuits carries them. `tests/counter_rng.rs` and
 # `tests/prover_data_cache.rs` are this side's and are kept by the rsync above.
-grep -q 'impl CounterModeRng for SaltRng' "$DST/src/key_derivation_v2.rs" && grep -q 'fn cached_prover_data' "$DST/src/machine.rs" \
-  && echo "anchors: #151 counter-mode RNG + ProverData cache ok" \
-  || { echo "sync-zkvm.sh: circuits' research/ lacks fullnode #151 (key_derivation_v2's CounterModeRng impls, machine.rs's cached_prover_data); port them upstream first" >&2; exit 1; }
+#
+# Constraint set 11 (circuits 76a48dc) carries the second half upstream, its own way: ZKVM-110's
+# per-machine prover-key cache (`Machine::prover_key`, a byte-budgeted LRU; `tests/prover_cache.rs`),
+# so the local `cached_prover_data` and its `tests/prover_data_cache.rs` are retired, not patched
+# back. The first half — the counter-mode salt streams — is not upstream (circuits' `vendor/` has
+# no `counter_rng.rs`), so it is applied here as a patch: `KeyRngV2` remembers whether it is
+# seed-keyed and only then hands out counter-mode keys (a label stream, a verifier key's, is drawn
+# serially as before: no key moves), `SaltRng` forwards, and `machine::config_with_rngs` is the
+# seeded-config test instrument `tests/counter_rng.rs` uses. Each anchor is asserted.
+python3 - "$DST/src/key_derivation_v2.rs" "$DST/src/machine.rs" <<'PY'
+import sys
+kd, mp = sys.argv[1], sys.argv[2]
+s = open(kd).read()
+if "impl CounterModeRng for SaltRng" not in s:
+    def rep(old, new):
+        global s
+        assert s.count(old) == 1, "key_derivation_v2.rs: a #151 anchor moved: " + old[:70]
+        s = s.replace(old, new)
+    rep("use p3_field::{PrimeCharacteristicRing, PrimeField64};\n",
+        "use p3_field::{PrimeCharacteristicRing, PrimeField64};\nuse p3_merkle_tree::CounterModeRng;\n")
+    rep("    out: [u32; 4],\n    pos: usize,\n}\n",
+        "    out: [u32; 4],\n    pos: usize,\n"
+        "    /// Keyed by a secret seed ([`SeedableRng::from_seed`]) rather than a public label: only then\n"
+        "    /// does it hand out counter-mode keys ([`CounterModeRng`], fullnode #151). A label stream is a\n"
+        "    /// verifier key's, public and pinned, and keeps its serial output bit for bit.\n"
+        "    seeded: bool,\n}\n")
+    rep("    fn from_parts(marker: &[u8], bytes: &[u8]) -> Self {\n", "    fn from_parts(marker: &[u8], bytes: &[u8], seeded: bool) -> Self {\n")
+    rep("        Self { state, out: [0; 4], pos: 4 }\n", "        Self { state, out: [0; 4], pos: 4, seeded }\n")
+    rep("    pub fn from_label(label: &[u8]) -> Self { Self::from_parts(b\"label\", label) }\n",
+        "    pub fn from_label(label: &[u8]) -> Self { Self::from_parts(b\"label\", label, false) }\n")
+    rep("    fn from_seed(seed: [u8; 32]) -> Self { Self::from_parts(b\"seed\", &seed) }\n}\n",
+        "    fn from_seed(seed: [u8; 32]) -> Self { Self::from_parts(b\"seed\", &seed, true) }\n}\n\n"
+        "/// Fullnode #151 (v0.8.3): a seed-keyed stream (a proving config's clone, keyed by OS entropy)\n"
+        "/// hands the hiding PCS and MMCS one fresh 256-bit key per call, squeezed from this sponge, and\n"
+        "/// they expand it in parallel with ChaCha20 (`p3_merkle_tree::counter_rng`). A label stream — a\n"
+        "/// verifier key's, which is public and pinned by consensus — hands out none and is drawn from\n"
+        "/// serially exactly as before, so no verifier key moves.\n"
+        "impl CounterModeRng for KeyRngV2 {\n"
+        "    fn counter_mode_key(&mut self) -> Option<[u8; 32]> {\n"
+        "        self.seeded.then(|| p3_merkle_tree::counter_rng::draw_key(self))\n"
+        "    }\n}\n")
+    rep("impl TryCryptoRng for SaltRng {}\n",
+        "impl TryCryptoRng for SaltRng {}\n\n"
+        "/// Fullnode #151: OS entropy (`Fresh`) and a seed-keyed sponge hand out counter-mode keys; a\n"
+        "/// label stream does not ([`KeyRngV2`]'s impl).\n"
+        "impl CounterModeRng for SaltRng {\n"
+        "    fn counter_mode_key(&mut self) -> Option<[u8; 32]> {\n"
+        "        match self {\n"
+        "            SaltRng::Fresh(r) => r.counter_mode_key(),\n"
+        "            SaltRng::Key(r) => r.counter_mode_key(),\n"
+        "        }\n"
+        "    }\n}\n")
+    open(kd, "w").write(s)
+m = open(mp).read()
+if "pub fn config_with_rngs" not in m:
+    anchor = "pub fn make_config(profile: FriProfile) -> Config {\n"
+    assert m.count(anchor) == 1, "machine.rs: make_config moved (config_with_rngs anchor)"
+    assert "fn build_config(profile: FriProfile, mmcs_rng: SaltRng, pcs_rng: SaltRng) -> Config {" in m, "machine.rs: build_config's signature moved"
+    m = m.replace(anchor,
+        "/// A test instrument (fullnode #151): a `Config` over explicit generators — a seeded pair makes a\n"
+        "/// proof reproducible (`tests/counter_rng.rs`). Never a production path: `make_config` (fresh\n"
+        "/// entropy) proves, `key_config` (label streams) keys.\n"
+        "#[doc(hidden)]\n"
+        "pub fn config_with_rngs(profile: FriProfile, mmcs_rng: SaltRng, pcs_rng: SaltRng) -> Config {\n"
+        "    build_config(profile, mmcs_rng, pcs_rng)\n"
+        "}\n\n" + anchor)
+    open(mp, "w").write(m)
+PY
+grep -q 'impl CounterModeRng for SaltRng' "$DST/src/key_derivation_v2.rs" && grep -q 'pub fn config_with_rngs' "$DST/src/machine.rs" \
+  && grep -q 'fn prover_key(&self, shape: VerifierKeyShape)' "$DST/src/machine.rs" \
+  && echo "anchors: #151 counter-mode RNG ok; prover-data cache is upstream's (ZKVM-110)" \
+  || { echo "sync-zkvm.sh: the #151 counter-mode patch or upstream's prover-key cache (Machine::prover_key) is missing" >&2; exit 1; }
 # M3.4/M4.1: `hash.rs`'s program-digest header and `tables/cpu.rs`'s in-circuit copy of the same
 # constant both read `crate::notes::domain::HC` upstream; M4.1 added a second such pair for the
 # input digest, `crate::notes::domain::IN`. Constraint set 6 added a third: `crate::notes::
@@ -713,6 +798,10 @@ grep -q "^rand-zkvm-cuda = { git = \"https://github.com/randprotocol/zkp-circuit
 # tables in a member manifest, and this workspace's root profiles already cover it (the
 # `profile.dev.package.randprotocol-rvm` entry mirrors the zkVM's).
 sed -i '' 's|^randprotocol_zkvm = { path = "../randprotocol-zkvm" }|randprotocol-zkvm = { path = "../randprotocol-zkvm" }|' "$RVM_DST/Cargo.toml"
+# Constraint set 11 (circuits 76a48dc): recursion's `parallel` feature forwards research's
+# (`"rand_zkvm/parallel"`), which the rename made `randprotocol_zkvm/parallel`; a feature names the
+# dependency by its key, hyphenated.
+sed -i '' 's|"randprotocol_zkvm/|"randprotocol-zkvm/|g' "$RVM_DST/Cargo.toml"
 python3 - "$RVM_DST/Cargo.toml" <<'PY'
 import sys
 p = sys.argv[1]

@@ -81,6 +81,9 @@ pub struct ProofShape {
     pub keccak_log_height: u8,
     pub sha256_log_height: u8,
     pub public_log_height: u8,
+    /// Constraint set 11 (ZKVM-112): the declared poseidon2 table height, a key component like the
+    /// rest (`randprotocol_zkvm::machine::VerifierKeyShape::poseidon2_log_height`).
+    pub poseidon2_log_height: u8,
 }
 
 /// A method added here must also be forwarded in the node's `verify_cache::CachingExecutor`, or
@@ -515,14 +518,14 @@ const STUB_AUTH_BINDING: usize = 5 + 32 + 8;
 const STUB_AUTH_GAS: usize = STUB_AUTH_BINDING + 32;
 /// The gas limit a stub auth proof declares unless a test chooses one: `gas_max(10, 0, 0)`,
 /// what every real auth proof declares (tier 10, no hash table).
-pub const STUB_AUTH_GAS_LIMIT: u64 = 1_279;
+pub const STUB_AUTH_GAS_LIMIT: u64 = 1_407;
 /// Stub multisig auth proof (private multisig phase 4): [`STUB_AUTH_MARKER`]'s layout under its
 /// own marker — `msau:` || `c` || blake3("rand-stub-auth", hc bytes)[..8] || binding || gas — so
 /// `verify_auth`'s guest check is the same for both shapes.
 const STUB_MSAUTH_MARKER: &[u8; 5] = b"msau:";
 /// The gas limit a stub multisig auth proof declares unless a test chooses one:
 /// `gas::msauth_gas_limit_pin()`, what every real multisig auth proof declares.
-pub const STUB_MSAUTH_GAS_LIMIT: u64 = 436_159;
+pub const STUB_MSAUTH_GAS_LIMIT: u64 = 355_775;
 
 /// The shape of a well-formed stub auth proof of either marker, or `None`.
 fn stub_auth_shape(proof: &[u8]) -> Option<AuthShape> {
@@ -900,6 +903,7 @@ impl ConfidentialExecutor for StubExecutor {
             keccak_log_height: h[2],
             sha256_log_height: h[3],
             public_log_height: 0,
+            poseidon2_log_height: 0,
         })
     }
 
@@ -1225,9 +1229,9 @@ mod tests {
         let binding = [6u32; 8];
         let mut b = StubExecutor::make_bundle_proof(&hc, &digest, &binding);
         assert_eq!(StubExecutor.bundle_gas_limit(&b).unwrap(), Some(crate::gas::gas_max(14, 0, 0)));
-        assert_eq!(crate::gas::gas_max(14, 0, 0), 20_479, "(2^14 − 1) + 2^12, the absorb term included");
-        StubExecutor::with_bundle_gas(&mut b, 20_480);
-        assert_eq!(StubExecutor.bundle_gas_limit(&b).unwrap(), Some(20_480));
+        assert_eq!(crate::gas::gas_max(14, 0, 0), 22_527, "(2^14 − 1) + 3·2^11, the absorb term included");
+        StubExecutor::with_bundle_gas(&mut b, 22_528);
+        assert_eq!(StubExecutor.bundle_gas_limit(&b).unwrap(), Some(22_528));
         assert_eq!(StubExecutor.bundle_proof_digest(&hc, &b).unwrap(), digest);
         assert_eq!(StubExecutor.verify_bundle(&hc, &b, &binding), Ok(()));
         assert_eq!(StubExecutor.bundle_gas_limit(b"junk"), Err(ConfidentialError::MalformedProof));
