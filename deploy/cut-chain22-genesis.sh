@@ -167,17 +167,19 @@
 #      registering a seed chosen against the current value. The commitments themselves are the
 #      validator operators' (BEACON_TSV), never chosen here.
 #
-#   9. Validator memory for the state-proof key build (CON-601, monorepo#23; CON-60, #6). The cut
-#      keeps max_tier 18 (the production sizing) and pins the engine's program height, which
-#      bounds the shapes a proof may declare to the chain's canonical ones. It does not bound the
-#      build: the first tier-18 state proof in a block makes every validator build a key at
-#      ~3.6 GB resident (the pool's per-node tier cap, --max-state-proof-tier, cannot apply to a
-#      block). A 2 GB or 4 GB validator can be killed applying it. The owner decides before the
-#      cut — resize every validator to ≥ 8 GB, or accept and name another plan — and the cut
-#      record's reason:, carries: or clients: line must say so (it must match
-#      CON-601 | validator memory | key build); the cut refuses a record that is silent.
-#      Precomputed, hash-pinned state-proof keys (loaded, as the msauth key is) would remove the
-#      build; they are not built yet.
+#   9. Validator memory for the state-proof key build (CON-601, monorepo#23; CON-60, #6) —
+#      DECIDED 2026-11-19: perps stays at max_tier 18 with 24 inputs, as on chain 21, and
+#      validators LOAD a pinned, precomputed tier-18 state-proof key (its hash in chain 22's
+#      genesis, shipped and loaded as the msauth key is) instead of building it (~3.6 GB
+#      resident, more than a 2 GB or 4 GB validator holds; the per-node --max-state-proof-tier
+#      cannot apply to a block). The key, its genesis field and the node's loader are a separate
+#      PR, not written yet (TODO below, where the cut asserts perps). Tier 16 was rejected: a
+#      close that liquidates more than about 3 accounts is over tier 16's 65 535 cycles (7
+#      liquidations 76 493, 14 liquidations 153 845 with no inputs; durian.market
+#      artifacts/perp-engine.tier), and no genesis field bounds liquidations, so a mass
+#      liquidation would leave the exchange unprovable (no forced exit). The cut record's
+#      reason:, carries: or clients: line names the pinned key (it must match CON-601 | pinned
+#      state-proof key | validator memory | key build); the cut refuses a record that is silent.
 #
 # Known gap (not a decision): no RPC serves `program_state.refuse_panics` (rand_getLimits'
 # program_state object is cell_fee/max_reads/max_writes/max_payouts). `check-limits` therefore
@@ -1605,7 +1607,13 @@ else:
         need(m["max_leverage"] >= 1 and m["maintenance_bps"] * m["max_leverage"] < 10000,
              f"market {m['symbol']}: maintenance {m['maintenance_bps']} bps is at or above the initial margin {10000 // max(m['max_leverage'], 1)} bps "
              f"that {m['max_leverage']}x implies (perp-core: ⌈notional / max_leverage⌉) — a max-leverage position would open liquidatable")
-    need(perps["max_tier"] == 18, f"perps.max_tier is {perps['max_tier']!r}, not 18 (the production sizing)")
+    need(perps["max_tier"] == 18, f"perps.max_tier is {perps['max_tier']!r}, not 18 (the production sizing; owner 2026-11-19: tier 18 "
+                                  f"stays, CON-601 met by a pinned precomputed state-proof key — tier 16 cannot prove a mass liquidation)")
+    # TODO(CON-601, owner 2026-11-19): once the pinned tier-18 state-proof key PR lands (the key
+    # built once, its hash a chain-22 genesis field, validators loading it as they load the
+    # msauth key), assert that field here: present, equal to the hash of the shipped key file
+    # (as RAND_MSAUTH_VK is checked), and add it to the field probe and to check-limits. The
+    # field does not exist yet — no name is assumed here.
     need(perps["max_block_inputs"] == 24, f"perps.max_block_inputs is {perps['max_block_inputs']!r}, not 24 — the production sizing at tier 18 "
          f"(durian.market's gated case block-24-14liq); nothing measured more")
     need(perps["engine_hc"] == E["EXPECT_ENGINE_HC"] == ENGINE_HC_DECIDED == p21["engine_hc"],
@@ -2372,7 +2380,7 @@ holder = payouts[len(rand_notes)] if dry else "rand1SELFTESTz"
 open(f"{st}/zusd-carry.txt", "w").write("".join(f"holder {holder} {fmt(n['amount'], 8)}\n" for n in zusd_notes))
 # A filled cut record (the fixture's — the real one is the operator's, published before the cut).
 open(f"{st}/cut-record.txt", "w").write(
-    "chain-id: 22\nreason: audit v11 gated fields — PST-1 refuse_panics, PERP-6 bound_payouts, PERP-101 sparse windows, CON-60, CON-601 validator memory for the tier-18 key build (fixture), MSA-4 max_accounts; "
+    "chain-id: 22\nreason: audit v11 gated fields — PST-1 refuse_panics, PERP-6 bound_payouts, PERP-101 sparse windows, CON-60, CON-601: validators load the pinned tier-18 state-proof key (genesis pin), never build it (fixture), MSA-4 max_accounts; "
     "#168 block context (reference_block_window) and #189 the randomness beacon\n"
     "carries: fixture register, bridge state, balances; the treasury 5 of 6 with six new signers, its balance carried from chain 21's multisig register; "
     "perps carried (empty), its genesis root chain 21's\n"
@@ -3403,7 +3411,7 @@ json.dump(a, open(p,'w'))" "$ST/answers.json"
   bash_refuses "a cut record that does not name PST-1" "names no PST-1" "${real_cut[@]}" CUT_RECORD="$ST/cut-record-no-pst1.txt" --
   bash_refuses "a cut record that does not name PERP-6" "names no PERP-6" "${real_cut[@]}" CUT_RECORD="$ST/cut-record-no-perp6.txt" --
   bash_refuses "a cut record that does not name PERP-101" "names no PERP-101" "${real_cut[@]}" CUT_RECORD="$ST/cut-record-no-perp101.txt" --
-  bash_refuses "a cut record that does not say how validators hold the tier-18 key build (CON-601)" "names no CON-601" "${real_cut[@]}" CUT_RECORD="$ST/cut-record-no-con601.txt" --
+  bash_refuses "a cut record that does not name the pinned tier-18 state-proof key (CON-601)" "names no CON-601" "${real_cut[@]}" CUT_RECORD="$ST/cut-record-no-con601.txt" --
   bash_refuses "MULTISIG_NOT_CARRIED_OK=1, the record's drops: silent" "names no dropped multisig register" "${real_cut[@]}" MULTISIG_NOT_CARRIED_OK=1 CUT_RECORD="$ST/cut-record-drops-nothing.txt" --
   bash_refuses "PERPS_STATE_NOT_CARRIED_OK=1, the record's drops: silent" "names no dropped perps exchange state" "${real_cut[@]}" PERPS_STATE_NOT_CARRIED_OK=1 --
   bash_refuses "PROGRAM_VAULTS_DROPPED_OK=1, the record's drops: silent" "names no dropped program vaults" "${real_cut[@]}" PROGRAM_VAULTS_DROPPED_OK=1 --
@@ -3615,11 +3623,13 @@ require_cut_record_mentions "$CUT_RECORD" 'PST-1|refuse_panics' "PST-1 (program_
 require_cut_record_mentions "$CUT_RECORD" 'PERP-6|bound_payouts' "PERP-6 (perps.bound_payouts, monorepo#13)" reason carries
 require_cut_record_mentions "$CUT_RECORD" 'PERP-101|sparse.windows|max_window_heights' "PERP-101 (perps.sparse_windows + max_window_heights, monorepo#12)" reason carries
 # CON-601 (monorepo#23, with CON-60 #6): the engine pin bounds which keys a state proof can ask
-# for, not what one costs to build — a block carrying a max_tier-18 proof still makes EVERY
-# validator build that key (3.56 GB resident measured; docs/perps.md "the node's tier cap"), and
-# no node policy can refuse a valid block. So the record must say how chain 22's validators hold
-# it (OPEN 9): every validator given the memory (≥ 8 GB), or another decision the owner names.
-require_cut_record_mentions "$CUT_RECORD" 'CON-601|validator.memory|key.build' "CON-601 (how every validator holds a max_tier-18 state-proof key build, about 3.6 GB: monorepo#23)" reason carries clients
+# for, not what one costs to build — a block carrying a max_tier-18 proof makes EVERY validator
+# build that key (3.56 GB resident measured; docs/perps.md "the node's tier cap"), and no node
+# policy can refuse a valid block. Decided 2026-11-19 (OPEN 9): validators load the pinned
+# tier-18 state-proof key (genesis pin), never build it; the record says so.
+# TODO(CON-601): when the pinned-key genesis field exists, the cut asserts it (py_splice, at the
+# perps max_tier check); until then this record line is the only CON-601 gate.
+require_cut_record_mentions "$CUT_RECORD" 'CON-601|pinned.*state.proof.key|validator.memory|key.build' "CON-601 (validators load the pinned tier-18 state-proof key, genesis pin, never build it: monorepo#23)" reason carries clients
 # The two features the owner added on 2026-11-18: the record says the chain carries them.
 require_cut_record_mentions "$CUT_RECORD" '#168|#184|reference.block|block.context' "the EVM block context (#168, program_state.reference_block_window)" reason carries
 require_cut_record_mentions "$CUT_RECORD" '#189|beacon|PREVRANDAO' "the randomness beacon (#189, genesis beacon)" reason carries

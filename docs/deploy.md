@@ -2075,11 +2075,26 @@ need it), each of which must hash differently. The real cut refuses a build with
 loudly (`AUDIT_V10 SKIPPED`), and puts in each operator input's lower bound (64; 1), loudly, as a
 placeholder. The cut record's `reason:` or `carries:` must name PST-1, PERP-6 and PERP-101; its
 `carries:` must name the treasury (carried, 5 of 6) and, unless `PERPS_STATE_NOT_CARRIED_OK=1`,
-perps (carried, empty). It must also say (in `reason:`, `carries:` or `clients:`, matching `CON-601`, `validator
-memory` or `key build`) how every validator holds a `max_tier`-18 state-proof key build, about
-3.6 GB resident: the engine pin bounds the shapes a proof may declare, not the build, and a block
-carrying a tier-18 proof makes every validator build the key (CON-601). Give every validator at
-least 8 GB before the cut, or name the plan the owner chose. Every node — validators, archives, the RPC nodes the sites read — runs v0.8.5 or later
+perps (carried, empty). It must also name CON-601 (in `reason:`, `carries:` or `clients:`, e.g.
+"CON-601: validators load the pinned tier-18 state-proof key (genesis pin), never build it").
+
+**CON-601: tier 18 stays, with a pinned state-proof key** (owner, 2026-11-19). The engine pin
+bounds the shapes a proof may declare, not the cost of building their key: a block carrying a
+tier-18 state proof makes every validator build a ~3.6 GB key (3.56 GB resident measured), more
+than a 2 GB or 4 GB validator holds, and node policy cannot refuse a valid block. Chain 22 keeps
+perps at `max_tier` 18 with `max_block_inputs` 24, as on chain 21. The tier-18 state-proof
+verifier key(s) are built once, their hash pinned in chain 22's genesis, and validators load them
+instead of building them, as the msauth key is shipped and loaded. That key, its genesis field
+and the node's loader are a separate PR, not written yet. The script carries a TODO where it will
+assert the field. **Tier 16 was rejected.** Its budget is 65 535 cycles, and a close that
+liquidates more than about 3 accounts exceeds it. Measured on the pinned engine f286a611… (durian.market
+`artifacts/perp-engine.tier`, README "Perps"): 7 liquidations 76 493 cycles, 14 liquidations
+153 845 with no inputs before the close (212 018 with 24 inputs: tier 18, 19 % left); within
+tier 16 only a fill (18 086), four fill blocks (24 576) and a close with no liquidation (43 854)
+were measured. No `max_block_inputs` value helps, since the cost is the liquidations. Nothing in
+the genesis bounds those: the 15-account limit is a ledger constant and a per-close liquidation
+cap is a later engine milestone. A mass liquidation would leave a tier-16 exchange unprovable,
+and with no forced exit its collateral would wait for ever. Every node — validators, archives, the RPC nodes the sites read — runs v0.8.5 or later
 from chain 22's first block: an older one refuses the file (`deny_unknown_fields` on the perps,
 multisig and program-state sections). durian.market's perp-prover must build sparse jobs
 (durian 28cebfb, PERP-101) before the first perps window on chain 22, and the prover host must fit

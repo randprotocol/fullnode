@@ -14,6 +14,9 @@ chain-id: <N>
 
 # Why a rolling update cannot do this: name the validity rule, the wire format or the verifier key
 # that changes. "A new feature" is not a reason; a node-only change rolls onto the live chain.
+# Chain 22 also names CON-601 here (or on carries: / clients:): "CON-601: validators load the
+# pinned tier-18 state-proof key (genesis pin), never build it" — perps stays at max_tier 18
+# (owner, 2026-11-19); the cut refuses a record silent on it.
 reason: <the validity rule, wire format or verifier key that forces a new genesis>
 
 # What the new genesis carries over from the old chain: the validator register, each bridged
