@@ -701,6 +701,18 @@ impl ConfidentialExecutor for AggExecutor {
         self.inner.set_perp_config(max_tier, engine_program_log_height)
     }
 
+    fn set_perp_pinned_keys(&self, pins: &[(randprotocol_core::confidential::ProofShape, [u8; 32])]) {
+        self.inner.set_perp_pinned_keys(pins)
+    }
+
+    fn install_perp_vk(&self, blob: &[u8]) -> Result<randprotocol_core::confidential::ProofShape, String> {
+        self.inner.install_perp_vk(blob)
+    }
+
+    fn perp_pinned_keys_installed(&self) -> usize {
+        self.inner.perp_pinned_keys_installed()
+    }
+
     /// The keys an `Invoke` verifies under are these too: its segment sits in the hardened
     /// call's public table (`program_state::segment_fits`), so it declares no shape a call to
     /// the same program does not.

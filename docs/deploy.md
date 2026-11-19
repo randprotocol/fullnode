@@ -120,6 +120,9 @@ rand-node verify --datadir /root/data-<letter>-<genesis8> --mode full   # stop t
 
 On a chain whose genesis names `hc_auth_multisig`, `rand-node verify` loads the pinned msauth
 verifier key exactly as `run` does (below, "The msauth verifier key") and refuses to verify without it.
+On a chain whose genesis names `perps.state_proof_keys` (chain 22), `run` and `verify` load the
+pinned perps state-proof keys the same way (below, "The perps state-proof verifier keys") and refuse
+without them.
 
 ### Reserved peers (audit v6, NET-1)
 
@@ -586,6 +589,65 @@ A node on a chain whose genesis names `hc_auth_multisig` verifies multisig autho
 
   It compares against the pin of the binary being installed on that host (`rand-node.new`), not
   a pin read on the operator's machine, so a blob and a build from different commits never pair.
+
+## The perps state-proof verifier keys (CON-601, chain 22 onward)
+
+A block carrying a tier-18 perps state proof used to make every validator build that shape's
+verifier key on first sight (~1.7 GB peak with `parallel`, ~3.3–4 GB without): a 2 GB validator
+could OOM on someone else's proof. Chain 22 pins the keys instead. Validators load them from
+shipped files at startup and never build one.
+
+- **The genesis field.** `perps.state_proof_keys`, a list of up to 8
+  `{tier, program_log_height, input_log_height, public_log_height, poseidon2_log_height, sha256}`
+  (sha256 = lowercase hex of the key file's raw bytes), in strictly increasing shape order. It
+  needs `perps.engine_program_log_height` and must name only canonical state-proof shapes of the
+  chain (tier ≤ `max_tier`, program = the engine's height, input ≤ min(tier+2, 16), poseidon2 even
+  ≤ tier+2, public in 7..= what `max_window_blocks` needs). It is serde-default and omitted when
+  empty, and bound into the genesis hash only when set, so chain 21's hash does not move.
+- **The rule.** When the list is non-empty, a state proof whose declared shape is not in it is
+  refused before any key is touched, at validate and at apply (`ProofRefused`, "not one of the
+  chain's N pinned state-proof key shapes"). A pinned shape verifies only against the key loaded
+  from its file; the node never builds a pinned key. An empty list keeps chain 21's behaviour
+  (build on demand under `PERP_KEY_BUILD_GATE`).
+- **Chain 22's four.** Tier 18 over the engine's program height 14, input 16, poseidon2 20, one
+  per public height (windows of 1..=11, 12..=27, 28..=59 and 60..=64 recorded blocks). These
+  are the shapes the engine's prover makes by default on a pinned chain. `--smallest` and
+  lower tiers are refused there.
+
+  | file | sha256 | bytes |
+  |---|---|---|
+  | `perp-vk-production-t18-pg14-in16-pub7-p2h20.bin` | `4dc1f18bdd6d9104ba1622710cf2c146f71759676dbdcb70dad036152242e8b4` | 13 685 |
+  | `perp-vk-production-t18-pg14-in16-pub8-p2h20.bin` | `6392e5e9b7348f3729ba2031e0e3ec9788d6ed62a14521526482c92615f55106` | 13 685 |
+  | `perp-vk-production-t18-pg14-in16-pub9-p2h20.bin` | `c31636aa281004163e6fe0debd81854f11d7bca6c8062a91b1501c7e593e5bf0` | 13 685 |
+  | `perp-vk-production-t18-pg14-in16-pub10-p2h20.bin` | `ae3d0dc276061fd2a87b2e91b239f6dcccb746b49dedeecfdb2aab977c95c370` | 13 685 |
+
+  They are committed in `crates/randprotocol-zkvm/keys/`, and their digests are compiled in
+  (`executor::perp_vk::CHAIN22_SHA256_PRODUCTION`). `rand-node keygen-perp-vk --print-pinned
+  production` prints `<file> <sha256>` per key, `--check FILE` prints a file's sha256, and
+  `--genesis-json DIR` prints the genesis list from the files in DIR. `--profile production
+  --out-dir DIR` rebuilds them on a big host: 20.6 s and 1.74 GB peak each with `parallel` and
+  `RAYON_NUM_THREADS=16`. The output is deterministic (`cargo test -p randprotocol-zkvm --test
+  perp_vk -- --ignored`).
+- **The location.** Beside the binary: `/usr/local/bin/perp-vk-production-*.bin` on the fleet.
+  `--perps-key-dir DIR` or `RAND_PERPS_KEY_DIR` overrides it. A debug build, or
+  `RAND_PERPS_KEY_DEV_FALLBACK=1`, falls back to the source tree's `keys/`. At startup the node
+  reads every file the genesis pins, holds each to its genesis sha256 and to its shape, and
+  installs it. If a file is missing, mismatched or refused, the node does not start, and the
+  error names the path and the digest. `rand_status.perps_keys` reports `{"source":
+  "loaded"|"absent", "keys": N}`, and `rand_getPerps.state_proof_keys` serves the list.
+- **The cut.** `deploy/cut-chain22-genesis.sh` holds the files in `PERPS_KEY_DIR` (default the
+  tree's `keys/`) to the cutting `rand-node`'s own pins, writes the field with `--genesis-json`,
+  asserts it in `py_splice`, probes it in the genesis hash (without it, and with one digest
+  changed), and reads it back in `check-limits` (`rand_getPerps.state_proof_keys` and
+  `rand_status.perps_keys` = loaded, 4).
+- **The roll.** `deploy/roll-all.sh` takes `PERPS_VK_DIR`, the directory that holds the release's
+  four files. With `RELEASE_SUMS`, each file must be the one the signed `SHA256SUMS` lists. On
+  each host it holds every file the `rand-node.new` being installed pins to that pin, with
+  `sha256sum` and with `--check`, and installs them beside the binary before any restart. A
+  mismatch skips the host, binaries included. Without `PERPS_VK_DIR`, the roll is refused if
+  any host's genesis names `state_proof_keys` or cannot be read. The release workflow ships
+  the four files beside the binaries, in `SHA256SUMS` and in the build attestation, after it
+  asserts that the built `rand-node` pins each one.
 
 ## Release trust
 

@@ -4851,6 +4851,7 @@ mod tests {
             max_window_heights: 0,
             engine_program_log_height: 0,
             max_pending_digests: 0,
+            state_proof_keys: Vec::new(),
             markets: vec![MarketSpec {
                 id: 0,
                 symbol: "BTC-PERP".into(),
@@ -4889,6 +4890,38 @@ mod tests {
         let mut too_much = on.clone();
         too_much.perps.as_mut().unwrap().initial_collateral = 1 << 63;
         assert!(matches!(too_much.build(&StubExecutor), Err(GenesisError::BadPerps(why)) if why.contains("initial_collateral")));
+        // CON-601: the pinned state-proof keys — bound only when set, every pin bound, through the
+        // file and back; refused without the engine pin (the section's own check).
+        let mut keyed = on.clone();
+        {
+            let k = keyed.perps.as_mut().unwrap();
+            k.engine_program_log_height = 14;
+            k.state_proof_keys = crate::ledger::perps::canonical_state_proof_shapes(16, 14, 8)
+                .iter()
+                .map(|s| crate::ledger::perps::StateProofKeyPin {
+                    tier: s.tier,
+                    program_log_height: s.program_log_height,
+                    input_log_height: s.input_log_height,
+                    public_log_height: s.public_log_height,
+                    poseidon2_log_height: s.poseidon2_log_height,
+                    sha256: [0xab; 32],
+                })
+                .collect();
+        }
+        let mut pinned_only = on.clone();
+        pinned_only.perps.as_mut().unwrap().engine_program_log_height = 14;
+        let keyed_g = build(&keyed);
+        assert_eq!(keyed_g.ledger.perps().unwrap().config.state_proof_keys.len(), 1, "8 blocks: one public height");
+        assert_ne!(keyed_g.hash(), build(&pinned_only).hash(), "state_proof_keys is bound");
+        assert!(keyed.to_json().contains("\"state_proof_keys\""));
+        assert!(!pinned_only.to_json().contains("state_proof_keys"), "absent from a file that does not set it");
+        assert_eq!(Genesis::from_json(&keyed.to_json()).unwrap(), keyed, "it round-trips");
+        let mut moved = keyed.clone();
+        moved.perps.as_mut().unwrap().state_proof_keys[0].sha256[0] = 0xac;
+        assert_ne!(build(&moved).hash(), keyed_g.hash(), "the digest is bound");
+        let mut unpinned_engine = keyed.clone();
+        unpinned_engine.perps.as_mut().unwrap().engine_program_log_height = 0;
+        assert!(matches!(unpinned_engine.build(&StubExecutor), Err(GenesisError::BadPerps(why)) if why.contains("state_proof_keys")));
         let stray = on.to_json().replace("\"max_tier\"", "\"max_tiers\"");
         assert!(Genesis::from_json(&stray).is_err(), "a stray key is refused");
         // Beside RPL-2's section too.

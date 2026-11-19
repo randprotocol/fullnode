@@ -90,7 +90,9 @@ pub struct ProofShape {
 /// that wrapper inherits the default. The private-multisig methods — `install_msauth_vk`,
 /// `enable_auth_multisig`, `build_msauth_key`, `auth_header`, `warm_auth_multisig` and
 /// `auth_multisig_key_ready` — have no default at all, so a wrapper that does not forward one
-/// does not compile.
+/// does not compile. The pinned state-proof key methods (CON-601) — `set_perp_pinned_keys`,
+/// `install_perp_vk` and `perp_pinned_keys_installed` — have defaults (no pins, refuse, 0) and are
+/// forwarded by both node wrappers (`CachingExecutor`, `AggExecutor`).
 pub trait ConfidentialExecutor: Send + Sync {
     /// Validate program code at deploy time (must be cheap: it runs inside block application)
     /// and return the code commitment recorded on chain.
@@ -246,6 +248,23 @@ pub trait ConfidentialExecutor: Send + Sync {
     /// CON-60: the genesis perps section's `max_tier` and `engine_program_log_height` (0 = none),
     /// told once at genesis load.
     fn set_perp_config(&self, _max_tier: u8, _engine_program_log_height: u8) {}
+    /// CON-601: the genesis perps section's pinned state-proof keys (`state_proof_keys`: each
+    /// shape and the SHA-256 of its key file), told once at genesis load. With any set, the
+    /// executor verifies a state proof only under a key installed from its pinned file
+    /// ([`Self::install_perp_vk`]) and **never builds one**: a shape not pinned, or pinned but not
+    /// installed, is refused before any key is touched. A no-op by default.
+    fn set_perp_pinned_keys(&self, _pins: &[(ProofShape, [u8; 32])]) {}
+    /// CON-601: install one pinned state-proof key from its file's bytes — refused unless their
+    /// SHA-256 is one [`Self::set_perp_pinned_keys`] named (checked before anything is decoded),
+    /// the blob is for this executor's profile and constraint set, and its shape is that pin's.
+    /// Returns the shape installed. Refuses by default (no key cache to install into).
+    fn install_perp_vk(&self, _blob: &[u8]) -> Result<ProofShape, String> {
+        Err("this executor holds no state-proof keys".into())
+    }
+    /// CON-601: how many pinned state-proof keys are installed (0 by default).
+    fn perp_pinned_keys_installed(&self) -> usize {
+        0
+    }
     /// [`Self::decode_invoke`]'s twin for [`Self::verify_perp`]: everything but the STARK
     /// verification, the segment's digest still compared. The ledger never calls this; kept as
     /// `verify_perp`'s header twin (no production caller). Defaults to the full verify.

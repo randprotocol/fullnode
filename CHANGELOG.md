@@ -12,6 +12,23 @@ stopped at v0.4 until 2026-09-30, when the entries v0.5 to v0.6.7 were written f
 
 ## Unreleased
 
+Perps (**a chain cut, chain 22**; chain 21 unchanged):
+
+- **Pinned state-proof verifier keys (CON-601, monorepo#23).** A new gated genesis field,
+  `perps.state_proof_keys`, lists the state-proof shapes a chain admits, each with the SHA-256 of
+  its precomputed key file. It is omitted when empty and bound into the genesis hash only when
+  set (`rand-perps-ext-3` in the persisted section). On such a chain an unpinned shape is refused
+  before any key build, at validate and apply. Pinned keys come only from hash-matched files,
+  loaded at startup (`--perps-key-dir`, `RAND_PERPS_KEY_DIR`, default beside the binary). The node
+  refuses to start if one is missing or mismatched, and never builds a pinned key.
+  `rand_status.perps_keys` and `rand_getPerps.state_proof_keys` report them. New
+  `rand-node keygen-perp-vk` (`--print-pinned`, `--check`, `--genesis-json`, `--profile
+  --out-dir`). Chain 22's four keys are the canonical tier-18 shapes (program 14, input 16,
+  poseidon2 20, public 7–10), 13 685 bytes each, committed in `crates/randprotocol-zkvm/keys/`,
+  shipped by the release workflow and installed by `deploy/roll-all.sh` (`PERPS_VK_DIR`). The
+  chain-22 cut script sets, asserts, hash-probes and reads back the field. `rand perp prove`
+  refuses a non-canonical shape on a pinned chain.
+
 zkVM (**a chain cut: constraint set 11, for chain 22 and v0.8.7**; chain 21 stays on the set-9
 v0.8.6 line):
 

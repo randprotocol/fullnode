@@ -295,6 +295,133 @@ pub mod msauth_vk {
     }
 }
 
+/// CON-601: the precomputed state-proof verifier keys (chain 22 on).
+///
+/// A block carrying a tier-18 state proof made every validator build its key — ~3.3–4 GB at
+/// tier 18, more than a 2 GB or 4 GB validator holds — and node policy cannot refuse a valid
+/// block. So a chain whose genesis lists `perps.state_proof_keys` (each a shape and the SHA-256
+/// of its key file) admits only those shapes, and a node **loads** each key from its file instead
+/// of building it, as it loads the msauth key ([`msauth_vk`]). The file is exactly the vendored
+/// machine's `VerifierKeyBlob::to_bytes()` for the shape, so its pin is the SHA-256 of the file
+/// bytes, checked before anything is decoded. Files live beside the binary
+/// (`/usr/local/bin/perp-vk-production-t18-pg14-in16-pub7-p2h20.bin`, …), or in
+/// `--perps-key-dir` / `RAND_PERPS_KEY_DIR`.
+///
+/// Unlike the msauth key, the pin that binds is the **genesis'**: a node installs exactly the
+/// files its genesis names. The digests below are this build's, of the chain-22 set
+/// ([`CHAIN22_SHAPES`]), for the release workflow, the roll scripts and the cut script to check a
+/// shipped file against (`rand-node keygen-perp-vk --print-pinned production`).
+pub mod perp_vk {
+    use crate::machine::{FriProfile, Machine};
+    pub use crate::machine::{InstallKeyError, VerifierKeyBlob, VerifierKeyShape};
+    use randprotocol_core::confidential::ProofShape;
+
+    /// The chain-22 perps sizing the shipped keys are for: `max_tier` 18, the pinned engine
+    /// image's program height 14, windows of 1..=64 recorded blocks.
+    pub const CHAIN22_MAX_TIER: u8 = 18;
+    pub const CHAIN22_ENGINE_PROGRAM_LOG_HEIGHT: u8 = 14;
+    pub const CHAIN22_MAX_WINDOW_BLOCKS: u64 = 64;
+
+    /// The chain-22 pinned shapes: the canonical shapes of tier 18 (input 16, poseidon2 20), one
+    /// per public height 7, 8, 9, 10 (`ledger::perps::canonical_state_proof_shapes`).
+    pub fn chain22_shapes() -> Vec<ProofShape> {
+        randprotocol_core::ledger::perps::canonical_state_proof_shapes(CHAIN22_MAX_TIER, CHAIN22_ENGINE_PROGRAM_LOG_HEIGHT, CHAIN22_MAX_WINDOW_BLOCKS)
+    }
+
+    /// No blob hashes to this: the value a pin holds until its blob exists.
+    pub const PIN_PENDING: &str = super::msauth_vk::PIN_PENDING;
+
+    /// SHA-256 of each chain-22 key file at the Production profile, in [`chain22_shapes`]'
+    /// order (public height 7, 8, 9, 10). Consensus-critical once a genesis names them (a crafted
+    /// preprocessed commitment could let a forged state proof verify): `deploy/cut-chain22-genesis.sh`
+    /// pins these into `perps.state_proof_keys`, and `tests/perp_vk.rs` regenerates them.
+    pub const CHAIN22_SHA256_PRODUCTION: [&str; 4] = [
+        "4dc1f18bdd6d9104ba1622710cf2c146f71759676dbdcb70dad036152242e8b4",
+        "6392e5e9b7348f3729ba2031e0e3ec9788d6ed62a14521526482c92615f55106",
+        "c31636aa281004163e6fe0debd81854f11d7bca6c8062a91b1501c7e593e5bf0",
+        "ae3d0dc276061fd2a87b2e91b239f6dcccb746b49dedeecfdb2aab977c95c370",
+    ];
+
+    /// This build's digests of the chain-22 key files for `profile`, as `(shape, sha256)`; Test
+    /// has none (its tier-18 build costs as much as Production's; tests pin their own small keys).
+    pub fn chain22_pins(profile: FriProfile) -> Vec<(ProofShape, &'static str)> {
+        match profile {
+            FriProfile::Production => chain22_shapes().into_iter().zip(CHAIN22_SHA256_PRODUCTION).collect(),
+            FriProfile::Test => Vec::new(),
+        }
+    }
+
+    fn profile_name(profile: FriProfile) -> &'static str {
+        match profile {
+            FriProfile::Production => "production",
+            FriProfile::Test => "test",
+        }
+    }
+
+    /// The fixed file name of `shape`'s key for `profile`:
+    /// `perp-vk-<profile>-t<tier>-pg<program>-in<input>-pub<public>-p2h<poseidon2>.bin`.
+    pub fn file_name(profile: FriProfile, shape: &ProofShape) -> String {
+        format!(
+            "perp-vk-{}-t{}-pg{}-in{}-pub{}-p2h{}.bin",
+            profile_name(profile),
+            shape.tier,
+            shape.program_log_height,
+            shape.input_log_height,
+            shape.public_log_height,
+            shape.poseidon2_log_height
+        )
+    }
+
+    /// The SHA-256 of `bytes`, lowercase hex ([`super::msauth_vk::digest`], the same function).
+    pub fn digest(bytes: &[u8]) -> String {
+        super::msauth_vk::digest(bytes)
+    }
+
+    /// The machine's key shape for a state proof's shape (no modq table).
+    pub fn key_shape(shape: &ProofShape) -> VerifierKeyShape {
+        super::perp_key_shape(shape)
+    }
+
+    /// The key file for `shape` at `profile`: the full build on a fresh machine, exported (the
+    /// `rand-node keygen-perp-vk` body; a big host at tier 18 — ~3.3–4 GB). Refused for a shape
+    /// the verifier would refuse or one with a hash table (the engine calls neither).
+    pub fn blob(profile: FriProfile, shape: &ProofShape) -> Result<Vec<u8>, String> {
+        if shape.keccak_log_height != 0 || shape.sha256_log_height != 0 {
+            return Err(format!("{shape:?}: a state-proof key has no keccak or sha256 table"));
+        }
+        let ks = key_shape(shape);
+        if !crate::machine::TIERS.contains(&(shape.tier as usize)) {
+            return Err(format!("{shape:?}: tier {} is not one of {:?}", shape.tier, crate::machine::TIERS));
+        }
+        ks.check().map_err(|e| format!("{shape:?}: {e:?}"))?;
+        Ok(Machine::new(profile).export_verifier_key(ks).to_bytes())
+    }
+
+    /// The checks a pinned blob passes before the machine installs it: its SHA-256 is
+    /// `want_digest` (on the raw bytes, first), it decodes, its profile is `profile`, and its shape
+    /// is `shape`'s key shape. The machine's install repeats the digest check and adds format,
+    /// constraint set, structure and lookups.
+    pub fn check(blob: &[u8], want_digest: &[u8; 32], profile: FriProfile, shape: &ProofShape) -> Result<VerifierKeyBlob, String> {
+        let got = crate::sha256::sha256(blob);
+        if &got != want_digest {
+            return Err(format!("has sha256 {}, not the pinned {}", hex(&got), hex(want_digest)));
+        }
+        let b = VerifierKeyBlob::from_bytes(blob).map_err(|e| format!("does not decode: {e:?}"))?;
+        if b.profile != profile {
+            return Err(format!("is for the {:?} profile; this node runs {profile:?}", b.profile));
+        }
+        let want = key_shape(shape);
+        if b.shape != want {
+            return Err(format!("holds the key for {:?}, not the pinned shape {want:?}", b.shape));
+        }
+        Ok(b)
+    }
+
+    pub fn hex(d: &[u8; 32]) -> String {
+        d.iter().map(|b| format!("{b:02x}")).collect()
+    }
+}
+
 /// The highest tier a *call* proof may declare (deep scan 2026-09-24, zkvm), enforced by
 /// `verify_call` before any verifier key is built, so it is a validity rule (admission and block
 /// apply both run `verify_call`). It is the highest tier `warm` pre-builds, and that is the
@@ -811,6 +938,15 @@ pub struct ZkExecutor {
     /// installs), each with whether the pin is in `perp_lineage_machine` (true) or `perp_machine`
     /// (false) — counted per machine against its own cap.
     perp_pinned: std::sync::Mutex<PerpPins>,
+    /// CON-601: the genesis `perps.state_proof_keys` — each pinned shape and its key file's
+    /// SHA-256 — set once by [`ConfidentialExecutor::set_perp_pinned_keys`]. Set, a state proof
+    /// verifies only under a key installed from its pinned file
+    /// ([`ConfidentialExecutor::install_perp_vk`], into `perp_lineage_machine`), and no state-proof
+    /// key is ever built: an unpinned shape, or a pinned one whose file was not installed, is
+    /// refused before any key.
+    perp_key_pins: std::sync::OnceLock<std::collections::BTreeMap<randprotocol_core::confidential::ProofShape, [u8; 32]>>,
+    /// CON-601: the pinned shapes whose keys were installed from their files.
+    perp_keys_installed: std::sync::Mutex<std::collections::BTreeSet<randprotocol_core::confidential::ProofShape>>,
     /// The tier-18 msauth verifier key, built once (spec §3.5, pre-flight finding 3): measured at
     /// Production on the 48 GB laptop at 78.6 s and ~4.0 GB peak (and resident after, on macOS's
     /// allocator — the key itself is a commitment and lookups), on 2–4 GB validators, so four
@@ -877,6 +1013,8 @@ impl ZkExecutor {
             perp_engine_plh: std::sync::atomic::AtomicU8::new(0),
             perp_max_tier: std::sync::atomic::AtomicU8::new(0),
             perp_pinned: std::sync::Mutex::new(PerpPins::default()),
+            perp_key_pins: std::sync::OnceLock::new(),
+            perp_keys_installed: std::sync::Mutex::new(std::collections::BTreeSet::new()),
             msauth_key: std::sync::OnceLock::new(),
             msauth_key_builds: std::sync::atomic::AtomicUsize::new(0),
             msauth_key_source: std::sync::OnceLock::new(),
@@ -1845,11 +1983,24 @@ impl ZkExecutor {
     ) -> Result<CallOutcome, ConfidentialError> {
         let proof = if verify {
             let proof = self.perp_pre_key(engine_hc, max_tier, segment, bytes)?;
-            // CON-60: the engine's own machines — the canonical one for the chain's canonical
-            // shapes, the general one otherwise; whichever already holds the key first.
-            self.perp_machine_for(&shape_of(&proof))
-                .verify_public(engine_hc, segment, &proof)
-                .map_err(|e| ConfidentialError::InvalidProof(format!("{e:?}")))?;
+            let shape = shape_of(&proof);
+            // CON-601: under pinned keys the key is the one installed from its file, never a
+            // build — `perp_pre_key` refused an unpinned shape; one pinned but not installed (a
+            // node started without its file, which `node::start` refuses) is refused here.
+            let machine = if self.perp_key_pins.get().is_some() {
+                if !Self::perp_cached_in(&self.perp_lineage_machine, &shape) {
+                    return Err(ConfidentialError::InvalidProof(format!(
+                        "the pinned state-proof key for {shape:?} is not loaded on this node (its key file, {}); a pinned key is never built",
+                        perp_vk::file_name(self.profile, &shape)
+                    )));
+                }
+                &self.perp_lineage_machine
+            } else {
+                // CON-60: the engine's own machines — the canonical one for the chain's canonical
+                // shapes, the general one otherwise; whichever already holds the key first.
+                self.perp_machine_for(&shape)
+            };
+            machine.verify_public(engine_hc, segment, &proof).map_err(|e| ConfidentialError::InvalidProof(format!("{e:?}")))?;
             proof
         } else {
             let proof = self.perp_header(max_tier, segment.len(), bytes)?;
@@ -1890,6 +2041,18 @@ impl ZkExecutor {
         // CON-601: the FRI transcript's structure, which `verify_fri` checks only after the key.
         if let Some(why) = fri_structure_violation(&proof, self.profile.num_queries()) {
             return Err(ConfidentialError::InvalidProof(why));
+        }
+        // CON-601: under the genesis key pins, only a pinned shape — the ledger refuses the rest
+        // from the header before it asks; this is the executor's own guard, so no caller of
+        // `verify_perp` (the pool's pre-screen included) can reach a key for another shape.
+        if let Some(pins) = self.perp_key_pins.get() {
+            let shape = shape_of(&proof);
+            if !pins.contains_key(&shape) {
+                return Err(ConfidentialError::InvalidProof(format!(
+                    "state proof shape {shape:?} is not one of the chain's {} pinned state-proof key shapes",
+                    pins.len()
+                )));
+            }
         }
         Ok(proof)
     }
@@ -2519,6 +2682,39 @@ impl ConfidentialExecutor for ZkExecutor {
         self.perp_engine_plh.store(engine_program_log_height, std::sync::atomic::Ordering::SeqCst);
     }
 
+    /// CON-601: pinned mode, set once and only for a non-empty list (a second call is ignored).
+    fn set_perp_pinned_keys(&self, pins: &[(randprotocol_core::confidential::ProofShape, [u8; 32])]) {
+        if !pins.is_empty() {
+            let _ = self.perp_key_pins.set(pins.iter().copied().collect());
+        }
+    }
+
+    /// CON-601: [`perp_vk::check`] against the pin whose digest the bytes have (on the raw bytes,
+    /// before any decode), then the machine's own pinned install into the canonical machine,
+    /// where the key is pinned (never evicted).
+    fn install_perp_vk(&self, blob: &[u8]) -> Result<randprotocol_core::confidential::ProofShape, String> {
+        let Some(pins) = self.perp_key_pins.get() else {
+            return Err("this chain pins no state-proof keys (no perps.state_proof_keys)".into());
+        };
+        let got = crate::sha256::sha256(blob);
+        let Some((shape, want)) = pins.iter().find(|(_, d)| **d == got) else {
+            return Err(format!(
+                "has sha256 {}, which is none of the {} pinned state-proof key digests ({})",
+                perp_vk::hex(&got),
+                pins.len(),
+                pins.values().map(perp_vk::hex).collect::<Vec<_>>().join(", ")
+            ));
+        };
+        perp_vk::check(blob, want, self.profile, shape)?;
+        self.perp_lineage_machine.install_verifier_key_pinned(blob, want).map_err(|e| format!("the machine refused the key: {e:?}"))?;
+        self.perp_keys_installed.lock().unwrap().insert(*shape);
+        Ok(*shape)
+    }
+
+    fn perp_pinned_keys_installed(&self) -> usize {
+        self.perp_keys_installed.lock().unwrap().len()
+    }
+
     /// CON-60: pin `shape`'s key where it is built, once a proof of it verified — only when the
     /// key is built already (this never builds) and while that machine has a pin left
     /// ([`PERP_CANONICAL_PINS`] in the canonical machine, [`PERP_GENERAL_PINS`] in the general
@@ -2531,6 +2727,10 @@ impl ConfidentialExecutor for ZkExecutor {
     /// keep can take the same last pin meanwhile, and the lock the pool's lineage check reads is
     /// never held across a key operation.
     fn keep_perp_key(&self, shape: &randprotocol_core::confidential::ProofShape) {
+        // CON-601: pinned keys are installed (and pinned in their machine) from their files.
+        if self.perp_key_pins.get().is_some() {
+            return;
+        }
         let canonical = if Self::perp_cached_in(&self.perp_lineage_machine, shape) {
             true
         } else if Self::perp_cached_in(&self.perp_machine, shape) {
@@ -2569,6 +2769,10 @@ impl ConfidentialExecutor for ZkExecutor {
     /// proofs used) where a proof of it would verify, and pin it. A shape the header rules
     /// refuse — a tier outside `TIERS`, heights out of range — is skipped, never built.
     fn warm_perp(&self, shape: &randprotocol_core::confidential::ProofShape) {
+        // CON-601: under pinned keys nothing is ever built; the keys come from their files.
+        if self.perp_key_pins.get().is_some() {
+            return;
+        }
         // Constraint set 11: the poseidon2 height is ranged with the rest (`VerifierKeyShape::check`).
         if !TIERS.contains(&(shape.tier as usize)) || perp_key_shape(shape).check().is_err() {
             return;

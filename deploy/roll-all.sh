@@ -17,6 +17,15 @@
 #   /usr/local/bin/msauth-vk-production.bin, beside the binary, before anything restarts. Node A
 #   on this Mac (when its launchd job is installed) gets the same file beside its own binary.
 #
+#   The perps state-proof verifier keys (CON-601, chain 22's `perps.state_proof_keys`) are the
+#   directory PERPS_VK_DIR holding the release's four perp-vk-production-*.bin. A node whose genesis
+#   names state_proof_keys refuses to start without every one, so a roll without PERPS_VK_DIR is
+#   refused when any droplet's genesis names it (or cannot be read). Each host holds every file
+#   the new build pins (`rand-node.new keygen-perp-vk --print-pinned production`: "<file> <sha256>"
+#   lines) to that pin, by sha256sum and by `--check`; a mismatch or a missing file skips the
+#   host's install, binaries included. Installed in /usr/local/bin beside the binary. With
+#   RELEASE_SUMS each file must also be the one the signed SHA256SUMS lists.
+#
 # 1. copies both binaries to every droplet in deploy/nodes.env and installs them only when each
 #    copy's sha256 equals the expected one (the release tag's), keeping the previous rand-node
 #    beside it as /root/rand-node.prev; nothing restarts yet;
@@ -48,6 +57,12 @@ if [ -n "$MSAUTH_VK" ]; then
 elif [ "${NO_MSAUTH_VK:-}" != 1 ]; then
   echo "no msauth-vk-production.bin (fifth argument or MSAUTH_VK): a v0.8.0+ node on a chain naming hc_auth_multisig refuses to start without it; pass it, or NO_MSAUTH_VK=1 for a chain without multisig"; exit 1
 fi
+PERPS_VK_DIR=${PERPS_VK_DIR:-}
+PERPS_VKS=()
+if [ -n "$PERPS_VK_DIR" ]; then
+  for f in "$PERPS_VK_DIR"/perp-vk-production-*.bin; do [ -f "$f" ] && PERPS_VKS+=("$f"); done
+  [ "${#PERPS_VKS[@]}" -eq 4 ] || { echo "PERPS_VK_DIR $PERPS_VK_DIR holds ${#PERPS_VKS[@]} perp-vk-production-*.bin, not the release's four"; exit 1; }
+fi
 . deploy/lib/verify-release.sh
 . deploy/lib/unit-limits.sh
 if [ -n "${RELEASE_SUMS:-}" ] || [ -n "${RELEASE_SIG:-}" ]; then
@@ -58,6 +73,7 @@ if [ -n "${RELEASE_SUMS:-}" ] || [ -n "${RELEASE_SIG:-}" ]; then
   [ "$WANT" = "$(release_sha "$RELEASE_SUMS" rand-node)" ] || { echo "the expected rand-node sha256 given here is not the one the signed SHA256SUMS lists — not rolling"; exit 1; }
   [ "$WANT_WALLET" = "$(release_sha "$RELEASE_SUMS" rand)" ] || { echo "the expected rand sha256 given here is not the one the signed SHA256SUMS lists — not rolling"; exit 1; }
   [ -z "$MSAUTH_VK" ] || verify_binary "$MSAUTH_VK" "$RELEASE_SUMS" msauth-vk-production.bin || exit 1
+  for f in "${PERPS_VKS[@]}"; do verify_binary "$f" "$RELEASE_SUMS" "$(basename "$f")" || exit 1; done
 else
   echo "################################################################################"
   echo "# UNSIGNED ROLL: no RELEASE_SUMS/RELEASE_SIG. Nothing ties these binaries to a"
@@ -91,6 +107,18 @@ if [ -z "$MSAUTH_VK" ]; then
   done
   [ -f ~/Library/LaunchAgents/org.randprotocol.node-a.plist ] && echo "   note: node A's launchd job is installed and its genesis is not checked under NO_MSAUTH_VK=1"
 fi
+# Without PERPS_VK_DIR: no droplet's genesis may name perps.state_proof_keys (the same read of
+# `<datadir>/genesis.json` as above; serde omits the key when the list is empty).
+if [ -z "$PERPS_VK_DIR" ]; then
+  for ip in $IPS; do
+    pk=$(ssh -o ConnectTimeout=15 -o BatchMode=yes root@$ip 'D=$(systemctl cat rand-node 2>/dev/null | grep -oE -- "--datadir[= ][^ ]*" | tail -1 | sed -E "s/^--datadir[= ]//"); [ -n "$D" ] && [ -r "$D/genesis.json" ] || { echo "unreadable ${D:-<no --datadir in the rand-node unit>}/genesis.json"; exit 0; }; if grep -q "\"state_proof_keys\"" "$D/genesis.json"; then echo "pinned $D/genesis.json"; else echo "plain"; fi' 2>/dev/null)
+    case "$pk" in
+      plain) ;;
+      pinned*) echo "no PERPS_VK_DIR but $ip's genesis names perps.state_proof_keys (${pk#pinned }): its node refuses to start without the four perp-vk-production-*.bin — pass PERPS_VK_DIR"; exit 1 ;;
+      *) echo "no PERPS_VK_DIR and $ip's genesis could not be read (${pk:-ssh failed}): cannot confirm it pins no state-proof keys — pass PERPS_VK_DIR, or fix the host first"; exit 1 ;;
+    esac
+  done
+fi
 echo "== install (no restart) $(date -u +%H:%M:%S)"
 # The msauth key blob's check and install, run on the host before the binaries' install (empty
 # when the roll carries no blob): the copy is intact (sha256) and is the blob the build being
@@ -102,6 +130,12 @@ VK_STEP="if [ -f /usr/local/bin/msauth-vk-production.bin ]; then vk_got=\$(/root
 if [ -n "$MSAUTH_VK" ]; then
   VK_STEP="[ \"\$(sha256sum /root/msauth-vk-production.bin.new | cut -d' ' -f1)\" = \"$VK_SHA\" ] && vk_got=\$(/root/rand-node.new keygen-msauth-vk --check /root/msauth-vk-production.bin.new) && vk_pin=\$(/root/rand-node.new keygen-msauth-vk --print-pinned production) && [ \"\$vk_got\" = \"\$vk_pin\" ] || { echo \"   msauth key blob is not the pinned \${vk_pin:-?} (has \${vk_got:-?}), skipping\"; rm -f /root/rand-node.new /root/rand.new /root/msauth-vk-production.bin.new; exit 1; }; install -m 644 /root/msauth-vk-production.bin.new /usr/local/bin/msauth-vk-production.bin; rm -f /root/msauth-vk-production.bin.new;"
 fi
+# CON-601: the perps key files' check and install (empty without PERPS_VK_DIR): every file the new
+# build pins is in /root/perp-vk.new with exactly that sha256, by sha256sum and `--check`.
+PVK_STEP=
+if [ -n "$PERPS_VK_DIR" ]; then
+  PVK_STEP="pvk_n=0; while read -r pvk_name pvk_pin; do [ -n \"\$pvk_name\" ] || continue; [ \"\$(sha256sum /root/perp-vk.new/\$pvk_name 2>/dev/null | cut -d' ' -f1)\" = \"\$pvk_pin\" ] && [ \"\$(/root/rand-node.new keygen-perp-vk --check /root/perp-vk.new/\$pvk_name)\" = \"\$pvk_pin\" ] || { echo \"   perps key \$pvk_name is not the pinned \$pvk_pin, skipping\"; rm -rf /root/rand-node.new /root/rand.new /root/perp-vk.new; exit 1; }; pvk_n=\$((pvk_n + 1)); done < <(/root/rand-node.new keygen-perp-vk --print-pinned production); [ \"\$pvk_n\" -eq 4 ] || { echo \"   this build pins \$pvk_n perps key files, not 4, skipping\"; rm -rf /root/rand-node.new /root/rand.new /root/perp-vk.new; exit 1; }; install -m 644 /root/perp-vk.new/perp-vk-production-*.bin /usr/local/bin/; rm -rf /root/perp-vk.new;"
+fi
 # PROC-601: the limits drop-in, written on the host after the binaries and before the restart.
 LIMITS_STEP=$(unit_limits_install_script rand-node)
 for ip in $IPS; do
@@ -109,7 +143,11 @@ for ip in $IPS; do
   if [ -n "$MSAUTH_VK" ]; then
     scp -q -o ConnectTimeout=15 -o BatchMode=yes "$MSAUTH_VK" root@$ip:/root/msauth-vk-production.bin.new || { echo "   $ip: msauth key copy failed"; ssh -o ConnectTimeout=15 -o BatchMode=yes root@$ip 'rm -f /root/rand-node.new /root/rand.new /root/msauth-vk-production.bin.new' 2>/dev/null; continue; }
   fi
-  ssh -o ConnectTimeout=15 -o BatchMode=yes root@$ip "set -e; [ \"\$(sha256sum /root/rand-node.new | cut -d' ' -f1)\" = \"$WANT\" ] && [ \"\$(sha256sum /root/rand.new | cut -d' ' -f1)\" = \"$WANT_WALLET\" ] || { echo '   sha mismatch, skipping'; rm -f /root/rand-node.new /root/rand.new /root/msauth-vk-production.bin.new; exit 1; }; chmod 755 /root/rand-node.new; $VK_STEP cp -f /usr/local/bin/rand-node /root/rand-node.prev; install -m 755 /root/rand-node.new /usr/local/bin/rand-node; install -m 755 /root/rand.new /usr/local/bin/rand; rm -f /root/rand-node.new /root/rand.new
+  if [ -n "$PERPS_VK_DIR" ]; then
+    { ssh -o ConnectTimeout=15 -o BatchMode=yes root@$ip 'rm -rf /root/perp-vk.new && mkdir -p /root/perp-vk.new' && scp -q -o ConnectTimeout=15 -o BatchMode=yes "${PERPS_VKS[@]}" root@$ip:/root/perp-vk.new/; } \
+      || { echo "   $ip: perps key copy failed"; ssh -o ConnectTimeout=15 -o BatchMode=yes root@$ip 'rm -rf /root/rand-node.new /root/rand.new /root/msauth-vk-production.bin.new /root/perp-vk.new' 2>/dev/null; continue; }
+  fi
+  ssh -o ConnectTimeout=15 -o BatchMode=yes root@$ip "set -e; [ \"\$(sha256sum /root/rand-node.new | cut -d' ' -f1)\" = \"$WANT\" ] && [ \"\$(sha256sum /root/rand.new | cut -d' ' -f1)\" = \"$WANT_WALLET\" ] || { echo '   sha mismatch, skipping'; rm -f /root/rand-node.new /root/rand.new /root/msauth-vk-production.bin.new; exit 1; }; chmod 755 /root/rand-node.new; $VK_STEP $PVK_STEP cp -f /usr/local/bin/rand-node /root/rand-node.prev; install -m 755 /root/rand-node.new /usr/local/bin/rand-node; install -m 755 /root/rand.new /usr/local/bin/rand; rm -f /root/rand-node.new /root/rand.new
 $LIMITS_STEP
 echo \"   \$(hostname): installed \$(/usr/local/bin/rand-node --version)\"" 2>&1 | tail -1
 done

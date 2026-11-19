@@ -152,6 +152,8 @@
 # §4) adds `src/auth.rs` (the auth guest's input layout and `c = H(AUTH, nk, salt)`, node-local tag
 # 65) and `tests/auth*.rs` (the P2-0 spike and what follows it), both excluded below for the same
 # reason; the guest itself is `guests::auth()` in the already-excluded `guests.rs`.
+# CON-601 adds `tests/perp_vk.rs` (excluded below): the chain-22 pinned state-proof key files'
+# checks, against `executor::perp_vk` in the (already excluded) `executor.rs`.
 #
 # Audit finding ZKV-2 (circuits 224960c): the Poseidon2 round constants are a committed literal
 # table, `src/poseidon2_constants.rs`, instead of a seeded `StdRng` draw (`rand` does not promise
@@ -261,7 +263,7 @@ rsync -a --delete --exclude target --exclude .git --exclude Cargo.lock --exclude
 rsync -a --delete --exclude executor.rs --exclude shielded.rs --exclude call_envelope.rs \
       --exclude viewing.rs --exclude bundle.rs --exclude hidden_bundle.rs \
       --exclude hidden_cheating.rs --exclude hidden_trace_forgery.rs --exclude guest_provenance.rs --exclude 'auth*.rs' --exclude evm_rt.rs --exclude sbpf_rt.rs \
-      --exclude perps_vectors.rs --exclude modq_cheating.rs \
+      --exclude perps_vectors.rs --exclude modq_cheating.rs --exclude perp_vk.rs \
       --exclude counter_rng.rs --exclude decode_memo.rs --exclude agents_counts.rs \
       "$SRC/tests/" "$DST/tests/"
 [ -f "$DST/src/guests.rs" ] || cp "$SRC/src/guests.rs" "$DST/src/guests.rs"

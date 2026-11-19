@@ -1066,6 +1066,12 @@ enum Cmd {
         /// (~80 s, ~4 GB at production) instead of refusing to start. Never set by a deploy script.
         #[arg(long)]
         build_msauth_key: bool,
+        /// CON-601: the directory holding the pinned perps state-proof key files (read only on a
+        /// chain whose genesis lists `perps.state_proof_keys`). Default: `$RAND_PERPS_KEY_DIR`,
+        /// else this binary's own directory (`/usr/local/bin` on the fleet). A missing or unpinned
+        /// file refuses the start; a pinned key is never built.
+        #[arg(long, value_name = "DIR")]
+        perps_key_dir: Option<PathBuf>,
     },
     /// Verify the chain in a data directory without running the node.
     Verify {
@@ -1082,6 +1088,9 @@ enum Cmd {
         /// `hc_auth_multisig`; a missing or unpinned file refuses the verify — it never builds).
         #[arg(long, value_name = "PATH")]
         msauth_vk: Option<PathBuf>,
+        /// CON-601: the pinned perps state-proof key files' directory, as for `run`.
+        #[arg(long, value_name = "DIR")]
+        perps_key_dir: Option<PathBuf>,
     },
     /// Database maintenance on a stopped node's data directory.
     Db {
@@ -1235,6 +1244,34 @@ enum Cmd {
         check: Option<PathBuf>,
         #[arg(long, value_name = "PROFILE", conflicts_with_all = ["profile", "out"])]
         print_pinned: Option<String>,
+    },
+    /// CON-601: the pinned perps state-proof verifier keys. `--profile P --out-dir DIR` builds
+    /// each canonical shape's key for `--max-tier` / `--engine-program-log-height` /
+    /// `--max-window-blocks` (chain 22's 18 / 14 / 64 by default; a big host: ~3.3–4 GB a tier-18
+    /// key) and writes `DIR/perp-vk-<profile>-t…-p2h….bin`, printing `<file> sha256 <hex> bytes
+    /// <n>` per key; `--check FILE` prints a file's SHA-256; `--print-pinned P` prints this build's
+    /// chain-22 files and digests; `--genesis-json DIR` prints the `perps.state_proof_keys` list
+    /// for the files in DIR. A validator loads the files from beside its binary and never builds.
+    KeygenPerpVk {
+        #[arg(long, requires = "out_dir")]
+        profile: Option<String>,
+        #[arg(long, requires = "profile")]
+        out_dir: Option<PathBuf>,
+        #[arg(long, default_value_t = randprotocol_zkvm::executor::perp_vk::CHAIN22_MAX_TIER)]
+        max_tier: u8,
+        #[arg(long, default_value_t = randprotocol_zkvm::executor::perp_vk::CHAIN22_ENGINE_PROGRAM_LOG_HEIGHT)]
+        engine_program_log_height: u8,
+        #[arg(long, default_value_t = randprotocol_zkvm::executor::perp_vk::CHAIN22_MAX_WINDOW_BLOCKS)]
+        max_window_blocks: u64,
+        /// Only the shape with this public height (with `--out-dir`; one key per run).
+        #[arg(long)]
+        public_log_height: Option<u8>,
+        #[arg(long, conflicts_with_all = ["profile", "out_dir", "print_pinned", "genesis_json"])]
+        check: Option<PathBuf>,
+        #[arg(long, value_name = "PROFILE", conflicts_with_all = ["profile", "out_dir", "genesis_json"])]
+        print_pinned: Option<String>,
+        #[arg(long, value_name = "DIR", conflicts_with_all = ["profile", "out_dir"])]
+        genesis_json: Option<PathBuf>,
     },
     /// Benchmarks of the node's own paths; no network, no database.
     Bench {
@@ -2792,6 +2829,32 @@ async fn main() -> Result<()> {
                 anyhow::bail!("keygen-msauth-vk: give --profile P --out FILE, --check FILE or --print-pinned P");
             }
         }
+        Cmd::KeygenPerpVk { profile, out_dir, max_tier, engine_program_log_height, max_window_blocks, public_log_height, check, print_pinned, genesis_json } => {
+            use randprotocol_node::perps_key;
+            use randprotocol_zkvm::executor::perp_vk;
+            let shapes = randprotocol_core::ledger::perps::canonical_state_proof_shapes(max_tier, engine_program_log_height, max_window_blocks);
+            if let Some(p) = print_pinned {
+                let profile = randprotocol_node::msauth_key::parse_profile(&p)?;
+                for (shape, pin) in perp_vk::chain22_pins(profile) {
+                    println!("{} {pin}", perp_vk::file_name(profile, &shape));
+                }
+            } else if let Some(f) = check {
+                println!("{}", randprotocol_node::msauth_key::check_file(&f)?);
+            } else if let Some(dir) = genesis_json {
+                println!("{}", serde_json::to_string(&perps_key::genesis_json(randprotocol_zkvm::machine::FriProfile::Production, &shapes, &dir)?)?);
+            } else if let (Some(p), Some(out)) = (profile, out_dir) {
+                let profile = randprotocol_node::msauth_key::parse_profile(&p)?;
+                let shapes: Vec<_> = shapes.into_iter().filter(|s| public_log_height.is_none_or(|h| s.public_log_height == h)).collect();
+                anyhow::ensure!(!shapes.is_empty(), "keygen-perp-vk: no canonical shape has public height {public_log_height:?}");
+                let t0 = std::time::Instant::now();
+                for (name, digest, bytes) in perps_key::keygen(profile, &shapes, &out)? {
+                    println!("{name} sha256 {digest} bytes {bytes}");
+                }
+                eprintln!("wrote {} keys into {} in {:.1?}", shapes.len(), out.display(), t0.elapsed());
+            } else {
+                anyhow::bail!("keygen-perp-vk: give --profile P --out-dir DIR, --check FILE, --print-pinned P or --genesis-json DIR");
+            }
+        }
         Cmd::Keygen { out } => {
             let kp = Keypair::generate();
             // Never over an existing file (VK-7): the key at `out` may be the only copy of a seed.
@@ -3228,7 +3291,7 @@ async fn main() -> Result<()> {
             println!("initialised {} at genesis {} (chain id {})", datadir.display(), gs.hash(), gs.chain_id);
             println!("{}", gas_summary(gs.ledger.gas()));
         }
-        Cmd::Verify { datadir, mode, repair, msauth_vk } => {
+        Cmd::Verify { datadir, mode, repair, msauth_vk, perps_key_dir } => {
             let mode: VerifyMode = mode.parse().map_err(|e: String| anyhow::anyhow!(e))?;
             let (gs, executor) = node::load_genesis(&datadir)?;
             refuse_test_fri_profile(&gs.fri_profile, test_profile_allowed)?;
@@ -3245,6 +3308,9 @@ async fn main() -> Result<()> {
             );
             // The pinned msauth key, loaded as `run` loads it: a replay must never build it.
             randprotocol_node::msauth_key::verify_startup(&gs, msauth_vk, executor.as_ref()).map_err(|e| anyhow::anyhow!("{e:#}; refusing to verify"))?;
+            // CON-601: and the pinned perps state-proof keys, loaded as `run` loads them.
+            randprotocol_node::perps_key::startup(&gs, &randprotocol_node::perps_key::PerpsKeyOptions { dir: perps_key_dir }, executor.as_ref())
+                .map_err(|e| anyhow::anyhow!("{e:#}; refusing to verify"))?;
             let storage = Storage::open(&datadir)?;
             let check = node::verify_store(&storage, &gs, mode, executor.as_ref())?;
             match &check.problem {
@@ -3281,6 +3347,7 @@ async fn main() -> Result<()> {
         Cmd::Run {
             msauth_vk,
             build_msauth_key,
+            perps_key_dir,
             datadir,
             key,
             listen,
@@ -3396,6 +3463,7 @@ async fn main() -> Result<()> {
                 prune_history,
                 gas_policy: randprotocol_core::gas::GasPolicy::from_prices(gas_price, byte_price),
                 msauth: randprotocol_node::msauth_key::MsauthKeyOptions { path: msauth_vk, build: build_msauth_key },
+                perps_keys: randprotocol_node::perps_key::PerpsKeyOptions { dir: perps_key_dir },
             }, rpc_options, node::NetOptions {
                 reserved_peers: reserved_peer,
                 strict_gossip,

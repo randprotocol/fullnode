@@ -185,6 +185,7 @@ async fn start_configured(dir: &tempfile::TempDir, key: &Keypair, genesis: Genes
         // pays the policy floor it reads from `rand_getLimits`.
         gas_policy: Some(randprotocol_core::gas::GasPolicy::DEFAULT),
         msauth,
+        perps_keys: Default::default(),
     })
     .await
     .expect("node starts")

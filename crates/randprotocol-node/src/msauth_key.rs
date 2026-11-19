@@ -440,6 +440,7 @@ mod tests {
             prune_history: None,
             gas_policy: None,
             msauth,
+            perps_keys: Default::default(),
         }
     }
 

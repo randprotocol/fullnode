@@ -339,6 +339,10 @@ pub struct NodeStatus {
     /// `hc_auth_multisig`. A multisig chain never runs without the key: a node that could not
     /// load it refused to start.
     pub msauth_key: crate::msauth_key::MsauthKeySource,
+    /// CON-601: this node's pinned perps state-proof keys — `{"source": "loaded", "keys": 4}` on
+    /// a chain whose genesis pins them (a node that could not load every one refused to start),
+    /// `{"source": "absent", "keys": 0}` elsewhere.
+    pub perps_keys: crate::perps_key::PerpsKeyStatus,
 }
 
 /// [`NodeStatus::gas_prices`]'s two amounts, decimal strings like every other RAND amount on the
@@ -3452,6 +3456,9 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
                 // CON-60: the genesis engine program-height pin, 0 when unset (chain 21); a
                 // prover proves at the canonical shape by default only when it is set.
                 "engine_program_log_height": c.engine_program_log_height,
+                // CON-601: the genesis' pinned state-proof keys (shape and file SHA-256 each),
+                // empty when unset (chain 21); a state proof of any other shape is refused.
+                "state_proof_keys": c.state_proof_keys,
                 // PERP-5: the genesis cap on unproved digests, 0 when unset (chain 21).
                 "max_pending_digests": c.max_pending_digests,
                 "max_block_inputs": c.max_block_inputs,
@@ -8715,6 +8722,7 @@ pub(crate) mod tests {
                 "max_window_heights": 0,
                 "engine_program_log_height": 0,
                 "max_pending_digests": 0,
+                "state_proof_keys": [],
                 "max_block_inputs": 8,
                 "min_deposit": "1000",
                 "engine_hc": word8_to_hex(&cfg.engine_hc),

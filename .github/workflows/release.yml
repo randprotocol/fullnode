@@ -188,7 +188,10 @@ jobs:
           # The precomputed msauth verifier key (private multisig): the committed blob, shipped
           # beside the binaries and installed at /usr/local/bin/msauth-vk-production.bin.
           cp crates/randprotocol-zkvm/keys/msauth-vk-production.bin dist/
-          ( cd dist && sha256sum rand-node rand rand-prover msauth-vk-production.bin > SHA256SUMS && cat SHA256SUMS )
+          # CON-601: the four pinned perps state-proof verifier keys (chain 22's
+          # perps.state_proof_keys), shipped beside the binaries and installed in /usr/local/bin.
+          cp crates/randprotocol-zkvm/keys/perp-vk-production-*.bin dist/
+          ( cd dist && sha256sum rand-node rand rand-prover msauth-vk-production.bin perp-vk-production-*.bin > SHA256SUMS && cat SHA256SUMS )
           dist/rand-node --version
       - name: The msauth key blob is the one this rand-node pins
         working-directory: fullnode
@@ -198,6 +201,19 @@ jobs:
           want=$(dist/rand-node keygen-msauth-vk --print-pinned production)
           echo "msauth-vk-production.bin sha256 $got, pinned $want"
           [ "$got" = "$want" ] || { echo "::error::dist/msauth-vk-production.bin ($got) is not the pin compiled into dist/rand-node ($want)"; exit 1; }
+      - name: The perps state-proof key files are the ones this rand-node pins (CON-601)
+        working-directory: fullnode
+        run: |
+          set -euo pipefail
+          n=0
+          while read -r name want; do
+            got=$(dist/rand-node keygen-perp-vk --check "dist/$name")
+            echo "$name sha256 $got, pinned $want"
+            [ "$got" = "$want" ] || { echo "::error::dist/$name ($got) is not the pin compiled into dist/rand-node ($want)"; exit 1; }
+            n=$((n + 1))
+          done < <(dist/rand-node keygen-perp-vk --print-pinned production)
+          shipped=$(ls dist/perp-vk-production-*.bin | wc -l)
+          [ "$n" -eq 4 ] && [ "$shipped" -eq "$n" ] || { echo "::error::rand-node pins $n perp-vk files, dist holds $shipped (want 4)"; exit 1; }
       - name: Build provenance
         uses: actions/attest-build-provenance@96278af6caaf10aea03fd8d33a09a777ca52d62f # v3.2.0
         with:
@@ -206,6 +222,7 @@ jobs:
             fullnode/dist/rand
             fullnode/dist/rand-prover
             fullnode/dist/msauth-vk-production.bin
+            fullnode/dist/perp-vk-production-*.bin
       - name: The release
         working-directory: fullnode
         env:
@@ -248,4 +265,4 @@ jobs:
           prerelease=""
           case "$TAG" in *-rc*|*-alpha*|*-beta*) prerelease="--prerelease" ;; esac
           gh release create "$TAG" --repo "$REPO" --verify-tag --title "$TAG" --notes-file notes.md $prerelease \
-            dist/rand-node dist/rand dist/rand-prover dist/msauth-vk-production.bin dist/SHA256SUMS
+            dist/rand-node dist/rand dist/rand-prover dist/msauth-vk-production.bin dist/perp-vk-production-*.bin dist/SHA256SUMS

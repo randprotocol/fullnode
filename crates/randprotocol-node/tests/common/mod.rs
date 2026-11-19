@@ -163,6 +163,7 @@ pub async fn start_one_validator_shaped(edit: impl FnOnce(&mut Genesis)) -> Test
         prune_history: None,
         gas_policy: None,
         msauth: Default::default(),
+        perps_keys: Default::default(),
     })
     .await
     .expect("node starts");

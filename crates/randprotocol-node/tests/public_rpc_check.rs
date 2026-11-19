@@ -50,6 +50,7 @@ async fn the_check_passes_on_the_public_listener_and_fails_on_the_operator_one()
             prune_history: None,
             gas_policy: None,
             msauth: Default::default(),
+            perps_keys: Default::default(),
         },
         RpcOptions { public_addr: Some(public_addr), ..RpcOptions::default() },
         NetOptions::default(),

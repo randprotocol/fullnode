@@ -67,6 +67,7 @@ async fn start_on_lanes(gen: &Genesis, seed: u8, bootstrap: Vec<libp2p::Multiadd
             prune_history: None,
             gas_policy: None,
             msauth: Default::default(),
+            perps_keys: Default::default(),
         },
         RpcOptions::default(),
         NetOptions { dandelion, anonymous_tx_only, ..NetOptions::default() },

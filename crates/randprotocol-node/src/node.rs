@@ -101,6 +101,9 @@ pub struct NodeConfig {
     /// Where the precomputed msauth verifier key is read from, and whether a missing one may be
     /// built here (plan Task 2b; consulted only on a chain naming `hc_auth_multisig`).
     pub msauth: crate::msauth_key::MsauthKeyOptions,
+    /// CON-601: where the pinned perps state-proof key files are read from (consulted only on a
+    /// chain whose genesis lists `perps.state_proof_keys`).
+    pub perps_keys: crate::perps_key::PerpsKeyOptions,
 }
 
 /// Handles returned by `Node::start` so tests and the CLI can observe the node.
@@ -186,6 +189,9 @@ pub fn load_genesis(datadir: &std::path::Path) -> Result<(GenesisState, Arc<dyn 
     if let Some(c) = gs.ledger.perps().map(|p| &p.config) {
         executor.set_perp_config(c.max_tier, c.engine_program_log_height);
     }
+    // CON-601: the genesis' pinned state-proof keys, so the bare executor never builds one —
+    // the files themselves are installed by `perps_key::startup` before anything verifies.
+    crate::perps_key::set_pins(&gs, executor.as_ref());
     Ok((gs, executor))
 }
 
@@ -2723,6 +2729,11 @@ pub async fn start_with(cfg: NodeConfig, rpc_options: RpcOptions, net_options: N
     let msauth_source = crate::msauth_key::startup(&gs, &cfg.msauth, bare_executor.as_ref())
         .map_err(|e| anyhow!("{e:#}; refusing to start"))?;
     let msauth_builder = bare_executor.clone();
+    // CON-601: the pinned perps state-proof keys, loaded (never built) before anything verifies:
+    // on a chain whose genesis lists `perps.state_proof_keys`, a missing or unpinned file refuses
+    // the start here.
+    let perps_keys = crate::perps_key::startup(&gs, &cfg.perps_keys, bare_executor.as_ref())
+        .map_err(|e| anyhow!("{e:#}; refusing to start"))?;
     // `--build-msauth-key` on a validator: built here, before anything starts, and a key whose
     // digest is not the pin refuses the start (`msauth_key::built_key_verdict`). A development
     // (non-validator) node builds it in the warm thread below and logs a mismatch.
@@ -2917,6 +2928,7 @@ pub async fn start_with(cfg: NodeConfig, rpc_options: RpcOptions, net_options: N
         prune_history_secs: cfg.prune_history.map(|d| d.as_secs()),
         reserved_peers: peer_bindings.reserved_count(),
         msauth_key: msauth_source,
+        perps_keys,
         ..Default::default()
     }));
     let (cmd_tx, cmd_rx) = mpsc::channel(256);
@@ -8398,6 +8410,7 @@ mod tests {
             prune_history: None,
             gas_policy: None,
             msauth: Default::default(),
+            perps_keys: Default::default(),
         };
         let wire = network::WireLimits::for_ledger(&gs.ledger);
         let max_block_bytes = gs.ledger.max_block_bytes();
