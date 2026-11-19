@@ -1,7 +1,9 @@
 # Multisig accounts: M-of-N controlled public balances
 
 > **Status: live on chain 21 (v0.8.0, cut 2026-10-12), which carries the foundation treasury
-> (2 of 3) in its `multisig` section.** The section is genesis-gated: a chain without it refuses
+> (2 of 3) in its `multisig` section; chain 22's treasury is 5 of 6, six new signers, its RAND
+> carried from chain 21's register (owner, 2026-11-19; `docs/deploy.md`, "The next cut: chain
+> 22").** The section is genesis-gated: a chain without it refuses
 > all four actions (`UnsupportedAction("multisig")`). Private multisig (`hc_auth_multisig`, below)
 > is enabled on chain 21 too, and one Production auth proof has completed (6 November 2026), though none has been spent on chain 21 ("Status: proved once, not yet spent on chain 21"). Design: `docs/superpowers/specs/2026-10-08-multisig-design.md`.
 
@@ -44,9 +46,12 @@ number of them with RAND, in its `multisig` section:
       "signers": [
         "<signer 1's Dilithium2 public key, hex>",
         "<signer 2's Dilithium2 public key, hex>",
-        "<signer 3's Dilithium2 public key, hex>"
+        "<signer 3's Dilithium2 public key, hex>",
+        "<signer 4's Dilithium2 public key, hex>",
+        "<signer 5's Dilithium2 public key, hex>",
+        "<signer 6's Dilithium2 public key, hex>"
       ],
-      "threshold": 2,
+      "threshold": 5,
       "balance": "500000000000000000"
     }
   ]
@@ -60,10 +65,10 @@ number of them with RAND, in its `multisig` section:
 | `max_accounts` | optional: the most accounts the register will ever hold, the seeded ones included. A `CreateMultisig` that would take the register past it is refused (`the multisig register is full`), permanently — no account is ever removed. Absent (chain 21 and every chain cut before the field), the register is unbounded. Part of the genesis hash only when present, so a file without it hashes as before; `rand_getLimits.multisig.max_accounts` serves it. On a chain without it, a node can still decline to pool creates past a size of its own: `rand-node run --max-multisig-accounts <COUNT>` (MSA-4, node policy: the create is not verified, pooled, relayed or proposed by that node, `MultisigAtNodeCap`; a block from a proposer without the flag that carries one still applies, so it bounds the register only when every proposer sets it). |
 | `salt` | 32 bytes (64 hex characters), the creator's randomness in the id. The chain never learns a name. |
 | `signers` | 1 to 10 distinct Dilithium2 public keys. **The order matters**: a signature names its signer by position (`0:<hex>`). |
-| `threshold` | `1 ≤ threshold ≤ signers`. **Use 2 of 3 or 3 of 5** for a treasury, so one lost key is survived by a rotation. |
+| `threshold` | `1 ≤ threshold ≤ signers`. **Use 5 of 6** for a treasury — the owner's rule for every RandProtocol multisig (treasury, bridge admin, any new one), never 2 of 3 — so one lost key is survived by a rotation while five signers remain. |
 | `balance` | RAND in units (1 RAND = 10⁹ units), a decimal string. `0` seeds an unfunded account. Only RAND can be seeded at genesis. |
 
-The example is the foundation treasury: 500 000 000 RAND, 2 of 3. `rand-node genesis` refuses a file
+The example is the foundation treasury: 500 000 000 RAND, 5 of 6. `rand-node genesis` refuses a file
 with more than ten signers, a duplicate key, a threshold outside `1..=signers`, a `create_fee` over
 1 000 RAND, more seeded accounts than `max_accounts`, two accounts with the same id, or balances that overflow a u64 (or, with the notes,
 stakes and vesting entries, the supply).
@@ -82,21 +87,24 @@ prints, after the genesis hash:
 
 ```
 multisig: create fee 1 RAND, 1 account(s)
-  multisig 9b2e…c41a 500000000 RAND, 2 of 3 signers
+  multisig 9b2e…c41a 500000000 RAND, 5 of 6 signers
 ```
 
 — the id to record in the cut record, and the balance to check against the allocation table. The id
 can be derived offline, before the file is final:
 
 ```bash
-rand-node multisig id --chain-id 20 --salt 5e1f…9f48 --threshold 2 --signer <pk1> --signer <pk2> --signer <pk3>
+rand-node multisig id --chain-id 20 --salt 5e1f…9f48 --threshold 5 \
+    --signer <pk1> --signer <pk2> --signer <pk3> --signer <pk4> --signer <pk5> --signer <pk6>
 ```
 
 ## Who does what
 
 ### The foundation, at the genesis cut
 
-1. Agree who the signers are and the threshold (the legal documents; **2 of 3 or 3 of 5**).
+1. Agree who the six signers are (the legal documents; the threshold is **5 of 6**, the owner's
+   rule). At a later cut the treasury may get a fresh key set: chain 22's six are new keys, none of
+   chain 21's three, and its balance is carried from chain 21's register.
 2. Collect each signer's **public** key (below). Never generate a signer's key for them.
 3. Write the `multisig` file with a random `salt` per account and pass it to
    `rand-node genesis … --multisig multisig.json --chain-id <N>`.
@@ -127,7 +135,7 @@ rand-node multisig id --chain-id 20 --salt 5e1f…9f48 --threshold 2 --signer <p
 Creating an account and putting value into it need a shielded spend, so they are the wallet's:
 
 ```bash
-rand multisig create --signer <pk1> --signer <pk2> --signer <pk3> --threshold 2 \
+rand multisig create --signer <pk1> --signer <pk2> --signer <pk3> --signer <pk4> --signer <pk5> --signer <pk6> --threshold 5 \
     [--salt <64 hex>] [--fund <RAND>] [--fund-token <asset> <amount>] [--fee <RAND>]
 rand multisig deposit <id> <amount> [--asset <index|id>] [--fee <RAND>]
 ```
@@ -155,11 +163,13 @@ rand-node multisig pay prepare --account <id> --to rand1… --amount 250000 --ou
 #    --amount is in its asset's display units (RAND at 9 decimals, a token at its own decimals)
 rand-node multisig pay prepare --account <id> --to rand1… --amount 10 --asset 0 \
                                                 --to rand1… --amount 500 --asset 2 --out pay.json
-# 2. each signer, on its own machine (offline is fine): read it, sign it
+# 2. each signer, on its own machine (offline is fine): read it, sign it — five of the six
 rand-node multisig pay sign --proposal pay.json --key signer-1.key.json     # prints 0:<hex>
 rand-node multisig pay sign --proposal pay.json --key signer-3.key.json     # prints 2:<hex>
+#    … and signers 4, 5 and 6 likewise (3:<hex>, 4:<hex>, 5:<hex>); signer 2 need not sign
 # 3. anyone: send it with the signatures
-rand-node multisig pay submit --proposal pay.json --signature 0:<hex> --signature 2:<hex> --rpc https://…
+rand-node multisig pay submit --proposal pay.json --signature 0:<hex> --signature 2:<hex> \
+    --signature 3:<hex> --signature 4:<hex> --signature 5:<hex> --rpc https://…
 ```
 
 - Each payout becomes a private note for its recipient, sealed in step 1. Every signer signs the
@@ -192,10 +202,13 @@ A lost or compromised key is replaced without moving the balance or changing the
 signers sign their own replacement:
 
 ```bash
-rand-node multisig rotate prepare --account <id> --signer <new pk1> --signer <new pk2> --signer <new pk3> --threshold 2 --out rotate.json
+# replace signer 2's lost key: the new set keeps the other five in place
+rand-node multisig rotate prepare --account <id> --signer <pk1> --signer <new pk2> --signer <pk3> \
+    --signer <pk4> --signer <pk5> --signer <pk6> --threshold 5 --out rotate.json
 rand-node multisig rotate sign --proposal rotate.json --key signer-1.key.json      # prints 0:<hex>
-rand-node multisig rotate sign --proposal rotate.json --key signer-3.key.json      # prints 2:<hex>
-rand-node multisig rotate submit --proposal rotate.json --signature 0:<hex> --signature 2:<hex>
+#    … and signers 3, 4, 5 and 6 likewise (2:<hex> … 5:<hex>): five of the current six
+rand-node multisig rotate submit --proposal rotate.json --signature 0:<hex> --signature 2:<hex> \
+    --signature 3:<hex> --signature 4:<hex> --signature 5:<hex>
 ```
 
 - The new set and threshold obey the creation bounds and replace the old ones atomically. The id,
@@ -383,9 +396,10 @@ Every amount is a decimal string. The same account from a shell: `rand-node mult
 
 - **Signer keys:** generated and held by each signer on its own machine, offline or
   hardware-backed. **Never two of them in one place**, in a shell profile, on a droplet or in this
-  repository: two keys in one place is a one-key treasury for a 2-of-3 account. A key file is a
+  repository: keys kept together are one key in practice, and a 5-of-6 account is only as strong
+  as the number of separate places its keys live. A key file is a
   `rand-node keygen` file (mode 600 enforced on load).
-- **`threshold < n`.** Recommended: 2 of 3 or 3 of 5. A lost key is then survived by a rotation
+- **`threshold < n`.** The rule for RandProtocol's accounts: 5 of 6. A lost key is then survived by a rotation
   while `threshold` signers remain; a `threshold == n` account is stranded by one lost key.
 - **The account needs 0.001 RAND per payment.** Keep a little RAND in the row; a payment whose
   rows cannot cover the payouts and the base is refused.
