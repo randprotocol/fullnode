@@ -523,7 +523,9 @@ pub fn run_call_with<H: Host, F: FnMut(u32) -> u32>(
 // salted `H_IN`, which a verifier cannot open, so it cannot carry a chain fact (a timestamp, a
 // chain id) a prover could not forge unless the public output binds it, as it does the call's own
 // fields. `evm2rv` bakes `CHAINID` into the translated code (bound by
-// the image hash), reads `ORIGIN` as `CALLER`, and traps on the rest as the interpreter does.
+// the image hash) and reads `ORIGIN` as `CALLER`. The block-context opcodes read the public
+// segment instead (`crate::block`, through `ffi::evm_block_context`), as the interpreter does:
+// the words an `InvokeAt`'s version-2 context carries, or a trap under any other.
 
 /// What runs the decoded call in place of the interpreter: given the host, the code, the calldata,
 /// the environment, the witness tree and the working buffers, produce the [`Outcome`]. It must

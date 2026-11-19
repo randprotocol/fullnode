@@ -42,6 +42,85 @@ impl evm_core::Host for HostRef {
         let digest = sponge_hash(&words[..n]);
         words[..8].copy_from_slice(&digest);
     }
+    /// No public segment: every word reads 0, which is no context version, so every
+    /// block-context opcode traps (`evm_core::block`) — what a version-1 context gives. A call
+    /// with a segment runs over [`HostPublic`].
+    fn read_public(&mut self, _idx: u32) -> u32 {
+        0
+    }
+}
+
+/// [`HostRef`] with a public segment: what the guest's `READ_PUBLIC` returns, for the
+/// block-context opcodes (`evm_core::block`). A read past the segment panics: in the guest it can
+/// never be satisfied, so such a run has no proof, and a test that reaches one has built the
+/// wrong segment.
+pub struct HostPublic<'a>(pub &'a [u32]);
+
+impl evm_core::Host for HostPublic<'_> {
+    fn keccak_f(&mut self, state: &mut [u32; 50]) {
+        HostRef.keccak_f(state)
+    }
+    fn poseidon2(&mut self, words: &mut [u32], n: usize) {
+        HostRef.poseidon2(words, n)
+    }
+    fn read_public(&mut self, idx: u32) -> u32 {
+        match self.0.get(idx as usize) {
+            Some(&w) => w,
+            None => panic!("READ_PUBLIC({idx}) past a {}-word segment: no proof", self.0.len()),
+        }
+    }
+}
+
+/// The block facts of an `InvokeAt`'s version-2 context (fullnode `BlockFacts`, issue #168), on
+/// chain `chain_id`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BlockFacts {
+    pub height: u64,
+    pub timestamp_ms: u64,
+    pub chain_id: u64,
+    pub basefee: u64,
+    /// The beacon's 32 bytes after the block's reveal; `None` on a chain without the beacon.
+    pub randomness: Option<[u8; 32]>,
+}
+
+impl BlockFacts {
+    /// The 17 block words the ledger puts at context words 11..28 (`BlockFacts::context_words`):
+    /// four u64s low word first, the randomness flag, then the beacon value as eight
+    /// little-endian words (all zero, and the flag 0, without one).
+    pub fn words(&self) -> [u32; 17] {
+        let mut w = [0u32; 17];
+        for (k, v) in [self.height, self.timestamp_ms / 1000, self.chain_id, self.basefee].into_iter().enumerate() {
+            w[2 * k] = v as u32;
+            w[2 * k + 1] = (v >> 32) as u32;
+        }
+        if let Some(r) = &self.randomness {
+            w[8] = 1;
+            for i in 0..8 {
+                w[9 + i] = u32::from_le_bytes(r[4 * i..4 * i + 4].try_into().unwrap());
+            }
+        }
+        w
+    }
+
+    /// An invoke's public segment for an EVM program (deploy-time public input empty):
+    /// `binding(8) ‖ context`, the context version 2 over a transition with no cells and no
+    /// payouts — header words 1..=10 all zero, then these 17 words.
+    pub fn segment(&self, binding: &Word8) -> Vec<u32> {
+        let mut s = binding.to_vec();
+        s.push(evm_core::block::CONTEXT_VERSION_BLOCK);
+        s.extend_from_slice(&[0; 10]);
+        s.extend_from_slice(&self.words());
+        s
+    }
+}
+
+/// A version-1 context's segment for an EVM program, `binding(8) ‖ [1, 0 × 10]`: an ordinary
+/// `Invoke` with no cells and no payouts.
+pub fn v1_segment(binding: &Word8) -> Vec<u32> {
+    let mut s = binding.to_vec();
+    s.push(1);
+    s.extend_from_slice(&[0; 10]);
+    s
 }
 
 /// The storage layouts (ZKVM-105): the tree's depth, which is also the width in bits of a leaf
@@ -329,12 +408,22 @@ impl EvmCall {
     /// root and the guest's witness-updated root are asserted equal, which is the one check that
     /// `StorageTree::store`'s sibling refresh and `SparseTree`'s rebuild agree.
     pub fn expected(&self) -> ([u32; 8], Outcome, SparseTree) {
+        self.expected_over(&mut HostRef)
+    }
+
+    /// [`expected`](EvmCall::expected) with `public` as the public segment the guest reads the
+    /// block-context words from (`evm_core::block`): an invoke's `binding ‖ context`,
+    /// [`BlockFacts::segment`] or [`v1_segment`].
+    pub fn expected_on(&self, public: &[u32]) -> ([u32; 8], Outcome, SparseTree) {
+        self.expected_over(&mut HostPublic(public))
+    }
+
+    fn expected_over<H: evm_core::Host>(&self, h: &mut H) -> ([u32; 8], Outcome, SparseTree) {
         assert_eq!(self.tree.depth(), DEPTH, "evm-core runs the current layout natively; a layout-1 call goes through evm-v1.bin");
         let words = self.input_words();
         // The guest keeps this in `.bss`; a host test boxes it (146 KiB is not for a frame).
         let mut ws = Box::new(Workspace::ZERO);
-        let (out, o) =
-            run_call_with(&mut HostRef, &mut ws, |i| words[i as usize], words.len() as u32);
+        let (out, o) = run_call_with(h, &mut ws, |i| words[i as usize], words.len() as u32);
         let mut post = self.tree.clone();
         if o.status() == 1 {
             for i in 0..ws.input.storage.len() {

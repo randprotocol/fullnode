@@ -12,7 +12,7 @@ lock is the one cargo reads) and `target/`; the manifests are verbatim, their `[
 included, which is why the root `Cargo.toml` lists all three paths under `[workspace] exclude`. The
 copies are byte-identical to this circuits commit:
 
-circuits: 76a48dca92a2d0382370f383d6680971db0cc574
+circuits: 41d64acd0fec1c6b15be18a8c7707ddce61ff790
 
 (Circuits main at constraint set 11: Grain-derived Poseidon2 round constants, the declared
 poseidon2 table height (an eighth verifier-key component), the per-instance quotient layout at

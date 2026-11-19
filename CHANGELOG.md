@@ -39,6 +39,12 @@ Perps (**a chain cut, chain 22**; chain 21 unchanged):
 zkVM (**a chain cut: constraint set 11, for chain 22 and v0.8.7**; chain 21 stays on the set-9
 v0.8.6 line):
 
+- **EVM block context in the guest** (circuits `41d64acd`, #27; issue #168): under an `InvokeAt`'s
+  version-2 context the vendored EVM interpreter's `NUMBER`, `TIMESTAMP`, `CHAINID`, `BASEFEE`,
+  `GASPRICE`, `PREVRANDAO` (beacon; traps without one), `COINBASE` (0) and `GASLIMIT` (`u32::MAX`)
+  read public words 11–27 instead of trapping. `evm_core::Host` gained `read_public`; `evm.bin` hc
+  `3869b014…8920720d`, `evm-v1.bin` `040c01c8…3454`. `CIRCUITS_PIN` and both rand-zkvm-cuda revs
+  at `41d64acd`. New `crates/randprotocol-zkvm/tests/invoke_at_context.rs`.
 - **Circuits re-vendored at constraint set 11** (circuits `76a48dc`, from `b3e21d9` at set 9):
   the Grain-derived Poseidon2 round constants (every guest `hc`, note commitment, nullifier,
   Merkle and state root and verifier key moves), a declared poseidon2 table height in the proof

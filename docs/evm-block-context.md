@@ -2,8 +2,9 @@
 
 Issue #168 (ZKVM-203). Status: **the node side is built and gated off; on no chain.** Chain 21 does
 not carry the genesis field, so nothing here changes its genesis hash, wire bytes, storage or
-behaviour. The guest side (the EVM opcodes that read these words) is circuits work on constraint
-set 10 and waits for the chain-22 cut — see §10.
+behaviour. The guest side (the EVM opcodes that read these words) is vendored from circuits
+`41d64acd` (circuits #27, constraint set 11; `evm.bin` hc `3869b014…8920720d`) and runs from the
+chain-22 cut — see §10.
 
 ## 1. The problem
 
@@ -128,7 +129,7 @@ ordinary `Invoke` or a `Call` every one of them keeps trapping.
 | `GASPRICE` | `= BASEFEE` (no tips) | words 17–18 |
 | `PREVRANDAO` | **traps while word 19 is 0** (a chain without the `beacon` section); the beacon value of block `h` when it is 1 — read §11.4 before using it | words 19–27 |
 | `COINBASE` | 0 | none: fees go to the proposer's register entry, which has no EVM address |
-| `GASLIMIT` | a protocol constant, fixed in the guest by the circuits change | none |
+| `GASLIMIT` | `u32::MAX` (`evm_core::block::BLOCK_GAS_LIMIT`): no call's `gas_limit` word can exceed it | none |
 | `BLOCKHASH` | traps | none: no header hash is in the context |
 | `BLOBHASH`, `BLOBBASEFEE` | trap | none: the chain has no blobs |
 | `SELFBALANCE` | traps; **not block context** — a contract's balance is its vault, a separate matter (a transition would have to declare it as a read) | none |
@@ -209,19 +210,21 @@ may name an older `h` inside the window to blur it, at the cost of an older time
 
 ## 10. Not in this slice
 
-All of it waits on the constraint-set-10 re-vendor at the chain-22 cut (this repository cannot
-vendor set 10 before it; `AGENTS.md`, "The constraint-set guard").
-
-- **Circuits.** Replace the traps with `READ_PUBLIC` reads of the words above in `evm-core`,
-  `evm-rt` and `evm2rv` (version check on word 0, `PREVRANDAO` gated on word 19, the `GASLIMIT`
-  constant); re-pin the images.
+- **Circuits — done.** circuits #27 (`41d64acd`, vendored with constraint set 11) replaces the
+  traps with `READ_PUBLIC` reads of the words above in `evm-core` (`evm_core::block`), `evm-rt`
+  and `evm2rv`: version check on word 0, `PREVRANDAO` gated on word 19, `GASLIMIT` = `u32::MAX`.
+  `crates/randprotocol-zkvm/tests/invoke_at_context.rs` runs the vendored interpreter over the
+  segment the ledger builds (`Transition::context_at` over `BlockFacts::context_words`) and proves
+  a Test-profile `InvokeAt` reading words 11–27, which verifies on its own block's segment and on
+  no other.
 - **Wallet / CLI.** Build an `InvokeAt`: read `rand_getBlockContext`, feed the words to the
   guest, set `ref_height`, and re-prove on `StaleReferenceBlock`. The wallet's public-note scan
   keys on `"invoke"` and must learn `"invoke_at"` to see such a transaction's payout notes.
-- **A real-prover test** of a permit-with-deadline contract end to end.
+- **A real-prover test** of a permit-with-deadline EVM contract end to end (the evm.bin
+  interpreter itself proved, not the small RV32 reader above).
 - **The cut.** `deploy/cut-chain22-genesis.sh` carrying the field; the value is the owner's.
 
-Tested here with `StubExecutor` only: no proof was made.
+The ledger side is tested with `StubExecutor`; the proof side by `invoke_at_context.rs`.
 
 ## 11. Randomness (PREVRANDAO): the beacon
 
@@ -229,8 +232,7 @@ Status: **built in the node and gated off; on no chain.** Genesis `beacon`. Chai
 section: its genesis hash, header and block bytes, state root, wire tags 0–45 and store rows are
 unchanged (pinned on the commit before the beacon, `crates/randprotocol-core/tests/
 beacon_gate_off_pin.rs` and `node::tests::chain_21_is_byte_for_byte_what_it_was_before_the_beacon`).
-The guest's `PREVRANDAO` read of words 19–27 is circuits work and waits for the constraint-set-10
-re-vendor (§10); nothing was proved here.
+The guest's `PREVRANDAO` read of words 19–27 is vendored from circuits `41d64acd` (§10).
 
 ### 11.1 What it is
 
@@ -400,8 +402,8 @@ delay construction (a VDF, or many blocks' values combined).
 
 ### 11.6 Not done
 
-- **Circuits**: the guest's `PREVRANDAO` read of words 19–27 (trap on word 19 = 0), with the rest
-  of §10, at the constraint-set-10 re-vendor; and a real-prover test.
+- **Circuits — done** (`41d64acd`, §10): the guest's `PREVRANDAO` read of words 19–27, trapping
+  on word 19 = 0. An evm.bin real-prover test is still open.
 - **`deploy/cut-chain22-genesis.sh`** does not carry the section: it does not yet carry
   `reference_block_window` either (§10), which the beacon requires. `deploy/fleet-watch.sh` has
   no beacon alert; the commands to build one on are above.

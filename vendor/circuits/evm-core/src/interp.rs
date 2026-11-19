@@ -14,9 +14,15 @@
 //! the decoded input plus these buffers — and `abi::run_call` is what the guest actually calls.
 //!
 //! **Out of scope traps.** Every opcode outside the plan's list — the `CALL`/`CREATE` family,
-//! precompiles, the block- and account-info opcodes (`BLOBHASH` and `BLOBBASEFEE` among them),
-//! `RETURNDATACOPY` with a non-zero length — halts with [`Halt::Trap`], with the single exception
-//! of `0xfe`, which is [`Halt::Invalid`]. A trap is an exceptional halt: status word 2.
+//! precompiles, the account-info opcodes, `BLOCKHASH`, `SELFBALANCE`, `BLOBHASH` and
+//! `BLOBBASEFEE`, `RETURNDATACOPY` with a non-zero length — halts with [`Halt::Trap`], with the
+//! single exception of `0xfe`, which is [`Halt::Invalid`]. A trap is an exceptional halt: status
+//! word 2.
+//!
+//! **Block context** ([`crate::block`], fullnode #168). `TIMESTAMP`, `NUMBER`, `CHAINID`,
+//! `BASEFEE`, `GASPRICE`, `PREVRANDAO`, `COINBASE`, `GASLIMIT` and `ORIGIN` run under a
+//! version-2 context (an `InvokeAt`'s public segment) and trap under any other, as they always
+//! did: under a version-1 context a run is what it was, halt kind included.
 //!
 //! **Gas** is a counter with the Shanghai static schedule for the supported subset and no refunds
 //! and no warm/cold access list — `SLOAD` is always 2100 and `SSTORE` is 20 000 or 2 900 on the
@@ -32,6 +38,7 @@
 
 use core::cmp::min;
 
+use crate::block;
 use crate::keccak256;
 use crate::storage::{StorageError, StorageTree};
 use crate::transient::Transient;
@@ -568,7 +575,22 @@ impl<'a, H: Host> Interpreter<'a, H> {
             }
             0xfe => return Ok(Some(Halt::Invalid)),
 
-            _ => return Ok(Some(Halt::Trap(op))),
+            // ---- block context (`crate::block`, fullnode #168) ----
+            // Only under a version-2 context (an `InvokeAt`); under any other the opcode traps as
+            // it always did, with nothing charged first, so a version-1 run is unchanged to the
+            // halt kind. The words are read here, when the opcode runs, and never up front: a
+            // segment without a context has no word to read, and a read past it has no proof.
+            // ORIGIN is CALLER under a version-2 context (one call, no relayer), as a translation
+            // has it everywhere. Every other byte the arms above do not run traps here too
+            // (`block_word` is `None` for it). This is the default arm, not an arm of its own,
+            // because a new arm reshaped the dispatch loop's inlining (below).
+            _ => {
+                let Some(v) = block_word(&mut *self.h, op, &self.env.caller) else {
+                    return Ok(Some(Halt::Trap(op)));
+                };
+                self.charge(G_BASE)?;
+                self.push(v)?;
+            }
         }
         Ok(None)
     }
@@ -673,7 +695,9 @@ pub fn scan_jumpdests(code: &[u8], bits: &mut [u32; MAX_CODE_BYTES / 32]) {
 /// `TSTORE` and `MCOPY`: the part that does not depend on the operands. Opcodes whose
 /// cost is wholly dynamic (`EXP`, `KECCAK256`, `SSTORE`, `LOGn`) charge it in their own arm and are
 /// zero here, as are the free ones (`STOP`, `RETURN`, `REVERT`, `INVALID`) and every unsupported
-/// byte, which traps before its cost could matter.
+/// byte, which traps before its cost could matter. The block-context opcodes and `ORIGIN` are zero
+/// here too: each charges its `G_BASE` in the dispatch's default arm, once the context has shown
+/// it runs.
 pub const fn static_gas(op: u8) -> u64 {
     match op {
         0x5b => G_JUMPDEST,
@@ -756,5 +780,22 @@ fn bool_word(b: bool) -> U256 {
         U256::ONE
     } else {
         U256::ZERO
+    }
+}
+
+/// What a block-context opcode (or `ORIGIN`, whose word is `caller`) pushes, or `None` when it
+/// traps: [`block::value`], and `None` for every byte that is not one of them. A free function
+/// over the host alone, out of line and cold, called from the dispatch's default arm: the loop
+/// passes it no reference to the interpreter, and its match keeps its shape, so its inlining is
+/// what it was before these opcodes ran. The ERC-20 transfer costs 845 cycles more (121 737
+/// against 120 892, one rematerialised constant per step). A `&mut self` method, or an arm of
+/// its own, un-inlined `U256::add`, the storage walk and others: 2 % to 10 % more.
+#[cold]
+#[inline(never)]
+fn block_word<H: Host>(h: &mut H, op: u8, caller: &U256) -> Option<U256> {
+    match op {
+        0x32 => block::is_block_context(h).then_some(*caller),
+        0x3a | 0x41..=0x46 | 0x48 => block::value(h, op),
+        _ => None,
     }
 }

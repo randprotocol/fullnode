@@ -465,3 +465,75 @@ fn the_bundle_guest_digest_diverges_from_the_honest_one_when_outputs_exceed_inpu
     let e = execute(&guests::bundle(), &v, &[], 1 << 22).unwrap();
     assert_ne!(e.outputs, notes::expected_bundle_outputs(&sk, &ins, &outs, anchor, 0, 0, asset, time));
 }
+
+// ---- the block context through the committed images (fullnode #168) -----------------------------
+
+/// `op`, then its word returned, as one call to the interpreter guest with no storage.
+fn block_call(op: u8) -> randprotocol_zkvm::evm::EvmCall {
+    let mut c = erc20_transfer(ALICE, BOB, U256::ZERO, &[]);
+    c.code = vec![op, 0x5f, 0x52, 0x60, 0x20, 0x5f, 0xf3];
+    c.calldata = vec![];
+    c.touched = vec![];
+    c
+}
+
+/// `evm.bin` and `evm-v1.bin` over an invoke's public segment: under a version-2 context each
+/// block-context opcode returns the word the interpreter computes natively (the eight outputs
+/// agree, the return-data hash among them); under a version-1 context each traps (status 2) with
+/// the outputs of a run with no context; `PREVRANDAO` traps without the beacon. A `Call`'s segment
+/// carries no context, so a run that reaches one of them reads past it, which the machine refuses
+/// (`ExecError::PublicIndex`: there is no proof of it), while a run that reaches none is unchanged.
+#[test]
+fn compiled_evm_reads_the_block_context_from_the_public_segment() {
+    use randprotocol_zkvm::emulator::ExecError;
+    use randprotocol_zkvm::evm::{v1_segment, BlockFacts};
+    let binding = [1, 2, 3, 4, 5, 6, 7, 8];
+    let mut r = [0u8; 32];
+    for (i, b) in r.iter_mut().enumerate() {
+        *b = 0xc3 ^ (i as u8).wrapping_mul(7);
+    }
+    let facts = BlockFacts {
+        height: 0x5_0000_0001,
+        timestamp_ms: 1_795_000_000_999,
+        chain_id: 22,
+        basefee: 0x7_0000_0009,
+        randomness: Some(r),
+    };
+    let with = facts.segment(&binding);
+    let without = BlockFacts { randomness: None, ..facts }.segment(&binding);
+    let v1 = v1_segment(&binding);
+    let (evm, evm_v1) = (guests::compiled::evm(), guests::compiled::evm_v1());
+    let cycles = 1 << 20;
+    for op in [0x32u8, 0x3a, 0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x48] {
+        let c = block_call(op);
+        let words = c.input_words();
+
+        let (want, o, _) = c.expected_on(&with);
+        assert_eq!(o.status(), 1, "{op:#04x}");
+        assert_eq!(execute(&evm, &words, &with, cycles).unwrap().outputs, want, "{op:#04x}: version 2");
+        assert_eq!(execute(&evm_v1, &words, &with, cycles).unwrap().outputs[0], 1, "{op:#04x}: layout 1");
+
+        let (want_nb, o_nb, _) = c.expected_on(&without);
+        assert_eq!(o_nb.status(), if op == 0x44 { 2 } else { 1 }, "{op:#04x}: no beacon");
+        assert_eq!(execute(&evm, &words, &without, cycles).unwrap().outputs, want_nb, "{op:#04x}: no beacon");
+
+        let (want_v1, o_v1, _) = c.expected_on(&v1);
+        assert_eq!(o_v1.status(), 2, "{op:#04x}: version 1 traps");
+        assert_eq!(want_v1, c.expected().0, "{op:#04x}: version 1 = no context");
+        assert_eq!(execute(&evm, &words, &v1, cycles).unwrap().outputs, want_v1, "{op:#04x}: version 1");
+        assert_eq!(execute(&evm_v1, &words, &v1, cycles).unwrap().outputs[0], 2, "{op:#04x}: layout 1, version 1");
+
+        // A `Call`: no context, and the run reads past the (empty) segment.
+        match execute(&evm, &words, &[], cycles) {
+            Err(ExecError::PublicIndex(8)) => {}
+            other => panic!("{op:#04x} under a Call: {:?}", other.map(|e| e.outputs)),
+        }
+    }
+    // The ERC-20 transfer reaches none of them: the same outputs over every segment, none at all
+    // included.
+    let t = erc20_transfer(ALICE, BOB, U256::from_u32(250), &[(ALICE, U256::from_u32(1000))]);
+    let (want, _, _) = t.expected();
+    for seg in [&with[..], &without[..], &v1[..], &[][..]] {
+        assert_eq!(execute(&evm, &t.input_words(), seg, cycles).unwrap().outputs, want, "{} words", seg.len());
+    }
+}

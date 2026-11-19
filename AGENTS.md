@@ -8,8 +8,10 @@ invariants, and known traps.
 
 ### Constraint set 11 re-vendored (issue #166 step 7; 2026-11-20, branch `feat/cs11-revendor`, PR open, NOT merged)
 
-`CIRCUITS_PIN` **`76a48dca`** (circuits main, "Constraint set 11: Grain constants, declared
-poseidon2 height, quotient layout, versioned rVM key"; was `b3e21d9`, set 9), synced with
+`CIRCUITS_PIN` **`41d64acd`** (circuits main: set 11 landed at `76a48dca`, "Constraint set 11:
+Grain constants, declared poseidon2 height, quotient layout, versioned rVM key"; then #27, the EVM
+guest's block context v2 for #168 — `evm.bin` hc `3869b014…`, `evm_core::Host::read_public`,
+proved end to end by `tests/invoke_at_context.rs`; was `b3e21d9`, set 9), synced with
 `deploy/sync-zkvm.sh`; seven guests (evm-v1 added). **A chain cut: chain 22 on, never a roll onto
 chain 21.** What moved, and where it lives:
 

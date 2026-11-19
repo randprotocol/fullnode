@@ -20,6 +20,11 @@ pub trait Host {
     /// The Poseidon2 sponge over `words[..n]`, digest written to `words[..8]` (POSEIDON2 syscall
     /// semantics).
     fn poseidon2(&mut self, words: &mut [u32], n: usize);
+    /// Public input word `idx` (the `READ_PUBLIC` syscall), which [`block`] reads the
+    /// block-context words through. In the guest an index past the public segment can never be
+    /// satisfied, so such a run has no proof; a host without a segment answers 0 (no context
+    /// version is 0).
+    fn read_public(&mut self, idx: u32) -> u32;
 }
 
 /// The rate of Keccak-256 in bytes: 136, the low 34 words of the 50-word state.
@@ -150,3 +155,7 @@ pub mod ffi;
 // `ffi`'s comment gives: no line above moves, so neither does any panic location the translated
 // contracts' shims embed from this file.
 pub mod transient;
+
+// Block context (fullnode #168): the words an `InvokeAt`'s version-2 context carries, read from
+// the public segment by the block-context opcodes. Declared last, like `transient`.
+pub mod block;

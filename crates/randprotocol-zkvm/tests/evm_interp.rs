@@ -853,3 +853,168 @@ fn revm_run_spec(code: &[u8], calldata: &[u8], spec: revm::primitives::hardfork:
     };
     RevmOutcome { status, ret: r.output.to_vec(), gas_used: r.gas.total_gas_spent() }
 }
+
+// ---- block context (fullnode #168, `evm_core::block`) ----
+
+use evm_core::block::{BLOCK_GAS_LIMIT, CONTEXT_BASE, CTX_HAS_RANDOMNESS};
+use randprotocol_zkvm::evm::{v1_segment, BlockFacts, HostPublic};
+
+const BINDING: [u32; 8] = [0xb1, 0xb2, 0xb3, 0xb4, 0xb5, 0xb6, 0xb7, 0xb8];
+
+fn beacon() -> [u8; 32] {
+    let mut b = [0u8; 32];
+    for (i, x) in b.iter_mut().enumerate() {
+        *x = 0x11u8.wrapping_mul(i as u8 + 1) ^ 0x80;
+    }
+    b
+}
+
+/// Every field over 32 bits, so a lost high word shows.
+fn facts() -> BlockFacts {
+    BlockFacts {
+        height: 0x0000_0003_0000_0019,
+        timestamp_ms: 0x0000_0123_4567_89ab,
+        chain_id: 0x0000_0001_0000_0016,
+        basefee: 0x0000_0002_0000_0064,
+        randomness: Some(beacon()),
+    }
+}
+
+/// `run` over a public segment: what the guest's `READ_PUBLIC` sees.
+fn run_on(code: &[u8], public: &[u32]) -> Outcome {
+    let mut h = HostPublic(public);
+    let mut st = StorageTree::new(empty_root());
+    let mut b = Box::new(Buffers::ZERO);
+    Interpreter::new(&mut h, code, &[], env(), &mut st, &mut b).run()
+}
+
+/// `op`, then its word returned: `op; PUSH0; MSTORE; PUSH1 32; PUSH0; RETURN`.
+fn returning(op: u8) -> Vec<u8> {
+    vec![op, 0x5f, 0x52, 0x60, 0x20, 0x5f, 0xf3]
+}
+
+fn word(o: &Outcome) -> U256 {
+    assert_eq!(o.halt, Halt::Return);
+    assert_eq!(o.ret_len, 32);
+    U256::from_be_bytes(o.ret[..32].try_into().unwrap())
+}
+
+/// The nine opcodes a version-2 context runs, with the word each pushes for [`facts`].
+fn table(f: &BlockFacts) -> Vec<(u8, U256)> {
+    let rand = f.randomness.map(|r| U256::from_be_bytes(&r));
+    let mut t = vec![
+        (0x32, env().caller),                       // ORIGIN = CALLER
+        (0x3a, U256::from_u64(f.basefee)),           // GASPRICE = BASEFEE
+        (0x41, U256::ZERO),                          // COINBASE
+        (0x42, U256::from_u64(f.timestamp_ms / 1000)), // TIMESTAMP, seconds
+        (0x43, U256::from_u64(f.height)),            // NUMBER = ref_height
+        (0x45, U256::from_u64(BLOCK_GAS_LIMIT)),     // GASLIMIT
+        (0x46, U256::from_u64(f.chain_id)),          // CHAINID
+        (0x48, U256::from_u64(f.basefee)),           // BASEFEE
+    ];
+    if let Some(r) = rand {
+        t.push((0x44, r)); // PREVRANDAO
+    }
+    t
+}
+
+const ALL: [u8; 9] = [0x32, 0x3a, 0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x48];
+/// op (2), PUSH0 (2), MSTORE (3 + 3 for one word), PUSH1 (3), PUSH0 (2).
+const RETURNING_GAS: u64 = 2 + 2 + 6 + 3 + 2;
+
+#[test]
+fn a_version_2_context_with_the_beacon_runs_every_block_opcode() {
+    let f = facts();
+    let seg = f.segment(&BINDING);
+    assert_eq!(seg.len(), 8 + 28, "binding, then the 28 context words");
+    assert_eq!(seg[CONTEXT_BASE as usize], 2);
+    for (op, want) in table(&f) {
+        let o = run_on(&returning(op), &seg);
+        assert_eq!(word(&o), want, "{op:#04x}");
+        assert_eq!(o.gas_used, RETURNING_GAS, "{op:#04x}: G_BASE like any base-cost opcode");
+    }
+    // The values themselves, spelled out once.
+    assert_eq!(word(&run_on(&returning(0x42), &seg)), U256::from_u64(0x0123_4567_89ab / 1000));
+    assert_eq!(word(&run_on(&returning(0x45), &seg)), U256::from_u64(0xffff_ffff));
+    // PREVRANDAO is the 32 beacon bytes read big-endian: its top byte is byte 0.
+    let r = word(&run_on(&returning(0x44), &seg));
+    assert_eq!(r.to_be_bytes(), beacon());
+}
+
+#[test]
+fn a_version_2_context_without_the_beacon_traps_prevrandao_only() {
+    let f = BlockFacts { randomness: None, ..facts() };
+    let seg = f.segment(&BINDING);
+    assert_eq!(seg[(CONTEXT_BASE + CTX_HAS_RANDOMNESS) as usize], 0);
+    for (op, want) in table(&f) {
+        assert_eq!(word(&run_on(&returning(op), &seg)), want, "{op:#04x}");
+    }
+    let o = run_on(&returning(0x44), &seg);
+    assert_eq!(o.halt, Halt::Trap(0x44));
+    assert_eq!(o.gas_used, env().gas_limit, "an exceptional halt spends the limit");
+    // A flag that is not exactly 1 is no beacon value, whatever the words after it hold.
+    for flag in [2u32, u32::MAX] {
+        let mut s = facts().segment(&BINDING);
+        s[(CONTEXT_BASE + CTX_HAS_RANDOMNESS) as usize] = flag;
+        assert_eq!(run_on(&returning(0x44), &s).halt, Halt::Trap(0x44), "flag {flag}");
+    }
+}
+
+/// Under a version-1 context — and any version but 2, and with no segment at all (`HostRef`) —
+/// each of the nine traps as it did before the block context existed: the same halt, the same
+/// gas, the same return data, so a version-1 run is unchanged.
+#[test]
+fn a_version_1_context_traps_every_block_opcode_as_before() {
+    let v1 = v1_segment(&BINDING);
+    let mut others = vec![v1.clone()];
+    for version in [0u32, 3, u32::MAX] {
+        let mut s = facts().segment(&BINDING);
+        s[CONTEXT_BASE as usize] = version;
+        others.push(s);
+    }
+    for op in ALL {
+        let code = returning(op);
+        let before = run(&code, &[]);
+        assert_eq!(before.halt, Halt::Trap(op), "{op:#04x} with no context");
+        for seg in &others {
+            let o = run_on(&code, seg);
+            assert_eq!(o.halt, before.halt, "{op:#04x} under version {}", seg[8]);
+            assert_eq!((o.gas_used, o.ret_len, o.n_logs), (before.gas_used, before.ret_len, before.n_logs));
+        }
+        // Mid-program: what ran before it is kept to the trap, as for any trapping opcode.
+        let mid = [0x60, 0x07, 0x5f, 0x52, op, 0x00];
+        assert_eq!(run_on(&mid, &v1).halt, Halt::Trap(op));
+    }
+    // A version-1 run that reaches none of them reads no context word at all: a segment too
+    // short to hold one (HostPublic panics on a read past it) runs the same as no segment.
+    let plain = [0x60, 0x2a, 0x5f, 0x52, 0x60, 0x20, 0x5f, 0xf3];
+    let o = run_on(&plain, &BINDING);
+    assert_eq!((word(&o), o.gas_used), (U256::from_u32(0x2a), run(&plain, &[]).gas_used));
+}
+
+/// The words nothing defines trap under a version-2 context too, and the opcodes are charged
+/// only once they run: with less gas than G_BASE left, a version-2 run is out of gas where a
+/// version-1 run traps.
+#[test]
+fn the_undefined_block_words_trap_and_the_gas_is_charged_after_the_check() {
+    let seg = facts().segment(&BINDING);
+    for op in [0x40u8, 0x47, 0x49, 0x4a] {
+        let code = [0x5f, op, 0x00];
+        assert_eq!(run_on(&code, &seg).halt, Halt::Trap(op), "{op:#04x}");
+    }
+    // PUSH0 (2) and then the block opcode with exactly one unit left.
+    for op in ALL {
+        let code = [0x5f, op, 0x00];
+        let mut h = HostPublic(&seg);
+        let mut st = StorageTree::new(empty_root());
+        let mut b = Box::new(Buffers::ZERO);
+        let e = Env { gas_limit: 3, ..env() };
+        let o = Interpreter::new(&mut h, &code, &[], e, &mut st, &mut b).run();
+        assert_eq!(o.halt, Halt::OutOfGas, "{op:#04x} under version 2");
+        let v1 = v1_segment(&BINDING);
+        let mut h = HostPublic(&v1);
+        let mut st = StorageTree::new(empty_root());
+        let o = Interpreter::new(&mut h, &code, &[], e, &mut st, &mut b).run();
+        assert_eq!(o.halt, Halt::Trap(op), "{op:#04x} under version 1");
+    }
+}

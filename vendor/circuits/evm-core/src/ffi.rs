@@ -33,6 +33,9 @@ impl Host for HostBox<'_> {
     fn poseidon2(&mut self, words: &mut [u32], n: usize) {
         self.0.poseidon2(words, n)
     }
+    fn read_public(&mut self, idx: u32) -> u32 {
+        self.0.read_public(idx)
+    }
 }
 
 // The halt codes the C runtime and the shim agree on. 0 is "no halt" (the FFI's success).
@@ -170,4 +173,25 @@ pub unsafe extern "C" fn evm_keccak256(host: *mut c_void, ptr: *const u8, len: u
     };
     let d = keccak256(h, msg);
     core::ptr::copy_nonoverlapping(d.as_ptr(), out, 32); // SAFETY: `out` is writable for 32 bytes and cannot overlap the local `d`.
+}
+
+/// A block-context opcode (`crate::block::value`): the word `op` pushes, written to `out`, and 0;
+/// or [`HALT_TRAP`] (`out` untouched) when it traps — a context version other than 2,
+/// `PREVRANDAO` without a beacon value, or an opcode the module does not define. The runtime's
+/// `evm_block_ctx` halts `Trap(op)` on a nonzero return.
+///
+/// # Safety
+/// `host` points to a live [`HostBox`]; `out` is writable for eight 4-aligned `u32`s.
+#[no_mangle]
+pub unsafe extern "C" fn evm_block_context(host: *mut c_void, op: u32, out: *mut u32) -> u32 {
+    let h = &mut *(host as *mut HostBox<'_>); // SAFETY: `host` is a live `HostBox`, not otherwise borrowed during the call.
+    match crate::block::value(h, op as u8) {
+        Some(v) => {
+            for (i, limb) in v.0.iter().enumerate() {
+                out.add(i).write(*limb); // SAFETY: `i < 8`, inside `out`'s eight writable words.
+            }
+            0
+        }
+        None => HALT_TRAP,
+    }
 }

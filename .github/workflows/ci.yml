@@ -72,12 +72,12 @@ env:
   CXXFLAGS: -include cstdint
   # The circuits commit this tree's vendored crates were synced from (deploy/sync-zkvm.sh). Bump it
   # in the same commit as a re-vendor, or CI builds this workspace against a tree it did not vendor.
-  # 76a48dc is circuits main at constraint set 11 (chain 22: Grain constants, the declared
+  # 41d64acd is circuits main at constraint set 11 (chain 22: Grain constants, the declared
   # poseidon2 height, the rate-1/4 per-instance quotient layout, versioned rVM keys, cell-count
-  # gas). Both rand-zkvm-cuda revs name this commit too. A later circuits commit that moves only a
-  # guest (the EVM block context) is one step: deploy/sync-zkvm.sh from it with CUDA_REV unchanged,
-  # this pin, and the hc pins the sync's guest tests name.
-  CIRCUITS_PIN: 76a48dca92a2d0382370f383d6680971db0cc574
+  # gas; set 11 itself landed at 76a48dc) plus circuits #27, the EVM guest's block context v2
+  # (fullnode #168: NUMBER/TIMESTAMP/CHAINID/BASEFEE/PREVRANDAO from an InvokeAt's public
+  # context words; evm.bin hc 3869b014...). Both rand-zkvm-cuda revs name this commit too.
+  CIRCUITS_PIN: 41d64acd0fec1c6b15be18a8c7707ddce61ff790
 
 jobs:
   check-and-test:
