@@ -75,6 +75,16 @@ Deploy (no node change):
   `PERPS_MAX_WINDOW_HEIGHTS` / `MULTISIG_MAX_ACCOUNTS` (still inputs) and that rand-archive-2 is
   abandoned, chain 21's history on record starting at height 187 556 (e, obs1). SELFTEST 404 →
   426.
+- **Chain 22 drops archive2 and accepts a pruned carry scan on the record** (owner's decisions of
+  2026-11-19). `BONDED` defaults to `obs1 g1 g2 g3 g4 g5 g6` and no other list is accepted:
+  chain 22 starts with 25 validators (quorum 17), the beacon takes 25 commitments, nothing reads
+  archive2's registration or key, and archive2's chain-21 stake is not recreated — the cut prints
+  it and the record's `drops:` must name archive2. `PRUNED_SCAN_OK=1` lets `snapshot` and
+  `balances` read a node with `prune_floor` above 0 (none other exists: e and obs1 prune below
+  187 556), prints the floor loudly and records it; the cut then needs the override and a
+  `scan-floor:` record line naming the floor, and refuses the override when nothing was pruned.
+  A pruned scan is complete for shielded notes and spends and misses only an envelope below the
+  floor that does not open (RS-1). SELFTEST 426 → 444.
 
 Node (issue #166, ZKVM-201; node-only, no wire, genesis or consensus change):
 
