@@ -7159,7 +7159,7 @@ mod tests {
         let total = cfg.check(20).expect("the example is a valid section");
         assert_eq!(total, 500_000_000 * UNITS_PER_RAND, "the treasury's 500 M RAND");
         let treasury = &cfg.accounts[0];
-        assert_eq!((treasury.signers.len(), treasury.threshold), (3, 2), "2 of 3");
+        assert_eq!((treasury.signers.len(), treasury.threshold), (6, 5), "5 of 6");
         // `rand-node genesis --multisig` reads the file through the same function the test does.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("multisig.json");
