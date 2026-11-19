@@ -1956,8 +1956,8 @@ not move), and read back by `check-limits`.
 | `max_tier`, `max_block_inputs` | 18, 24 | the documented production sizing: durian.market's gated case `block-24-14liq` (24 inputs, a close that liquidates 14) is 212 018 cycles, inside tier 18 with 15 % headroom; 25 is refused. |
 | `max_window_blocks` | 64 | the ceiling; 64 close-only blocks do not fit tier 18 (≈ 25 k cycles a close), so `perp-prover run` halves its window until one fits. |
 | `min_deposit` | 100000000 | 1 zUSD (eight decimals). |
-| `engine_hc` | `f286a611…1573` | durian.market's pinned `artifacts/perp-engine.image.bin`; the cut runs `rand perp image-hc --image $PERP_IMAGE` and refuses any other. |
-| `genesis_root` | derived | `$PERP_PROVER genesis-state` over the market list, then `rand perp genesis-root --state`; printed as `PERPS GENESIS ROOT` for the cut record. The real cut refuses without `PERP_PROVER` (durian.market's `perp-prover`, built from the commit that pinned the image). |
+| `engine_hc` | `482215a8…5073` | durian.market's pinned `artifacts/perp-engine.image.bin` under constraint set 11 (chain 21's image, the same bytes, sha256 `77dfc228…`; chain 21 names it `f286a611…1573` under set 9); the cut runs `rand perp image-hc --image $PERP_IMAGE` and refuses any other. |
+| `genesis_root` | derived, must be `a45d8fda…98b4` | `$PERP_PROVER genesis-state` over the market list, then `rand perp genesis-root --state`; refused unless it is the recorded set-11 root `a45d8fdab8cf7dab972e76dd6a7a18d9e82fc8210afab672a161ee60021698b4` (chain 21's 26 genesis words under the Grain constants; chain 21's set-9 root `da0e3a53…` is refused); printed as `PERPS GENESIS ROOT` for the cut record. The real cut refuses without `PERP_PROVER` (durian.market's `perp-prover`, built from the commit that pinned the image). |
 
 The section is **spliced**, not passed as `rand-node genesis --perps`: the base file lists no
 token (zUSD is a bridged token and is spliced in with the bridge section), and `Genesis::validate`
@@ -2035,8 +2035,8 @@ issues at the cut: randprotocol/monorepo#15 (PST-1), #13 (PERP-6) and #12 (PERP-
 | `beacon` | `commit_delay_blocks` `256` (**owner value to confirm**, OPEN 10) + one commitment per validator (the operators') | the randomness beacon: every block opens with its proposer's hash-chain reveal; refused by the node without the window. Carried by the owner's decision of 2026-11-18 | `docs/evm-block-context.md` §11 (PR #189) |
 
 Everything else is chain 21's, asserted equal: `fees` {burn_base, burn_floor}, `perps` (BTC-PERP on
-zUSD, the pinned engine, tier 18, 24 inputs — and its `genesis_root`, re-derived by perp-prover,
-must equal chain 21's `da0e3a53…`), `multisig` create fee 1 RAND with one treasury (now 5 of 6,
+zUSD, tier 18, 24 inputs; the same engine image at its set-11 hc `482215a8…`, and its
+`genesis_root`, re-derived by perp-prover, must equal the recorded set-11 root `a45d8fda…`), `multisig` create fee 1 RAND with one treasury (now 5 of 6,
 item 3 below), `hc_auth_multisig` 9705f8e2…, 6 MiB proofs and 19 MiB blocks, and chain 20's shape
 before them.
 
@@ -2070,8 +2070,9 @@ before them.
    treasury.
 4. **Chain 21's perps exchange: carried (empty)** (decided 2026-11-19). It holds 0 collateral and 0
    RAND (`rand_getSupply.perps_collateral_held` and `perps_rand_held` `"0"`), and chain 22's engine
-   starts from `perp-prover genesis-state` over the same markets on the same engine, so the same
-   root, `da0e3a53…`, asserted equal. When the snapshot shows the exchange empty (`rand_getPerps`
+   starts from `perp-prover genesis-state` over the same markets on the same engine: chain 21's
+   genesis words, hashed under constraint set 11 to the recorded root `a45d8fda…98b4` (not chain
+   21's set-9 `da0e3a53…`), asserted equal. When the snapshot shows the exchange empty (`rand_getPerps`
    accounts, pending withdrawals and collateral; `rand_getPerpAccounts`; the two supply counters)
    the cut needs no override, and the record's `carries:` line must name perps. A non-empty
    exchange is still refused unless `PERPS_STATE_NOT_CARRIED_OK=1` and the record's `drops:`

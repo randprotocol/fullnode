@@ -14,6 +14,13 @@ stopped at v0.4 until 2026-09-30, when the entries v0.5 to v0.6.7 were written f
 
 Perps (**a chain cut, chain 22**; chain 21 unchanged):
 
+- **Chain 22's perps on constraint set 11.** The cut pins the engine at `482215a8…5073` (chain
+  21's image, the same bytes, under the Grain Poseidon2 constants; durian.market #2) and the perps
+  `genesis_root` at the recorded set-11 root `a45d8fda…98b4` (`perp-prover genesis-state` →
+  `rand perp genesis-root`; the genesis words are chain 21's). It no longer asserts chain 21's
+  `f286a611…` / `da0e3a53…`; `perp_genesis_root_step` refuses the set-9 root and any other
+  (selftest 474 passed, 0 failed). `tests/vectors/perps-v1.json`'s three digests are regenerated
+  under set 11: `perps_vectors` failed on the set-9 values.
 - **Pinned state-proof verifier keys (CON-601, monorepo#23).** A new gated genesis field,
   `perps.state_proof_keys`, lists the state-proof shapes a chain admits, each with the SHA-256 of
   its precomputed key file. It is omitted when empty and bound into the genesis hash only when
