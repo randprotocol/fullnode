@@ -24,6 +24,12 @@ seven of them are the files the fleet installs) and the owner's `SHA256SUMS.sig`
 
 Release (no node change beyond the version):
 
+- **The chain-22 cut re-derives every shielded address under set 11** (#199). The same spend
+  key has a different `rand1…` address under set 11 (`pk = H_PK(nk)` is a Poseidon2 output).
+  `cut-chain22-genesis.sh` now takes `WALLET22` (the v0.8.7 `rand`) next to chain 21's
+  `WALLET`, and tells them apart by a probe key. It re-derives every alloc, zUSD carry, faucet
+  recipient and validator payout from a held key file (or a recorded `given=` address and
+  fingerprint), and refuses any address chain 21 knew. The fee recipient has no chain-21 default.
 - **The fleet switch from chain 21 to chain 22: `deploy/cutover-fleet-chain22.sh`** (#197),
   derived from chain 21's cutover. The build is v0.8.7 at constraint set 11, so `switch` keeps
   v0.8.6's `rand-node`, `rand` and chain 21's msauth blob as `*.pre-c22` and `rollback` restores
