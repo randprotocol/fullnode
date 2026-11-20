@@ -359,6 +359,7 @@ a time.
 | v0.7.0 | node-only: the audit v7 addendum (bounded by-hash deferral, header pages capped by reply size, a prover timeout, the wallet's resumable first sync hardened) and the last audit v6 rows (a clean-clone build, an incremental token root, the key-separation schedule); the first workflow-built, signed release | 20 |
 | v0.8.0 | chain 21's cut build: constraint set 9 (rVM phase 4's Merkle spans, the MODQ chip), tree aggregation, scan heads, compact blocks, the `fees` section, RPL-3 perps, public and private multisig | 21 |
 | v0.8.2 | node-only on chain 21: the audit v10 node, perps and prover-pool fixes (the prover memory gate, the two-member pool pin, threshold release signatures); its consensus rules are genesis-gated to the next cut | 21 |
+| v0.8.7 | chain 22's cut build: constraint set 11 (Grain Poseidon2 constants, declared poseidon2 height, rate-¼ quotient layout, versioned rVM keys, cell-count gas: bundle 22 527, auth 1 407, msauth 355 775), EVM block context and the randomness beacon, pinned perps state-proof keys, the 5-of-6 treasury; refuses chains 14–21 ([release notes](docs/releases/v0.8.7.md)) | 22 |
 
 ## v0.5: RPL, zUSD and bridge hardening
 

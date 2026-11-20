@@ -6,7 +6,12 @@ invariants, and known traps.
 
 ## Project memory (state as of 2026-11-08)
 
-### Constraint set 11 re-vendored (issue #166 step 7; 2026-11-20, branch `feat/cs11-revendor`, PR open, NOT merged)
+### Constraint set 11 re-vendored (issue #166 step 7; 2026-11-20, #194 merged as `94b2c15c`; v0.8.7)
+
+**v0.8.7** is this build: version bump on `release/v0.8.7` (from main `e79070a7`, after #197's
+`cutover-fleet-chain22.sh`), release notes `docs/releases/v0.8.7.md`. Not tagged, signed or
+rolled as of 2026-11-20; the chain-22 genesis hash and its `CHAIN_CONSTRAINT_SETS` row are
+`PLACEHOLDER-…` there until the cut.
 
 `CIRCUITS_PIN` **`41d64acd`** (circuits main: set 11 landed at `76a48dca`, "Constraint set 11:
 Grain constants, declared poseidon2 height, quotient layout, versioned rVM key"; then #27, the EVM

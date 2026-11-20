@@ -12,6 +12,38 @@ stopped at v0.4 until 2026-09-30, when the entries v0.5 to v0.6.7 were written f
 
 ## Unreleased
 
+Nothing yet.
+
+## v0.8.7 — PLACEHOLDER-TAG-DATE (chain 22, **a chain cut**: constraint set 11; a set-11 node refuses every chain 14–21 genesis, so this release is never rolled onto chain 21)
+
+The release notes — the set-11 gas change as a governance record, the chain-22 cut, the operator
+upgrade steps and the rollback — are [`docs/releases/v0.8.7.md`](docs/releases/v0.8.7.md).
+Assets: `rand-node`, `rand`, `rand-prover`, `msauth-vk-production.bin` (set 11, `168d79a8…71b3`)
+and the four `perp-vk-production-t18-*.bin` state-proof keys, with `SHA256SUMS` (eight lines;
+seven of them are the files the fleet installs) and the owner's `SHA256SUMS.sig`.
+
+Release (no node change beyond the version):
+
+- **The chain-22 cut re-derives every shielded address under set 11** (#199). The same spend
+  key has a different `rand1…` address under set 11 (`pk = H_PK(nk)` is a Poseidon2 output).
+  `cut-chain22-genesis.sh` now takes `WALLET22` (the v0.8.7 `rand`) next to chain 21's
+  `WALLET`, and tells them apart by a probe key. It re-derives every alloc, zUSD carry, faucet
+  recipient and validator payout from a held key file (or a recorded `given=` address and
+  fingerprint), and refuses any address chain 21 knew. The fee recipient has no chain-21 default.
+- **The fleet switch from chain 21 to chain 22: `deploy/cutover-fleet-chain22.sh`** (#197),
+  derived from chain 21's cutover. The build is v0.8.7 at constraint set 11, so `switch` keeps
+  v0.8.6's `rand-node`, `rand` and chain 21's msauth blob as `*.pre-c22` and `rollback` restores
+  all three. Seven signed files are staged and checked on every host (`rand-node`, `rand`, the
+  set-11 msauth blob, the four perps keys). New phases `beacon-init` (each validator makes its own
+  seed on its own host; the seed never leaves it) and `beacon-collect` (`BEACON_TSV`);
+  `check-beacon-seed.sh` runs at `stop`, `switch`, `start` and `wait`. 25 validators (archive2
+  dropped), quorum 17. `stop` refuses without `CONFIRM_HALT_CHAIN21=halt-chain-21-for-<first 8 hex
+  of the pushed genesis hash>`. `verify` needs the `CHAIN_CONSTRAINT_SETS` row. Every changing
+  phase appends to `deploy/roll-records/v0.8.7-chain22-cutover.record`. `SELFTEST=1` rehearses
+  the whole cutover against 26 fake hosts (`deploy/rehearse-cutover-fleet-chain22.sh`).
+- **Workspace version 0.8.7** (`Cargo.toml`, the seven workspace crates in `Cargo.lock`, the
+  `rand_getVersion` test).
+
 Perps (**a chain cut, chain 22**; chain 21 unchanged):
 
 - **Chain 22's perps on constraint set 11.** The cut pins the engine at `482215a8…5073` (chain
