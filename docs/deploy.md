@@ -2098,6 +2098,58 @@ RPL-2 program vaults stay **dropped** (`rand_getSupply.program_rand_held`;
 programs' state, but its script never counted their RAND. durian.market's AMM is redeployed on
 chain 22, and the 200 RAND in its chain-21 pool is dropped.
 
+**Every shielded address is re-derived under constraint set 11** (2026-11-20). Set 11 changes
+the Poseidon2 constants, so `pk = H_PK(nk)` and the `rand1…` address move for the same spend key
+(the operator's test key: PNKR-0783-FNHS-K5AY under v0.8.0, KWTC-Y3MQ-XX7S-JVXP under set 11). A
+genesis note sealed to a chain-21 (set-9) address can never be spent by a set-11 wallet: funds
+lost, silently. So the cut takes **two** wallets and never carries a chain-21 `rand1`:
+
+| input | default | what |
+|---|---|---|
+| `WALLET` | `target/release/rand` (this tree's build is set 11 and is refused: point it at v0.8.6) | chain 21's rand (v0.8.6, set 9): reads chain 21 (`balances`' scan) and proves a key file's chain-21 address |
+| `WALLET22` | none | the v0.8.7 rand from the signed release (set 11): derives **every** chain-22 address, fingerprints given ones and the fee recipient, and runs `perp image-hc` / `perp genesis-root` |
+| `PAYOUT_KEYS_DIRS` | `~/.rand-chain14/payout ~/.rand-chain15/payout ~/.rand-chain21/payout` | `<validator name>.key.json`, each validator's payout key |
+| `FAUCET_RECIPIENTS` | `~/.rand-chain22/faucet-recipients.txt` (required; chain 21's allowlist is no longer the default) | one carry line per recipient |
+| `FEE_RECIPIENT_FILE` | `~/.rand-chain22/fee-recipient-address.txt` | the owner's **set-11** address, one line |
+| `FEE_RECIPIENT_FINGERPRINT` | none | that address's set-11 fingerprint |
+| `SET11_GIVEN` | empty | labels of carry lines whose set-11 address its holder sent (no key file here); each must be on the cut record's `set11-given:` line |
+
+- **Which set a binary is.** The cut runs both on a public probe key (spend key `01`×32, never
+  funded) and refuses unless `WALLET` prints set 9's `XCGM-G4XD-CQQA-753X` and `WALLET22` set 11's
+  `S3VP-7C0T-GGSA-BJJY` (checked on the build droplet's set-11 `rand`, 2026-11-20). A `WALLET22`
+  that is chain 21's rand (the same address as `WALLET`), a set-11 `WALLET`, or either of an
+  unknown set is refused by name.
+- **Carry lines** (`ALLOC_ADDRESSES`, `ZUSD_CARRY`, `FAUCET_RECIPIENTS`):
+  `<label> <set-11 rand1…> [<amount>] key=<key file>|given=<fingerprint> [c21=<chain-21 rand1…>]`.
+  `balances` writes `ALLOC_ADDRESSES` in this form (the address WALLET22 derives, `key=` the file it
+  scanned, `c21=` the chain-21 address it scanned) and prints `ZUSD_CARRY` key= lines for the
+  operator wallets holding zUSD. The cut re-derives every `key=` file with both binaries and refuses
+  a line whose address is not WALLET22's derivation, is the key's set-9 address, or whose `c21=` is
+  not the key's set-9 address; an alloc line needs `key=` and `c21=`. `given=` is for a holder whose
+  key is not here (Anish's zUSD, a faucet recipient): only in `ZUSD_CARRY` / `FAUCET_RECIPIENTS`,
+  only under `SET11_GIVEN` and the record's `set11-given:` line, and WALLET22 must print the
+  line's fingerprint for it. A faucet line's `c21=` names the chain-21 entry it replaces; the list
+  must be chain 21's allowlist at set-11 addresses, in order, unless `FAUCET_RECIPIENTS_CHANGED=1`.
+- **Validator payouts** are `rand1` shielded addresses too: each is the set-11 address of the payout
+  key file under `PAYOUT_KEYS_DIRS` whose set-9 address is the validator's chain-21 payout.
+- **Not moved:** validator, faucet-minter and beacon addresses are `Address::from_public_key`
+  (blake3 of `"rand-address"` ‖ a Dilithium2 (ML-DSA) public key, `randprotocol-core/src/crypto.rs`); treasury
+  signers and guardians are public keys. No Poseidon2 in any of them, so they carry as chain 21 has them.
+- **The fee recipient** (`bridge.fees.recipient`): chain 21's is the owner's wallet at its set-9
+  address (fingerprint `89DS-4Q4X-HXSX-MBYW`). The owner runs `rand address --key <their key file>`
+  with the v0.8.7 wallet, writes the address to `FEE_RECIPIENT_FILE` and gives its fingerprint as
+  `FEE_RECIPIENT_FINGERPRINT`; the cut checks it with WALLET22 and refuses `89DS-…` and chain 21's
+  address by name. The fee bps stay chain 21's.
+- **Backstop.** Before it writes the file, the cut refuses any `rand1` in the genesis that chain 21
+  knew (its genesis, a key file's set-9 address, a `c21=` column) and any alloc note sealed to a
+  chain-21 pk. The record gets `address-derivation: set 11 via WALLET22 sha256 … (probe …), chain 21
+  via WALLET sha256 …; <n> key file(s) re-derived; given: …`.
+- **DRY_RUN** makes throwaway keys with WALLET22 for the synthetic wallets and the faucet allowlist
+  (`FAUCET_RECIPIENTS_CHANGED=1`, loudly) and a throwaway fee recipient when there is no
+  `FEE_RECIPIENT_FILE`; payouts come from the real `PAYOUT_KEYS_DIRS`.
+- `deploy/cutover-fleet-chain22.sh balances` and `cut` refuse without both wallets (or with one
+  binary as both) and put WALLET22's sha256 on the roll record.
+
 **Chain 21's history on record** (decision 7, 2026-11-19). rand-archive-2 (`ARCHIVE2`) is
 abandoned. Chain 21's history on record starts at height **187 556**, on hosts e and obs1, and
 both report `rand_status.prune_floor` 187556: no unpruned chain-21 node exists. State the floor on

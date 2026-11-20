@@ -51,14 +51,19 @@
 #
 #   [PRUNED_SCAN_OK=1] deploy/cut-chain22-genesis.sh snapshot <dir>
 #                                                    # chain 21 still up, bridge daemons stopped
-#   [PRUNED_SCAN_OK=1] WALLET=<chain 21's rand, v0.8.2> deploy/cut-chain22-genesis.sh balances <dir>
-#                                                    # read-only toward the chain: the RAND carry list.
+#   [PRUNED_SCAN_OK=1] WALLET=<chain 21's rand, v0.8.2> WALLET22=<v0.8.7's rand, set 11> \
+#     deploy/cut-chain22-genesis.sh balances <dir>
+#                                                    # read-only toward the chain: the RAND carry list,
+#                                                    # each wallet at its SET-11 address (WALLET22) with
+#                                                    # its key file and chain-21 address on the line.
 #                                                    # PRUNED_SCAN_OK=1 (owner, 2026-11-19): accept a
 #                                                    # pruned CHAIN21_RPC — none other exists (e, obs1:
 #                                                    # prune_floor 187556; rand-archive-2 abandoned);
 #                                                    # the cut then needs it too and the record's
 #                                                    # `scan-floor: <floor>` (what it loses: py_snapshot)
-#   CUT_RECORD=<record> CHAIN21_SNAPSHOT=<dir> NODE=<the cut build's rand-node> WALLET=<its rand> \
+#   CUT_RECORD=<record> CHAIN21_SNAPSHOT=<dir> NODE=<the cut build's rand-node> \
+#     WALLET=<chain 21's rand, v0.8.2> WALLET22=<the cut build's rand, v0.8.7: set 11> \
+#     FEE_RECIPIENT_FINGERPRINT=<the owner's set-11 fingerprint> [SET11_GIVEN=<labels>] \
 #     EXPECT_NODE_VERSION=<that release> PERP_PROVER=<durian's perp-prover> \
 #     PERPS_MAX_WINDOW_HEIGHTS=<64..4096> MULTISIG_MAX_ACCOUNTS=<n ≥ 1> \
 #     [BEACON_TSV=<name ↔ commitment>] [REFERENCE_BLOCK_WINDOW=<256..4096, 256>] \
@@ -77,8 +82,11 @@
 #                                                    # chain 22's row (issue #166, below) — it exits
 #                                                    # non-zero until the row the cut printed is added
 #   SELFTEST=1 deploy/cut-chain22-genesis.sh         # no network, no binaries: the assembly on fixtures
-#   DRY_RUN=1 NODE=… WALLET=… PERP_PROVER=… RAND_MSAUTH_VK=<msauth-vk-production.bin> \
-#     deploy/cut-chain22-genesis.sh
+#   DRY_RUN=1 NODE=… WALLET=… WALLET22=… PERP_PROVER=… RAND_MSAUTH_VK=<msauth-vk-production.bin> \
+#     deploy/cut-chain22-genesis.sh                  # (the carry wallets, the faucet allowlist and,
+#                                                    # without FEE_RECIPIENT_FILE, the fee recipient are
+#                                                    # THROWAWAY keys WALLET22 makes; the payouts are
+#                                                    # derived from PAYOUT_KEYS_DIRS as at the cut)
 #                                                    # no network: the REAL cut path (rand-node genesis,
 #                                                    # alloc-note, perp-prover genesis-state, init, a
 #                                                    # loopback probe node) on inputs synthesised from
@@ -251,6 +259,54 @@
 #     `carries:`). No deploy/cutover-fleet-chain22.sh exists yet: derive it from chain 21's.
 #   * NODE must report rand-node $EXPECT_NODE_VERSION (no default, OPEN 7), v0.8.5 or later. `balances` runs with
 #     chain 21's own build, v0.8.2 (WALLET).
+#   * EVERY SHIELDED ADDRESS IS RE-DERIVED UNDER CONSTRAINT SET 11 (the cut-blocking bug of
+#     2026-11-20; bridge#15 found the same on its side). Set 11 changes the Poseidon2 constants, so
+#     `pk = H_PK(nk)` — and with it the rand1… address — moves for the SAME spend key (a throwaway
+#     key: PNKR-0783-FNHS-K5AY under v0.8.0, KWTC-Y3MQ-XX7S-JVXP under set 11). A genesis note,
+#     payout or allowlist entry at a set-9 address can never be spent or used by a set-11 wallet:
+#     silent loss of funds. So TWO wallet binaries, never one:
+#       - WALLET   — chain 21's rand (set 9), only to READ chain 21 (`balances`' scan) and to prove a
+#                    key file is the chain-21 wallet a line claims (its set-9 address);
+#       - WALLET22 — the cut build's rand (v0.8.7, from the signed release; NO default), to DERIVE
+#                    every address chain 22's genesis holds, and for every set-11 step (`perp
+#                    image-hc`, `perp genesis-root`, fingerprints).
+#     Both are identified by a PROBE: a fixed, public, never-funded spend key (PROBE_SPEND_KEY, 0x01
+#     × 32) whose address fingerprint is PROBE_FP_SET9 under set 9 and PROBE_FP_SET11 under set 11
+#     (read 2026-11-20 with v0.8.0 and the #194 tree's rand). `check_wallet_sets` refuses a WALLET22
+#     that is not set 11 (a set-9 one by name), a WALLET that is set 11, and two binaries that
+#     derive one address. The design, per input:
+#       - ALLOC_ADDRESSES (`balances` writes it): `<label> <set-11 rand1…> <RAND> key=<key file>
+#         c21=<chain-21 rand1…>`. The cut RE-DERIVES each line from its key file (WALLET22 must
+#         give the address column, WALLET the c21= column) and matches c21= + amount one-for-one
+#         against the scan (balances.json). A line with no key= — a hand-typed or chain-21 address —
+#         is refused: every RAND alloc comes from a HELD key file.
+#       - ZUSD_CARRY: the same `key=` lines, or, for a holder whose key is not here (Anish; the
+#         owner's own wallet), `<label> <set-11 rand1…> <zUSD> given=<set-11 fingerprint>`: the
+#         holder ran `rand address` with the v0.8.7 wallet and sent both; WALLET22 must print that
+#         fingerprint for the address, the label must be in SET11_GIVEN, and the cut record's
+#         `set11-given:` line must name it.
+#       - FAUCET_RECIPIENTS (default ~/.rand-chain22/faucet-recipients.txt, REQUIRED — chain 21's
+#         genesis allowlist is set 9 and no longer the default): `<label> <set-11 rand1…> key=<key
+#         file>` or `… given=<fingerprint> [c21=<the chain-21 entry it replaces>]`, the same rules.
+#         The list is "unchanged" when its chain-21 counterparts (WALLET's derivation, or c21=) are
+#         chain 21's allowlist in order; anything else needs FAUCET_RECIPIENTS_CHANGED=1.
+#       - The validators' PAYOUTS (chain 21's register and genesis carry set-9 rand1… payouts):
+#         each validator's payout key file, `<dir>/<name>.key.json` under PAYOUT_KEYS_DIRS, is the
+#         one whose WALLET (set-9) address IS its chain-21 payout; its WALLET22 address is the
+#         chain-22 payout. A validator with no such key file is refused.
+#       - The bridge FEE RECIPIENT is the owner's own wallet, known here only as an address: a
+#         chain-22 FEE_RECIPIENT_FILE (default ~/.rand-chain22/fee-recipient-address.txt) and
+#         FEE_RECIPIENT_FINGERPRINT, NO default, checked with WALLET22. Chain 21's recipient (its
+#         address, or fingerprint 89DS-4Q4X-HXSX-MBYW) is refused by name.
+#       - The validator, faucet-minter, beacon and staking addresses are NOT shielded addresses:
+#         `Address::from_public_key` is blake3("rand-address" ‖ ML-DSA public key)
+#         (randprotocol-core crypto.rs), no Poseidon2, so set 11 does not move them; the treasury
+#         signers and guardians are public keys. The fingerprint itself is blake3 too (it does not
+#         depend on the set; the ADDRESS it is taken of does).
+#     And a BACKSTOP on the finished file (py_splice): no rand1… string and no note `opening.pk` in
+#     chain 22's genesis may be one chain 21 knew (its genesis's addresses and alloc pks, every
+#     key file's set-9 address, every c21= column). The cut record gets `address-derivation: set 11
+#     via WALLET22 sha256 <hex> (probe <fp>), chain 21 via WALLET sha256 <hex>`.
 #   * THE CONSTRAINT-SET ROW (issue #166, ZKVM-201). A genesis records no constraint set; the node
 #     binds one to a chain by genesis hash in `constraint_set::CHAIN_CONSTRAINT_SETS`
 #     (crates/randprotocol-node/src/constraint_set.rs), and every cut adds its row. The hash does not
@@ -300,8 +356,16 @@
 #   TREASURY          default ~/.rand-chain22/treasury.txt, chain 21's format: `signer <name> <2624
 #                     hex>` × 6 in order (none of them chain 21's), `threshold 5`, `balance <RAND>`
 #                     equal to chain 21's multisig_rand_held (OPEN 3). Public keys only.
-#   FEE_RECIPIENT_FILE  default ~/.rand-chain20/fee-recipient-address.txt — chain 20's and chain
-#                     21's recipient, fingerprint 89DS-4Q4X-HXSX-MBYW (it never moved).
+#   FEE_RECIPIENT_FILE  default ~/.rand-chain22/fee-recipient-address.txt — the owner's wallet AT
+#                     ITS SET-11 ADDRESS (one rand1… line), with FEE_RECIPIENT_FINGERPRINT (no
+#                     default): the owner runs `rand address --key <their key>` with the v0.8.7
+#                     wallet and sends both. Chain 20's and 21's file (~/.rand-chain20/…, fingerprint
+#                     89DS-4Q4X-HXSX-MBYW) is the set-9 address and is refused.
+#   FAUCET_RECIPIENTS default ~/.rand-chain22/faucet-recipients.txt (required; format above).
+#   PAYOUT_KEYS_DIRS  default ~/.rand-chain14/payout ~/.rand-chain15/payout ~/.rand-chain21/payout:
+#                     <name>.key.json per validator (read only to derive addresses).
+#   SET11_GIVEN       the labels of the ZUSD_CARRY / FAUCET_RECIPIENTS lines whose set-11 address
+#                     is given (given=<fingerprint>), not derived; the record's set11-given: names each.
 #   BEACON_TSV        default ~/.rand-chain22/beacon-commitments.tsv: "<validator name> <64 hex>",
 #                     one line per chain-22 validator (the 25 names of GENESIS_NAMES and BONDED), each
 #                     commitment what that validator's own `rand-node beacon init --chain-id 22`
@@ -357,7 +421,14 @@ cd "$(dirname "$0")/.."
 . deploy/lib/cut-policy.sh
 
 NODE=${NODE:-target/release/rand-node}
-WALLET=${WALLET:-target/release/rand}
+WALLET=${WALLET:-target/release/rand}     # chain 21's rand (set 9): READS chain 21 only — this tree's own build is set 11 and is refused
+WALLET22=${WALLET22:-}                    # the cut build's rand (v0.8.7, set 11, from the signed release): DERIVES every chain-22 address; no default
+# The wallet probe (header, "EVERY SHIELDED ADDRESS"): a fixed, public spend key — NEVER FUND IT —
+# and its address fingerprint under each constraint set (read 2026-11-20: rand v0.8.0 for set 9,
+# the #194 tree's rand for set 11). Not overridable: another set edits these together.
+PROBE_SPEND_KEY=0101010101010101010101010101010101010101010101010101010101010101
+PROBE_FP_SET9=XCGM-G4XD-CQQA-753X
+PROBE_FP_SET11=S3VP-7C0T-GGSA-BJJY
 CHAIN_ID=${CHAIN_ID:-22}
 OUT=${OUT:-deploy/genesis-chain22.json}
 CUT_RECORD=${CUT_RECORD:-$HOME/.rand-chain22/cut-record.txt}   # deploy/cut-record.template, filled in and published before the cut
@@ -394,10 +465,12 @@ _have_bonded=$(printf '%s ' $BONDED); _have_bonded=${_have_bonded% }
 VALIDATOR_COUNT=$(( $(wc -w <<<"$GENESIS_NAMES") + $(wc -w <<<"$BONDED") ))
 VALIDATOR_QUORUM=$(( 2 * VALIDATOR_COUNT / 3 + 1 ))
 FAUCET_MINTERS=${FAUCET_MINTERS:-$GENESIS_NAMES}   # chain 21's list; another one needs FAUCET_MINTERS_CHANGED=1
-FAUCET_RECIPIENTS=${FAUCET_RECIPIENTS:-}           # unset: chain 21's genesis allowlist; a file ("<name> rand1…") changes it
+FAUCET_RECIPIENTS=${FAUCET_RECIPIENTS:-$HOME/.rand-chain22/faucet-recipients.txt}   # required: "<label> <set-11 rand1…> key=<file>|given=<fp> [c21=<rand1…>]" (chain 21's allowlist is set 9)
 STAKE_RAND=${STAKE_RAND:-1000}
-ALLOC_ADDRESSES=${ALLOC_ADDRESSES:-$HOME/.rand-chain22/alloc-rand.txt}   # "<label> rand1… <RAND>" per line (`balances` writes it)
-ZUSD_CARRY=${ZUSD_CARRY:-$HOME/.rand-chain22/zusd-carry.txt}             # "<label> rand1… <zUSD>" per line
+ALLOC_ADDRESSES=${ALLOC_ADDRESSES:-$HOME/.rand-chain22/alloc-rand.txt}   # "<label> <set-11 rand1…> <RAND> key=<file> c21=<rand1…>" per line (`balances` writes it)
+ZUSD_CARRY=${ZUSD_CARRY:-$HOME/.rand-chain22/zusd-carry.txt}             # "<label> <set-11 rand1…> <zUSD> key=<file>|given=<fp>" per line
+PAYOUT_KEYS_DIRS=${PAYOUT_KEYS_DIRS:-$HOME/.rand-chain14/payout $HOME/.rand-chain15/payout $HOME/.rand-chain21/payout}   # <name>.key.json: each validator's payout key (address derivation only)
+SET11_GIVEN=${SET11_GIVEN:-}                       # labels whose set-11 address is given=<fingerprint>, not derived; named on the record's set11-given: line
 WALLETS_DIRS=${WALLETS_DIRS:-$HOME/.rand-chain17/alloc-wallets $HOME/.rand-chain18/wallets $HOME/.rand-chain19/wallets $HOME/.rand-chain20/wallets $HOME/.rand-chain21/wallets}   # `balances`: dirs of *.key.json (a missing dir is skipped, printed); never a checkout's wallets/
 REQUIRED_WALLETS=${REQUIRED_WALLETS:-relayer}      # `balances`: <name>.key.json that must be under WALLETS_DIRS before the scan (the relayer's link went missing once)
 BALANCES_RESCAN=${BALANCES_RESCAN:-1}              # `balances`: `rand sync --rescan` (from leaf 0) — never trust a laptop note store
@@ -491,8 +564,9 @@ ROTATION_NEEDS_POSSESSION=${ROTATION_NEEDS_POSSESSION:-true}
 PROGRAM_STATE_CELL_FEE=${PROGRAM_STATE_CELL_FEE:-10000000}   # 0.01 RAND a created cell: docs/program-state.md, chain 21's
 BRIDGE_MINT_BPS=${BRIDGE_MINT_BPS:-10}                       # chain 21's: 0.1 % each way (docs/bridge.md §25)
 BRIDGE_BURN_BPS=${BRIDGE_BURN_BPS:-10}
-FEE_RECIPIENT_FILE=${FEE_RECIPIENT_FILE:-$HOME/.rand-chain20/fee-recipient-address.txt}   # chain 20's and chain 21's recipient, the user's own wallet (one rand1… line)
-FEE_RECIPIENT_FINGERPRINT=${FEE_RECIPIENT_FINGERPRINT:-89DS-4Q4X-HXSX-MBYW}
+FEE_RECIPIENT_FILE=${FEE_RECIPIENT_FILE:-$HOME/.rand-chain22/fee-recipient-address.txt}   # the owner's wallet at its SET-11 address (one rand1… line)
+FEE_RECIPIENT_FINGERPRINT=${FEE_RECIPIENT_FINGERPRINT:-}     # the owner's set-11 fingerprint: NO default (chain 21's is refused)
+FEE_RECIPIENT_FINGERPRINT_CHAIN21=89DS-4Q4X-HXSX-MBYW        # chain 20's and 21's recipient (set 9): refused by name
 FEE_RECIPIENT=${FEE_RECIPIENT:-}                             # set by load_fee_recipient (the selftest sets a fixture)
 # ── chain 21's `fees` section (docs/fees.md §1.3), carried and asserted equal. Not overridable. NOT
 # subsidy_net_of_fees (needs aggregation, refused until it is re-measured).
@@ -640,7 +714,8 @@ export CHAIN_ID CHAIN21_GENESIS CHAIN21_HASH CHAIN21_GENESIS_SHA256 CHAIN21_TREA
   PERPS_KEY_DIR PERPS_STATE_PROOF_SHAPES_DECIDED PERPS_STATE_PROOF_KEYS_JSON PERPS_KEY_PINS \
   MULTISIG_CREATE_FEE TREASURY_THRESHOLD TREASURY_SIGNERS TREASURY MULTISIG_MAX_ACCOUNTS \
   PROGRAM_STATE_REFUSE_PANICS TOKENS_INCREMENTAL_ROOT AUDIT_V10_SKIPPED EXPECT_HC_AUTH_MULTISIG \
-  REFERENCE_BLOCK_WINDOW BEACON_COMMIT_DELAY_BLOCKS BEACON_TSV BLOCK_CONTEXT_SKIPPED
+  REFERENCE_BLOCK_WINDOW BEACON_COMMIT_DELAY_BLOCKS BEACON_TSV BLOCK_CONTEXT_SKIPPED \
+  WALLET WALLET22 PROBE_SPEND_KEY PROBE_FP_SET9 PROBE_FP_SET11 PAYOUT_KEYS_DIRS SET11_GIVEN FEE_RECIPIENT_FINGERPRINT_CHAIN21
 
 # Decimal RAND/zUSD text → base units, the exact rule of `parse_amount` (no float anywhere).
 # shellcheck disable=SC2089,SC2090  # python source in a string, exported whole, never word-split
@@ -654,16 +729,36 @@ def units(s, decimals=9):
 def fmt(u, decimals=9):
     w, f = divmod(u, 10**decimals)
     return f"{w}" if not f else f"{w}.{f:0{decimals}d}".rstrip("0")
-def alloc_lines(path):
-    rows = []
+# The chain-22 carry lines (header, "EVERY SHIELDED ADDRESS"): "<label> <set-11 rand1…> [<amount>]"
+# then key=<key file> (derived) or given=<set-11 fingerprint> (sent by its holder), and c21=<the
+# chain-21 rand1…> (balances writes it; optional elsewhere). A chain-21-format line (no key=/given=)
+# is refused: every address it holds is set 9.
+LABEL_RE = __import__("re").compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+def carry_rows(path, amounts=True):
+    rows, n = [], 3 if amounts else 2
+    amt, and_amt = (" <amount>", " and amount") if amounts else ("", "")
+    shape = f"<label> <set-11 rand1…>{amt} key=<key file>|given=<fingerprint> [c21=<chain-21 rand1…>]"
     for line in open(path):
         f = line.split()
         if not f or f[0].startswith("#"):
             continue
-        if len(f) != 3 or not f[1].startswith("rand1"):
-            raise SystemExit(f"cut-chain22: {path}: {line.rstrip()!r} is not \"<label> rand1… <amount>\"")
-        rows.append((f[0], f[1], f[2]))
+        if len(f) < n or not f[1].startswith("rand1") or not LABEL_RE.match(f[0]):
+            raise SystemExit(f"cut-chain22: {path}: {line.rstrip()[:90]!r} is not \"{shape}\"")
+        r = {"label": f[0], "address": f[1], "amount": f[2] if amounts else None, "key": None, "given": None, "c21": None}
+        for tok in f[n:]:
+            k, eq, v = tok.partition("=")
+            if not eq or k not in ("key", "given", "c21") or not v or r[k] is not None:
+                raise SystemExit(f"cut-chain22: {path}: {f[0]}: {tok[:40]!r} — after the address{and_amt} only key=, given= and c21=, each once (\"{shape}\")")
+            r[k] = v
+        if (r["key"] is None) == (r["given"] is None):
+            raise SystemExit(f"cut-chain22: {path}: {f[0]}: neither key=<key file> nor given=<fingerprint> (or both) — a chain-21 carry line? "
+                             f"Every chain-22 address is set 11: derived from a held key file by WALLET22 (key=), or given by its holder with its v0.8.7 fingerprint (given=)")
+        if r["c21"] is not None and not r["c21"].startswith("rand1"):
+            raise SystemExit(f"cut-chain22: {path}: {f[0]}: c21= is not a rand1… address")
+        rows.append(r)
     return rows
+def alloc_lines(path):
+    return [(r["label"], r["address"], r["amount"]) for r in carry_rows(path)]
 '
 # shellcheck disable=SC2090
 export UNITS_PY
@@ -680,23 +775,242 @@ need_chain21_rpc() {
   echo "cut-chain22: $CHAIN21_RPC answers as chain 21 ($(date -u +%T))"
 }
 
-# The fee recipient: one rand1… address from FEE_RECIPIENT_FILE whose fingerprint, as the WALLET
-# binary computes it, is FEE_RECIPIENT_FINGERPRINT. `rand contacts add` prints an address's
-# fingerprint; it runs under a throwaway --key in a temp dir (it writes only <key>.contacts.json).
-load_fee_recipient() {
+# ══ constraint set 11's addresses (header, "EVERY SHIELDED ADDRESS IS RE-DERIVED") ══════════════
+# The probe key's address fingerprint as <rand> derives it ('' when it prints none). The probe is a
+# PUBLIC, never-funded spend key, written 0600 into a temp dir (Wallet::load refuses a loose mode).
+probe_fingerprint() {   # <rand binary>
+  local d fp
+  d=$(mktemp -d)
+  ( umask 077; printf '{\n  "version": 2,\n  "spend_key": "%s"\n}\n' "$PROBE_SPEND_KEY" > "$d/probe.key.json" )
+  fp=$("$1" --key "$d/probe.key.json" address 2>&1 >/dev/null | sed -n 's/^fingerprint \([0-9A-Z-]*\)$/\1/p' | head -1 || true)
+  rm -rf "$d"
+  printf '%s' "$fp"
+}
+
+# WALLET reads chain 21 (set 9) and WALLET22 derives chain 22's addresses (set 11): each is what it
+# claims, by the probe — never the version string (the #194 tree's set-11 rand says 0.8.6).
+check_wallet_sets() {
+  local fp9 fp11
+  [ -n "$WALLET22" ] || { echo "cut-chain22: WALLET22 is unset — the cut build's rand (v0.8.7, constraint set 11, from the signed release) derives every address chain 22's genesis holds; WALLET ($WALLET) only reads chain 21. No default" >&2; exit 1; }
+  [ -x "$WALLET22" ] || { echo "cut-chain22: WALLET22=$WALLET22 is not executable — the cut build's rand (v0.8.7, set 11)" >&2; exit 1; }
+  [ -x "$WALLET" ] || { echo "cut-chain22: WALLET=$WALLET is not executable — chain 21's rand (v0.8.2, set 9)" >&2; exit 1; }
+  fp11=$(probe_fingerprint "$WALLET22"); fp9=$(probe_fingerprint "$WALLET")
+  [ -n "$fp11" ] || { echo "cut-chain22: WALLET22=$WALLET22 printed no fingerprint for the probe key (\`rand --key <probe> address\`) — not a rand wallet" >&2; exit 1; }
+  [ -n "$fp9" ] || { echo "cut-chain22: WALLET=$WALLET printed no fingerprint for the probe key (\`rand --key <probe> address\`) — not a rand wallet" >&2; exit 1; }
+  # WALLET first: a set-11 WALLET is refused by name (whatever WALLET22 is), then WALLET22.
+  case "$fp9" in
+    "$PROBE_FP_SET9") ;;
+    "$PROBE_FP_SET11") echo "cut-chain22: WALLET=$WALLET is a constraint-set-11 rand (probe $fp9): WALLET reads chain 21 and proves each key file's chain-21 address, so it must be chain 21's v0.8.2 (set 9, probe $PROBE_FP_SET9); the set-11 rand is WALLET22" >&2; exit 1;;
+    *) echo "cut-chain22: WALLET=$WALLET derives the probe key at fingerprint $fp9 — not set 9 ($PROBE_FP_SET9), chain 21's; refusing an unknown constraint set" >&2; exit 1;;
+  esac
+  case "$fp11" in
+    "$PROBE_FP_SET11") ;;
+    "$PROBE_FP_SET9") echo "cut-chain22: WALLET22=$WALLET22 is a constraint-set-9 rand, chain 21's: it derives the probe key's set-9 address ($fp11), the SAME address as WALLET. Chain 22's addresses need v0.8.7's rand (set 11, probe $PROBE_FP_SET11) — a set-9 address in chain 22's genesis is unspendable" >&2; exit 1;;
+    *) echo "cut-chain22: WALLET22=$WALLET22 derives the probe key at fingerprint $fp11 — neither set 11 ($PROBE_FP_SET11) nor set 9 ($PROBE_FP_SET9); refusing an unknown constraint set" >&2; exit 1;;
+  esac
+  [ "$fp11" != "$fp9" ] || { echo "cut-chain22: WALLET22 and WALLET derive the SAME address for the probe key ($fp11) — one constraint set twice" >&2; exit 1; }
+  WALLET_SHA256=$(shasum -a 256 "$WALLET" | cut -c1-64); WALLET22_SHA256=$(shasum -a 256 "$WALLET22" | cut -c1-64)
+  export WALLET_SHA256 WALLET22_SHA256
+  echo "cut-chain22: WALLET22 is constraint set 11 (probe $fp11, sha256 ${WALLET22_SHA256:0:16}…); WALLET is set 9, chain 21's (probe $fp9, sha256 ${WALLET_SHA256:0:16}…) — chain 22's addresses are WALLET22's"
+}
+
+# An address's fingerprint as WALLET22 prints it ('' when none): `rand contacts add` under a
+# throwaway --key in a temp dir (it writes only <key>.contacts.json). The fingerprint is blake3 of
+# the address bytes (it does not depend on the set); WALLET22 is used so one binary vouches for all.
+fingerprint_of() {   # <rand1…>
   local d got
-  [ -f "$FEE_RECIPIENT_FILE" ] || { echo "cut-chain22: no fee recipient file $FEE_RECIPIENT_FILE (the user's wallet address, one rand1… line)" >&2; exit 1; }
+  d=$(mktemp -d)
+  got=$("$WALLET22" --key "$d/fingerprint-only.key.json" contacts add fingerprint-check "$1" --yes 2>&1 | sed -n 's/^fingerprint \([0-9A-Z-]*\)$/\1/p' | head -1 || true)
+  rm -rf "$d"
+  printf '%s' "$got"
+}
+
+# The fee recipient: the OWNER'S wallet at its SET-11 address, one rand1… line in FEE_RECIPIENT_FILE,
+# whose fingerprint as WALLET22 computes it is FEE_RECIPIENT_FINGERPRINT (no default). Chain 21's
+# recipient — its address, or fingerprint 89DS-4Q4X-HXSX-MBYW — is the set-9 address and refused.
+load_fee_recipient() {
+  local got c21 want
+  want=$(tr '[:lower:]' '[:upper:]' <<<"$FEE_RECIPIENT_FINGERPRINT")
+  local how="the owner runs \`rand address --key <their key file>\` with the v0.8.7 wallet (WALLET22, set 11) and sends the rand1… line it prints (→ FEE_RECIPIENT_FILE) and its \`fingerprint\` (→ FEE_RECIPIENT_FINGERPRINT)"
+  [ -n "$want" ] || { echo "cut-chain22: FEE_RECIPIENT_FINGERPRINT is unset — the owner's SET-11 fingerprint, no default (chain 21's $FEE_RECIPIENT_FINGERPRINT_CHAIN21 is set 9): $how" >&2; exit 1; }
+  [ "$want" != "$FEE_RECIPIENT_FINGERPRINT_CHAIN21" ] || { echo "cut-chain22: FEE_RECIPIENT_FINGERPRINT is $FEE_RECIPIENT_FINGERPRINT_CHAIN21, chain 21's fee recipient — the owner's wallet at its SET-9 address, which no set-11 wallet can spend: $how" >&2; exit 1; }
+  [ -f "$FEE_RECIPIENT_FILE" ] || { echo "cut-chain22: no fee recipient file $FEE_RECIPIENT_FILE (the owner's wallet at its set-11 address, one rand1… line): $how" >&2; exit 1; }
   FEE_RECIPIENT=$(tr -d ' \t\r\n' < "$FEE_RECIPIENT_FILE")
   case "$FEE_RECIPIENT" in rand1*) ;; *) echo "cut-chain22: $FEE_RECIPIENT_FILE does not hold a rand1… address" >&2; exit 1;; esac
   [ "$(wc -l < "$FEE_RECIPIENT_FILE" | tr -d ' ')" -le 1 ] || { echo "cut-chain22: $FEE_RECIPIENT_FILE holds more than one line" >&2; exit 1; }
-  [ -x "$WALLET" ] || { echo "cut-chain22: WALLET=$WALLET is not executable — it computes the fee recipient's fingerprint" >&2; exit 1; }
-  d=$(mktemp -d)
-  got=$("$WALLET" --key "$d/fingerprint-only.key.json" contacts add fee-recipient "$FEE_RECIPIENT" --yes 2>&1 | sed -n 's/^fingerprint \([0-9A-Z-]*\)$/\1/p' | head -1 || true)
-  rm -rf "$d"
-  [ -n "$got" ] || { echo "cut-chain22: $WALLET printed no fingerprint for the fee recipient in $FEE_RECIPIENT_FILE (not a shielded address?)" >&2; exit 1; }
-  [ "$got" = "$FEE_RECIPIENT_FINGERPRINT" ] || { echo "cut-chain22: the fee recipient in $FEE_RECIPIENT_FILE has fingerprint $got, not FEE_RECIPIENT_FINGERPRINT $FEE_RECIPIENT_FINGERPRINT — refusing (the wrong wallet would collect every bridge fee for the chain's life)" >&2; exit 1; }
+  c21=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["bridge"]["fees"]["recipient"])' "$CHAIN21_GENESIS" 2>/dev/null || true)
+  [ "$FEE_RECIPIENT" != "$c21" ] || { echo "cut-chain22: $FEE_RECIPIENT_FILE holds chain 21's fee recipient (fingerprint $FEE_RECIPIENT_FINGERPRINT_CHAIN21) — the owner's wallet at its SET-9 address, which no set-11 wallet can spend: $how" >&2; exit 1; }
+  [ -x "$WALLET22" ] || { echo "cut-chain22: WALLET22=${WALLET22:-<unset>} is not executable — it computes the fee recipient's fingerprint" >&2; exit 1; }
+  got=$(fingerprint_of "$FEE_RECIPIENT")
+  [ -n "$got" ] || { echo "cut-chain22: $WALLET22 printed no fingerprint for the fee recipient in $FEE_RECIPIENT_FILE (not a shielded address?)" >&2; exit 1; }
+  [ "$got" != "$FEE_RECIPIENT_FINGERPRINT_CHAIN21" ] || { echo "cut-chain22: the fee recipient in $FEE_RECIPIENT_FILE has fingerprint $got, chain 21's recipient — its set-9 address: $how" >&2; exit 1; }
+  [ "$got" = "$want" ] || { echo "cut-chain22: the fee recipient in $FEE_RECIPIENT_FILE has fingerprint $got, not FEE_RECIPIENT_FINGERPRINT $want — refusing (the wrong wallet would collect every bridge fee for the chain's life)" >&2; exit 1; }
   export FEE_RECIPIENT
-  echo "cut-chain22: bridge fee recipient: ${#FEE_RECIPIENT}-char address from $FEE_RECIPIENT_FILE, fingerprint $got (= FEE_RECIPIENT_FINGERPRINT)"
+  echo "cut-chain22: bridge fee recipient: ${#FEE_RECIPIENT}-char set-11 address from $FEE_RECIPIENT_FILE, fingerprint $got (= FEE_RECIPIENT_FINGERPRINT; WALLET22)"
+}
+
+# Every key file the chain-22 addresses come from, derived by BOTH binaries, → $TMP:
+#   derived-wallets.tsv    <key file>\t<WALLET22's (set-11) address>\t<WALLET's (set-9) address>
+#   payout-keys.tsv        <validator name>\t<key file>   (each PAYOUT_KEYS_DIRS/<name>.key.json found)
+#   given-fingerprints.tsv <address>\t<WALLET22's fingerprint of it>   (each given= line)
+# The key files are read by the wallets only (to derive an address); none is copied or printed.
+derive_wallet_addresses() {
+  local name d p a11 a9 addr fp
+  : > "$TMP/derived-wallets.tsv"; : > "$TMP/payout-keys.tsv"; : > "$TMP/given-fingerprints.tsv"
+  for name in $GENESIS_NAMES $BONDED; do
+    for d in $PAYOUT_KEYS_DIRS; do
+      [ ! -f "$d/$name.key.json" ] || printf '%s\t%s\n' "$name" "$d/$name.key.json" >> "$TMP/payout-keys.tsv"
+    done
+  done
+  while IFS= read -r p; do
+    [ -n "$p" ] || continue
+    refuse_in_tree_key "$p"
+    a11=$("$WALLET22" --key "$p" address 2>/dev/null | head -1 || true)
+    a9=$("$WALLET" --key "$p" address 2>/dev/null | head -1 || true)
+    case "$a11" in rand1*) ;; *) echo "cut-chain22: $WALLET22 derives no address from $p — not a wallet key file (or not 0600)" >&2; exit 1;; esac
+    case "$a9" in rand1*) ;; *) echo "cut-chain22: $WALLET derives no address from $p — not a wallet key file (or not 0600)" >&2; exit 1;; esac
+    [ "$a11" != "$a9" ] || { echo "cut-chain22: $p derives one address under WALLET22 and WALLET — the two binaries are one constraint set" >&2; exit 1; }
+    printf '%s\t%s\t%s\n' "$p" "$a11" "$a9" >> "$TMP/derived-wallets.tsv"
+  done < <({ python3 -c '
+import os, sys
+exec(os.environ["UNITS_PY"])
+for path, amounts in ((os.environ["ALLOC_ADDRESSES"], True), (os.environ["ZUSD_CARRY"], True), (os.environ["FAUCET_RECIPIENTS"], False)):
+    for r in carry_rows(path, amounts):
+        if r["key"]:
+            print(r["key"])'; cut -f2 "$TMP/payout-keys.tsv"; } | sort -u)
+  while IFS= read -r addr; do
+    [ -n "$addr" ] || continue
+    fp=$(fingerprint_of "$addr")
+    [ -n "$fp" ] || { echo "cut-chain22: $WALLET22 printed no fingerprint for the given address ${addr:0:16}… (not a shielded address?)" >&2; exit 1; }
+    printf '%s\t%s\n' "$addr" "$fp" >> "$TMP/given-fingerprints.tsv"
+  done < <(python3 -c '
+import os
+exec(os.environ["UNITS_PY"])
+for path, amounts in ((os.environ["ZUSD_CARRY"], True), (os.environ["FAUCET_RECIPIENTS"], False)):
+    for r in carry_rows(path, amounts):
+        if r["given"]:
+            print(r["address"])' | sort -u)
+  echo "cut-chain22: $(wc -l < "$TMP/derived-wallets.tsv" | tr -d ' ') key file(s) derived by WALLET22 (set 11) and WALLET (set 9), $(wc -l < "$TMP/given-fingerprints.tsv" | tr -d ' ') given address(es) fingerprinted"
+}
+
+# The checks every chain-22 address must pass (CARRY_PY, shared by py_addresses and py_splice):
+# each key= line's address IS WALLET22's derivation of its key file (and c21=, when given, WALLET's);
+# a given= line is named in SET11_GIVEN and its fingerprint is the one WALLET22 prints; ALLOC_ADDRESSES
+# is key= lines only, each with c21=; no address any input holds is one chain 21 knew.
+# shellcheck disable=SC2016,SC2089  # Python source in a string, exported whole, never word-split
+CARRY_PY='
+import json as _json, os as _os
+B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+def pk_of(addr):
+    """The 32-byte pk (hex) a rand1… address opens to, or None when it is not base58 / too short."""
+    n = 0
+    s = addr[len("rand1"):] if addr.startswith("rand1") else addr
+    for c in s:
+        i = B58.find(c)
+        if i < 0:
+            return None
+        n = n * 58 + i
+    raw = b"\x00" * (len(s) - len(s.lstrip("1"))) + (n.to_bytes((n.bit_length() + 7) // 8, "big") if n else b"")
+    return raw[:32].hex() if len(raw) >= 32 else None
+def load_derived(tmp):
+    d, g, p = {}, {}, {}
+    for line in open(_os.path.join(tmp, "derived-wallets.tsv")):
+        if line.strip():
+            k, a11, a9 = line.rstrip("\n").split("\t")
+            d[k] = (a11, a9)
+    gp = _os.path.join(tmp, "given-fingerprints.tsv")
+    if _os.path.isfile(gp):
+        for line in open(gp):
+            if line.strip():
+                a, fp = line.rstrip("\n").split("\t")
+                g[a] = fp.upper()
+    pp = _os.path.join(tmp, "payout-keys.tsv")
+    if _os.path.isfile(pp):
+        for line in open(pp):
+            if line.strip():
+                n, k = line.rstrip("\n").split("\t")
+                p.setdefault(n, []).append(k)
+    return d, g, p
+def walk_rand1(x, out):
+    if isinstance(x, dict):
+        for v in x.values():
+            walk_rand1(v, out)
+    elif isinstance(x, list):
+        for v in x:
+            walk_rand1(v, out)
+    elif isinstance(x, str) and x.startswith("rand1"):
+        out.add(x)
+    return out
+def chain21_known(g21, derived, extra=()):
+    """Every shielded address (and pk) chain 21 knew: its genesis, each key file at set 9, each c21=."""
+    addrs = walk_rand1(g21, set()) | {a9 for _, a9 in derived.values()} | set(x for x in extra if x)
+    pks = {pk_of(a) for a in addrs} | {n["opening"]["pk"] for n in g21.get("alloc", []) if n.get("opening", {}).get("pk")}
+    pks.discard(None)
+    return addrs, pks
+def check_carry_files(E, derived, given_fps, g21):
+    """ALLOC_ADDRESSES, ZUSD_CARRY, FAUCET_RECIPIENTS against the derivations; exits on the first refusal."""
+    def need(c, m):
+        if not c:
+            raise SystemExit(f"cut-chain22: {m}")
+    given_ok = E.get("SET11_GIVEN", "").split()
+    files = (("ALLOC_ADDRESSES", True), ("ZUSD_CARRY", True), ("FAUCET_RECIPIENTS", False))
+    rows = {v: carry_rows(E[v], a) for v, a in files}
+    extra = [r["c21"] for rs in rows.values() for r in rs]
+    c21_addrs, c21_pks = chain21_known(g21, derived, extra)
+    used_given = set()
+    for var, _ in files:
+        seen_l, seen_a = set(), set()
+        for r in rows[var]:
+            lab, a = r["label"], r["address"]
+            # (ZUSD_CARRY may pay one holder in several notes, as chain 21 did)
+            need(var == "ZUSD_CARRY" or (lab not in seen_l and a not in seen_a), f"{var}: {lab} — a label or an address twice")
+            seen_l.add(lab); seen_a.add(a)
+            key, c21, given = r["key"], r["c21"], r["given"]
+            if key is not None:
+                need(key in derived, f"{var}: {lab}: its key file {key} was not derived (derive_wallet_addresses runs before this check)")
+                a11, a9 = derived[key]
+                need(a != a9, f"{var}: {lab}: {a[:16]}… is the CHAIN-21 (set-9) address of its key file — a set-11 wallet can never spend it; "
+                              f"the set-11 address WALLET22 derives is {a11[:16]}… (re-run `balances` with WALLET22, or fix the line)")
+                need(a == a11, f"{var}: {lab}: {a[:16]}… is not the set-11 address WALLET22 derives from its key file ({a11[:16]}…) — refusing an address no held key derives")
+                need(c21 is None or c21 == a9, f"{var}: {lab}: c21= {(c21 or "")[:16]}… is not the chain-21 address of its key file ({a9[:16]}…, WALLET)")
+                need(var != "ALLOC_ADDRESSES" or c21 is not None, f"{var}: {lab}: no c21= — `balances` writes each line with the chain-21 address it scanned; regenerate it")
+            else:
+                need(var != "ALLOC_ADDRESSES", f"{var}: {lab}: given= — every RAND alloc comes from a held key file (key=, as `balances` writes it); a given address is for ZUSD_CARRY / FAUCET_RECIPIENTS only")
+                need(lab in given_ok, f"{var}: {lab}: given= — a set-11 address its holder sent, not derived here: name {lab} in SET11_GIVEN (and on the set11-given: line of the cut record) to accept it")
+                need(a in given_fps, f"{var}: {lab}: the given address was not fingerprinted (derive_wallet_addresses runs before this check)")
+                need(given_fps[a] == given.upper(), f"{var}: {lab}: WALLET22 prints fingerprint {given_fps[a]} for the given address, the line says {given} — a typo or another wallet")
+                used_given.add(lab)
+            need(a not in c21_addrs and (pk_of(a) is None or pk_of(a) not in c21_pks),
+                 f"{var}: {lab}: {a[:16]}… is an address chain 21 knew (its genesis, the set-9 address of a key file, or a c21= column) — a set-9 address in chain 22 is unspendable")
+    need(set(given_ok) <= used_given, f"SET11_GIVEN names {sorted(set(given_ok) - used_given)}, which no given= line uses — unset what is not given")
+    return rows
+'
+# shellcheck disable=SC2090
+export CARRY_PY
+
+# Before any note is sealed: every carry line against the derivations ($TMP, derive_wallet_addresses).
+py_addresses() {
+  python3 - <<'PY'
+import json, os, sys
+E = os.environ
+exec(E["UNITS_PY"]); exec(E["CARRY_PY"])
+derived, given_fps, _ = load_derived(E["TMP"])
+rows = check_carry_files(E, derived, given_fps, json.load(open(E["CHAIN21_GENESIS"])))
+given = sorted(r["label"] for rs in rows.values() for r in rs if r["given"])
+print(f"cut-chain22: set-11 addresses: ALLOC_ADDRESSES {len(rows['ALLOC_ADDRESSES'])}, ZUSD_CARRY {len(rows['ZUSD_CARRY'])}, "
+      f"FAUCET_RECIPIENTS {len(rows['FAUCET_RECIPIENTS'])} line(s) — each key= line re-derived by WALLET22 from its key file, "
+      f"none an address chain 21 knew; given (SET11_GIVEN, fingerprint-checked): {', '.join(given) or 'none'}")
+PY
+}
+
+# The cut record's address-derivation line (once): which binaries derived chain 22's addresses.
+record_address_derivation() {   # <cut record>
+  local line n
+  n=$(wc -l < "$TMP/derived-wallets.tsv" | tr -d ' ')
+  line="address-derivation: set 11 via WALLET22 sha256 $WALLET22_SHA256 (probe $PROBE_FP_SET11), chain 21 via WALLET sha256 $WALLET_SHA256 (probe $PROBE_FP_SET9); $n key file(s) re-derived; given: ${SET11_GIVEN:-none}"
+  ! grep -qxF "$line" "$1" || return 0
+  [ -z "$(tail -c1 "$1")" ] || echo >> "$1"
+  printf '# written by the cut: every rand1… address in chain 22'"'"'s genesis was derived under constraint set 11\n%s\n' "$line" >> "$1"
 }
 
 # ══ snapshot: read-only reads of chain 21 and of the source endpoints ═════════════════════════
@@ -884,6 +1198,13 @@ def rand(key, *args):
     if p.returncode != 0:
         sys.exit(f"cut-chain22: rand {' '.join(args)} for {key}: {p.stderr.strip()}")
     return p.stdout
+def address22(key):
+    """The key file's chain-22 address: WALLET22 (set 11) derives it — never the chain-21 one the scan reads."""
+    p = subprocess.run([E["WALLET22"], "--key", key, "address"], capture_output=True, text=True)
+    a = (p.stdout.splitlines() or [""])[0].strip()
+    if p.returncode != 0 or not a.startswith("rand1"):
+        sys.exit(f"cut-chain22: WALLET22 address for {key}: {p.stderr.strip()[:200]}")
+    return a
 files = []
 for d in E["WALLETS_DIRS"].split():
     if os.path.isdir(d):
@@ -898,6 +1219,9 @@ sync = ["sync", "--rescan"] if E.get("BALANCES_RESCAN", "1") == "1" else ["sync"
 for f in files:
     label = os.path.basename(f)[: -len(".key.json")]
     addr = rand(f, "address").splitlines()[0].strip()
+    addr22 = address22(f)
+    if addr22 == addr:
+        sys.exit(f"cut-chain22: {f} derives one address under WALLET and WALLET22 — the two binaries are one constraint set")
     rand(f, *sync)
     out = rand(f, "balance")
     line = next((l for l in out.splitlines() if l.startswith("balance: ") and l.endswith(" RAND")), None)
@@ -915,7 +1239,7 @@ for f in files:
             pend.append((cols[1], cols[2], cols[5]))
     if pend:
         pending_by_wallet.append((label, pend))
-    row = {"label": label, "address": addr, "rand_units": ru, "zusd_units": zu, "file": f}
+    row = {"label": label, "address": addr, "address22": addr22, "rand_units": ru, "zusd_units": zu, "file": os.path.abspath(f)}
     prev = by_addr.get(addr)
     if prev and (prev["rand_units"], prev["zusd_units"]) != (ru, zu):
         sys.exit(f"cut-chain22: {prev['file']} and {f} are one address with different balances — reconcile the note stores")
@@ -964,21 +1288,31 @@ if uncovered:
 
 json.dump({"chain21_hash": E["CHAIN21_HASH"], "taken_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
            "height_from": height0, "height_to": height1, "wallets": rows, "carried_rand_units": total,
+           "wallet22_sha256": E.get("WALLET22_SHA256", ""), "wallet_sha256": E.get("WALLET_SHA256", ""),
            "uncovered_genesis_allocs": uncovered, "rescanned": sync == ["sync", "--rescan"], "prune_floor": prune_floor},
           open(os.path.join(E["SNAP"], "balances.json"), "w"), indent=1)
 os.makedirs(os.path.dirname(E["ALLOC_ADDRESSES"]) or ".", exist_ok=True)
 with open(E["ALLOC_ADDRESSES"], "w") as out:
-    out.write(f"# chain-22 RAND carry: chain-21 balances at heights {height0}..{height1}, `balances` step\n")
+    out.write(f"# chain-22 RAND carry: chain-21 balances at heights {height0}..{height1}, `balances` step\n"
+              f"# <label> <SET-11 address: WALLET22 sha256 {E.get('WALLET22_SHA256', '?')[:16]}…> <RAND> key=<key file> c21=<the chain-21 address scanned>\n"
+              f"# the cut re-derives each address from its key file; never edit an address by hand\n")
     for r in carry:
-        out.write(f"{r['label']} {r['address']} {fmt(r['rand_units'])}\n")
+        out.write(f"{r['label']} {r['address22']} {fmt(r['rand_units'])} key={r['file']} c21={r['address']}\n")
 print(f"cut-chain22: {len(carry)} wallet(s) with RAND, Σ {fmt(total)} RAND → {E['ALLOC_ADDRESSES']} (+ {E['SNAP']}/balances.json)")
 z = [r for r in rows if r["zusd_units"]]
 if z:
     op_total = sum(r["zusd_units"] for r in z)
     print(f"cut-chain22: zUSD held by operator wallets: " + ", ".join(f"{r['label']} {r['zusd_units']}" for r in z) + f" (Σ {op_total})")
+    print("cut-chain22: their ZUSD_CARRY lines, at the set-11 addresses (key= lines; a holder whose key is not here sends a given= line):")
+    for r in z:
+        print(f"    {r['label']} {r['address22']} {fmt(r['zusd_units'], 8)} key={r['file']}")
     if os.path.isfile(E["ZUSD_CARRY"]):
-        carry_total = sum(units(a, 8) for _, _, a in alloc_lines(E["ZUSD_CARRY"]))
-        if carry_total != op_total:
+        try:
+            carry_total = sum(units(a, 8) for _, _, a in alloc_lines(E["ZUSD_CARRY"]))
+        except SystemExit as e:
+            print(f"cut-chain22: ⚠ {E['ZUSD_CARRY']} is not a chain-22 carry file ({e}) — write it with set-11 addresses (key= / given=) before the cut")
+            carry_total = None
+        if carry_total is not None and carry_total != op_total:
             print(f"cut-chain22: ⚠ Σ operator-wallet zUSD ({op_total}) != Σ ZUSD_CARRY ({carry_total}) — "
                   f"a non-operator holder (e.g. Anish's wallet) legitimately differs; verify by hand")
 PY
@@ -1034,17 +1368,34 @@ for a in gone:
 for r in rows:
     live = register.get(r["address"])
     need(live is not None, f"{r['name']} ({r['address']}) is not in chain 21's register")
-    need(live["payout"] == r["payout"], f"{r['name']}: payout differs from chain 21's register")
+    need(live["payout"] == r["payout"], f"{r['name']}: payout differs from chain 21's register")   # still the chain-21 (set-9) payout here
     need(int(live["stake"]) == stake and not live["pending"], f"{r['name']}: chain 21 stake {live['stake']} / pending {live['pending']}, not a plain {stake}")
     need(live["active"], f"{r['name']} is not active on chain 21")
     need(int(live.get("rewards", "0")) == 0 or E.get("REWARDS_DROPPED_OK"),
          f"{r['name']}: chain 21 shows {live['rewards']} unwithdrawn reward units — withdraw them before the cut "
          f"(rewards are not carried), or set REWARDS_DROPPED_OK=1 to drop them")
 need(len({r["public_key"] for r in rows}) == count and len({r["address"] for r in rows}) == count, "a validator twice")
+# Constraint set 11 (header, "EVERY SHIELDED ADDRESS"): a payout is a shielded address, and chain 21's
+# (above, `payout`) is SET 9 — rewards paid there are unspendable by a set-11 wallet. Each validator's
+# chain-22 payout is WALLET22's derivation of the payout key file whose WALLET (set-9) derivation IS
+# its chain-21 payout (PAYOUT_KEYS_DIRS/<name>.key.json; derive_wallet_addresses).
+exec(E["UNITS_PY"]); exec(E["CARRY_PY"])
+derived, _, payout_keys = load_derived(E["TMP"])
+for r in rows:
+    r["payout21"] = r["payout"]
+    hits = sorted({derived[k][0] for k in payout_keys.get(r["name"], []) if k in derived and derived[k][1] == r["payout21"]})
+    need(payout_keys.get(r["name"]), f"{r['name']}: no payout key file {r['name']}.key.json under PAYOUT_KEYS_DIRS ({E['PAYOUT_KEYS_DIRS']}) — "
+                                     f"its chain-21 payout is a set-9 address; chain 22 pays it at the set-11 address WALLET22 derives from that key")
+    need(hits, f"{r['name']}: none of its payout key files ({', '.join(payout_keys[r['name']])}) derives its chain-21 payout {r['payout21'][:16]}… under WALLET "
+               f"— not this validator's payout key; refusing to guess its set-11 payout")
+    need(len(hits) == 1, f"{r['name']}: two payout key files derive its chain-21 payout but different set-11 addresses — impossible for one key; check PAYOUT_KEYS_DIRS")
+    r["payout"] = hits[0]
+    need(r["payout"] != r["payout21"], f"{r['name']}: the set-11 payout is the chain-21 one — WALLET22 is not set 11")
+need(len({r["payout"] for r in rows}) == len({r["payout21"] for r in rows}), "two validators' payouts collapse onto one set-11 address")
 total_rewards = sum(int(register[r["address"]].get("rewards", "0")) for r in rows)
 if total_rewards:
     print(f"cut-chain22: ⚠ dropping {total_rewards} unwithdrawn reward unit(s) across the register (REWARDS_DROPPED_OK=1)")
-need([(v["public_key"], v["payout"]) for n, v in zip(names21, g21["validators"]) if n not in dropped_names] == [(r["public_key"], r["payout"]) for r in rows],
+need([(v["public_key"], v["payout"]) for n, v in zip(names21, g21["validators"]) if n not in dropped_names] == [(r["public_key"], r["payout21"]) for r in rows],
      f"the {count} are not chain 21's genesis validators without {', '.join(dropped_names)} (keys, payouts or order)")
 json.dump(rows, open(os.path.join(E["TMP"], "validators.json"), "w"))
 with open(os.path.join(E["TMP"], "validator-args"), "w") as f:
@@ -1053,7 +1404,8 @@ with open(os.path.join(E["TMP"], "validator-args"), "w") as f:
 t = g21["tokens"]
 json.dump({"registration_fee": t["registration_fee"], "mint_cap_per_day": t["mint_cap_per_day"], "tokens": []},
           open(os.path.join(E["TMP"], "tokens.json"), "w"))
-print(f"cut-chain22: {count} validators × {E['STAKE_RAND']} RAND (quorum {E['VALIDATOR_QUORUM']}), equal to chain 21's register at height {snap['status_height']} without {', '.join(dropped_names)}")
+print(f"cut-chain22: {count} validators × {E['STAKE_RAND']} RAND (quorum {E['VALIDATOR_QUORUM']}), equal to chain 21's register at height {snap['status_height']} without {', '.join(dropped_names)}; "
+      f"each payout at its SET-11 address (WALLET22, from the payout key file whose set-9 address is the chain-21 payout)")
 PY
 }
 
@@ -1290,6 +1642,11 @@ need(g21.get("chain_id") == 21 and "fees" in g21 and "perps" in g21 and "multisi
      "CHAIN21_GENESIS is not chain 21's (chain id 21 with fees, perps, multisig and hc_auth_multisig; none of the fields chain 22 adds)")
 b21 = g21["bridge"]
 need({c: E[f"C21_EMITTER_{c}"] for c in "2345"} == b21["emitters"], "C21_EMITTER_* are not deploy/genesis-chain21.json's emitters")
+# Constraint set 11: every carry line again (py_addresses ran before the notes were sealed), and the
+# chain-21 addresses the backstop at the end refuses in the finished file.
+exec(E["CARRY_PY"])
+derived, given_fps, _ = load_derived(E["TMP"])
+carry = check_carry_files(E, derived, given_fps, g21)
 
 # ── bridge: chain 21's live values, the floors re-derived, rotation and fees chain 21's ─────────
 rotated = E.get("BRIDGE_ROTATED")
@@ -1439,10 +1796,15 @@ bal_file = E.get("BALANCES_FILE", "")
 if os.path.isfile(bal_file):
     bal = json.load(open(bal_file))
     need(bal["chain21_hash"] == E["CHAIN21_HASH"], "balances.json is not of chain 21")
+    # the scan is chain 21's (set-9 addresses); each alloc line names the one it carries (c21=, checked
+    # against its key file by check_carry_files) and sits at its key file's set-11 address
     scanned = sorted((w["address"], w["rand_units"]) for w in bal["wallets"] if w["rand_units"] > 0)
-    listed = sorted((addr, units(a)) for _, addr, a in alloc)
+    listed = sorted((r["c21"], units(r["amount"])) for r in carry["ALLOC_ADDRESSES"])
     need(sum(u for _, u in scanned) == alloc_total, f"Σ alloc RAND {alloc_total} != Σ scanned balances {sum(u for _, u in scanned)}")
-    need(scanned == listed, "ALLOC_ADDRESSES is not the scanned wallets one-for-one (address, amount) — regenerate it with `balances`")
+    need(scanned == listed, "ALLOC_ADDRESSES is not the scanned wallets one-for-one (chain-21 address, amount) — regenerate it with `balances`")
+    a22 = {w["address"]: w.get("address22") for w in bal["wallets"]}
+    need(all(a22.get(r["c21"]) in (None, r["address"]) for r in carry["ALLOC_ADDRESSES"]),
+         "an ALLOC_ADDRESSES line's set-11 address is not the one `balances` wrote for that wallet — regenerate it with `balances`")
     uncovered = bal.get("uncovered_genesis_allocs") or []
     need(not uncovered or E.get("UNCOVERED_ALLOCS_OK"),
          "chain 21 genesis alloc(s) match no scanned wallet, so their value would be dropped silently: "
@@ -1525,17 +1887,20 @@ if prog:
 # ── staking: chain 21's (the entry budget in basis points, admission by vote); no slashing ──────
 s21 = g21["staking"]
 need("slashing" not in s21, "chain 21's staking has `slashing` — this script carries none")
-if E.get("FAUCET_RECIPIENTS"):
-    recipients = [l.split()[-1] for l in open(E["FAUCET_RECIPIENTS"]) if l.strip() and not l.startswith("#")]
-    need(recipients and all(r.startswith("rand1") for r in recipients) and len(set(recipients)) == len(recipients),
-         "FAUCET_RECIPIENTS: rand1… addresses, each once")
-    need(recipients == s21["faucet_recipients"] or E.get("FAUCET_RECIPIENTS_CHANGED"),
-         f"the faucet allowlist differs from chain 21's ({len(s21['faucet_recipients'])} → {len(recipients)}) "
-         f"— set FAUCET_RECIPIENTS_CHANGED=1 if that is the decision")
-    if recipients != s21["faucet_recipients"]:
-        warnings.append(f"faucet allowlist changed from chain 21's ({len(s21['faucet_recipients'])} → {len(recipients)})")
-else:
-    recipients = s21["faucet_recipients"]
+# The allowlist at SET-11 addresses (chain 21's genesis list is set 9 and is never carried as is):
+# "unchanged" means its chain-21 counterparts — each key file's WALLET address, or a given line's
+# c21= — are chain 21's allowlist, in order.
+frows = carry["FAUCET_RECIPIENTS"]
+recipients = [r["address"] for r in frows]
+need(recipients, "FAUCET_RECIPIENTS lists no recipient")
+counterparts = [derived[r["key"]][1] if r["key"] else r["c21"] for r in frows]
+faucet_same = counterparts == s21["faucet_recipients"]
+need(faucet_same or E.get("FAUCET_RECIPIENTS_CHANGED"),
+     f"the faucet allowlist is not chain 21's at set-11 addresses ({len(s21['faucet_recipients'])} chain-21 entries, "
+     f"{sum(1 for c in counterparts if c in s21['faucet_recipients'])} of FAUCET_RECIPIENTS' {len(recipients)} map onto them in order) — "
+     f"set FAUCET_RECIPIENTS_CHANGED=1 if that is the decision")
+if not faucet_same:
+    warnings.append(f"faucet allowlist changed from chain 21's ({len(s21['faucet_recipients'])} → {len(recipients)})")
 vals = {v["name"]: v for v in json.load(open(os.path.join(E["TMP"], "validators.json")))}
 minters = []
 for name in E["FAUCET_MINTERS"].split():
@@ -1864,16 +2229,27 @@ need(fees == {"mint_bps": 10, "burn_bps": 10, "recipient": E["FEE_RECIPIENT"]},
 payouts = {v["payout"] for v in g["validators"]}
 need(fees["recipient"] not in payouts or E.get("FEE_RECIPIENT_IS_PAYOUT_OK"),
      "bridge.fees.recipient is a validator's payout address — docs/deploy.md: a dedicated key, never a validator's (FEE_RECIPIENT_IS_PAYOUT_OK=1 to accept)")
-need(fees == b21.get("fees") or E.get("FEE_RECIPIENT_CHANGED"),
-     "bridge.fees is not chain 21's (deploy/genesis-chain21.json) — FEE_RECIPIENT_CHANGED=1 only for a knowingly new recipient")
+# chain 21's bps; its recipient is the owner's wallet at its SET-9 address — never carried (set 11)
+need({k: v for k, v in fees.items() if k != "recipient"} == {k: v for k, v in (b21.get("fees") or {}).items() if k != "recipient"},
+     "bridge.fees' mint_bps / burn_bps are not chain 21's (deploy/genesis-chain21.json)")
+need(fees["recipient"] != (b21.get("fees") or {}).get("recipient"),
+     "bridge.fees.recipient is chain 21's (fingerprint 89DS-4Q4X-HXSX-MBYW) — the owner's wallet at its SET-9 address, unspendable on chain 22: "
+     "the owner's set-11 address goes in FEE_RECIPIENT_FILE (`rand address` with the v0.8.7 wallet)")
 if fees["recipient"] in {a for _, a, _ in alloc}:
     warnings.append("the bridge fee recipient is also a carried RAND wallet (an alloc) — its viewing key sees every fee note")
 need(g["epoch_blocks"] == int(E["EPOCH_BLOCKS"]) == g21["epoch_blocks"], "epoch_blocks is not chain 21's")
 need(len(g["validators"]) == int(E["VALIDATOR_COUNT"]) == 25 and all(v["stake"] == int(E["STAKE_RAND"]) * 10**9 for v in g["validators"]), "validators wrong")
 need([v["public_key"] for v in g["validators"]] == [vals[n]["public_key"] for n in vals], "validator order/keys wrong")
 g21_by_pk = {v["public_key"]: v for v in g21["validators"]}
-need(all(v == g21_by_pk.get(v["public_key"]) for v in g["validators"]),
-     "not chain 21's shape: ['validators'] — a validator entry (stake, payout, …) differs from its chain-21 genesis entry")
+vals_by_pk = {v["public_key"]: v for v in vals.values()}
+# chain 21's entry with the payout moved to its set-11 address (py_validators derived it from the key
+# file whose set-9 address is chain 21's payout) — and nothing else moved
+need(all(v["public_key"] in g21_by_pk and vals_by_pk[v["public_key"]]["payout21"] == g21_by_pk[v["public_key"]]["payout"]
+         and v == {**g21_by_pk[v["public_key"]], "payout": vals_by_pk[v["public_key"]]["payout"]} for v in g["validators"]),
+     "not chain 21's shape: ['validators'] — a validator entry (stake, …) differs from its chain-21 genesis entry, or its payout is not the set-11 "
+     "address py_validators derived")
+need(not {v["payout"] for v in g["validators"]} & {v["payout"] for v in g21["validators"]},
+     "a validator payout is chain 21's (set-9) address — its rewards would be unspendable on chain 22")
 for i, n in enumerate(g["alloc"]):
     need(n.get("opening") is not None, f"alloc note {i} has no opening (core I-2)")
 need(sum(n["amount"] for n in g["alloc"] if n["opening"].get("asset", 0) == 1) == locked_total, "Σ zUSD notes != Σ locked")
@@ -1918,14 +2294,14 @@ if E.get("LIMITS_CHANGED"):
     excused |= {"max_program_words", "max_proof_bytes", "max_block_bytes", "max_call_envelope_bytes", "max_program_public_words"}
 moved = sorted(k for k in set(g) | set(g21) if k not in excused and g.get(k) != g21.get(k))
 need(not moved, f"not chain 21's shape: {moved} differ from chain 21's genesis")
-want_staking = s21
+want_staking = {**s21, "faucet_recipients": recipients}   # the allowlist at its set-11 addresses (asserted above)
 if not (E.get("FAUCET_RECIPIENTS_CHANGED") or E.get("FAUCET_MINTERS_CHANGED")):
     need(st == want_staking, f"staking is not chain 21's: "
          f"{sorted(k for k in set(st) | set(want_staking) if st.get(k) != want_staking.get(k))} differ")
+# (bridge.fees: its recipient moves to the set-11 address by design, its bps asserted above)
 bridge_moved = sorted(k for k in set(g["bridge"]) | set(b21)
-                      if k not in ("burn_sequence", "min_inbound_sequence") and g["bridge"].get(k) != b21.get(k))
-need(not bridge_moved or rotated or (bridge_moved == ["emitters"] and E.get("EMITTERS_CHANGED"))
-     or (bridge_moved == ["fees"] and E.get("FEE_RECIPIENT_CHANGED")),
+                      if k not in ("burn_sequence", "min_inbound_sequence", "fees") and g["bridge"].get(k) != b21.get(k))
+need(not bridge_moved or rotated or (bridge_moved == ["emitters"] and E.get("EMITTERS_CHANGED")),
      f"bridge fields {bridge_moved} differ from chain 21's genesis (BRIDGE_ROTATED=1 carries a live rotation)")
 strip_locked = lambda toks: [{**t, "backings": [{k: v for k, v in b.items() if k != "locked"} for b in t["backings"]]} for t in toks]
 need({**{k: v for k, v in g["tokens"].items() if k != "incremental_root"}, "tokens": strip_locked(g["tokens"]["tokens"])}
@@ -1944,6 +2320,15 @@ need(ms["create_fee"] == g21["multisig"]["create_fee"] and set(ms) - {"max_accou
      "multisig differs from chain 21's in more than max_accounts and the treasury's salt, signers, threshold (5 of 6) and carried balance")
 now_ms = int(time.time() * 1000)
 need(g["timestamp_ms"] <= now_ms + 15_000, "timestamp_ms is in the future beyond the 15 s vote drift bound")
+# ── the BACKSTOP (constraint set 11): no shielded address in chain 22's genesis — a rand1… string
+# anywhere, or a note's opening pk — is one chain 21 knew (its genesis, every key file's set-9
+# address, every c21= column). A set-9 address here would hold value no set-11 wallet can spend. ──
+c21_addrs, c21_pks = chain21_known(g21, derived, [r["c21"] for rs in carry.values() for r in rs] + [v["payout21"] for v in vals.values()])
+stale = sorted(a for a in walk_rand1(g, set()) if a in c21_addrs or (pk_of(a) is not None and pk_of(a) in c21_pks))
+need(not stale, f"{len(stale)} chain-21 (set-9) address(es) in chain 22's genesis ({', '.join(a[:16] + '…' for a in stale[:4])}) — "
+                f"unspendable by a set-11 wallet; every address must be WALLET22's derivation")
+stale_pk = [i for i, n in enumerate(g["alloc"]) if (n.get("opening") or {}).get("pk") in c21_pks]
+need(not stale_pk, f"alloc note(s) {stale_pk[:6]} are sealed to a chain-21 (set-9) pk — unspendable by a set-11 wallet")
 
 json.dump(g, open(out, "w"), indent=2)
 open(out, "a").write("\n")
@@ -1989,12 +2374,12 @@ perp_genesis_root_step() {
   PERPS_STEP=markets py_perps
   "$PERP_PROVER" genesis-state --markets "$TMP/perps-markets.json" --out "$TMP/perp-state0.json" \
     || { echo "cut-chain22: \`$PERP_PROVER genesis-state\` failed" >&2; exit 1; }
-  PERP_GENESIS_ROOT=$("$WALLET" perp genesis-root --state "$TMP/perp-state0.json" | tail -1)
+  PERP_GENESIS_ROOT=$("$WALLET22" perp genesis-root --state "$TMP/perp-state0.json" | tail -1)
   [[ $PERP_GENESIS_ROOT =~ ^[0-9a-f]{64}$ ]] || { echo "cut-chain22: \`rand perp genesis-root\` printed '$PERP_GENESIS_ROOT', not a root" >&2; exit 1; }
   [ "$PERP_GENESIS_ROOT" != "$PERP_GENESIS_ROOT_CHAIN21" ] \
-    || { echo "cut-chain22: \`$WALLET perp genesis-root\` printed chain 21's set-9 root $PERP_GENESIS_ROOT_CHAIN21 — a rand of constraint set 9; chain 22 needs v0.8.7 (set 11)" >&2; exit 1; }
+    || { echo "cut-chain22: \`$WALLET22 perp genesis-root\` printed chain 21's set-9 root $PERP_GENESIS_ROOT_CHAIN21 — a rand of constraint set 9; chain 22 needs v0.8.7 (set 11)" >&2; exit 1; }
   [ "$PERP_GENESIS_ROOT" = "$PERP_GENESIS_ROOT_DECIDED" ] \
-    || { echo "cut-chain22: \`$WALLET perp genesis-root\` printed $PERP_GENESIS_ROOT, not the recorded set-11 root $PERP_GENESIS_ROOT_DECIDED (the same markets on the same engine) — another perp-prover state layout or constraint set" >&2; exit 1; }
+    || { echo "cut-chain22: \`$WALLET22 perp genesis-root\` printed $PERP_GENESIS_ROOT, not the recorded set-11 root $PERP_GENESIS_ROOT_DECIDED (the same markets on the same engine) — another perp-prover state layout or constraint set" >&2; exit 1; }
   export PERP_GENESIS_ROOT
 }
 
@@ -2462,7 +2847,7 @@ fi
 # hex), none of them chain 21's — at the snapshot's 100 000 RAND.
 py_fixtures() {
   python3 - <<'PY'
-import copy, json, os, time
+import copy, hashlib, json, os, time
 E = os.environ; st = E["ST"]; dry = E.get("FIXTURE_MODE") == "dryrun"
 exec(E["UNITS_PY"])
 g21 = json.load(open(E["CHAIN21_GENESIS"]))
@@ -2472,6 +2857,8 @@ gnames, bnames = E["GENESIS_NAMES"].split(), E["BONDED"].split()
 # registration file the fixture does not even write: nothing may need it)
 names21 = gnames + E["CHAIN21_BONDED"].split()
 names = gnames + bnames
+payout11 = lambda n: f"rand1SELFTEST11payout{n}"   # the selftest's fake set-11 payouts (py_validators derives them)
+rekey = lambda n: {**n, "opening": {**n["opening"], "pk": hashlib.sha256(("set-11 " + n["opening"]["pk"]).encode()).hexdigest()}}   # a fixture note at a set-11 pk
 assert len(names21) == len(g21["validators"]) == 26 and len(names) == 25 and set(names21) - set(names) == set(E["DROPPED_VALIDATORS"].split())
 minters = g21["staking"]["faucet_minters"]
 assert len(minters) == len(gnames)
@@ -2515,19 +2902,47 @@ snap = {"taken_at": "dryrun" if dry else "selftest", "genesis_hash": E["CHAIN21_
 json.dump(snap, open(f"{st}/snap/chain21-state.json", "w"))
 rand_notes = [n for n in g21["alloc"] if n["opening"].get("asset", 0) == 0]
 zusd_notes = [n for n in g21["alloc"] if n["opening"].get("asset", 0) == 1]
-payouts = list(dict.fromkeys(v["payout"] for v in g21["validators"]))
-assert len(payouts) >= len(rand_notes) + 1, "not enough distinct payout addresses for the dry-run carry"
-wallets = [{"label": f"w{i}", "address": payouts[i] if dry else f"rand1SELFTEST{i}", "rand_units": n["amount"], "zusd_units": 0, "file": "-"}
+# The carry wallets (constraint set 11: each line names its key file; the cut re-derives it). The dry
+# run's are THROWAWAY keys WALLET22 made (bash, before this step: $ST/dry-derived.tsv, "<label> <key
+# file> <set-11 address> <set-9 address>"); the selftest's are fake files at fake addresses, their
+# "derivations" written where derive_wallet_addresses writes them ($ST/tmp/*.tsv).
+faucet21 = g21["staking"]["faucet_recipients"]
+labels = [f"w{i}" for i in range(len(rand_notes))] + ["holder"] + [f"f{i:02d}" for i in range(len(faucet21))]
+if dry:
+    keyed = {l: (k, a11, a9) for l, k, a11, a9 in (line.rstrip("\n").split("\t") for line in open(f"{st}/dry-derived.tsv") if line.strip())}
+    assert set(labels) <= set(keyed), "the dry run's throwaway keys do not cover the fixture wallets"
+else:
+    os.makedirs(f"{st}/keys"); os.makedirs(f"{st}/payout")
+    keyed = {}
+    for i, l in enumerate(labels):
+        k = f"{st}/keys/{l}.key.json"
+        open(k, "w").write("{}\n"); os.chmod(k, 0o600)
+        a9 = f"rand1SELFTEST{i}" if l.startswith("w") else "rand1SELFTESTz" if l == "holder" else faucet21[int(l[1:])]
+        keyed[l] = (k, f"rand1SELFTEST11{l}", a9)
+    p21 = {n: v["payout"] for n, v in zip(names21, g21["validators"])}
+    with open(f"{st}/tmp/derived-wallets.tsv", "w") as dw, open(f"{st}/tmp/payout-keys.tsv", "w") as pk:
+        for l, (k, a11, a9) in keyed.items():
+            dw.write(f"{k}\t{a11}\t{a9}\n")
+        for n in names:
+            k = f"{st}/payout/{n}.key.json"
+            open(k, "w").write("{}\n"); os.chmod(k, 0o600)
+            dw.write(f"{k}\t{payout11(n)}\t{p21[n]}\n")
+            pk.write(f"{n}\t{k}\n")
+    open(f"{st}/tmp/given-fingerprints.tsv", "w").write("")
+wallets = [{"label": f"w{i}", "address": keyed[f"w{i}"][2], "address22": keyed[f"w{i}"][1], "rand_units": n["amount"], "zusd_units": 0, "file": keyed[f"w{i}"][0]}
            for i, n in enumerate(rand_notes)]
-wallets.append({"label": "empty", "address": "rand1FIXTUREempty", "rand_units": 0, "zusd_units": 0, "file": "-"})
+wallets.append({"label": "empty", "address": "rand1FIXTUREempty", "address22": "rand1FIXTURE11empty", "rand_units": 0, "zusd_units": 0, "file": "-"})
 json.dump({"chain21_hash": E["CHAIN21_HASH"], "height_from": 50000, "height_to": 50000, "wallets": wallets,
            "uncovered_genesis_allocs": [], "rescanned": True}, open(f"{st}/snap/balances.json", "w"))
 with open(f"{st}/alloc-rand.txt", "w") as f:
     f.write(f"# {'dry run' if dry else 'selftest'}\n")
     for w in wallets[:-1]:
-        f.write(f"{w['label']} {w['address']} {fmt(w['rand_units'])}\n")
-holder = payouts[len(rand_notes)] if dry else "rand1SELFTESTz"
-open(f"{st}/zusd-carry.txt", "w").write("".join(f"holder {holder} {fmt(n['amount'], 8)}\n" for n in zusd_notes))
+        f.write(f"{w['label']} {w['address22']} {fmt(w['rand_units'])} key={w['file']} c21={w['address']}\n")
+hk, h11, _ = keyed["holder"]
+open(f"{st}/zusd-carry.txt", "w").write("".join(f"holder {h11} {fmt(n['amount'], 8)} key={hk}\n" for n in zusd_notes))
+fl = [f"f{i:02d} {keyed[f'f{i:02d}'][1]} key={keyed[f'f{i:02d}'][0]}\n" for i in range(len(faucet21))]
+open(f"{st}/faucet-recipients.txt", "w").write(f"# {'dry run: THROWAWAY keys' if dry else 'selftest'}\n" + "".join(fl))
+open(f"{st}/faucet-recipients-changed.txt", "w").write("".join(fl[:-1]))
 # A filled cut record (the fixture's — the real one is the operator's, published before the cut).
 open(f"{st}/cut-record.txt", "w").write(
     "chain-id: 22\nreason: audit v11 gated fields — PST-1 refuse_panics, PERP-6 bound_payouts, PERP-101 sparse windows, CON-60, CON-601: validators load the pinned tier-18 state-proof key (genesis pin), never build it (fixture), MSA-4 max_accounts; "
@@ -2567,10 +2982,9 @@ json.dump({**{k: d[k] for k in ("collateral_asset", "max_tier", "max_window_bloc
            "max_pending_digests": int(E["PERPS_MAX_PENDING_DIGESTS"]),
            "state_proof_keys": json.loads(E["PERPS_STATE_PROOF_KEYS_JSON"])},
           open(f"{st}/tmp/perps.json", "w"))
-open(f"{st}/faucet-recipients-changed.txt", "w").write("someone rand1SELFTESTfaucetrecipientchanged\n")
 with open(f"{st}/tmp/token-notes.jsonl", "w") as f:
     for n in zusd_notes:
-        f.write(json.dumps(n) + "\n")
+        f.write(json.dumps(rekey(n)) + "\n")
 # what `rand-node genesis --hardening-v6 --bundle-guest v3 --auth-guest --gas-… --testnet
 # --binding-domain 1 --proof-window-blocks 1024 --program-state-cell-fee … --program-state-refuse-panics
 # --fees … --auth-multisig-guest --tokens-incremental-root` writes, before the splice
@@ -2579,8 +2993,10 @@ base = {k: g21[k] for k in ("chain_id", "timestamp_ms", "validators", "faucet", 
                            "epoch_blocks", "max_program_words", "max_proof_bytes", "max_block_bytes", "max_call_envelope_bytes",
                            "max_program_public_words", "envelope_bytes", "hardening_v6", "hc_auth")}
 tb, tg, bps = (int(x) for x in E["GAS_DYNAMIC"].split(","))
-base.update(chain_id=22, timestamp_ms=int(time.time() * 1000), alloc=rand_notes,
-            validators=[v for n, v in zip(names21, g21["validators"]) if n in names], hc_bundle=E["EXPECT_HC_BUNDLE"], hc_auth=E["EXPECT_HC_AUTH"],
+# What `rand-node genesis --alloc <set-11 address>=…` seals: notes to set-11 pks (fixture: chain 21's
+# notes re-keyed), the validators' payouts at their set-11 addresses (fixture: payout11).
+base.update(chain_id=22, timestamp_ms=int(time.time() * 1000), alloc=[rekey(n) for n in rand_notes],
+            validators=[{**v, "payout": payout11(n)} for n, v in zip(names21, g21["validators"]) if n in names], hc_bundle=E["EXPECT_HC_BUNDLE"], hc_auth=E["EXPECT_HC_AUTH"],
             max_proof_bytes=int(E["MAX_PROOF_BYTES"]), max_block_bytes=int(E["MAX_BLOCK_BYTES"]),
             hc_auth_multisig=E["EXPECT_HC_AUTH_MULTISIG"],
             tokens={"registration_fee": g21["tokens"]["registration_fee"], "mint_cap_per_day": g21["tokens"]["mint_cap_per_day"],
@@ -2621,7 +3037,8 @@ PY
 # ══ SELFTEST: the python steps on fixtures derived from deploy/genesis-chain21.json ════════════
 if [ "${SELFTEST:-}" = 1 ]; then
   ST=$(mktemp -d); FAKE_RPC_PID=; trap 'rm -rf "$ST"; [ -z "$FAKE_RPC_PID" ] || kill "$FAKE_RPC_PID" 2>/dev/null || true' EXIT
-  FEE_RECIPIENT=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["bridge"]["fees"]["recipient"])' "$CHAIN21_GENESIS")   # chain 21's
+  C21_FEE_RECIPIENT=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["bridge"]["fees"]["recipient"])' "$CHAIN21_GENESIS")   # chain 21's (set 9)
+  FEE_RECIPIENT=rand1SELFTEST11feerecipient   # a fixture set-11 recipient (load_fee_recipient's own cases are below)
   PERP_GENESIS_ROOT=$(printf 'ab%.0s' $(seq 32))   # a fixture root (the cut derives the real one with perp-prover)
   # Fixture values for the operator inputs and the derived pin (the cut reads the pin off the image);
   # the fixture root is not chain 21's, so FIXTURE_ROOT_OK; chain 21's treasury holds its genesis
@@ -2649,6 +3066,7 @@ PY
   NEW_EMITTER=$(printf '0%.0s' $(seq 63))1
   export SNAPSHOT_FILE=$ST/snap/chain21-state.json BALANCES_FILE=$ST/snap/balances.json CHAIN21_GENESIS=$ST/genesis-chain21.json \
     VALIDATORS_TSV=$ST/validators.tsv REGISTRATIONS=$ST/reg ALLOC_ADDRESSES=$ST/alloc-rand.txt ZUSD_CARRY=$ST/zusd-carry.txt \
+    FAUCET_RECIPIENTS=$ST/faucet-recipients.txt SET11_GIVEN='' \
     TMP=$ST/tmp HC_REPORTED=$EXPECT_HC_BUNDLE
   pass=0; fail=0
   ok()  { echo "selftest: ok   — $1"; pass=$((pass+1)); }
@@ -2716,15 +3134,20 @@ assert g["testnet"] is True and g["binding_domain"] == 1 and g["proof_window_blo
 assert (g["max_proof_bytes"], g["max_block_bytes"]) == (g21["max_proof_bytes"], g21["max_block_bytes"]) == (6291456, 19922944)
 assert g["gas"] == {**g21["gas"], "bundle_gas_limit": 22527} and g21["gas"]["bundle_gas_limit"] == 20479 and g["gas"]["dynamic"]["target_block_bytes"] == 9961472 and g["gas"]["dynamic"]["byte_load"] == "paying"
 assert g["bridge"]["rotation"] == g21["bridge"]["rotation"] == {"delay_secs": 86400, "needs_possession": True}
-assert g["bridge"]["fees"] == g21["bridge"]["fees"] and g["bridge"]["fees"]["mint_bps"] == g["bridge"]["fees"]["burn_bps"] == 10
+assert g["bridge"]["fees"] == {**g21["bridge"]["fees"], "recipient": "rand1SELFTEST11feerecipient"} and g["bridge"]["fees"]["mint_bps"] == g["bridge"]["fees"]["burn_bps"] == 10
 assert list(g["bridge"]) == list(g21["bridge"])
 assert g["bridge"]["emitters"] == g21["bridge"]["emitters"] and g["bridge"]["min_inbound_sequence"] == {"2": 3, "3": 5, "4": 3, "5": 7}
 assert g["bridge"]["burn_sequence"] == 14 and g["bridge"]["guardian_set_index"] == g21["bridge"]["guardian_set_index"]
-assert g["staking"] == g21["staking"] and g["staking"]["max_stake_entry_bps_per_epoch"] == 2500 and g["staking"]["admission_by_vote"] is True
+f11 = [l.split()[1] for l in open(E["FAUCET_RECIPIENTS"]) if l.strip() and not l.startswith("#")]
+assert g["staking"] == {**g21["staking"], "faucet_recipients": f11} and len(f11) == 16 and not set(f11) & set(g21["staking"]["faucet_recipients"])
+assert g["staking"]["max_stake_entry_bps_per_epoch"] == 2500 and g["staking"]["admission_by_vote"] is True
 assert "slashing" not in g["staking"] and "vesting" not in g and "aggregation" not in g
 assert [(b["chain"], b["locked"]) for b in g["tokens"]["tokens"][0]["backings"] if "locked" in b] == [(2, 2200000000), (3, 2300199900), (4, 3000000000), (5, 2500000000)]
 n21 = E["GENESIS_NAMES"].split() + E["CHAIN21_BONDED"].split()
-assert g["validators"] == [v for n, v in zip(n21, g21["validators"]) if n != "archive2"] and len(g["validators"]) == 25 and g["consensus_domain"] == 1
+# chain 21's validators without archive2, each payout at its set-11 address (constraint set 11)
+assert g["validators"] == [{**v, "payout": f"rand1SELFTEST11payout{n}"} for n, v in zip(n21, g21["validators"]) if n != "archive2"] and len(g["validators"]) == 25 and g["consensus_domain"] == 1
+assert not {v["payout"] for v in g["validators"]} & {v["payout"] for v in g21["validators"]}
+assert not {n["opening"]["pk"] for n in g["alloc"]} & {n["opening"]["pk"] for n in g21["alloc"]}
 assert g21["validators"][n21.index("archive2")] not in g["validators"]
 assert sum(n["amount"] for n in g["alloc"] if n["opening"].get("asset", 0) == 0) == sum(n["amount"] for n in g21["alloc"] if n["opening"].get("asset", 0) == 0)
 assert sum(n["amount"] for n in g["alloc"] if n["opening"].get("asset", 0) == 1) == 10000199900
@@ -3152,8 +3575,8 @@ d["supply"]["total_supply"] = str(2**66); json.dump(d, open(sys.argv[4], "w"))' 
   refuse "a rotation delay off 86400"        "$S" 'pass' "bridge.rotation is" ROTATION_DELAY_SECS=3600
   refuse "a mint fee off 10 bps"             "$S" 'pass' "bridge.fees is" BRIDGE_MINT_BPS=30
   refuse "no fee recipient loaded"           "$S" 'pass' "load_fee_recipient did not run" FEE_RECIPIENT=
-  refuse "a validator payout as fee recipient" "$S" 'pass' "a validator's payout address" FEE_RECIPIENT="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["validators"][0]["payout"])' "$ST/genesis-chain21.json")"
-  refuse "a fee recipient that is not chain 21's" "$S" 'pass' "FEE_RECIPIENT_CHANGED=1 only" FEE_RECIPIENT=rand1SELFTESTotherrecipient
+  refuse "a validator payout (set 11) as fee recipient" "$S" 'pass' "a validator's payout address" FEE_RECIPIENT=rand1SELFTEST11payouta
+  refuse "chain 21's (set-9) fee recipient in bridge.fees" "$S" 'pass' "bridge.fees.recipient is chain 21's (fingerprint 89DS-4Q4X-HXSX-MBYW)" FEE_RECIPIENT="$C21_FEE_RECIPIENT"
   refuse "a stake entry budget off 2500 bps" "$S" 'pass' "not 2500" STAKE_ENTRY_BPS=3333
   refuse "slashing in chain 21's staking"    "$G" 'd["staking"]["slashing"] = {"equivocation_bps": 500, "jail_epochs": 2}' "carries none"
   refuse "a vesting section on chain 21"     "$G" 'd["vesting"] = {"entries": []}' "vesting section"
@@ -3506,22 +3929,71 @@ json.dump(a, open(p,'w'))" "$ST/answers.json"
   bash_refuses "balances without the relayer's key file" "relayer.key.json is in none of" WALLETS_DIRS="$ST/wd" WALLET=/usr/bin/true ALLOC_ADDRESSES="$ST/none.txt" CHAIN21_RPC=http://127.0.0.1:9 -- balances "$ST/snap-bal"
   echo '{}' > "$ST/wd/relayer.key.json"
   bash_refuses "balances on a dead tunnel (relayer present)" "is not answering" WALLETS_DIRS="$ST/wd" WALLET=/usr/bin/true ALLOC_ADDRESSES="$ST/none.txt" CHAIN21_RPC=http://127.0.0.1:9 -- balances "$ST/snap-bal"
+  # Fake wallets of a constraint set (header, "EVERY SHIELDED ADDRESS"): `address` prints a
+  # set-dependent address for a key file (its path hashed; FAKE_NO_ADDR=1: none) and, for the probe
+  # key, that set's pinned probe fingerprint (FAKE_PROBE_FP_<set> overrides); `contacts add` the
+  # address's fake fingerprint (fake_fp; FAKE_FP overrides); `keygen` writes a key file; `perp
+  # image-hc` as v0.8.2 does (FAKE_HC, FAKE_EPLH); `balance` 5 RAND and `asset-balance` 0.
+  fake_fp() { printf '%s' "$1" | shasum | cut -c1-16 | tr 'a-f' 'A-F' | sed 's/\(....\)\(....\)\(....\)\(....\)/\1-\2-\3-\4/'; }
+  mkfake_wallet() {  # <set> <probe fingerprint> <path>
+    cat > "$3" <<FAKE
+#!/usr/bin/env bash
+# selftest fake rand, constraint set $1
+key=; args=()
+while [ \$# -gt 0 ]; do case "\$1" in --key) key=\$2; shift 2;; --rpc) shift 2;; *) args+=("\$1"); shift;; esac; done
+fp() { printf '%s' "\$1" | shasum | cut -c1-16 | tr 'a-f' 'A-F' | sed 's/\(....\)\(....\)\(....\)\(....\)/\1-\2-\3-\4/'; }
+case "\${args[0]:-} \${args[1]:-}" in
+  "perp image-hc") echo "\${FAKE_HC:-$ENGINE_HC_DECIDED}"; [ -z "\${FAKE_EPLH-14}" ] || echo "engine_program_log_height \${FAKE_EPLH-14}" >&2;;
+  "contacts add") echo "fingerprint \${FAKE_FP:-\$(fp "\${args[3]}")}"; echo saved;;
+  "keygen "*) ( umask 077; echo "{\"fake\": \"\$key\"}" > "\$key" ); echo "wrote \$key";;
+  "address "*) [ -z "\${FAKE_NO_ADDR:-}" ] || exit 1
+    if [ "\$(basename "\$key")" = probe.key.json ]; then a=rand1PROBEset$1; f=\${FAKE_PROBE_FP_$1:-$2}
+    else a=rand1S$1x\$(printf '%s' "\$key" | shasum | cut -c1-20 | tr 0 z); f=\$(fp "\$a"); fi   # base58: no 0
+    echo "\$a"; echo "fingerprint \$f" >&2;;
+  "asset-balance "*) echo "asset 1: 0";;
+  "balance "*) echo "balance: 5 RAND";;
+esac
+exit 0
+FAKE
+    chmod +x "$3"
+  }
+  mkfake_wallet 9 "$PROBE_FP_SET9" "$ST/fake-rand9"; mkfake_wallet 11 "$PROBE_FP_SET11" "$ST/fake-rand"; mkfake_wallet 10 ZZZZ-ZZZZ-ZZZZ-ZZZZ "$ST/fake-rand10"
+  export -f check_wallet_sets probe_fingerprint fingerprint_of derive_wallet_addresses py_addresses record_address_derivation refuse_in_tree_key
   # A PRUNED chain-21 node (owner, 2026-11-19: e and obs1 report prune_floor 187556, rand-archive-2
   # abandoned): `snapshot` and `balances` refuse it without PRUNED_SCAN_OK=1 and accept it with it,
   # the floor printed loudly. A fake chain 21 on loopback and a fake `rand` that holds 5 RAND.
   python3 -c 'import json,sys; json.dump({"rand_getGenesisHash": sys.argv[2], "rand_status": {"height": 190000, "prune_floor": 187556}}, open(sys.argv[1], "w"))' "$ST/pruned.json" "$CHAIN21_HASH"
   fake_rpc "$ST/pruned.json" "$ST/pruned-port"; PRPC=http://127.0.0.1:$(cat "$ST/pruned-port")
-  # shellcheck disable=SC2016  # the fake's own source
-  printf '#!/usr/bin/env bash\ncase "$*" in *asset-balance*) echo "asset 1: 0";; *" balance"*) echo "balance: 5 RAND";; *" address"*) echo rand1SELFTESTpruned;; esac\nexit 0\n' > "$ST/fake-wallet"; chmod +x "$ST/fake-wallet"
   mkdir -p "$ST/snap-pruned-1" "$ST/snap-pruned-2"; cp "$ST/snap/chain21-state.json" "$ST/snap-pruned-1/"; cp "$ST/snap/chain21-state.json" "$ST/snap-pruned-2/"
   bash_refuses "balances on a pruned node without PRUNED_SCAN_OK (no unpruned chain-21 node exists)" "no unpruned chain-21 node exists since rand-archive-2 was abandoned" \
-    WALLETS_DIRS="$ST/wd" WALLET="$ST/fake-wallet" ALLOC_ADDRESSES="$ST/pruned-alloc-1.txt" CHAIN21_RPC="$PRPC" CHAIN21_GENESIS=deploy/genesis-chain21.json -- balances "$ST/snap-pruned-1"
-  if env -u PRUNED_SCAN_OK SELFTEST=0 PRUNED_SCAN_OK=1 WALLETS_DIRS="$ST/wd" WALLET="$ST/fake-wallet" ALLOC_ADDRESSES="$ST/pruned-alloc-2.txt" CHAIN21_RPC="$PRPC" \
+    WALLETS_DIRS="$ST/wd" WALLET="$ST/fake-rand9" WALLET22="$ST/fake-rand" ALLOC_ADDRESSES="$ST/pruned-alloc-1.txt" CHAIN21_RPC="$PRPC" CHAIN21_GENESIS=deploy/genesis-chain21.json -- balances "$ST/snap-pruned-1"
+  if env -u PRUNED_SCAN_OK SELFTEST=0 PRUNED_SCAN_OK=1 WALLETS_DIRS="$ST/wd" WALLET="$ST/fake-rand9" WALLET22="$ST/fake-rand" ALLOC_ADDRESSES="$ST/pruned-alloc-2.txt" CHAIN21_RPC="$PRPC" \
        CHAIN21_GENESIS=deploy/genesis-chain21.json bash "$0" balances "$ST/snap-pruned-2" >"$ST/log" 2>&1 \
      && grep -q 'PRUNED SCAN (PRUNED_SCAN_OK=1).*below height 187556' "$ST/log" && grep -q 'scan-floor: 187556' "$ST/log" \
-     && python3 -c 'import json,sys; b=json.load(open(sys.argv[1])); assert b["prune_floor"] == 187556 and b["carried_rand_units"] == 5 * 10**9' "$ST/snap-pruned-2/balances.json"; then
+     && python3 -c 'import json,sys; b=json.load(open(sys.argv[1])); assert b["prune_floor"] == 187556 and b["carried_rand_units"] == 2 * 5 * 10**9' "$ST/snap-pruned-2/balances.json"; then
     ok "balances on a pruned node with PRUNED_SCAN_OK=1 — accepted, the floor 187556 printed loudly and written to balances.json"
   else bad "balances, pruned, PRUNED_SCAN_OK=1: $(tail -2 "$ST/log")"; fi
+  # Constraint set 11: `balances` scans with WALLET (set 9) and writes each wallet at the address
+  # WALLET22 (set 11) derives, its key file and its chain-21 address on the line; refused without a
+  # WALLET22, with a set-9 one, or with a set-11 WALLET.
+  if python3 - "$ST/pruned-alloc-2.txt" "$ST/snap-pruned-2/balances.json" "$ST/wd" <<'PY'
+import json, os, sys
+rows = [l.split() for l in open(sys.argv[1]) if l.strip() and not l.startswith("#")]
+b = json.load(open(sys.argv[2]))
+assert len(rows) == 2 and [r[0] for r in rows] == ["relayer", "shielded-1"], rows
+for r in rows:
+    assert len(r) == 5 and r[1].startswith("rand1S11x") and r[2] == "5" and r[3] == "key=" + os.path.join(os.path.abspath(sys.argv[3]), r[0] + ".key.json") and r[4].startswith("c21=rand1S9x"), r
+assert all(w["address"].startswith("rand1S9x") and w["address22"].startswith("rand1S11x") for w in b["wallets"])
+assert b["wallet22_sha256"] and b["wallet_sha256"] and b["wallet22_sha256"] != b["wallet_sha256"]
+PY
+  then ok "balances writes each wallet at its SET-11 address (WALLET22), with key=<its key file> and c21=<the chain-21 address scanned>; balances.json keeps both"
+  else bad "balances' set-11 alloc lines: $(head -3 "$ST/pruned-alloc-2.txt" | cut -c1-120)"; fi
+  bash_refuses "balances without WALLET22 (the scan would write set-9 addresses)" "WALLET22 is unset — the cut build's rand (v0.8.7, constraint set 11" \
+    WALLETS_DIRS="$ST/wd" WALLET="$ST/fake-rand9" WALLET22= ALLOC_ADDRESSES="$ST/pruned-alloc-3.txt" CHAIN21_RPC="$PRPC" CHAIN21_GENESIS=deploy/genesis-chain21.json PRUNED_SCAN_OK=1 -- balances "$ST/snap-pruned-1"
+  bash_refuses "balances with a set-9 WALLET22" "is a constraint-set-9 rand, chain 21's" \
+    WALLETS_DIRS="$ST/wd" WALLET="$ST/fake-rand9" WALLET22="$ST/fake-rand9" ALLOC_ADDRESSES="$ST/pruned-alloc-3.txt" CHAIN21_RPC="$PRPC" CHAIN21_GENESIS=deploy/genesis-chain21.json PRUNED_SCAN_OK=1 -- balances "$ST/snap-pruned-1"
+  bash_refuses "balances with a set-11 WALLET (it must read chain 21)" "WALLET=$ST/fake-rand is a constraint-set-11 rand" \
+    WALLETS_DIRS="$ST/wd" WALLET="$ST/fake-rand" WALLET22="$ST/fake-rand" ALLOC_ADDRESSES="$ST/pruned-alloc-3.txt" CHAIN21_RPC="$PRPC" CHAIN21_GENESIS=deploy/genesis-chain21.json PRUNED_SCAN_OK=1 -- balances "$ST/snap-pruned-1"
   bash_refuses "snapshot on a pruned node without PRUNED_SCAN_OK" "no unpruned chain-21 node exists since rand-archive-2 was abandoned" \
     CHAIN21_RPC="$PRPC" CHAIN21_GENESIS=deploy/genesis-chain21.json -- snapshot "$ST/snap-pruned-3"
   # with it, `snapshot` passes the floor (and then stops at the fake's missing validators: no more is served)
@@ -3530,25 +4002,180 @@ json.dump(a, open(p,'w'))" "$ST/answers.json"
     ok "snapshot on a pruned node with PRUNED_SCAN_OK=1 — accepted past the floor check, the floor 187556 printed loudly"
   else bad "snapshot, pruned, PRUNED_SCAN_OK=1: $(tail -2 "$ST/log")"; fi
   kill "$FAKE_RPC_PID" 2>/dev/null || true; FAKE_RPC_PID=
-  # A fake `rand`: `perp image-hc` prints FAKE_HC (default the pinned engine's) on stdout and
-  # `engine_program_log_height ${FAKE_EPLH}` (default 14; none when FAKE_EPLH is set empty) on
-  # stderr, as v0.8.2 does; anything else prints a fingerprint (the fee recipient's check).
-  # shellcheck disable=SC2016  # the fake's own source: expanded when it runs, not here
-  printf '#!/usr/bin/env bash\ncase "$*" in *"perp image-hc"*) echo "${FAKE_HC:-%s}"; [ -z "${FAKE_EPLH-14}" ] || echo "engine_program_log_height ${FAKE_EPLH-14}" >&2; exit 0;; esac\necho "fingerprint ${FAKE_FP:-89DS-4Q4X-HXSX-MBYW}"\necho saved\n' "$ENGINE_HC_DECIDED" > "$ST/fake-rand"; chmod +x "$ST/fake-rand"
-  echo "rand1SELFTESTfeerecipient" > "$ST/fee-ok.txt"; echo "not-an-address" > "$ST/fee-bad.txt"; printf 'rand1a\nrand1b\n' > "$ST/fee-two.txt"
+  # The fee recipient (constraint set 11): the owner's set-11 address and fingerprint, checked by
+  # WALLET22 ($ST/fake-rand, the set-11 fake); chain 21's recipient refused by address and by name.
+  echo "rand1SELFTEST11feerecipient" > "$ST/fee-ok.txt"; echo "not-an-address" > "$ST/fee-bad.txt"; printf 'rand1a\nrand1b\n' > "$ST/fee-two.txt"
+  printf '%s\n' "$C21_FEE_RECIPIENT" > "$ST/fee-c21.txt"
+  FEE_FP_OK=$(fake_fp rand1SELFTEST11feerecipient)
   fp_case() {  # <description> <want ok|refuse> <phrase> <env…>
     local what=$1 want=$2 phrase=$3; shift 3
     # shellcheck disable=SC2016  # expanded by the child bash
-    if env "$@" bash -c 'WALLET=$FAKE_WALLET; load_fee_recipient' >"$ST/log" 2>&1; then r=ok; else r=refuse; fi
+    if env FEE_RECIPIENT_FINGERPRINT="$FEE_FP_OK" "$@" bash -c 'WALLET22=$FAKE_WALLET; load_fee_recipient' >"$ST/log" 2>&1; then r=ok; else r=refuse; fi
     if [ "$r" = "$want" ] && grep -qF -- "$phrase" "$ST/log"; then ok "$what — $(grep -o 'cut-chain22: .*' "$ST/log" | tail -1 | cut -c1-110)"
     else bad "$what — got $r: $(tail -1 "$ST/log")"; fi
   }
   export -f load_fee_recipient
-  fp_case "the fee recipient with the expected fingerprint is loaded" ok "fingerprint 89DS-4Q4X-HXSX-MBYW (= FEE_RECIPIENT_FINGERPRINT)" FAKE_WALLET="$ST/fake-rand" FEE_RECIPIENT_FILE="$ST/fee-ok.txt"
+  fp_case "the owner's set-11 fee recipient with its fingerprint is loaded (WALLET22)" ok "fingerprint $FEE_FP_OK (= FEE_RECIPIENT_FINGERPRINT; WALLET22)" FAKE_WALLET="$ST/fake-rand" FEE_RECIPIENT_FILE="$ST/fee-ok.txt"
+  fp_case "the fingerprint given in lower case is accepted" ok "(= FEE_RECIPIENT_FINGERPRINT; WALLET22)" FAKE_WALLET="$ST/fake-rand" FEE_RECIPIENT_FILE="$ST/fee-ok.txt" FEE_RECIPIENT_FINGERPRINT="$(tr '[:upper:]' '[:lower:]' <<<"$FEE_FP_OK")"
+  fp_case "no FEE_RECIPIENT_FINGERPRINT (no chain-21 default)" refuse "FEE_RECIPIENT_FINGERPRINT is unset — the owner's SET-11 fingerprint, no default" FAKE_WALLET="$ST/fake-rand" FEE_RECIPIENT_FILE="$ST/fee-ok.txt" FEE_RECIPIENT_FINGERPRINT=
+  fp_case "chain 21's fingerprint 89DS-4Q4X-HXSX-MBYW, by name" refuse "FEE_RECIPIENT_FINGERPRINT is 89DS-4Q4X-HXSX-MBYW, chain 21's fee recipient — the owner's wallet at its SET-9 address" FAKE_WALLET="$ST/fake-rand" FEE_RECIPIENT_FILE="$ST/fee-ok.txt" FEE_RECIPIENT_FINGERPRINT=89DS-4Q4X-HXSX-MBYW
+  fp_case "…and it tells the owner to run rand address with the v0.8.7 wallet" refuse "runs \`rand address --key <their key file>\` with the v0.8.7 wallet" FAKE_WALLET="$ST/fake-rand" FEE_RECIPIENT_FILE="$ST/fee-ok.txt" FEE_RECIPIENT_FINGERPRINT=89ds-4q4x-hxsx-mbyw
+  fp_case "chain 21's fee recipient ADDRESS (chain 20's file), with any fingerprint" refuse "holds chain 21's fee recipient (fingerprint 89DS-4Q4X-HXSX-MBYW)" FAKE_WALLET="$ST/fake-rand" FEE_RECIPIENT_FILE="$ST/fee-c21.txt"
+  fp_case "an address whose fingerprint is chain 21's" refuse "chain 21's recipient — its set-9 address" FAKE_WALLET="$ST/fake-rand" FAKE_FP=89DS-4Q4X-HXSX-MBYW FEE_RECIPIENT_FILE="$ST/fee-ok.txt"
+  fp_case "no WALLET22 to fingerprint it" refuse "WALLET22=<unset> is not executable" FAKE_WALLET= FEE_RECIPIENT_FILE="$ST/fee-ok.txt"
   fp_case "a fee recipient whose fingerprint differs is refused" refuse "not FEE_RECIPIENT_FINGERPRINT" FAKE_WALLET="$ST/fake-rand" FAKE_FP=AAAA-BBBB-CCCC-DDDD FEE_RECIPIENT_FILE="$ST/fee-ok.txt"
   fp_case "a missing fee recipient file is refused" refuse "no fee recipient file" FAKE_WALLET="$ST/fake-rand" FEE_RECIPIENT_FILE="$ST/none.txt"
   fp_case "a fee recipient file of two lines is refused" refuse "more than one line" FAKE_WALLET="$ST/fake-rand" FEE_RECIPIENT_FILE="$ST/fee-two.txt"
   fp_case "a wallet that prints no fingerprint is refused" refuse "printed no fingerprint" FAKE_WALLET=/usr/bin/true FEE_RECIPIENT_FILE="$ST/fee-ok.txt"
+  fp_case "a file that is no address" refuse "does not hold a rand1… address" FAKE_WALLET="$ST/fake-rand" FEE_RECIPIENT_FILE="$ST/fee-bad.txt"
+
+  # ── constraint set 11: the two wallets (check_wallet_sets), by the probe key's fingerprint ──
+  ws_case() {  # <description> <want ok|refuse> <phrase> <env…>
+    local what=$1 want=$2 phrase=$3 r; shift 3
+    if env WALLET="$ST/fake-rand9" WALLET22="$ST/fake-rand" "$@" bash -c 'check_wallet_sets' >"$ST/log" 2>&1; then r=ok; else r=refuse; fi
+    if [ "$r" = "$want" ] && grep -qF -- "$phrase" "$ST/log"; then ok "check_wallet_sets: $what — $(grep -o 'cut-chain22: .*' "$ST/log" | tail -1 | cut -c1-110)"
+    else bad "check_wallet_sets: $what — got $r: $(tail -1 "$ST/log")"; fi
+  }
+  ws_case "WALLET set 9 and WALLET22 set 11 (the probe's pinned fingerprints)" ok "WALLET22 is constraint set 11 (probe $PROBE_FP_SET11"
+  ws_case "no WALLET22 (no default)" refuse "WALLET22 is unset" WALLET22=
+  ws_case "a WALLET22 that is not executable" refuse "is not executable — the cut build's rand" WALLET22="$ST/no-such-rand"
+  ws_case "a WALLET22 that derives the same address as WALLET (both set 9)" refuse "is a constraint-set-9 rand, chain 21's: it derives the probe key's set-9 address ($PROBE_FP_SET9), the SAME address as WALLET" WALLET22="$ST/fake-rand9"
+  ws_case "the two swapped (WALLET set 11, WALLET22 set 9)" refuse "WALLET=$ST/fake-rand is a constraint-set-11 rand" WALLET="$ST/fake-rand" WALLET22="$ST/fake-rand9"
+  ws_case "a set-11 WALLET (both set 11)" refuse "WALLET=$ST/fake-rand is a constraint-set-11 rand (probe $PROBE_FP_SET11): WALLET reads chain 21" WALLET="$ST/fake-rand"
+  ws_case "a WALLET22 of an unknown set" refuse "neither set 11 ($PROBE_FP_SET11) nor set 9" WALLET22="$ST/fake-rand10"
+  ws_case "a WALLET of an unknown set" refuse "not set 9 ($PROBE_FP_SET9), chain 21's" WALLET="$ST/fake-rand10"
+  ws_case "a WALLET22 that prints no probe fingerprint" refuse "WALLET22=/usr/bin/true printed no fingerprint for the probe key" WALLET22=/usr/bin/true
+  ws_case "a set-11 probe fingerprint off the pin (another set 11 build)" refuse "neither set 11" FAKE_PROBE_FP_11=AAAA-AAAA-AAAA-AAAA
+  # the probe key file the binaries read: 0600, the pinned public spend key, version 2
+  # shellcheck disable=SC2016  # the spy's own source
+  printf '%s\n' '#!/usr/bin/env bash' 'while [ "$1" != --key ]; do shift; done' \
+    'python3 -c "import os,sys; print(oct(os.stat(sys.argv[1]).st_mode & 0o777)[2:])" "$2" > "$PROBE_SEEN"; cat "$2" >> "$PROBE_SEEN"; echo "fingerprint X" >&2' > "$ST/probe-spy"; chmod +x "$ST/probe-spy"
+  if PROBE_SEEN="$ST/probe-seen" bash -c 'probe_fingerprint "$0" >/dev/null' "$ST/probe-spy" \
+     && [ "$(head -1 "$ST/probe-seen")" = 600 ] && python3 -c 'import json,sys; d=json.loads("".join(open(sys.argv[1]).read().splitlines(True)[1:])); assert d == {"version": 2, "spend_key": "01" * 32}' "$ST/probe-seen"; then
+    ok "the probe key is written 0600 as {version 2, spend_key 01×32} (the pinned public probe, never funded) and removed after"
+  else bad "the probe key file: $(cat "$ST/probe-seen" 2>/dev/null | head -2)"; fi
+
+  # ── derive_wallet_addresses: every key file behind a chain-22 address, through both binaries ──
+  mkdir -p "$ST/dw-tmp" "$ST/dw-pay"
+  for n in $GENESIS_NAMES $BONDED; do echo '{}' > "$ST/dw-pay/$n.key.json"; done
+  if env TMP="$ST/dw-tmp" WALLET="$ST/fake-rand9" WALLET22="$ST/fake-rand" PAYOUT_KEYS_DIRS="$ST/dw-pay $ST/no-such-dir" bash -c 'derive_wallet_addresses' >"$ST/log" 2>&1 \
+     && python3 - "$ST/dw-tmp" "$ST/dw-pay" "$GENESIS_NAMES $BONDED" "$ALLOC_ADDRESSES" "$ZUSD_CARRY" "$FAUCET_RECIPIENTS" <<'PY'
+import os, sys
+t, pay, names = sys.argv[1], sys.argv[2], sys.argv[3].split()
+d = [l.rstrip("\n").split("\t") for l in open(f"{t}/derived-wallets.tsv")]
+keys = {tok[4:] for f in sys.argv[4:] for l in open(f) for tok in l.split() if tok.startswith("key=")}
+assert len(d) == len({k for k, _, _ in d}) and {k for k, _, _ in d} == keys | {f"{pay}/{n}.key.json" for n in names}
+assert len(names) == 25 and all(a11.startswith("rand1S11x") and a9.startswith("rand1S9x") for _, a11, a9 in d)
+assert len([l for l in open(f"{t}/payout-keys.tsv")]) == 25 and open(f"{t}/given-fingerprints.tsv").read() == ""
+PY
+  then ok "derive_wallet_addresses: each key= file and each validator's payout key derived by WALLET22 (set 11) and WALLET (set 9); a missing PAYOUT_KEYS_DIRS entry skipped — $(tail -1 "$ST/log" | cut -c1-90)"
+  else bad "derive_wallet_addresses: $(tail -2 "$ST/log")"; fi
+  if env TMP="$ST/dw-tmp" WALLET="$ST/fake-rand9" WALLET22="$ST/fake-rand" FAKE_NO_ADDR=1 PAYOUT_KEYS_DIRS="$ST/dw-pay" bash -c 'derive_wallet_addresses' >"$ST/log" 2>&1; then bad "derive_wallet_addresses on a key file no wallet reads — accepted"
+  elif grep -q 'derives no address from' "$ST/log"; then ok "derive_wallet_addresses: a key file WALLET22 cannot read is refused"
+  else bad "derive_wallet_addresses, unreadable key: $(tail -1 "$ST/log")"; fi
+  printf 'w0 rand1x 1 key=%s/no-such.key.json c21=rand1y\n' "$ST" > "$ST/alloc-missing-key.txt"
+  if env TMP="$ST/dw-tmp" WALLET="$ST/fake-rand9" WALLET22="$ST/fake-rand" ALLOC_ADDRESSES="$ST/alloc-missing-key.txt" PAYOUT_KEYS_DIRS="$ST/dw-pay" bash -c 'derive_wallet_addresses' >"$ST/log" 2>&1; then bad "derive_wallet_addresses on a missing key file — accepted"
+  elif grep -q 'key-guard: .*no-such.key.json does not exist' "$ST/log"; then ok "derive_wallet_addresses: a key= file that does not exist is refused"
+  else bad "derive_wallet_addresses, missing key: $(tail -1 "$ST/log")"; fi
+  printf 'w0 rand1x 1 key=%s/deploy/cut-chain22-genesis.sh c21=rand1y\n' "$PWD" > "$ST/alloc-in-tree.txt"
+  if env TMP="$ST/dw-tmp" WALLET="$ST/fake-rand9" WALLET22="$ST/fake-rand" ALLOC_ADDRESSES="$ST/alloc-in-tree.txt" PAYOUT_KEYS_DIRS="$ST/dw-pay" bash -c 'derive_wallet_addresses' >"$ST/log" 2>&1; then bad "derive_wallet_addresses on a key file inside the repository — accepted"
+  elif grep -q 'a validator key inside the repository' "$ST/log"; then ok "derive_wallet_addresses: a key= file inside the repository is refused (key-guard)"
+  else bad "derive_wallet_addresses, in-tree key: $(tail -1 "$ST/log")"; fi
+
+  # ── the carry lines against the derivations (check_carry_files; py_addresses, and py_splice again) ──
+  # <description> <phrase> <var=file content…> — each case runs py_addresses, then the full splice
+  GIVEN_FP=ANIS-H000-0000-0011
+  printf 'rand1SELFTEST11anish\t%s\nrand1SELFTEST11owner\t%s\n%s\t%s\n' "$GIVEN_FP" "OWNE-R000-0000-0011" \
+    "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["staking"]["faucet_recipients"][0])' "$CHAIN21_GENESIS")" CHAI-N210-0000-0000 > "$ST/tmp/given-fingerprints.tsv"
+  A_OK=$(cat "$ALLOC_ADDRESSES"); Z_OK=$(cat "$ZUSD_CARRY"); F_OK=$(cat "$FAUCET_RECIPIENTS")
+  A1=$(grep -m1 '^w0 ' "$ALLOC_ADDRESSES")
+  read -r _ A1_11 A1_AMT A1_KEY A1_C21 <<<"$A1"
+  Z1=$(grep -m1 '^holder ' "$ZUSD_CARRY"); read -r _ _ Z1_AMT _ <<<"$Z1"
+  F0=$(grep -m1 '^f00 ' "$FAUCET_RECIPIENTS"); F21_0=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["staking"]["faucet_recipients"][0])' "$CHAIN21_GENESIS")
+  carry_case() {  # <description> <want ok|refuse> <phrase> <which: A|Z|F> <file content> [env…]
+    local what=$1 want=$2 phrase=$3 which=$4 content=$5 r v; shift 5
+    case "$which" in A) v=ALLOC_ADDRESSES;; Z) v=ZUSD_CARRY;; F) v=FAUCET_RECIPIENTS;; esac
+    printf '%s\n' "$content" > "$ST/carry-case.txt"
+    fresh
+    if env "$v=$ST/carry-case.txt" "$@" bash -c 'py_addresses && py_validators >/dev/null && py_splice' >"$ST/log" 2>&1; then r=ok; else r=refuse; fi
+    if [ "$r" = "$want" ] && grep -qF -- "$phrase" "$ST/log"; then ok "$what — $(grep -o 'cut-chain22: .*' "$ST/log" | if [ "$want" = ok ]; then head -1; else tail -1; fi | cut -c1-110)"
+    else bad "$what — got $r (wanted $want, \"$phrase\"): $(grep -o 'cut-chain22: .*' "$ST/log" | tail -1 | cut -c1-160)"; fi
+  }
+  # shellcheck disable=SC2001  # sed edits lines of the multi-line carry fixtures
+  {
+  carry_case "the fixture carry files (every line key=, re-derived)" ok "set-11 addresses: ALLOC_ADDRESSES 7, ZUSD_CARRY 3, FAUCET_RECIPIENTS 16 line(s)" A "$A_OK"
+  # ALLOC_ADDRESSES
+  carry_case "a chain-21-format alloc line (no key=, no given=)" refuse "neither key=<key file> nor given=<fingerprint>" A "$(sed 's/ key=.*//' <<<"$A_OK")"
+  carry_case "an alloc line at its key file's CHAIN-21 address" refuse "is the CHAIN-21 (set-9) address of its key file" A "$(sed "s| $A1_11 | ${A1_C21#c21=} |" <<<"$A_OK")"
+  carry_case "an alloc line at an address no held key derives" refuse "is not the set-11 address WALLET22 derives from its key file" A "$(sed "s| $A1_11 | rand1SELFTEST11someoneelse |" <<<"$A_OK")"
+  carry_case "an alloc line whose key file was never derived" refuse "was not derived" A "$(sed "s|$A1_KEY|key=$ST/keys/unknown.key.json|" <<<"$A_OK")"
+  carry_case "an alloc line with given= (RAND allocs are held keys only)" refuse "every RAND alloc comes from a held key file" A "$(sed "s|^w0 .*|w0 rand1SELFTEST11anish $A1_AMT given=$GIVEN_FP|" <<<"$A_OK")" SET11_GIVEN=w0
+  carry_case "an alloc line without c21=" refuse "no c21= — \`balances\` writes each line" A "$(sed "s| $A1_C21||" <<<"$A_OK")"
+  carry_case "an alloc line whose c21= is not its key file's chain-21 address" refuse "is not the chain-21 address of its key file" A "$(sed "s|$A1_C21|c21=rand1SELFTEST99|" <<<"$A_OK")"
+  carry_case "an alloc line with key= and given= both" refuse "neither key=<key file> nor given=<fingerprint> (or both)" A "$(sed "s|^\(w0 .*\)|\1 given=$GIVEN_FP|" <<<"$A_OK")"
+  carry_case "an alloc line with an unknown field" refuse "only key=, given= and c21=, each once" A "$(sed "s|^\(w0 .*\)|\1 note=hello|" <<<"$A_OK")"
+  carry_case "an alloc line with key= twice" refuse "only key=, given= and c21=, each once" A "$(sed "s|^\(w0 .*\)|\1 $A1_KEY|" <<<"$A_OK")"
+  carry_case "an alloc label that is no label" refuse "is not \"<label> <set-11 rand1…> <amount>" A "$(sed 's|^w0 |w0/x |' <<<"$A_OK")"
+  carry_case "two alloc lines of one wallet" refuse "a label or an address twice" A "$(printf '%s\n%s' "$A_OK" "$(sed 's/^w0 /w0b /' <<<"$A1")")"
+  # ZUSD_CARRY
+  carry_case "a chain-21-format zUSD line" refuse "neither key=<key file> nor given=<fingerprint>" Z "$(sed 's/ key=.*//' <<<"$Z_OK")"
+  Z_GIVEN=$(sed "1s|^holder .*|anish rand1SELFTEST11anish $Z1_AMT given=$GIVEN_FP|" <<<"$Z_OK")
+  carry_case "a given zUSD holder (Anish) not in SET11_GIVEN" refuse "name anish in SET11_GIVEN (and on the set11-given: line of the cut record)" Z "$Z_GIVEN"
+  carry_case "a given zUSD holder in SET11_GIVEN, its fingerprint matching" ok "given (SET11_GIVEN, fingerprint-checked): anish" Z "$Z_GIVEN" SET11_GIVEN=anish
+  carry_case "a given zUSD holder whose fingerprint differs (a typo)" refuse "a typo or another wallet" Z "$(sed "s|given=$GIVEN_FP|given=ANIS-H000-0000-0099|" <<<"$Z_GIVEN")" SET11_GIVEN=anish
+  carry_case "a given zUSD address that is chain 21's (Anish's set-9 address)" refuse "is an address chain 21 knew" Z "$(sed "s|rand1SELFTEST11anish $Z1_AMT given=$GIVEN_FP|$F21_0 $Z1_AMT given=CHAI-N210-0000-0000|" <<<"$Z_GIVEN")" SET11_GIVEN=anish
+  carry_case "a given zUSD address never fingerprinted" refuse "was not fingerprinted" Z "$(sed "s|rand1SELFTEST11anish|rand1SELFTEST11nobody|" <<<"$Z_GIVEN")" SET11_GIVEN=anish
+  carry_case "SET11_GIVEN naming a label no given= line uses" refuse "which no given= line uses" Z "$Z_GIVEN" SET11_GIVEN="anish owner"
+  carry_case "a zUSD key= line at its key file's chain-21 address" refuse "is the CHAIN-21 (set-9) address of its key file" Z "$(sed 's| rand1SELFTEST11holder | rand1SELFTESTz |' <<<"$Z_OK")"
+  # FAUCET_RECIPIENTS
+  carry_case "chain 21's genesis allowlist as FAUCET_RECIPIENTS (set-9 lines)" refuse "neither key=<key file> nor given=<fingerprint>" F "$(python3 -c 'import json,sys; [print(f"r{i} {a}") for i, a in enumerate(json.load(open(sys.argv[1]))["staking"]["faucet_recipients"])]' "$CHAIN21_GENESIS")"
+  carry_case "a faucet line at its key file's chain-21 address" refuse "is the CHAIN-21 (set-9) address of its key file" F "$(sed "s|^f00 rand1SELFTEST11f00 |f00 $F21_0 |" <<<"$F_OK")"
+  carry_case "a faucet recipient given (Anish) in place of its chain-21 entry (c21=): unchanged" ok "set-11 addresses:" F "$(sed "s|^f00 .*|anish rand1SELFTEST11anish given=$GIVEN_FP c21=$F21_0|" <<<"$F_OK")" SET11_GIVEN=anish
+  carry_case "a faucet recipient given without c21=: a changed allowlist" refuse "set FAUCET_RECIPIENTS_CHANGED=1 if that is the decision" F "$(sed "s|^f00 .*|anish rand1SELFTEST11anish given=$GIVEN_FP|" <<<"$F_OK")" SET11_GIVEN=anish
+  carry_case "…accepted with FAUCET_RECIPIENTS_CHANGED=1" ok "set-11 addresses:" F "$(sed "s|^f00 .*|anish rand1SELFTEST11anish given=$GIVEN_FP|" <<<"$F_OK")" SET11_GIVEN=anish FAUCET_RECIPIENTS_CHANGED=1
+  carry_case "a faucet allowlist out of chain 21's order" refuse "FAUCET_RECIPIENTS_CHANGED=1 if that is" F "$(printf '%s\n%s' "$(grep -v '^f00 ' <<<"$F_OK")" "$F0")"
+  carry_case "an empty faucet allowlist" refuse "FAUCET_RECIPIENTS lists no recipient" F "# nothing" FAUCET_RECIPIENTS_CHANGED=1
+  carry_case "a faucet recipient twice" refuse "a label or an address twice" F "$(printf '%s\n%s' "$F_OK" "$(sed 's/^f00 /f00b /' <<<"$F0")")" FAUCET_RECIPIENTS_CHANGED=1
+  }
+
+  # ── the validators' payouts at set-11 addresses (py_validators, from PAYOUT_KEYS_DIRS) ──
+  cp "$ST/tmp/payout-keys.tsv" "$ST/payout-keys.keep"; cp "$ST/tmp/derived-wallets.tsv" "$ST/derived.keep"
+  payout_case() {  # <description> <phrase> <python mutating the two tsv files>
+    python3 -c "import sys; pk, dw = sys.argv[1], sys.argv[2]; $3" "$ST/tmp/payout-keys.tsv" "$ST/tmp/derived-wallets.tsv"
+    fresh
+    if bash -c 'py_validators >/dev/null && py_splice' >"$ST/log" 2>&1; then bad "$1 — accepted"
+    elif grep -qF -- "$2" "$ST/log"; then ok "$1 — $(grep -o 'cut-chain22: .*' "$ST/log" | tail -1 | cut -c1-110)"
+    else bad "$1 — wrong refusal (wanted \"$2\"): $(grep -o 'cut-chain22: .*' "$ST/log" | tail -1 | cut -c1-160)"; fi
+    cp "$ST/payout-keys.keep" "$ST/tmp/payout-keys.tsv"; cp "$ST/derived.keep" "$ST/tmp/derived-wallets.tsv"
+  }
+  if py_validators >"$ST/log" 2>&1 && python3 - "$ST/tmp/validator-args" "$ST/tmp/validators.json" "$CHAIN21_GENESIS" <<'PY'
+import json, sys
+a = open(sys.argv[1]).read().split("\n")
+pay = [l.split(",")[2] for l in a if l.count(",") == 2]
+v = json.load(open(sys.argv[2])); g21 = json.load(open(sys.argv[3]))
+assert len(pay) == 25 and all(p.startswith("rand1SELFTEST11payout") for p in pay) and [x["payout"] for x in v] == pay
+assert not set(pay) & {x["payout"] for x in g21["validators"]} and all(x["payout21"] in {y["payout"] for y in g21["validators"]} for x in v)
+PY
+  then ok "py_validators: every --validator payout is the SET-11 address of the payout key file whose set-9 address is the chain-21 payout"
+  else bad "py_validators' set-11 payouts: $(tail -1 "$ST/log")"; fi
+  payout_case "a validator with no payout key file under PAYOUT_KEYS_DIRS" "c: no payout key file c.key.json under PAYOUT_KEYS_DIRS" 'l = [x for x in open(pk) if not x.startswith("c\t")]; open(pk, "w").writelines(l)'
+  payout_case "a payout key file that is not that validator's (another chain-21 payout)" "none of its payout key files" 'l = open(dw).read().splitlines(True); l = [x if "/payout/a.key.json" not in x else x.rsplit("\t", 1)[0] + "\trand1SELFTESTnotapayout\n" for x in l]; open(dw, "w").writelines(l)'
+  payout_case "a payout whose set-11 derivation is its chain-21 address (a set-9 WALLET22)" "the set-11 payout is the chain-21 one" 'l = open(dw).read().splitlines(True); l = [x if "/payout/a.key.json" not in x else "\t".join([x.split("\t")[0], x.split("\t")[2].strip(), x.split("\t")[2]]) for x in l]; open(dw, "w").writelines(l)'
+  refuse "a chain-21 (set-9) payout in the written validators" "$B" 'd["validators"][0]["payout"] = json.load(open(sys.argv[1].replace("base.json", "genesis-chain21.json")))["validators"][0]["payout"]' "its payout is not the set-11"
+  # ── the backstop on the finished file: no chain-21 pk in a note ──
+  refuse "an alloc note sealed to a chain-21 pk" "$B" 'd["alloc"][0]["opening"]["pk"] = json.load(open(sys.argv[1].replace("base.json", "genesis-chain21.json")))["alloc"][0]["opening"]["pk"]' "sealed to a chain-21 (set-9) pk"
+  refuse "a validator payout that is a chain-21 address of another kind (a faucet recipient's)" "$B" 'd["validators"][0]["payout"] = json.load(open(sys.argv[1].replace("base.json", "genesis-chain21.json")))["staking"]["faucet_recipients"][0]' "its payout is not the set-11"
+
+  # ── the cut record's address-derivation line ──
+  printf 'reason: fixture\nrollback: fixture' > "$ST/record-ad.txt"
+  # shellcheck disable=SC2016  # expanded by the inner bash
+  if env TMP="$ST/tmp" WALLET_SHA256="$(printf '9%.0s' $(seq 64))" WALLET22_SHA256="$(printf 'b%.0s' $(seq 64))" SET11_GIVEN="anish owner" \
+       bash -c 'record_address_derivation "$1" && record_address_derivation "$1"' _ "$ST/record-ad.txt" \
+     && [ "$(grep -c '^address-derivation: ' "$ST/record-ad.txt")" = 1 ] \
+     && grep -qx "address-derivation: set 11 via WALLET22 sha256 $(printf 'b%.0s' $(seq 64)) (probe $PROBE_FP_SET11), chain 21 via WALLET sha256 $(printf '9%.0s' $(seq 64)) (probe $PROBE_FP_SET9); $(wc -l < "$ST/tmp/derived-wallets.tsv" | tr -d ' ') key file(s) re-derived; given: anish owner" "$ST/record-ad.txt" \
+     && [ "$(_cut_record_value "$ST/record-ad.txt" rollback)" = fixture ]; then
+    ok "the cut record gets one address-derivation: line (set 11 via WALLET22 sha256 …, the probe, the key files, the given labels)"
+  else bad "record_address_derivation: $(tail -2 "$ST/record-ad.txt")"; fi
   # CON-601: perps_keys_step against a fake rand-node whose `keygen-perp-vk` answers from the
   # committed files (--print-pinned: PERPS_KEY_PINS, or FAKE_PINS; --check: the file's sha256;
   # --genesis-json: PERPS_STATE_PROOF_KEYS_JSON), and a copy of the files with one byte changed.
@@ -3583,7 +4210,7 @@ json.dump(a, open(p,'w'))" "$ST/answers.json"
     local what=$1 want=$2 phrase=$3 r; shift 3
     mkdir -p "$ST/gr-tmp"
     # shellcheck disable=SC2016  # expanded by the child bash
-    if env TMP="$ST/gr-tmp" PERP_PROVER="$ST/fake-root-prover" WALLET="$ST/fake-root-rand" PERP_GENESIS_ROOT= "$@" \
+    if env TMP="$ST/gr-tmp" PERP_PROVER="$ST/fake-root-prover" WALLET22="$ST/fake-root-rand" PERP_GENESIS_ROOT= "$@" \
          bash -c 'perp_genesis_root_step && echo "root $PERP_GENESIS_ROOT"' >"$ST/log" 2>&1; then r=ok; else r=refuse; fi
     if [ "$r" = "$want" ] && grep -qF -- "$phrase" "$ST/log"; then ok "perp_genesis_root_step: $what — $(tail -1 "$ST/log" | cut -c1-110)"
     else bad "perp_genesis_root_step: $what — got $r: $(tail -1 "$ST/log")"; fi
@@ -3611,9 +4238,9 @@ json.dump(a, open(p,'w'))" "$ST/answers.json"
   sed 's/^drops:.*/drops: nothing/' "$ST/cut-record.txt" > "$ST/cut-record-drops-nothing.txt"
   sed 's/; #168 block context (reference_block_window) and #189/; #189/' "$ST/cut-record.txt" > "$ST/cut-record-no-ctx.txt"
   sed 's/ and #189 the randomness beacon//' "$ST/cut-record.txt" > "$ST/cut-record-no-beacon.txt"
-  printf '%s\n' "$FEE_RECIPIENT" > "$ST/fee-c21.txt"
   real_cut=(CUT_POLICY_GENESIS_DIR="$ST/gendir-21" CUT_RECORD="$ST/cut-record.txt" CHAIN21_SNAPSHOT="$ST/snap" CHAIN21_GENESIS=deploy/genesis-chain21.json
-            OUT="$ST/not-yet.json" NODE="$ST/fake-node" WALLET="$ST/fake-rand" FEE_RECIPIENT_FILE="$ST/fee-c21.txt"
+            OUT="$ST/not-yet.json" NODE="$ST/fake-node" WALLET="$ST/fake-rand9" WALLET22="$ST/fake-rand"
+            FEE_RECIPIENT_FILE="$ST/fee-ok.txt" FEE_RECIPIENT_FINGERPRINT="$FEE_FP_OK"
             TREASURY="$ST/treasury.txt" PERP_PROVER="$ST/fake-prover" PERP_IMAGE="$ST/fake-image"
             PERPS_MAX_WINDOW_HEIGHTS=256 MULTISIG_MAX_ACCOUNTS=1)
   for f in --fees --multisig --auth-multisig-guest --tokens-incremental-root --gas-byte-load; do
@@ -3643,6 +4270,16 @@ json.dump(a, open(p,'w'))" "$ST/answers.json"
   bash_refuses "a rand-node whose --version names no release" "below v0.8.5" "${real_cut[@]}" NODE_VERSION_OK=1 FAKE_VERSION=dev --
   bash_refuses "a rand-node that does not re-derive chain 21's hash" "not chain 21's ca76c276" "${real_cut[@]}" NODE_VERSION_OK=1 --
   bash_refuses "the real cut without PERP_PROVER" "PERP_PROVER is unset or not executable" "${real_cut[@]}" PERP_PROVER= --
+  bash_refuses "the real cut without WALLET22 (constraint set 11)" "WALLET22 is unset — the cut build's rand (v0.8.7, constraint set 11" "${real_cut[@]}" WALLET22= --
+  bash_refuses "the real cut with chain 21's rand as WALLET22" "is a constraint-set-9 rand, chain 21's" "${real_cut[@]}" WALLET22="$ST/fake-rand9" --
+  bash_refuses "the real cut with the set-11 rand as WALLET (the old single-wallet call)" "is a constraint-set-11 rand" "${real_cut[@]}" WALLET="$ST/fake-rand" --
+  bash_refuses "the real cut without a FAUCET_RECIPIENTS file (chain 21's allowlist is no longer the default)" "missing $ST/no-faucet.txt" "${real_cut[@]}" FAUCET_RECIPIENTS="$ST/no-faucet.txt" --
+  bash_refuses "the real cut with chain 21's fee recipient file" "holds chain 21's fee recipient" "${real_cut[@]}" NODE_VERSION_OK=1 FEE_RECIPIENT_FILE="$ST/fee-c21.txt" --
+  bash_refuses "the real cut without FEE_RECIPIENT_FINGERPRINT" "FEE_RECIPIENT_FINGERPRINT is unset" "${real_cut[@]}" NODE_VERSION_OK=1 FEE_RECIPIENT_FINGERPRINT= --
+  bash_refuses "SET11_GIVEN without the record's set11-given: line" "names no the given set-11 address anish" "${real_cut[@]}" SET11_GIVEN=anish --
+  printf 'set11-given: anish (sent 2026-11-20 with fingerprint ANIS-H000-0000-0011)\n' | cat "$ST/cut-record.txt" - > "$ST/cut-record-given.txt"
+  bash_refuses "SET11_GIVEN named on set11-given: (passes, stops at EXPECT_NODE_VERSION)" "EXPECT_NODE_VERSION is unset" "${real_cut[@]}" SET11_GIVEN=anish CUT_RECORD="$ST/cut-record-given.txt" --
+  bash_refuses "SET11_GIVEN holding a non-label" "SET11_GIVEN names 'a/b', not a carry label" "${real_cut[@]}" SET11_GIVEN=a/b --
   bash_refuses "an engine image whose hc is not the pinned engine" "not EXPECT_ENGINE_HC" "${real_cut[@]}" NODE_VERSION_OK=1 FAKE_HC="$(printf 'cd%.0s' $(seq 32))" --
   bash_refuses "no engine image" "missing $ST/no-image" "${real_cut[@]}" PERP_IMAGE="$ST/no-image" --
   bash_refuses "no treasury file" "missing $ST/no-treasury.txt" "${real_cut[@]}" TREASURY="$ST/no-treasury.txt" --
@@ -3672,7 +4309,8 @@ json.dump(a, open(p,'w'))" "$ST/answers.json"
   # later, at the fake's init)
   dry=(env -u MIN_INBOUND_2 -u MIN_INBOUND_3 -u MIN_INBOUND_4 -u MIN_INBOUND_5 -u PERPS_MAX_WINDOW_HEIGHTS -u MULTISIG_MAX_ACCOUNTS
        -u ENGINE_PROGRAM_LOG_HEIGHT -u TREASURY_SALT -u FIXTURE_ROOT_OK -u MULTISIG_NOT_CARRIED_OK SELFTEST=0 DRY_RUN=1
-       CHAIN21_GENESIS=deploy/genesis-chain21.json TREASURY="$ST/no-treasury.txt" NODE="$ST/fake-node" WALLET="$ST/fake-rand" FEE_RECIPIENT_FILE="$ST/fee-c21.txt")
+       CHAIN21_GENESIS=deploy/genesis-chain21.json TREASURY="$ST/no-treasury.txt" NODE="$ST/fake-node" WALLET="$ST/fake-rand9" WALLET22="$ST/fake-rand"
+       FEE_RECIPIENT_FILE="$ST/no-fee.txt")
   if "${dry[@]}" PERP_PROVER= FAKE_V10_FLAG= bash "$0" >"$ST/log" 2>&1; then bad "DRY_RUN on a fake rand-node finished"
   elif grep -q 'AUDIT_V10 SKIPPED ⚠⚠⚠' "$ST/log" && grep -q 'PERPS SKIPPED ⚠⚠⚠' "$ST/log" && grep -q "cutting with rand-node 0.8.5" "$ST/log" \
        && grep -q "six FIXTURE treasury signers (not chain 21's), 5 of 6" "$ST/log" && ! grep -q 'PLACEHOLDER 64' "$ST/log"; then
@@ -3773,11 +4411,32 @@ fi
 if [ "${DRY_RUN:-}" = 1 ]; then
   ST=$(mktemp -d)
   export ST FIXTURE_MODE=dryrun
+  # Constraint set 11: the synthetic carry wallets and faucet allowlist are THROWAWAY keys WALLET22
+  # makes here (never a real wallet), each derived by both binaries for py_fixtures; the payouts are
+  # the real chain-21 ones, so the cut derives them from PAYOUT_KEYS_DIRS as the real cut does.
+  check_wallet_sets
+  mkdir -p "$ST/dry-keys"; : > "$ST/dry-derived.tsv"
+  for l in $(python3 -c 'import json,sys; g=json.load(open(sys.argv[1]))
+n=sum(1 for x in g["alloc"] if x["opening"].get("asset", 0) == 0)
+print(*[f"w{i}" for i in range(n)], "holder", "fee", *[f"f{i:02d}" for i in range(len(g["staking"]["faucet_recipients"]))])' "$CHAIN21_GENESIS"); do
+    k=$ST/dry-keys/$l.key.json
+    "$WALLET22" --key "$k" keygen >/dev/null || { echo "cut-chain22: DRY RUN — \`$WALLET22 keygen\` failed for a throwaway key" >&2; exit 1; }
+    a11=$("$WALLET22" --key "$k" address 2>/dev/null | head -1 || true); a9=$("$WALLET" --key "$k" address 2>/dev/null | head -1 || true)
+    case "$a11$a9" in rand1*rand1*) ;; *) echo "cut-chain22: DRY RUN — no address for the throwaway key $k" >&2; exit 1;; esac
+    printf '%s\t%s\t%s\t%s\n' "$l" "$k" "$a11" "$a9" >> "$ST/dry-derived.tsv"
+  done
   py_fixtures
   CHAIN21_SNAPSHOT=$ST/snap VALIDATORS_TSV=$ST/validators.tsv REGISTRATIONS=$ST/reg \
     ALLOC_ADDRESSES=$ST/alloc-rand.txt ZUSD_CARRY=$ST/zusd-carry.txt CUT_RECORD=$ST/cut-record.txt
   OUT=${DRY_OUT:-$ST/genesis-chain22.DRY-RUN.json}
-  export CHAIN21_SNAPSHOT VALIDATORS_TSV REGISTRATIONS ALLOC_ADDRESSES ZUSD_CARRY
+  FAUCET_RECIPIENTS=$ST/faucet-recipients.txt FAUCET_RECIPIENTS_CHANGED=1
+  echo "cut-chain22: DRY RUN — the carry wallets and the faucet allowlist are THROWAWAY keys (WALLET22 keygen) at set-11 addresses → $ST (FAUCET_RECIPIENTS_CHANGED=1: not chain 21's allowlist)" >&2
+  if [ ! -f "$FEE_RECIPIENT_FILE" ]; then
+    awk -F'\t' '$1 == "fee" {print $3}' "$ST/dry-derived.tsv" > "$ST/fee-recipient.txt"
+    FEE_RECIPIENT_FILE=$ST/fee-recipient.txt FEE_RECIPIENT_FINGERPRINT=$(fingerprint_of "$(cat "$ST/fee-recipient.txt")")
+    echo "cut-chain22: DRY RUN — no FEE_RECIPIENT_FILE: a THROWAWAY fee recipient ($FEE_RECIPIENT_FINGERPRINT) — the real cut needs the owner's set-11 address and fingerprint" >&2
+  fi
+  export CHAIN21_SNAPSHOT VALIDATORS_TSV REGISTRATIONS ALLOC_ADDRESSES ZUSD_CARRY FAUCET_RECIPIENTS FAUCET_RECIPIENTS_CHANGED FEE_RECIPIENT_FILE FEE_RECIPIENT_FINGERPRINT
   # OPS-402: once chain 22 is cut and its genesis committed, `refuse_reused_chain_id 22` would
   # stop every dry run (a rehearsal of this script, not a cut). The dry run scans a copy of the
   # committed genesis files without chain 22's own; the real cut still scans deploy/ and refuses.
@@ -3832,7 +4491,9 @@ if [ "${1:-}" = balances ]; then
   need_chain21_rpc
   [ -f "$SNAP/chain21-state.json" ] || { echo "cut-chain22: take the snapshot first ($0 snapshot $SNAP)" >&2; exit 1; }
   refuse_in_tree_key "$SNAP/chain21-state.json"
-  export SNAP WALLET WALLETS_DIRS
+  # WALLET scans chain 21 (set 9); WALLET22 writes each wallet's chain-22 (set-11) address.
+  check_wallet_sets
+  export SNAP WALLET WALLET22 WALLETS_DIRS
   py_balances
   exit 0
 fi
@@ -3883,6 +4544,12 @@ require_cut_record_mentions "$CUT_RECORD" '#189|beacon|PREVRANDAO' "the randomne
 for n in $DROPPED_VALIDATORS; do
   require_cut_record_mentions "$CUT_RECORD" "$n" "the dropped validator $n (its chain-21 stake is not recreated on chain 22)" drops
 done
+# Constraint set 11: a set-11 address its holder SENT (given=, not derived from a held key file) is
+# accepted only for the labels in SET11_GIVEN, and the record's set11-given: line names each.
+for l in $SET11_GIVEN; do
+  [[ $l =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || { echo "cut-chain22: SET11_GIVEN names '$l', not a carry label" >&2; exit 1; }
+  require_cut_record_mentions "$CUT_RECORD" "(^|[^A-Za-z0-9._-])${l}([^A-Za-z0-9._-]|\$)" "the given set-11 address $l (SET11_GIVEN: its holder sent it with its v0.8.7 fingerprint)" set11-given || exit 1
+done
 # An empty exchange is carried (OPEN 4, 2026-11-19): without the override, the carries: line says so.
 [ "${PERPS_STATE_NOT_CARRIED_OK:-}" = 1 ] || require_cut_record_mentions "$CUT_RECORD" 'perp' "perps on its carries: line (chain 21's exchange carried (empty), its genesis root asserted equal)" carries
 [ -n "$CHAIN21_SNAPSHOT" ] || { echo "cut-chain22: CHAIN21_SNAPSHOT is unset — run \`$0 snapshot <dir>\` while chain 21 is up" >&2; exit 1; }
@@ -3902,13 +4569,13 @@ if [ "$SCAN_FLOOR" -gt 0 ]; then
   require_cut_record_mentions "$CUT_RECORD" "(^|[^0-9])${SCAN_FLOOR}([^0-9]|\$)" "the carry scan's floor $SCAN_FLOOR (PRUNED_SCAN_OK=1: chain 21 scanned from a pruned node)" scan-floor
   echo "cut-chain22: ⚠ PRUNED SCAN: chain 21 was scanned from height $SCAN_FLOOR (PRUNED_SCAN_OK=1; the record's scan-floor: names it)" >&2
 fi
-for bin in "$NODE" "$WALLET"; do
-  [ -x "$bin" ] || { echo "cut-chain22: $bin is not executable — the binaries of the cut build (v0.8.5 or later)" >&2; exit 1; }
-done
-for f in "$SNAPSHOT_FILE" "$VALIDATORS_TSV" "$ALLOC_ADDRESSES" "$ZUSD_CARRY" "$CHAIN21_GENESIS" "$TREASURY" "$PERP_IMAGE" "$BEACON_TSV" ${FAUCET_RECIPIENTS:+"$FAUCET_RECIPIENTS"}; do
+[ -x "$NODE" ] || { echo "cut-chain22: $NODE is not executable — the cut build's rand-node (v0.8.5 or later)" >&2; exit 1; }
+# Two wallets (constraint set 11): WALLET22 derives chain 22's addresses, WALLET is chain 21's (set 9).
+check_wallet_sets
+for f in "$SNAPSHOT_FILE" "$VALIDATORS_TSV" "$ALLOC_ADDRESSES" "$ZUSD_CARRY" "$FAUCET_RECIPIENTS" "$CHAIN21_GENESIS" "$TREASURY" "$PERP_IMAGE" "$BEACON_TSV"; do
   [ -f "$f" ] || { echo "cut-chain22: missing $f" >&2; exit 1; }
 done
-for f in "$SNAPSHOT_FILE" "$VALIDATORS_TSV" "$ALLOC_ADDRESSES" "$ZUSD_CARRY" "$TREASURY" "$BEACON_TSV" ${FAUCET_RECIPIENTS:+"$FAUCET_RECIPIENTS"}; do
+for f in "$SNAPSHOT_FILE" "$VALIDATORS_TSV" "$ALLOC_ADDRESSES" "$ZUSD_CARRY" "$FAUCET_RECIPIENTS" "$TREASURY" "$BEACON_TSV"; do
   refuse_in_tree_key "$f"
 done
 for n in $BONDED; do refuse_in_tree_key "$REGISTRATIONS/$n.txt"; done
@@ -3942,23 +4609,23 @@ fi
 # The audit-v10 fields (v0.8.2): `--program-state-refuse-panics` (PST-1) and `rand perp image-hc`
 # printing the engine's program height (CON-60) — the same release ships the perps and multisig
 # fields, which an older build refuses inside their sections (deny_unknown_fields). One gate.
-EPLH_GOT=$("$WALLET" perp image-hc --image "$PERP_IMAGE" 2>&1 >/dev/null | sed -n 's/^engine_program_log_height \([0-9][0-9]*\)$/\1/p' | tail -1 || true)
+EPLH_GOT=$("$WALLET22" perp image-hc --image "$PERP_IMAGE" 2>&1 >/dev/null | sed -n 's/^engine_program_log_height \([0-9][0-9]*\)$/\1/p' | tail -1 || true)
 if ! grep -qE -- '(^|[[:space:]])--program-state-refuse-panics([[:space:]=<,]|$)' <<<"$HELP" || [ -z "$EPLH_GOT" ]; then
   if [ "${DRY_RUN:-}" = 1 ]; then
     AUDIT_V10_SKIPPED=1; export AUDIT_V10_SKIPPED
     cat >&2 <<EOF
-cut-chain22: ⚠⚠⚠ AUDIT_V10 SKIPPED ⚠⚠⚠ — $NODE genesis has no --program-state-refuse-panics, or \`$WALLET perp
+cut-chain22: ⚠⚠⚠ AUDIT_V10 SKIPPED ⚠⚠⚠ — $NODE genesis has no --program-state-refuse-panics, or \`$WALLET22 perp
 cut-chain22:     image-hc\` prints no engine_program_log_height: a build before v0.8.2 (299378d0). The dry run
 cut-chain22:     goes on WITHOUT refuse_panics, bound_payouts, sparse_windows, max_window_heights,
 cut-chain22:     engine_program_log_height, max_pending_digests and max_accounts, and without their probes;
 cut-chain22:     the REAL cut refuses.
 EOF
   else
-    echo "cut-chain22: $NODE genesis has no --program-state-refuse-panics, or \`$WALLET perp image-hc\` prints no engine_program_log_height — a build before v0.8.2 (299378d0); the audit-v10 fields (PST-1, PERP-6, PERP-101, CON-60, MSA-4) cannot be written" >&2; exit 1
+    echo "cut-chain22: $NODE genesis has no --program-state-refuse-panics, or \`$WALLET22 perp image-hc\` prints no engine_program_log_height — a build before v0.8.2 (299378d0); the audit-v10 fields (PST-1, PERP-6, PERP-101, CON-60, MSA-4) cannot be written" >&2; exit 1
   fi
 else
   # CON-60: the pin is what this build reads off the pinned image, and must be the decided height.
-  [ "$EPLH_GOT" = "$EXPECT_ENGINE_PROGRAM_LOG_HEIGHT" ] || { echo "cut-chain22: \`$WALLET perp image-hc --image $PERP_IMAGE\` prints engine_program_log_height $EPLH_GOT, not EXPECT_ENGINE_PROGRAM_LOG_HEIGHT $EXPECT_ENGINE_PROGRAM_LOG_HEIGHT — another engine image" >&2; exit 1; }
+  [ "$EPLH_GOT" = "$EXPECT_ENGINE_PROGRAM_LOG_HEIGHT" ] || { echo "cut-chain22: \`$WALLET22 perp image-hc --image $PERP_IMAGE\` prints engine_program_log_height $EPLH_GOT, not EXPECT_ENGINE_PROGRAM_LOG_HEIGHT $EXPECT_ENGINE_PROGRAM_LOG_HEIGHT — another engine image" >&2; exit 1; }
   ENGINE_PROGRAM_LOG_HEIGHT=$EPLH_GOT; export ENGINE_PROGRAM_LOG_HEIGHT
   echo "cut-chain22: engine program height $ENGINE_PROGRAM_LOG_HEIGHT (\`rand perp image-hc\`, = EXPECT_ENGINE_PROGRAM_LOG_HEIGHT) → perps.engine_program_log_height"
   # The two operator inputs (OPEN 1, OPEN 2): no default on the real cut; DRY_RUN puts in each
@@ -4024,8 +4691,8 @@ fi
 echo "cut-chain22: cutting with $NODE_VERSION"
 if [ -z "${PERPS_SKIPPED:-}" ]; then
   # The engine: this build's `rand perp image-hc` over the image must be the decided engine.
-  ENGINE_HC_GOT=$("$WALLET" perp image-hc --image "$PERP_IMAGE" 2>/dev/null | tail -1 || true)
-  [ "$ENGINE_HC_GOT" = "$EXPECT_ENGINE_HC" ] || { echo "cut-chain22: \`$WALLET perp image-hc --image $PERP_IMAGE\` printed '${ENGINE_HC_GOT}', not EXPECT_ENGINE_HC $EXPECT_ENGINE_HC — the wrong engine image (or a rand without \`perp image-hc\`)" >&2; exit 1; }
+  ENGINE_HC_GOT=$("$WALLET22" perp image-hc --image "$PERP_IMAGE" 2>/dev/null | tail -1 || true)
+  [ "$ENGINE_HC_GOT" = "$EXPECT_ENGINE_HC" ] || { echo "cut-chain22: \`$WALLET22 perp image-hc --image $PERP_IMAGE\` printed '${ENGINE_HC_GOT}', not EXPECT_ENGINE_HC $EXPECT_ENGINE_HC — the wrong engine image (or a rand without \`perp image-hc\`)" >&2; exit 1; }
   echo "cut-chain22: engine image $PERP_IMAGE: hc $ENGINE_HC_GOT (= EXPECT_ENGINE_HC, durian.market's pinned engine)"
 fi
 load_fee_recipient
@@ -4047,6 +4714,10 @@ echo "cut-chain22: chain 21's treasury id ${T21:0:12}… (rand-node multisig id 
 # CON-601: the pinned state-proof keys, from the shipped files (before the perps section is written).
 [ -n "${PERPS_SKIPPED:-}${AUDIT_V10_SKIPPED:-}" ] || perps_keys_step
 
+# Constraint set 11: every key file behind a chain-22 address, derived by WALLET22 and WALLET, and
+# every carry line checked against them — before a payout is written or a note sealed.
+derive_wallet_addresses
+py_addresses
 py_validators
 
 # The beacon (#189): BEACON_TSV joined by name with the validators, at the addresses their public
@@ -4069,12 +4740,12 @@ export TREASURY_ID
 if [ -z "${PERPS_SKIPPED:-}" ]; then
   perp_genesis_root_step
   PERPS_STEP=section py_perps
-  echo "cut-chain22: perps genesis root $PERP_GENESIS_ROOT ($PERP_PROVER genesis-state → $WALLET perp genesis-root); the section is spliced after zUSD"
+  echo "cut-chain22: perps genesis root $PERP_GENESIS_ROOT ($PERP_PROVER genesis-state → $WALLET22 perp genesis-root); the section is spliced after zUSD"
 fi
 
 args=()
 while IFS= read -r l; do args+=("$l"); done < "$TMP/validator-args"
-while read -r label addr amount; do
+while read -r label addr amount _src; do   # _src: key= / c21= (py_addresses checked them)
   case "$label" in ''|'#'*) continue;; esac
   args+=(--alloc "$addr=$amount")
 done < "$ALLOC_ADDRESSES"
@@ -4088,7 +4759,7 @@ v10_args=()
 
 # zUSD genesis notes: fresh openings, sealed to each carried holder (asset 1 = zUSD, 8 decimals).
 : > "$TMP/token-notes.jsonl"
-while read -r label addr amount; do
+while read -r label addr amount _src; do   # _src: key= / given= (py_addresses checked them)
   case "$label" in ''|'#'*) continue;; esac
   "$NODE" alloc-note --to "$addr" --amount "$amount" --asset 1 --envelope-bytes "$ENVELOPE_BYTES" | python3 -c 'import json,sys;print(json.dumps(json.load(sys.stdin)))' >> "$TMP/token-notes.jsonl"
   echo "cut-chain22: zUSD genesis note, $amount zUSD to $label"
@@ -4196,6 +4867,8 @@ if [ -z "${BLOCK_CONTEXT_SKIPPED:-}" ]; then
   record_beacon "$CUT_RECORD" "$REFERENCE_BLOCK_WINDOW" "$BEACON_COMMIT_DELAY_BLOCKS" "$TMP/beacon-record.txt" \
     || BC_RECORDED="⚠ NOT written to $CUT_RECORD (append failed) — copy $TMP/beacon-record.txt there by hand"
 fi
+AD_RECORDED="appended to $CUT_RECORD (address-derivation:)"
+record_address_derivation "$CUT_RECORD" || AD_RECORDED="⚠ NOT written to $CUT_RECORD (append failed) — add the address-derivation: line by hand"
 TS=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['timestamp_ms'])" "$OUT")
 AGE=$(( ( $(date +%s) * 1000 - TS ) / 1000 ))
 
@@ -4208,7 +4881,8 @@ cut-chain22: limits: max_proof_bytes $MAX_PROOF_BYTES, max_block_bytes $MAX_BLOC
 cut-chain22: testnet: true; binding_domain: $BINDING_DOMAIN; proof_window_blocks: $PROOF_WINDOW_BLOCKS
 cut-chain22: gas: $GAS_PRICE/gas, $BYTE_PRICE/KiB, bundle limit $BUNDLE_GAS_LIMIT, dynamic $GAS_DYNAMIC, ceilings $MAX_GAS_PRICE/$MAX_BYTE_PRICE, byte load $GAS_BYTE_LOAD
 cut-chain22: envelope_bytes $ENVELOPE_BYTES — every genesis note sealed in the 1 860-B form
-cut-chain22: bridge.fees: mint $BRIDGE_MINT_BPS bps, burn $BRIDGE_BURN_BPS bps, recipient fingerprint $FEE_RECIPIENT_FINGERPRINT (from $FEE_RECIPIENT_FILE)
+cut-chain22: bridge.fees: mint $BRIDGE_MINT_BPS bps, burn $BRIDGE_BURN_BPS bps, recipient fingerprint $FEE_RECIPIENT_FINGERPRINT (set 11, from $FEE_RECIPIENT_FILE)
+cut-chain22: addresses: constraint set 11 — every payout, alloc, zUSD holder and faucet recipient derived by WALLET22 (sha256 $WALLET22_SHA256) from its key file (given: ${SET11_GIVEN:-none}); $AD_RECORDED
 cut-chain22: staking: chain 21's (max_stake_entry_bps_per_epoch $STAKE_ENTRY_BPS, admission_by_vote); no slashing
 cut-chain22: program_state: cell_fee $PROGRAM_STATE_CELL_FEE$([ -n "${AUDIT_V10_SKIPPED:-}" ] && echo ", refuse_panics SKIPPED — NOT what chain 22 will be" || echo ", refuse_panics true (PST-1)")
 cut-chain22: tokens: incremental_root true (TOK-1)
