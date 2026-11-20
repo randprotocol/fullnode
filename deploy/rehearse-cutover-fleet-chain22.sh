@@ -284,7 +284,7 @@ cp deploy/lib/cut-policy.sh deploy/lib/verify-release.sh deploy/lib/fleet-env.sh
 { echo '#!/usr/bin/env bash'
   echo '# rehearsal stub of deploy/cut-chain22-genesis.sh: logs its arguments and environment; the validator lists are the real ones'
   grep -E '^(GENESIS_NAMES|BONDED|DROPPED_VALIDATORS)=' deploy/cut-chain22-genesis.sh
-  echo 'echo "STUB $* PRUNED_SCAN_OK=${PRUNED_SCAN_OK:-} BEACON_TSV=${BEACON_TSV:-} NODE=${NODE:-} DRY_RUN=${DRY_RUN:-}" >> "$STUB_LOG"'
+  echo 'echo "STUB $* PRUNED_SCAN_OK=${PRUNED_SCAN_OK:-} BEACON_TSV=${BEACON_TSV:-} NODE=${NODE:-} DRY_RUN=${DRY_RUN:-} WALLET=${WALLET:-} WALLET22=${WALLET22:-}" >> "$STUB_LOG"'
   echo 'echo "cut-chain22-genesis.sh (stub) ran: ${1:-cut}"'
   echo 'if [ "${1:-}" = check-limits ]; then exit "${STUB_LIMITS_RC:-0}"; fi; exit "${STUB_RC:-0}"'
 } > "$T/repo/deploy/cut-chain22-genesis.sh"
@@ -435,14 +435,22 @@ t "bridge-stop (guardians + the relayer)" 0 "BRIDGE-STOP DONE" env RELAYER_HOST=
 chk "…six guardians and the relayer inactive" '[ "$(cat $H/192.0.2.10{1..6}/state/rand-guardian | sort -u)" = inactive ] && [ "$(cat $H/192.0.2.150/state/rand-relayer)" = inactive ]'
 t "snapshot without CHAIN21_RPC" 1 "CHAIN21_RPC is unset" "$F" snapshot "$T/snap"
 t "snapshot" 0 "rand-guardian inactive" env CHAIN21_RPC=http://127.0.0.1:8545 "$F" snapshot "$T/snap"
-chk "…the cut script ran snapshot with PRUNED_SCAN_OK=1 and no DRY_RUN" 'grep -q "^STUB snapshot $T/snap PRUNED_SCAN_OK=1 .* DRY_RUN=$" $T/stub.log'
-t "balances" 0 "inactive" env CHAIN21_RPC=http://127.0.0.1:8545 WALLET=/x/rand "$F" balances "$T/snap"
-chk "…with PRUNED_SCAN_OK=1" 'grep -q "^STUB balances $T/snap PRUNED_SCAN_OK=1" $T/stub.log'
+chk "…the cut script ran snapshot with PRUNED_SCAN_OK=1 and no DRY_RUN" 'grep -q "^STUB snapshot $T/snap PRUNED_SCAN_OK=1 .* DRY_RUN= WALLET=" $T/stub.log'
+# constraint set 11: balances and the cut take chain 21's rand (WALLET) AND v0.8.7's (WALLET22)
+t "balances without WALLET22" 1 "WALLET22=<unset> is not executable — the v0.8.7 rand" env CHAIN21_RPC=http://127.0.0.1:8545 WALLET="$BIN/old/rand" WALLET22= "$F" balances "$T/snap"
+t "balances without WALLET" 1 "WALLET=<unset> is not executable — chain 21's" env CHAIN21_RPC=http://127.0.0.1:8545 WALLET= WALLET22="$BIN/new/rand" "$F" balances "$T/snap"
+t "balances with chain 21's rand as WALLET22" 1 "WALLET and WALLET22 are the same binary" env CHAIN21_RPC=http://127.0.0.1:8545 WALLET="$BIN/old/rand" WALLET22="$BIN/old/rand" "$F" balances "$T/snap"
+t "balances" 0 "inactive" env CHAIN21_RPC=http://127.0.0.1:8545 WALLET="$BIN/old/rand" WALLET22="$BIN/new/rand" "$F" balances "$T/snap"
+chk "…with PRUNED_SCAN_OK=1 and both wallets passed through" 'grep -q "^STUB balances $T/snap PRUNED_SCAN_OK=1 .* WALLET=$BIN/old/rand WALLET22=$BIN/new/rand$" $T/stub.log'
+chk "…and the roll record names WALLET22's sha256 (set 11)" 'grep -q "balances with PRUNED_SCAN_OK=1, WALLET22 sha256 $(cut -c1-16 <<<"$NEW_SHA_WALLET") (set 11), WALLET sha256 $(cut -c1-16 <<<"$OLD_SHA_WALLET")" "$ROLL_RECORD"'
+export WALLET="$BIN/old/rand" WALLET22="$BIN/new/rand"
+t "the cut without WALLET22" 1 "WALLET22=<unset> is not executable" env WALLET22= "$F" cut
 t "a cut the cut script refuses" 1 "refused" env STUB_RC=1 "$F" cut
 grep -v '^nyc2 ' "$BEACON_TSV" > "$T/beacon-24.tsv"
 t "the cut with a BEACON_TSV missing a validator" 1 "does not name exactly chain 22's 25" env BEACON_TSV="$T/beacon-24.tsv" "$F" cut
 t "the cut" 0 "(stub) ran: cut" "$F" cut
-chk "…the cut script ran with PRUNED_SCAN_OK=1 and the collected BEACON_TSV" 'tail -1 $T/stub.log | grep -q "^STUB  PRUNED_SCAN_OK=1 BEACON_TSV=$BEACON_TSV NODE=.* DRY_RUN=$"'
+chk "…the cut script ran with PRUNED_SCAN_OK=1, the collected BEACON_TSV and both wallets" 'tail -1 $T/stub.log | grep -q "^STUB  PRUNED_SCAN_OK=1 BEACON_TSV=$BEACON_TSV NODE=.* DRY_RUN= WALLET=$BIN/old/rand WALLET22=$BIN/new/rand$"'
+unset WALLET WALLET22
 # The genesis files the cut would have written: chain 22's shape, the collected commitments.
 cat > "$T/mkgen.py" <<'PY'
 import json, sys

@@ -44,6 +44,20 @@ chain 21.** What moved, and where it lives:
   chain 21's); wallet and randscan WASM; bridge commitments. A later circuits PR (EVM block
   context / PREVRANDAO) moves the evm guest's hc again: one more `CIRCUITS_PIN` step.
 
+### Chain 22's shielded addresses are re-derived under constraint set 11 (2026-11-20, branch `fix/cut22-set11-addresses`, PR open, NOT merged; deploy only)
+
+Set 11 moves every `rand1` address for the same spend key (`pk = H_PK(nk)` is Poseidon2). The cut
+script read every carried address from chain-21 tooling, which would have sealed chain 22's genesis
+notes to set-9 addresses no set-11 wallet can spend. Now `deploy/cut-chain22-genesis.sh` takes
+`WALLET` (chain 21's rand, reads chain 21) and `WALLET22` (v0.8.7, set 11, no default; derives
+everything), told apart by a public probe key's fingerprint (set 9 `XCGM-G4XD-CQQA-753X`, set 11
+`S3VP-7C0T-GGSA-BJJY`). Carry lines name `key=<file>` (re-derived by both binaries) or, under
+`SET11_GIVEN` plus a `set11-given:` record line, `given=<fingerprint>`; payouts come from
+`PAYOUT_KEYS_DIRS`; the fee recipient needs the owner's set-11 `FEE_RECIPIENT_FILE` and
+`FEE_RECIPIENT_FINGERPRINT` (89DS-4Q4X-HXSX-MBYW refused by name); a backstop refuses any chain-21
+`rand1` or pk in the finished file. Validator, minter and beacon addresses are blake3 of a Dilithium2
+public key and do not move. `docs/deploy.md` "Every shielded address is re-derived under constraint set 11".
+
 ### The chain-22 treasury is 5 of 6 with its RAND carried; perps carried empty (2026-11-19, branch `feat/chain22-treasury-carry`; deploy only)
 
 Owner's decisions of 2026-11-19 in `deploy/cut-chain22-genesis.sh` (OPEN 1–4 of its header;
@@ -3096,6 +3110,13 @@ never move them.
 
 ### Repo workflow traps
 
+- **A constraint-set cut moves every shielded address.** `rand1…` is derived through Poseidon2
+  (`pk = H_PK(nk)`), so a set change gives the same key file a new address. Never carry a `rand1`
+  from the old chain's genesis, `balances`, a contacts file or an earlier chain's text file into a
+  new-set genesis: re-derive it from the key file with the NEW set's `rand` (the chain-22 cut's
+  `WALLET22`), or take it from the holder with its fingerprint. Dilithium-key addresses
+  (validators, minters, the beacon) and public keys do not move. Fingerprints are blake3 of the
+  address, so a fingerprint from the old set names the old address.
 - **This repo is worked on by multiple agents/sessions in parallel**, in the
   same checkout. Branches and the worktree HEAD move mid-task. Before
   committing, re-check `git worktree list` and `git log main`; for anything

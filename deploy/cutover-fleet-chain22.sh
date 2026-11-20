@@ -84,8 +84,12 @@
 #   deploy/cutover-fleet-chain22.sh beacon-collect     # read-only: the 25 commitments → BEACON_TSV
 #   [RELAYER_HOST=…] deploy/cutover-fleet-chain22.sh bridge-stop   # guardians (+ relayer) down
 #   CHAIN21_RPC=<tunnel to e or obs1> deploy/cutover-fleet-chain22.sh snapshot <dir>
-#   CHAIN21_RPC=… WALLET=<v0.8.6 rand> deploy/cutover-fleet-chain22.sh balances <dir>
-#   CUT_RECORD=… CHAIN21_SNAPSHOT=<dir> NODE=… WALLET=… … deploy/cutover-fleet-chain22.sh cut
+#   CHAIN21_RPC=… WALLET=<v0.8.6 rand> WALLET22=<v0.8.7 rand> deploy/cutover-fleet-chain22.sh balances <dir>
+#   CUT_RECORD=… CHAIN21_SNAPSHOT=<dir> NODE=… WALLET=… WALLET22=… FEE_RECIPIENT_FILE=… \
+#     FEE_RECIPIENT_FINGERPRINT=<the owner's SET-11 fingerprint> … deploy/cutover-fleet-chain22.sh cut
+#   (constraint set 11 moves every rand1 address for the same key: WALLET, chain 21's rand, reads
+#    chain 21; WALLET22, the signed v0.8.7 rand, derives every chain-22 address — cut-chain22-genesis.sh,
+#    "EVERY SHIELDED ADDRESS IS RE-DERIVED UNDER CONSTRAINT SET 11")
 #   (the second operator re-derives the hash and writes second-hash into the record; the
 #    CHAIN_CONSTRAINT_SETS row the cut printed is committed)
 #   LOCAL_NODE=<v0.8.7 rand-node> RELEASE_SUMS=… deploy/cutover-fleet-chain22.sh push <genesis>
@@ -718,6 +722,17 @@ snapshot|balances|cut)
   # deploy/cut-chain22-genesis.sh, with PRUNED_SCAN_OK=1 (owner, 2026-11-19: e and obs1 prune below
   # 187556 and no unpruned chain-21 node exists) and, for the cut, the collected BEACON_TSV.
   ARGS=()
+  # balances and the cut derive chain 22's addresses: both wallets, by path, and their sha256 on the
+  # roll record (the cut script then tells set 9 from set 11 by the probe key's fingerprint).
+  WALLETS_NOTE=
+  if [ "$PHASE" != snapshot ]; then
+    [ -x "${WALLET:-}" ] || dry || { echo "$PHASE: WALLET=${WALLET:-<unset>} is not executable — chain 21's v$OLD_VERSION rand (constraint set 9), which reads chain 21" >&2; exit 1; }
+    [ -x "${WALLET22:-}" ] || dry || { echo "$PHASE: WALLET22=${WALLET22:-<unset>} is not executable — the v0.8.7 rand from the signed release (constraint set 11), which derives every chain-22 address; chain 21's rand would carry set-9 addresses no set-11 wallet can spend" >&2; exit 1; }
+    if [ -x "${WALLET:-}" ] && [ -x "${WALLET22:-}" ]; then
+      [ "$(file_sha "$WALLET")" != "$(file_sha "$WALLET22")" ] || { echo "$PHASE: WALLET and WALLET22 are the same binary — WALLET22 must be the v0.8.7 (set-11) rand" >&2; exit 1; }
+      WALLETS_NOTE=", WALLET22 sha256 $(file_sha "$WALLET22" | cut -c1-16) (set 11), WALLET sha256 $(file_sha "$WALLET" | cut -c1-16) (chain 21)"
+    fi
+  fi
   case "$PHASE" in
     snapshot|balances)
       DIR=${2:?$PHASE <dir>}; ARGS=("$PHASE" "$DIR")
@@ -735,11 +750,11 @@ snapshot|balances|cut)
       fi
       ;;
   esac
-  if dry; then echo "[dry-run] local: PRUNED_SCAN_OK=1 BEACON_TSV=$BEACON_TSV $CUT_SCRIPT ${ARGS[*]}"; exit 0; fi
+  if dry; then echo "[dry-run] local: PRUNED_SCAN_OK=1 BEACON_TSV=$BEACON_TSV WALLET=${WALLET:-<unset>} WALLET22=${WALLET22:-<unset>} $CUT_SCRIPT ${ARGS[*]}"; exit 0; fi
   env -u DRY_RUN -u SELFTEST PRUNED_SCAN_OK=1 BEACON_TSV="$BEACON_TSV" CUT_RECORD="$CUT_RECORD" bash "$CUT_SCRIPT" ${ARGS[@]+"${ARGS[@]}"} \
     || { echo "$PHASE: $CUT_SCRIPT refused (above)" >&2; exit 1; }
-  if [ "$PHASE" = cut ]; then rec "the cut ($CUT_SCRIPT) with PRUNED_SCAN_OK=1 and BEACON_TSV sha256 $(file_sha "$BEACON_TSV" | cut -c1-16)"
-  else rec "$CUT_SCRIPT $PHASE with PRUNED_SCAN_OK=1"; fi
+  if [ "$PHASE" = cut ]; then rec "the cut ($CUT_SCRIPT) with PRUNED_SCAN_OK=1 and BEACON_TSV sha256 $(file_sha "$BEACON_TSV" | cut -c1-16)$WALLETS_NOTE"
+  else rec "$CUT_SCRIPT $PHASE with PRUNED_SCAN_OK=1$WALLETS_NOTE"; fi
   ;;
 push)
   need_local_node
