@@ -1,0 +1,24 @@
+# Roll record — chain 21 → chain 22 on v0.8.7 (a chain cut: all-stop, then a quorum, then the archives).
+#
+# Written by deploy/cutover-fleet-chain22.sh as the phases ran; one line per phase, appended, never
+# written over. Names only: the fleet's addresses are the operator's (configuration/fleet).
+
+release: v0.8.7 (v0.8.7, constraint set 11); chain 21 ran v0.8.6 (6591c884187126f118460c940d15715032bd124f)
+hosts: 25 — validators 25 (a b c d e f lon1 sfo3 tor1 blr1 syd1 atl1 ams3 nyc1 nyc2 sfo2 mkc1 mem1 obs1 g1 g2 g3 g4 g5 g6), first group 23 (a b c d f lon1 sfo3 tor1 blr1 syd1 atl1 ams3 nyc1 nyc2 sfo2 mkc1 mem1 g1 g2 g3 g4 g5 g6), late e obs1; quorum 17
+skipped: archive2 (dropped from chain 22; never contacted)
+tool: deploy/cutover-fleet-chain22.sh (bf5aabdf)
+bridge-stop: 2026-11-20T12:35:32Z rand-guardian inactive on the six guardian hosts; relayer: inactive
+snapshot: 2026-11-20T12:36:26Z deploy/cut-chain22-genesis.sh snapshot with PRUNED_SCAN_OK=1
+balances: 2026-11-20T19:57:15Z deploy/cut-chain22-genesis.sh balances with PRUNED_SCAN_OK=1, WALLET22 sha256 4ca4f9083a4549f9 (set 11), WALLET sha256 4cd9beafdc9c05fd (chain 21)
+cut: 2026-11-20T20:09:04Z the cut (deploy/cut-chain22-genesis.sh) with PRUNED_SCAN_OK=1 and BEACON_TSV sha256 21ce8dc37cb9ec56, WALLET22 sha256 4ca4f9083a4549f9 (set 11), WALLET sha256 4cd9beafdc9c05fd (chain 21)
+cut: 2026-11-21T03:12:17Z the cut (deploy/cut-chain22-genesis.sh) with PRUNED_SCAN_OK=1 and BEACON_TSV sha256 21ce8dc37cb9ec56, WALLET22 sha256 4ca4f9083a4549f9 (set 11), WALLET sha256 4cd9beafdc9c05fd (chain 21)
+push: 2026-11-21T03:13:30Z pushed genesis 29d67542941f2eb6f2c1bb68c759926f5d814c9e2c7a934292806a2d98b7e9c0 (file sha256 d109860fc672e12cc9d88057c75d838bfa30812dfe999bd257dc5bccc32c4541) to 25 hosts; chain 21 still running
+stop: 2026-11-21T03:14:42Z stopped chain 21 (v0.8.6) on 25 hosts at height 2105486 at c, for genesis 29d67542941f2eb6f2c1bb68c759926f5d814c9e2c7a934292806a2d98b7e9c0 (CONFIRM_HALT_CHAIN21 given)
+switch: 2026-11-21T03:15:03Z switched 25 hosts to genesis 29d67542941f2eb6f2c1bb68c759926f5d814c9e2c7a934292806a2d98b7e9c0: v0.8.7 installed, *.pre-c22 kept, constraint-set marker 11, beacon seeds checked on 25 validators
+start: 2026-11-21T03:15:39Z started the first group on chain 22: 23 validators (a b c d f lon1 sfo3 tor1 blr1 syd1 atl1 ams3 nyc1 nyc2 sfo2 mkc1 mem1 g1 g2 g3 g4 g5 g6), quorum 17; bootstraps c d first
+check-limits: 2026-11-21T03:16:03Z check-limits passed against c for genesis 29d67542941f2eb6f2c1bb68c759926f5d814c9e2c7a934292806a2d98b7e9c0
+start-archives: 2026-11-21T03:16:27Z started the archives / observers on chain 22: e obs1
+wait: 2026-11-21T03:20:53Z all 25 on 29d67542941f2eb6f2c1bb68c759926f5d814c9e2c7a934292806a2d98b7e9c0 at height 258, but a validator's beacon seed does not open its commitment in force
+wait: 2026-11-21T03:26:12Z CHAIN 22 LIVE: all 25 hosts on 29d67542941f2eb6f2c1bb68c759926f5d814c9e2c7a934292806a2d98b7e9c0, healthy, msauth + perps keys loaded, c at height 535; beacon seeds open on 25 validators
+verify: 2026-11-21T03:26:55Z verified: CHAIN_CONSTRAINT_SETS holds (22, 29d67542941f2eb6f2c1bb68c759926f5d814c9e2c7a934292806a2d98b7e9c0, 11); a release for chain 22 may be tagged from this tree
+bridge-start: 2026-11-21T03:34:03Z rand-guardian active on the six guardian hosts; relayer: active
