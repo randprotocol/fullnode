@@ -62,7 +62,7 @@ pub const MARKER_FILE: &str = "constraint-set";
 ///
 /// No record states chain 20's set in one sentence the way chains 16-19 have one; its row rests on
 /// the build it was cut with and on v0.8.0's refusal of it.
-pub const CHAIN_CONSTRAINT_SETS: [(u64, &str, u32); 8] = [
+pub const CHAIN_CONSTRAINT_SETS: [(u64, &str, u32); 9] = [
     (14, "1cff3b7da248d93ab547aef5c05bb7d0d22da510b592dab9cf7374807de7c7ff", 6),
     (15, "cc30e0854fb25b3abcee96bb7bc206dcd6e37862f6dfe80a05b3e474c2d1b6b8", 6),
     (16, "20925ae63cfa6e6c96f3ff369486ead8ea04821fec026a55df9e2893f3d53005", 7),
@@ -71,6 +71,7 @@ pub const CHAIN_CONSTRAINT_SETS: [(u64, &str, u32); 8] = [
     (19, "a3defc937d561d4beb1df9a08c9cb87a3dc32dadbfc2d1814ab6f627b0a2228a", 8),
     (20, "6210cf071a390d7ac61d8cbea5dd9d139d1a493a862b54a45a498f36af2d5135", 8),
     (21, "ca76c2766ed6090ac6ba5dad86b724dd5d2b80c0edfaed287cd8b129e663ca9a", 9),
+    (22, "29d67542941f2eb6f2c1bb68c759926f5d814c9e2c7a934292806a2d98b7e9c0", 11),
 ];
 
 /// The listed chain with this genesis hash (hex): its chain id and constraint set.
