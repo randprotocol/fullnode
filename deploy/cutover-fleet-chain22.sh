@@ -1057,7 +1057,7 @@ wait)
   read -r NEW _ <<<"$(genesis_hash "$GENESIS")"; P=${NEW:0:8}
   if dry; then
     echo "[dry-run] every ${WAIT_SLEEP:-20} s, up to $WAIT_TRIES times: on each of the $NALL hosts rand_getGenesisHash == $NEW, rand_getHealth ok, rand_status.msauth_key loaded, perps_keys loaded (4); $BOOT1's height > 2; then check-beacon-seed.sh --rpc on the $NVALSET validators"
-    rpc "$BOOT1" rand_status; each "$VAL_N" "$(r_paths); $(beacon_check /usr/local/bin/rand-node \$HG \$NEWDIR 127.0.0.1:8545)"; exit 0
+    rpc "$BOOT1" rand_status; each "$VAL_N" "$(r_paths); $(beacon_check /usr/local/bin/rand-node \$HG \$NEWDIR http://127.0.0.1:8545)"; exit 0
   fi
   [ ${#NEW} -eq 64 ] || { echo "wait: could not derive the genesis hash" >&2; exit 1; }
   for _ in $(seq 1 "$WAIT_TRIES"); do
@@ -1074,7 +1074,7 @@ wait)
     echo "  $(date -u +%T) $ok/$NALL on chain 22, healthy, msauth + perps keys loaded; $BOOT1 height ${H:-?}${late:+; not yet:$late}"
     if [ "$ok" = "$NALL" ] && [ -n "$H" ] && [ "$H" -gt 2 ]; then
       echo "== every validator's beacon seed against its running node (check-beacon-seed.sh --rpc)"
-      each "$VAL_N" "set -e; $(r_paths); $(beacon_check /usr/local/bin/rand-node \$HG \$NEWDIR 127.0.0.1:8545); echo \"\$H_NAME beacon seed opens the commitment in force\"" \
+      each "$VAL_N" "set -e; $(r_paths); $(beacon_check /usr/local/bin/rand-node \$HG \$NEWDIR http://127.0.0.1:8545); echo \"\$H_NAME beacon seed opens the commitment in force\"" \
         || { rec "all $NALL on $NEW at height $H, but a validator's beacon seed does not open its commitment in force"; echo "wait: a validator's beacon seed does not open its commitment in force (above) — it misses its slots" >&2; exit 1; }
       rec "CHAIN 22 LIVE: all $NALL hosts on $NEW, healthy, msauth + perps keys loaded, $BOOT1 at height $H; beacon seeds open on $NVALSET validators"
       echo "=== $(date -u +%T) CUTOVER DONE: all $NALL on $NEW, committing at $H — next: bridge-start, verify"; exit 0
