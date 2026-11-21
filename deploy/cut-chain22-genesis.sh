@@ -61,7 +61,7 @@
 #                                                    # prune_floor 187556; rand-archive-2 abandoned);
 #                                                    # the cut then needs it too and the record's
 #                                                    # `scan-floor: <floor>` (what it loses: py_snapshot)
-#   CUT_RECORD=<record> CHAIN21_SNAPSHOT=<dir> NODE=<the cut build's rand-node> \
+#   CUT_RECORD=<record> CHAIN21_SNAPSHOT=<dir> NODE=<the cut build's rand-node> NODE21=<chain 21's rand-node, v0.8.6> \
 #     WALLET=<chain 21's rand, v0.8.2> WALLET22=<the cut build's rand, v0.8.7: set 11> \
 #     FEE_RECIPIENT_FINGERPRINT=<the owner's set-11 fingerprint> [SET11_GIVEN=<labels>] \
 #     EXPECT_NODE_VERSION=<that release> PERP_PROVER=<durian's perp-prover> \
@@ -421,6 +421,11 @@ cd "$(dirname "$0")/.."
 . deploy/lib/cut-policy.sh
 
 NODE=${NODE:-target/release/rand-node}
+# Chain 21's rand-node (v0.8.6, constraint set 9), used for ONE step: re-deriving chain 21's genesis hash
+# from CHAIN21_GENESIS. A set-11 NODE refuses to init any chain-14…21 file ("proofs were made under
+# constraint set 9 … refusing to init"), so the probe needs the release that runs chain 21. Defaults to
+# NODE (the self-test's fake node accepts both).
+NODE21=${NODE21:-$NODE}
 WALLET=${WALLET:-target/release/rand}     # chain 21's rand (set 9): READS chain 21 only — this tree's own build is set 11 and is refused
 WALLET22=${WALLET22:-}                    # the cut build's rand (v0.8.7, set 11, from the signed release): DERIVES every chain-22 address; no default
 # The wallet probe (header, "EVERY SHIELDED ADDRESS"): a fixed, public spend key — NEVER FUND IT —
@@ -2037,7 +2042,7 @@ else:
         spk = perps.get("state_proof_keys")
         SPK_SHAPE = ["tier", "program_log_height", "input_log_height", "public_log_height", "poseidon2_log_height"]
         shapes = json.loads(E["PERPS_STATE_PROOF_SHAPES_DECIDED"])
-        need(isinstance(spk, list) and all(isinstance(k, dict) and list(k) == SPK_SHAPE + ["sha256"] for k in spk)
+        need(isinstance(spk, list) and all(isinstance(k, dict) and sorted(k) == sorted(SPK_SHAPE + ["sha256"]) for k in spk)   # key SET: rand-node writes the fields sorted
              and [[k[f] for f in SPK_SHAPE] for k in spk] == shapes,
              f"perps.state_proof_keys is {spk!r}, not the four canonical tier-18 shapes {shapes} (tier, program, input, public, "
              f"poseidon2 — CON-601, owner 2026-11-19)")
@@ -4703,9 +4708,10 @@ export TMP
 # This rand-node hashes chain 21's fields as chain 21 did: it re-derives chain 21's own genesis hash
 # from the committed file (so every field carried from chain 21 is hashed, and the three new
 # sections are the only difference the cut makes).
-H21=$("$NODE" init --datadir "$TMP/chain21-probe" --genesis "$CHAIN21_GENESIS" 2>"$TMP/chain21-probe.err" | sed -n 's/.*genesis \([0-9a-f]\{64\}\).*/\1/p' || true)
-[ "$H21" = "$CHAIN21_HASH" ] || { echo "cut-chain22: $NODE derives '${H21:-nothing}' from $CHAIN21_GENESIS, not chain 21's $CHAIN21_HASH ($(tail -1 "$TMP/chain21-probe.err" | cut -c1-90))" >&2; exit 1; }
-echo "cut-chain22: this rand-node re-derives chain 21's genesis ${H21:0:12}… from $CHAIN21_GENESIS"
+[ -x "$NODE21" ] || { echo "cut-chain22: NODE21=$NODE21 is not executable — chain 21's rand-node (set 9) re-derives chain 21's genesis" >&2; exit 1; }
+H21=$("$NODE21" init --datadir "$TMP/chain21-probe" --genesis "$CHAIN21_GENESIS" 2>"$TMP/chain21-probe.err" | sed -n 's/.*genesis \([0-9a-f]\{64\}\).*/\1/p' || true)
+[ "$H21" = "$CHAIN21_HASH" ] || { echo "cut-chain22: $NODE21 derives '${H21:-nothing}' from $CHAIN21_GENESIS, not chain 21's $CHAIN21_HASH ($(tail -1 "$TMP/chain21-probe.err" | cut -c1-90)) — a set-11 rand-node refuses chain 21's file: NODE21=<chain 21's v0.8.6 rand-node>" >&2; exit 1; }
+echo "cut-chain22: $NODE21 ($("$NODE21" --version 2>/dev/null || echo '?')) re-derives chain 21's genesis ${H21:0:12}… from $CHAIN21_GENESIS"
 # ... and chain 21's treasury id, offline, from the same file (the id `snapshot` read the vault at).
 T21=$(treasury_id_of "$CHAIN21_GENESIS")
 [ "$T21" = "$CHAIN21_TREASURY_ID" ] || { echo "cut-chain22: $NODE derives chain 21's treasury id '${T21:-nothing}', not CHAIN21_TREASURY_ID $CHAIN21_TREASURY_ID" >&2; exit 1; }
