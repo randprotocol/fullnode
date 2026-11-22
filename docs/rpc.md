@@ -261,6 +261,14 @@ On a chain whose genesis sets `staking.faucet_recipients` (chain 15) only the li
 paid: a mint to any other address is refused at admission with `the faucet may not mint to this
 recipient (not in staking.faucet_recipients)` (`docs/staking.md` §2).
 
+**Chain 22, from the open-mint height (v0.8.8).** From `CHAIN_22_OPEN_MINT_HEIGHT` on, neither list
+applies (`docs/staking.md` §2). Any validator whose key has a row in the register serves
+`rand_mint` to any address, and `faucet` in `rand_status` / `rand_getEmission` flips to `true` on
+such a node at the first commit past the height. A validator key with no register row answers
+`this node's key <address> has no row in the validator register, …`. The per-mint cap, the epoch
+budget and the rate limit are unchanged. `rand_mint` stays off the public listener, so an operator
+mints through their own node's local RPC (`rand faucet --rpc http://127.0.0.1:…`).
+
 The faucet is rate limited per node process: eight mints back to back, refilling at one a
 second. Past that the call answers `faucet is rate limited on this node (8 mints back to back,
 refilling at 1/s); try again shortly`, so a faucet flood cannot fill the pool ahead of a bridge

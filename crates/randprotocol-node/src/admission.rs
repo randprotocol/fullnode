@@ -476,8 +476,6 @@ pub fn is_permanent(e: &TxError) -> bool {
             | TxError::BadMintSignature
             // A mint's commitment is a function of its own bytes (`ledger::mint_commitment`).
             | TxError::MintCommitmentMismatch
-            // A mint's recipient `pk` is its own bytes, against a genesis list (chain 15).
-            | TxError::FaucetRecipientNotAllowed
             // A faucet mint at or above 2^63 (deep scan 2026-09-24): the node's own byte verdict
             // for a note no proof could spend (`oversized_note`), against a constant — unlike
             // `MintTooLarge`, which stays out (see the doc comment).
@@ -1234,6 +1232,35 @@ pub fn faucet_refusal(gs: &randprotocol_core::genesis::GenesisState, is_validato
     ))
 }
 
+/// [`faucet_refusal`] against the ledger the mint would be validated on: from the chain's
+/// open-mint height on (`Ledger::open_mint`, chain 22's `staking::OPEN_MINT_ACTIVATIONS`) neither
+/// genesis list binds, and the ledger's rule is a row in the validator register — so this node can
+/// serve `rand_mint` exactly when the faucet is on, it runs as a validator and its key has a row.
+/// Below the height, and on every chain without one, it is [`faucet_refusal`] unchanged.
+pub fn faucet_refusal_at(
+    gs: &randprotocol_core::genesis::GenesisState,
+    ledger: &randprotocol_core::Ledger,
+    is_validator: bool,
+    key: &randprotocol_core::Address,
+) -> Option<String> {
+    if !ledger.open_mint() {
+        return faucet_refusal(gs, is_validator, key);
+    }
+    if !gs.faucet {
+        return Some("faucet is disabled on this chain".into());
+    }
+    if !is_validator {
+        return Some("faucet mints are signed by validators; ask a validator node".into());
+    }
+    if !ledger.validators().contains_key(key) {
+        return Some(format!(
+            "this node's key {key} has no row in the validator register, so the ledger refuses its mints; bond it (the \
+             set must admit it first) or ask a validator node"
+        ));
+    }
+    None
+}
+
 /// A faucet `Mint` whose minter has a row in the validator register but is not in `minters`
 /// ([`faucet_minters`]): `TxError::MinterNotAllowed`. `None` for everything else — including a
 /// minter with no row at all, which is the ledger's own `MinterNotValidator`, left to `validate`
@@ -1252,6 +1279,12 @@ pub fn minter_not_allowed(
     let randprotocol_core::Action::Mint { minter, .. } = &tx.action else {
         return None;
     };
+    // From the chain's open-mint height on (chain 22) any key with a register row mints — the
+    // ledger's own rule then — so the policy steps aside. Read at the pool's ledger height, the
+    // same height the ledger's own `validate` judges the mint at here.
+    if ledger.open_mint() {
+        return None;
+    }
     let addr = minter.address();
     (ledger.validators().contains_key(&addr) && !minters.contains(&addr)).then_some(TxError::MinterNotAllowed(addr))
 }
@@ -1560,7 +1593,6 @@ mod tests {
             TxError::InvalidBundleProof(ConfidentialError::MalformedProof),
             TxError::BadMintSignature,
             TxError::MintCommitmentMismatch,
-            TxError::FaucetRecipientNotAllowed,
             TxError::ProofTooLarge,
             TxError::EnvelopeTooLarge,
             // Spec 2026-09-26 §2.4: an envelope's length against the genesis constant.
@@ -1589,6 +1621,9 @@ mod tests {
             // Audit v4, STAKE-2: the faucet budget is per epoch, and the next epoch admits the
             // very same bytes again — a cached refusal would censor the faucet for good.
             TxError::FaucetBudgetExhausted { budget: 100, minted: 100 },
+            // Chain 22's open mint: the recipient list binds only below the activation height,
+            // so a refusal cached there would censor the same bytes once it has passed.
+            TxError::FaucetRecipientNotAllowed,
         ] {
             assert!(!is_permanent(&e), "{e} depends on state and must not be cached");
         }
@@ -2404,6 +2439,55 @@ mod tests {
         let honest = mint(&operator, 60);
         assert!(pool.precheck(&honest, &l, &StubExecutor).is_ok());
         assert!(pool.insert(honest, &l, &StubExecutor).is_ok());
+
+        // Chain 22's open mint: an activation height still ahead changes nothing ...
+        l.set_open_mint_from(Some(31));
+        assert_eq!(pool.precheck(&attack, &l, &StubExecutor).err(), Some(MempoolError::Invalid(TxError::MinterNotAllowed(bonder.address()))));
+        // ... and from it on the bonder's mint pools, while a key with no row is still refused.
+        l.set_height(31);
+        assert!(l.open_mint());
+        assert_eq!(minter_not_allowed(&attack, &l, &faucet_minters(&gs)), None);
+        assert!(pool.insert(attack, &l, &StubExecutor).is_ok());
+        assert_eq!(
+            pool.insert(mint(&stranger, 70), &l, &StubExecutor),
+            Err(MempoolError::Invalid(TxError::MinterNotValidator(stranger.address())))
+        );
+    }
+
+    /// `faucet_refusal_at`: below the open-mint height (and on every chain without one) it is
+    /// `faucet_refusal`; from it on a validator whose key has a register row serves `rand_mint`,
+    /// listed or not, and a key with no row is told so.
+    #[test]
+    fn from_the_open_mint_height_any_registered_validator_serves_the_faucet() {
+        use crate::storage::fixtures;
+        let (a, b, later, stranger) = (fixtures::key(1), fixtures::key(2), fixtures::key(9), fixtures::key(10));
+        let mut g = fixtures::genesis_file_of(1, &[&a, &b], Vec::new(), 10);
+        g.faucet = true;
+        let gs = g.build(&randprotocol_core::confidential::StubExecutor).unwrap();
+        assert_eq!(gs.ledger.open_mint_from(), None, "a devnet genesis has no activation");
+        let mut l = gs.ledger.clone();
+        // `later` gets a register row, as a `Bond` would write it.
+        let mut register = l.validators().clone();
+        let mut row = register[&a.address()].clone();
+        row.public_key = later.public_key().clone();
+        register.insert(later.address(), row);
+        let mut l2 = randprotocol_core::Ledger::new(1, fixtures::HC, register, &randprotocol_core::confidential::StubExecutor);
+        l2.set_faucet(true);
+        l2.set_height(100);
+        assert_eq!(faucet_refusal_at(&gs, &l2, true, &later.address()), faucet_refusal(&gs, true, &later.address()));
+        assert!(faucet_refusal_at(&gs, &l2, true, &later.address()).is_some(), "no activation: the genesis validators only");
+        l2.set_open_mint_from(Some(101));
+        assert!(faucet_refusal_at(&gs, &l2, true, &later.address()).is_some(), "the height is still ahead");
+        l2.set_height(101);
+        assert_eq!(faucet_refusal_at(&gs, &l2, true, &later.address()), None);
+        assert_eq!(faucet_refusal_at(&gs, &l2, true, &a.address()), None);
+        let why = faucet_refusal_at(&gs, &l2, true, &stranger.address()).unwrap();
+        assert!(why.contains("no row in the validator register"), "{why}");
+        assert_eq!(faucet_refusal_at(&gs, &l2, false, &later.address()).as_deref(), Some("faucet mints are signed by validators; ask a validator node"));
+        l.set_open_mint_from(Some(0));
+        g.faucet = false;
+        let off = g.build(&randprotocol_core::confidential::StubExecutor).unwrap();
+        assert_eq!(faucet_refusal_at(&off, &l, true, &a.address()).as_deref(), Some("faucet is disabled on this chain"));
     }
 
     /// #153: `faucet` in `rand_status` means "this node can mint here" — the faucet on, a validator,

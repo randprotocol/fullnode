@@ -12,7 +12,7 @@ stopped at v0.4 until 2026-09-30, when the entries v0.5 to v0.6.7 were written f
 
 ## Unreleased
 
-Nothing yet.
+- **Chain 22: open validator mint, height-activated** (v0.8.8 draft, [`docs/releases/v0.8.8.md`](docs/releases/v0.8.8.md)). This is a consensus rule change on the live chain and needs a flag-day roll. From `staking::CHAIN_22_OPEN_MINT_HEIGHT`, a faucet `Mint` is no longer held to `staking.faucet_recipients` or `staking.faucet_minters`. Any registered validator mints to anyone, under the same 100-RAND cap and 10 000-RAND epoch budget. The genesis does not change. The height is a placeholder (`u64::MAX`) until the roll is scheduled.
 
 ## v0.8.7 — PLACEHOLDER-TAG-DATE (chain 22, **a chain cut**: constraint set 11; a set-11 node refuses every chain 14–21 genesis, so this release is never rolled onto chain 21)
 

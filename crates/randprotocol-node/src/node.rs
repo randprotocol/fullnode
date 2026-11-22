@@ -274,6 +274,10 @@ pub fn reload_ledger_from(
     // PST-1 (genesis `program_state.refuse_panics`): a node that came back without it would apply
     // a panicked invoke its peers refuse — a fork at the first one after its restart.
     ledger.set_refuse_panicked_invokes(gs.ledger.refuse_panicked_invokes());
+    // And the open-mint activation height (chain 22; `staking::OPEN_MINT_ACTIVATIONS`, keyed by
+    // the genesis hash, set by `Genesis::build`): a node that came back without it would refuse,
+    // from that height, every unlisted mint its peers apply — a fork at the first one.
+    ledger.set_open_mint_from(gs.ledger.open_mint_from());
     // And the proof window (issue #118; genesis `proof_window_blocks`), with the anchor rows past
     // the 256 `load_ledger` reads: a node that came back at 256 would refuse every bundle whose
     // anchor or `time` is older than that and inside the genesis window — applied by its peers,
@@ -2918,7 +2922,7 @@ pub async fn start_with(cfg: NodeConfig, rpc_options: RpcOptions, net_options: N
         is_validator: hs.is_validator(),
         active_validator: hs.current_set().contains(&key.address()),
         // #153: "this node can mint here", not just "the genesis turns the faucet on".
-        faucet: admission::faucet_refusal(&gs, hs.is_validator(), &key.address()).is_none(),
+        faucet: admission::faucet_refusal_at(&gs, hs.tip_ledger(), hs.is_validator(), &key.address()).is_none(),
         confidential: gs.confidential,
         testnet: gs.testnet,
         fri_profile: gs.fri_profile.clone(),
@@ -3503,6 +3507,9 @@ impl Node {
         // Distinct from `is_validator`, which only says the node holds a key at all.
         s.active_validator = self.hs.current_set().contains(&self.address);
         let ledger = self.hs.committed_ledger();
+        // #153's predicate, re-read each commit: from the chain's open-mint height on (chain 22)
+        // a validator bonded after genesis can mint too, so the startup value would go stale.
+        s.faucet = admission::faucet_refusal_at(&self.gs, ledger, self.hs.is_validator(), &self.address).is_none();
         s.programs = ledger.programs().len() as u64;
         // The aggregation section (spec §8): the register's size straight from the ledger, and
         // the work-list count over the window the chain runs with — both zeroed without the
@@ -4538,7 +4545,7 @@ impl Node {
     /// anything is built, rather than by the pool after.
     async fn mint(&mut self, to: ShieldedAddress, amount: u64) -> std::result::Result<Hash, String> {
         let key = Keypair::from_seed(self.cfg.seed).expect("seed validated at startup");
-        if let Some(why) = admission::faucet_refusal(&self.gs, self.hs.is_validator(), &key.address()) {
+        if let Some(why) = admission::faucet_refusal_at(&self.gs, self.hs.tip_ledger(), self.hs.is_validator(), &key.address()) {
             return Err(why);
         }
         if amount > FAUCET_MAX_UNITS {

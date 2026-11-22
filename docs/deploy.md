@@ -16,7 +16,7 @@ and describe the chain they were written for (14 to 17). What runs now, from
 | guests | `hc_bundle` = bundle guest v3, `hc_auth` = the auth guest (split authorisation, since chain 17); `hardening_v6`; `consensus_domain` 1 |
 | gas | `gas_price` 100, `byte_price` 800, `bundle_gas_limit` 20 479, `metering: "circuit"`, `dynamic` {`target_block_bytes` 10 485 760, `target_block_gas` 262 144, `adjust_bps` 1 250, floors 100 / 800} |
 | note envelopes | `envelope_bytes: 1860` — every note envelope is exactly 1 860 bytes and carries the encrypted memo field |
-| faucet | on, for an allow-list: 16 `faucet_recipients`, 18 `faucet_minters`, 10 000 RAND per 1 000-block epoch |
+| faucet | on, for an allow-list: 16 `faucet_recipients`, 18 `faucet_minters`, 10 000 RAND per 1 000-block epoch. From `CHAIN_22_OPEN_MINT_HEIGHT` (v0.8.8, not scheduled yet) both lists are lifted: any registered validator mints, to anyone, under the same cap and budget (`docs/staking.md` §2) |
 | bridge | guardian set 1, rules v2: 100 000 zUSD per backing and 4 000 zUSD across all backings per rolling 24 h |
 | aggregation | off: no genesis carries the section and the node refuses one |
 
@@ -1067,7 +1067,8 @@ same section, and sets `"faucet": true` at the top level:
   `bridge` section is refused (`FaucetWithBridge`). Each entry is a full `rand1…` address — what
   `rand address` prints — or its `pk` as 64 hex characters; only the `pk` is committed, so an
   address can be pasted as it is. `rand_mint` to any other
-  address is refused at admission. **Mainnet never carries a faucet**, allowlisted or not — and
+  address is refused at admission. Not cached as permanent since v0.8.8. On chain 22 neither list
+  binds from `CHAIN_22_OPEN_MINT_HEIGHT` on (see below and `docs/staking.md` §2). **Mainnet never carries a faucet**, allowlisted or not — and
   since audit v6 (STAKE-2) that is a check, not a sentence: a genesis with `faucet: true` and a
   `bridge` section is refused at `init` (`FaucetWithBridgeNeedsTestnet`) unless its top level
   says `"testnet": true` (`rand-node genesis --testnet`), whatever its `staking` section and
@@ -1081,6 +1082,14 @@ same section, and sets `"faucet": true` at the top level:
   genesis validators) keeps a bonder from draining the budget. Each entry is a validator's base58
   address, its 64 hex characters, or its `public_key` hex; non-empty, no key twice, committed only
   when present.
+- **Chain 22's open-mint height (v0.8.8)**: `staking::CHAIN_22_OPEN_MINT_HEIGHT` in
+  `crates/randprotocol-core/src/ledger/staking.rs`. It is a build constant, not a genesis field, so
+  chain 22's file and hash stay as they are. From that height on, both lists above are lifted for
+  chain 22's genesis hash only. The constant is `u64::MAX` (not scheduled) until the release that
+  sets it. **Setting it is a flag day**: choose a height far enough past the tip that all 25 hosts
+  are rolled to the build before the chain reaches it. At about 1 block/s, a day is about 86 400
+  blocks. A host still on the old build at that height refuses the first unlisted mint its peers
+  apply, and forks off.
 
 Like the rest of the section: `rand-node genesis` never writes them, the cut script splices them
 in, and `rand-node init` on the finished file prints the hash that matters. Chain 14 has no
