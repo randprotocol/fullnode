@@ -1,0 +1,50 @@
+# Roll record — v0.8.8, one host at a time (a node-only, same-chain roll; no genesis, no cut).
+#
+# Written by deploy/roll-fleet.sh as the roll ran (audit v14, PROC-751); not written by hand.
+# Every value on a host: line was read from that host by the gate at the time given. Names
+# only: the fleet's addresses are the operator's (the private configuration repository).
+
+release: v0.8.8
+tool: deploy/roll-fleet.sh (abef4490) calling deploy/update-droplet.sh per host
+binary: rand-node sha256 85187d09d20162590a9017c8f572b7b3dafa22846bc2dcd1d6ab275a7fb0c979; rand sha256 bd02f365a47f7d6649e20c8698d4f1322c472049cd8da21debec5ab6e7cba65e
+authenticated: signed: SHA256SUMS sha256 d2c65af439d30c550b5db8c40c278744a6250d5563766aa96e4df912e1dc5b6d, ~/.rand-chain22/release-v0.8.8/SHA256SUMS is signed by dendi@randprotocol (1 of the required 1)
+gate: height within 5 of the reference, at least 10 peers, service active, installed rand-node is the release's, reference past its height before the host was stopped; timeout 900 s, poll 10 s
+order: A B C D F LON1 SFO3 TOR1 BLR1 SYD1 ATL1 AMS3 NYC1 NYC2 SFO2 MKC1 MEM1 G1 G2 G3 G4 G5 G6 ARCHIVE E
+skipped: ARCHIVE2 (--skip; not contacted)
+started: 2026-11-22T05:05:42Z
+host: A started=2026-11-22T05:05:44Z updated=2026-11-22T05:06:43Z rejoined=2026-11-22T05:07:01Z polls=2 active=active rand-node-sha256=85187d09d20162590a9017c8f572b7b3dafa22846bc2dcd1d6ab275a7fb0c979 height=80686 peers=20 ref=E ref-height=80687 ref-height-before=80623
+host: B started=2026-11-22T05:07:02Z updated=2026-11-22T05:08:26Z rejoined=2026-11-22T05:10:05Z polls=8 active=active rand-node-sha256=85187d09d20162590a9017c8f572b7b3dafa22846bc2dcd1d6ab275a7fb0c979 height=80839 peers=24 ref=E ref-height=80840 ref-height-before=80689
+host: C started=2026-11-22T05:10:06Z updated=2026-11-22T05:12:54Z rejoined=2026-11-22T05:14:18Z polls=6 active=active rand-node-sha256=85187d09d20162590a9017c8f572b7b3dafa22846bc2dcd1d6ab275a7fb0c979 height=81048 peers=24 ref=E ref-height=81050 ref-height-before=80841
+host: D started=2026-11-22T05:14:19Z updated=2026-11-22T05:17:07Z rejoined=2026-11-22T05:17:39Z polls=2 active=active rand-node-sha256=85187d09d20162590a9017c8f572b7b3dafa22846bc2dcd1d6ab275a7fb0c979 height=81218 peers=24 ref=E ref-height=81223 ref-height-before=81051
+host: F started=2026-11-22T05:17:40Z updated=2026-11-22T05:20:32Z rejoined=2026-11-22T05:22:03Z polls=6 active=active rand-node-sha256=85187d09d20162590a9017c8f572b7b3dafa22846bc2dcd1d6ab275a7fb0c979 height=81445 peers=24 ref=E ref-height=81448 ref-height-before=81224
+host: LON1 started=2026-11-22T05:22:04Z updated=2026-11-22T05:25:35Z rejoined=2026-11-22T05:26:27Z polls=4 active=active rand-node-sha256=85187d09d20162590a9017c8f572b7b3dafa22846bc2dcd1d6ab275a7fb0c979 height=81675 peers=24 ref=E ref-height=81676 ref-height-before=81448
+host: SFO3 started=2026-11-22T05:26:28Z updated=2026-11-22T05:30:01Z rejoined=2026-11-22T05:31:08Z polls=5 active=active rand-node-sha256=85187d09d20162590a9017c8f572b7b3dafa22846bc2dcd1d6ab275a7fb0c979 height=81915 peers=24 ref=E ref-height=81917 ref-height-before=81677
+host: TOR1 started=2026-11-22T05:31:09Z updated=2026-11-22T05:34:46Z rejoined=2026-11-22T05:36:01Z polls=5 active=active rand-node-sha256=85187d09d20162590a9017c8f572b7b3dafa22846bc2dcd1d6ab275a7fb0c979 height=82163 peers=21 ref=E ref-height=82165 ref-height-before=81918
+host: BLR1 started=2026-11-22T05:36:08Z updated=2026-11-22T05:40:17Z rejoined=2026-11-22T05:41:31Z polls=6 active=active rand-node-sha256=85187d09d20162590a9017c8f572b7b3dafa22846bc2dcd1d6ab275a7fb0c979 height=82444 peers=24 ref=E ref-height=82445 ref-height-before=82172
+host: SYD1 started=2026-11-22T05:41:32Z updated=2026-11-22T05:43:03Z rejoined=2026-11-22T05:43:35Z polls=3 active=active rand-node-sha256=85187d09d20162590a9017c8f572b7b3dafa22846bc2dcd1d6ab275a7fb0c979 height=82550 peers=24 ref=E ref-height=82551 ref-height-before=82446
+host: ATL1 started=2026-11-22T05:43:36Z updated=2026-11-22T05:47:25Z rejoined=2026-11-22T05:48:04Z polls=3 active=active rand-node-sha256=85187d09d20162590a9017c8f572b7b3dafa22846bc2dcd1d6ab275a7fb0c979 height=82782 peers=21 ref=E ref-height=82783 ref-height-before=82552
+host: AMS3 started=2026-11-22T05:48:05Z updated=2026-11-22T05:50:38Z rejoined=2026-11-22T05:52:47Z polls=9 active=active rand-node-sha256=85187d09d20162590a9017c8f572b7b3dafa22846bc2dcd1d6ab275a7fb0c979 height=83017 peers=25 ref=E ref-height=83019 ref-height-before=82784
+host: NYC1 started=2026-11-22T05:52:48Z updated=2026-11-22T05:56:35Z rejoined=2026-11-22T05:57:50Z polls=5 active=active rand-node-sha256=85187d09d20162590a9017c8f572b7b3dafa22846bc2dcd1d6ab275a7fb0c979 height=83277 peers=25 ref=E ref-height=83279 ref-height-before=83020
+host: NYC2 started=2026-11-22T05:57:51Z updated=2026-11-22T06:00:59Z rejoined=2026-11-22T06:01:55Z polls=4 active=active rand-node-sha256=85187d09d20162590a9017c8f572b7b3dafa22846bc2dcd1d6ab275a7fb0c979 height=83488 peers=25 ref=E ref-height=83490 ref-height-before=83280
+host: SFO2 started=2026-11-22T06:01:57Z updated=2026-11-22T06:05:30Z rejoined=2026-11-22T06:06:39Z polls=5 active=active rand-node-sha256=85187d09d20162590a9017c8f572b7b3dafa22846bc2dcd1d6ab275a7fb0c979 height=83732 peers=25 ref=E ref-height=83733 ref-height-before=83491
+host: MKC1 started=2026-11-22T06:06:40Z updated=2026-11-22T06:08:35Z rejoined=2026-11-22T06:10:29Z polls=8 active=active rand-node-sha256=85187d09d20162590a9017c8f572b7b3dafa22846bc2dcd1d6ab275a7fb0c979 height=83924 peers=24 ref=E ref-height=83925 ref-height-before=83734
+host: MEM1 started=2026-11-22T06:10:30Z updated=2026-11-22T06:14:02Z rejoined=2026-11-22T06:15:58Z polls=7 active=active rand-node-sha256=85187d09d20162590a9017c8f572b7b3dafa22846bc2dcd1d6ab275a7fb0c979 height=84199 peers=24 ref=E ref-height=84200 ref-height-before=83927
+host: G1 started=2026-11-22T06:16:00Z updated=2026-11-22T06:21:53Z rejoined=2026-11-22T06:21:59Z polls=1 active=active rand-node-sha256=85187d09d20162590a9017c8f572b7b3dafa22846bc2dcd1d6ab275a7fb0c979 height=84513 peers=17 ref=E ref-height=84514 ref-height-before=84201
+host: G2 started=2026-11-22T06:22:00Z updated=2026-11-22T06:25:34Z rejoined=2026-11-22T06:25:40Z polls=1 active=active rand-node-sha256=85187d09d20162590a9017c8f572b7b3dafa22846bc2dcd1d6ab275a7fb0c979 height=84704 peers=23 ref=E ref-height=84706 ref-height-before=84515
+host: G3 started=2026-11-22T06:25:41Z updated=2026-11-22T06:28:47Z rejoined=2026-11-22T06:28:52Z polls=1 active=active rand-node-sha256=85187d09d20162590a9017c8f572b7b3dafa22846bc2dcd1d6ab275a7fb0c979 height=84871 peers=15 ref=E ref-height=84873 ref-height-before=84707
+host: G4 started=2026-11-22T06:28:53Z updated=2026-11-22T06:33:49Z rejoined=2026-11-22T06:33:54Z polls=1 active=active rand-node-sha256=85187d09d20162590a9017c8f572b7b3dafa22846bc2dcd1d6ab275a7fb0c979 height=85132 peers=20 ref=E ref-height=85133 ref-height-before=84874
+host: G5 started=2026-11-22T06:33:55Z updated=2026-11-22T06:36:25Z rejoined=2026-11-22T06:36:31Z polls=1 active=active rand-node-sha256=85187d09d20162590a9017c8f572b7b3dafa22846bc2dcd1d6ab275a7fb0c979 height=85268 peers=18 ref=E ref-height=85270 ref-height-before=85135
+host: G6 started=2026-11-22T06:36:33Z updated=2026-11-22T06:37:38Z rejoined=2026-11-22T06:37:43Z polls=1 active=active rand-node-sha256=85187d09d20162590a9017c8f572b7b3dafa22846bc2dcd1d6ab275a7fb0c979 height=85331 peers=14 ref=E ref-height=85333 ref-height-before=85272
+host: ARCHIVE started=2026-11-22T06:37:44Z updated=2026-11-22T06:38:55Z rejoined=2026-11-22T06:43:11Z polls=20 active=active rand-node-sha256=85187d09d20162590a9017c8f572b7b3dafa22846bc2dcd1d6ab275a7fb0c979 height=85598 peers=24 ref=E ref-height=85600 ref-height-before=85334
+host: E started=2026-11-22T06:43:13Z updated=2026-11-22T06:44:16Z rejoined=2026-11-22T06:48:01Z polls=18 active=active rand-node-sha256=85187d09d20162590a9017c8f572b7b3dafa22846bc2dcd1d6ab275a7fb0c979 height=85836 peers=24 ref=A ref-height=85837 ref-height-before=85602
+result: complete — every host in the order rolled and rejoined
+rolled: 25 of 25
+not-rolled: none
+finished: 2026-11-22T06:48:01Z
+
+# Added by the operator after the tool finished (not gate-read):
+# - Outside the inventory: durian.market's site node (rand-chain22.service, not a validator) was
+#   rolled by hand at ~05:20Z: release files in /opt/durian/bin-v088 (sha256 checked against the
+#   signed SHA256SUMS), unit path bin-v087 → bin-v088 (old unit kept as .bak-v087); back at the tip.
+# - archive2 (old account, chain 21) was skipped by name: unreachable, not on chain 22.
+# - Fork: chain 22 block 140 000 (CHAIN_22_OPEN_MINT_HEIGHT); at 06:48Z the tip was ~85 900.
