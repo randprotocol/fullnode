@@ -237,7 +237,8 @@ pub enum TxError {
     FaucetBudgetExhausted { budget: u64, minted: u64 },
     /// Chain 15's faucet allowlist (`staking.faucet_recipients`): the mint's note is for a spend
     /// key the genesis does not list. The list is a genesis constant and `pk` is the mint's own
-    /// bytes, so this one is permanent.
+    /// bytes, but the list binds only below the chain's open-mint height (`Ledger::open_mint`,
+    /// chain 22), so the verdict depends on the height and is not a permanent one.
     #[error("the faucet may not mint to this recipient (not in staking.faucet_recipients)")]
     FaucetRecipientNotAllowed,
     #[error("confidential computation is disabled on this chain")]
@@ -810,6 +811,13 @@ pub struct Ledger {
     /// outside the state root and equality, restored by `reload_ledger`; `false` on chain 21 and
     /// every chain cut before the field.
     refuse_panicked_invokes: bool,
+    /// The open-mint activation height (`staking::OPEN_MINT_ACTIVATIONS`, chain 22): from this
+    /// height on a faucet `Mint` is no longer held to `staking.faucet_recipients` or
+    /// `staking.faucet_minters` ([`Ledger::open_mint`]). Not from the genesis file but from this
+    /// build's table keyed by the genesis hash, set by `Genesis::build` and restored by
+    /// `reload_ledger`; outside the state root and equality like `refuse_panicked_invokes`.
+    /// `None` on every other chain.
+    open_mint_from: Option<u64>,
     /// Issue #168: genesis `program_state.reference_block_window` — how many closed blocks an
     /// `InvokeAt` may name as its reference block; 0, chain 21 and every chain cut before the
     /// field, is off. A parameter like `refuse_panicked_invokes`: outside the state root and
@@ -1003,6 +1011,7 @@ impl Ledger {
             hc_auth_multisig: None,
             testnet: false,
             refuse_panicked_invokes: false,
+            open_mint_from: None,
             reference_block_window: 0,
             block_facts: VecDeque::new(),
             proof_window_blocks: None,
@@ -1080,6 +1089,7 @@ impl Ledger {
             hc_auth_multisig: None,
             testnet: false,
             refuse_panicked_invokes: false,
+            open_mint_from: None,
             reference_block_window: 0,
             block_facts: VecDeque::new(),
             proof_window_blocks: None,
@@ -1946,6 +1956,26 @@ impl Ledger {
     /// Set by genesis from `program_state.refuse_panics`, and by `reload_ledger` on every restart.
     pub fn set_refuse_panicked_invokes(&mut self, on: bool) {
         self.refuse_panicked_invokes = on;
+    }
+
+    /// The open-mint activation height this ledger runs with (`staking::OPEN_MINT_ACTIVATIONS`),
+    /// `None` on a chain without one.
+    pub fn open_mint_from(&self) -> Option<u64> {
+        self.open_mint_from
+    }
+
+    /// Set by `Genesis::build` from `staking::open_mint_activation` of the genesis hash, and by
+    /// `reload_ledger` on every restart.
+    pub fn set_open_mint_from(&mut self, height: Option<u64>) {
+        self.open_mint_from = height;
+    }
+
+    /// Whether the block being applied (`height`) is at or past the open-mint activation height:
+    /// a faucet `Mint` then needs neither `staking.faucet_recipients` nor `staking.faucet_minters`
+    /// — only the faucet switch, the per-mint cap, the epoch budget, a register row, the
+    /// signature and the value rule. `false` on every chain without an activation.
+    pub fn open_mint(&self) -> bool {
+        self.open_mint_from.is_some_and(|h| self.height >= h)
     }
 
     /// Issue #168: genesis `program_state.reference_block_window`; 0 is off.
@@ -2868,7 +2898,8 @@ impl Ledger {
                     }
                     // The allowlist (chain 15): the published opening's `pk` is the note's owner —
                     // the value rule below ties `cm` to it — so a key off the list gets nothing.
-                    if let Some(list) = &s.faucet_recipients {
+                    // Lifted from the chain's open-mint height on (`open_mint`, chain 22).
+                    if let Some(list) = s.faucet_recipients.as_ref().filter(|_| !self.open_mint()) {
                         if !list.iter().any(|r| r.0 == *pk) {
                             return Err(TxError::FaucetRecipientNotAllowed);
                         }
@@ -2882,7 +2913,9 @@ impl Ledger {
                 // enough — a permissionless `Bond` writes one, and the key is active two epochs
                 // later — so the minter must be on the genesis list. Before the signature, like
                 // the row check. Chain 15 has no list and runs on the node's admission policy.
-                if let Some(list) = self.staking.as_ref().and_then(|s| s.faucet_minters.as_ref()) {
+                // Lifted from the chain's open-mint height on (`open_mint`, chain 22): any key
+                // with a register row mints — and `admission_by_vote` decides who gets one.
+                if let Some(list) = self.staking.as_ref().and_then(|s| s.faucet_minters.as_ref()).filter(|_| !self.open_mint()) {
                     if !list.iter().any(|m| m.0 == addr) {
                         return Err(TxError::MinterNotAllowed(addr));
                     }

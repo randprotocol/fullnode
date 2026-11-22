@@ -193,9 +193,9 @@ One more optional field lets a testnet keep a faucet beside a bridge (chain 15):
   address, exactly what `rand --key <wallet.key.json> address` prints (its `pk` is taken, its
   ML-KEM key dropped), or that `pk`'s 64 hex characters; the file is written back as hex, and only
   the 32 `pk` bytes are committed to the genesis hash, key by key in file order, so both spellings
-  are the same chain. An empty or duplicated list is refused at `init` (`BadStaking`). The refusal
-  is about the transaction's own bytes against a genesis constant, so the node caches it as
-  permanent. A tester outside the list is sent coins by a listed wallet, like anyone else.
+  are the same chain. An empty or duplicated list is refused at `init` (`BadStaking`). Since
+  v0.8.8 the refusal is not cached as permanent: on chain 22 the list stops binding at a height
+  (below). A tester outside the list is sent coins by a listed wallet, like anyone else.
 
 **Who may sign a faucet `Mint` (RESCAN-LEDGER-1).** The ledger's rule is a row in the validator
 register. A permissionless `Bond` writes that row at once, and the bonded key is in the active set
@@ -214,6 +214,21 @@ key in hex as `validators[].public_key` carries it; the file is written back as 
 address, only the 32 address bytes are committed, key by key in file order, and an empty or
 duplicated list is refused at `init` (`BadStaking`). Where a genesis lists it, every node's pool
 admits exactly that list. Absent, it commits nothing — chain 15 runs without it.
+
+**Chain 22: open mint from a height (v0.8.8).** From the height
+`staking::CHAIN_22_OPEN_MINT_HEIGHT` (`OPEN_MINT_ACTIVATIONS` in `ledger/staking.rs`, keyed by chain
+22's genesis hash `29d67542…`), neither list is read: any key with a row in the validator register
+may sign a faucet `Mint`, to any recipient. What still holds: `faucet: true`, `FAUCET_MAX_UNITS`
+(100 RAND) per mint, `faucet_budget_per_epoch` (10 000 RAND per epoch, shared by every minter),
+the register row (`MinterNotValidator`), the minter's signature and the value rule. Under
+`admission_by_vote` a key gets a register row only after the set votes it in, so in practice this
+means "anyone the set has admitted as a validator mints for themselves". Below the height both lists
+hold exactly as before, so replaying chain 22's earlier blocks gives the same result. The genesis file and its hash do not
+change. The height is a constant of the build, and every validator must run a build carrying it
+before that height. The node's pool policy (the genesis-validator minter set) and `rand_mint`'s
+up-front check follow the same height. Because the recipient refusal now depends on the height,
+`FaucetRecipientNotAllowed` is no longer cached as a permanent verdict. No other chain has an
+activation.
 
 ### Admission by vote (audit v6, STAKE-2: `staking.admission_by_vote`)
 

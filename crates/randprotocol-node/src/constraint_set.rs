@@ -462,4 +462,28 @@ mod tests {
         assert!(e.contains("not a constraint-set number"), "{e}");
         assert_eq!(std::fs::read(dir.path().join(MARKER_FILE)).unwrap(), b"nine", "never overwritten");
     }
+
+    /// Chain 22's open-mint activation (`staking::OPEN_MINT_ACTIVATIONS`) is keyed by a genesis
+    /// hash this table lists under the same chain id, and the committed
+    /// `deploy/genesis-chain22.json` — whose hash `the_table_is_the_committed_genesis_files` holds
+    /// to its row, so the file and the hash are unchanged — builds a ledger that carries it. Every
+    /// other committed file that builds carries none.
+    #[test]
+    fn the_open_mint_activation_is_chain_22s_genesis_and_its_ledger_carries_it() {
+        use randprotocol_core::ledger::staking::{open_mint_activation, CHAIN_22_OPEN_MINT_HEIGHT, OPEN_MINT_ACTIVATIONS};
+        for (chain, hash, _) in OPEN_MINT_ACTIVATIONS {
+            assert_eq!(listed(hash).map(|(c, _)| c), Some(chain), "the activation names chain {chain}'s listed genesis");
+        }
+        let deploy = concat!(env!("CARGO_MANIFEST_DIR"), "/../../deploy");
+        let file = randprotocol_core::genesis::Genesis::from_json(&std::fs::read_to_string(format!("{deploy}/genesis-chain22.json")).unwrap()).unwrap();
+        let executor = crate::node::executor_for_profile(&file.fri_profile).unwrap();
+        let gs = file.build(executor.as_ref()).unwrap();
+        assert_eq!(gs.hash().to_hex(), "29d67542941f2eb6f2c1bb68c759926f5d814c9e2c7a934292806a2d98b7e9c0", "chain 22's genesis is unchanged");
+        assert_eq!(gs.ledger.open_mint_from(), Some(CHAIN_22_OPEN_MINT_HEIGHT));
+        for (chain, hash) in committed_genesis_files() {
+            if chain != 22 {
+                assert_eq!(open_mint_activation(&hash), None, "chain {chain}");
+            }
+        }
+    }
 }

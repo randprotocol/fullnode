@@ -1949,6 +1949,10 @@ impl Genesis {
         // BIND-1: the binding domain carries the same hash, for the same reason set here; like the
         // signing domain it is not state.
         ledger.set_binding_domain(crate::types::BindingDomain::for_version(self.binding_domain.unwrap_or(0), block.hash()));
+        // A height-activated rule on a running chain (chain 22's open mint) is keyed by the
+        // genesis hash, so it too can only be set once the block exists. Not state, not in the
+        // file and not in the hash: the root and the hash above are unaffected.
+        ledger.set_open_mint_from(crate::ledger::staking::open_mint_activation(&block.hash().to_hex()));
         Ok(GenesisState {
             chain_id: self.chain_id,
             faucet: self.faucet,

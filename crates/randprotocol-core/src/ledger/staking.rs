@@ -97,6 +97,34 @@ pub struct ValidatorEntry {
     pub activation_epoch: u64,
 }
 
+/// Chain 22's open-mint activation height: **block 140 000** (set 2026-11-22 for v0.8.8, owner's
+/// decision; tip 73 774 at 02:54Z, ~0.866 blocks/s, so expected ~2026-11-23 00:08Z).
+///
+/// From this height on, both faucet allow-lists are lifted for chain 22's genesis hash. Every
+/// host must run v0.8.8 before the chain reaches it: a node still on v0.8.7 at `H` refuses the
+/// first unlisted mint its peers apply, and forks off. Before `H` both builds agree on every block,
+/// so the roll goes one host at a time.
+pub const CHAIN_22_OPEN_MINT_HEIGHT: u64 = 140_000;
+
+/// Height-activated rule changes on running chains, by genesis hash (hex): `(chain id, genesis
+/// hash, height)`. From `height` on — the block at `height` included — a faucet `Mint` is no
+/// longer held to `staking.faucet_recipients` or `staking.faucet_minters`
+/// ([`Ledger::open_mint`]); see [`StakingConfig`].
+///
+/// Keyed by the genesis hash rather than the chain id, so a devnet or test chain that reuses id 22
+/// is not affected. Set on the ledger by `Genesis::build` once the genesis hash exists, and
+/// restored by the node's `reload_ledger` on every restart, like every other genesis parameter.
+/// Not consensus state: outside the state root and the ledger's equality — but a consensus rule,
+/// so every validator must run a build with the same row before the height arrives.
+pub const OPEN_MINT_ACTIVATIONS: [(u64, &str, u64); 1] =
+    [(22, "29d67542941f2eb6f2c1bb68c759926f5d814c9e2c7a934292806a2d98b7e9c0", CHAIN_22_OPEN_MINT_HEIGHT)];
+
+/// The open-mint activation height of the chain whose genesis hash is `genesis_hex`, if any
+/// ([`OPEN_MINT_ACTIVATIONS`]).
+pub fn open_mint_activation(genesis_hex: &str) -> Option<u64> {
+    OPEN_MINT_ACTIVATIONS.iter().find(|(_, h, _)| *h == genesis_hex).map(|(_, _, height)| *height)
+}
+
 /// The `staking` genesis section (audit v4, STAKE-2): a per-epoch budget for the testnet faucet
 /// and an activation delay for bonds. Present only on a chain whose genesis carries it — the
 /// three rules it switches on are gated on `Ledger::staking()` being `Some`, so chain 14, which
@@ -137,6 +165,14 @@ pub struct ValidatorEntry {
 ///   `bond_activation_epochs + 1` epochs later — so neither bounds who drains the budget. An empty
 ///   or duplicated list is refused; absent, the register row is the rule and every node's
 ///   admission policy admits the genesis validators only.
+///
+/// Both lists are lifted, on a running chain, from the height [`OPEN_MINT_ACTIVATIONS`] names for
+/// its genesis hash (chain 22, the owner's decision of 2026-11-22: any key that runs a validator
+/// may mint RAND for any recipient). From that height on neither list is read; the faucet switch,
+/// [`crate::ledger::FAUCET_MAX_UNITS`], the epoch budget, the register row
+/// (`TxError::MinterNotValidator`), the signature and the value rule all still hold, and
+/// `admission_by_vote` still decides who gets a register row. Below it the lists hold exactly as
+/// before. The genesis file and hash are untouched — the height is a property of this build.
 ///
 /// And audit v6's (STAKE-2), each absent from every genesis through chain 18, omitted from the file
 /// when absent and committed to the genesis hash under its own tag, after every tag that existed
@@ -2228,6 +2264,111 @@ mod tests {
         // And a bonder the list names mints like any other listed key.
         listed_stranger.set_staking(Some(cfg(Some(vec![FaucetMinter(genesis.address()), FaucetMinter(bonder.address())]))));
         assert_eq!(listed_stranger.validate(&attack, &StubExecutor), Ok(()));
+    }
+
+    /// Chain 22's open mint (`OPEN_MINT_ACTIVATIONS`). Below the activation height both genesis
+    /// lists hold exactly as before — an unlisted recipient is `FaucetRecipientNotAllowed`, a
+    /// bonded but unlisted minter `MinterNotAllowed`, at admission and at apply, the ledger
+    /// untouched. From the height on (the block at it included) a registered validator mints to
+    /// anyone, while a key with no register row is still `MinterNotValidator`, and the faucet
+    /// switch, the per-mint cap and the epoch budget all still bind. A ledger with no activation
+    /// (every other chain) keeps the lists at every height.
+    #[test]
+    fn from_the_open_mint_height_neither_faucet_list_binds_and_every_other_rule_still_does() {
+        use crate::ledger::FAUCET_MAX_UNITS;
+        const H: u64 = 50;
+        let genesis = key(1);
+        let bonder = key(9);
+        let stranger = key(10);
+        let budget = 3 * FAUCET_MAX_UNITS;
+        let cfg = StakingConfig {
+            faucet_budget_per_epoch: budget,
+            bond_activation_epochs: 2,
+            faucet_recipients: Some(vec![FaucetRecipient([5; 8])]),
+            faucet_minters: Some(vec![FaucetMinter(genesis.address())]),
+            ..Default::default()
+        };
+        let mint = |l: &Ledger, k: &Keypair, pk: u32, r: u32, amount: u64| {
+            Transaction::mint(CHAIN, [pk; 8], l.height() as u32, [r; 8], env(), amount, k, &StubExecutor)
+        };
+        let mut base = sectioned(vec![entry(&genesis, MIN_STAKE, payout(1))], cfg);
+        base.set_faucet(true);
+        let t = bond_tx(&base, 40, &bonder, MIN_STAKE, Some(registration(&bonder, payout(9))));
+        base.apply_tx(&t, &genesis.address(), &StubExecutor).unwrap();
+        assert!(base.validators().contains_key(&bonder.address()), "the bonder has a register row");
+        assert_eq!(base.open_mint_from(), None, "no activation unless one is set");
+
+        let mut scheduled = base.clone();
+        scheduled.set_open_mint_from(Some(H));
+
+        // Below the height — and at every height without an activation — the old rules, exactly.
+        for (mut l, height) in [(scheduled.clone(), H - 1), (base.clone(), H - 1), (base.clone(), H), (base.clone(), H + 1_000)] {
+            l.set_height(height);
+            assert!(!l.open_mint());
+            let unlisted_recipient = mint(&l, &genesis, 9, 100, FAUCET_MAX_UNITS);
+            assert_eq!(l.validate(&unlisted_recipient, &StubExecutor), Err(TxError::FaucetRecipientNotAllowed));
+            let before = l.clone();
+            assert_eq!(l.apply_tx(&unlisted_recipient, &genesis.address(), &StubExecutor), Err(TxError::FaucetRecipientNotAllowed));
+            assert_eq!(l, before, "a refused mint leaves the ledger untouched");
+            let unlisted_minter = mint(&l, &bonder, 5, 101, FAUCET_MAX_UNITS);
+            let refusal = TxError::MinterNotAllowed(bonder.address());
+            assert_eq!(l.validate(&unlisted_minter, &StubExecutor), Err(refusal.clone()));
+            assert_eq!(l.apply_tx(&unlisted_minter, &genesis.address(), &StubExecutor), Err(refusal));
+            assert_eq!(l, before);
+            assert_eq!(
+                l.validate(&mint(&l, &stranger, 5, 102, 1), &StubExecutor),
+                Err(TxError::MinterNotValidator(stranger.address()))
+            );
+            // Both listed: admitted, as before.
+            l.apply_tx(&mint(&l, &genesis, 5, 103, FAUCET_MAX_UNITS), &genesis.address(), &StubExecutor).unwrap();
+        }
+
+        // At the height: a registered validator off the minter list mints to a key off the
+        // recipient list.
+        let mut l = scheduled.clone();
+        l.set_height(H);
+        assert!(l.open_mint());
+        let open = mint(&l, &bonder, 9, 200, FAUCET_MAX_UNITS);
+        assert_eq!(l.validate(&open, &StubExecutor), Ok(()));
+        l.apply_tx(&open, &genesis.address(), &StubExecutor).unwrap();
+        // A key with no register row is still no minter.
+        assert_eq!(
+            l.validate(&mint(&l, &stranger, 9, 201, 1), &StubExecutor),
+            Err(TxError::MinterNotValidator(stranger.address()))
+        );
+        // The per-mint cap still binds.
+        assert!(matches!(
+            l.validate(&mint(&l, &bonder, 9, 202, FAUCET_MAX_UNITS + 1), &StubExecutor),
+            Err(TxError::MintTooLarge { cap: FAUCET_MAX_UNITS, .. })
+        ));
+        // And the epoch budget: two more full mints fill it, the next unit is refused.
+        l.set_height(H + 1);
+        assert!(l.open_mint(), "and every height after it");
+        l.apply_tx(&mint(&l, &genesis, 11, 203, FAUCET_MAX_UNITS), &genesis.address(), &StubExecutor).unwrap();
+        l.apply_tx(&mint(&l, &bonder, 12, 204, FAUCET_MAX_UNITS), &genesis.address(), &StubExecutor).unwrap();
+        assert_eq!(l.faucet_epoch_counters(), (H / 10, budget));
+        assert!(matches!(
+            l.validate(&mint(&l, &bonder, 13, 205, 1), &StubExecutor),
+            Err(TxError::FaucetBudgetExhausted { minted, .. }) if minted == budget
+        ));
+        // And the faucet switch.
+        l.set_height(H + 10);
+        l.set_faucet(false);
+        assert_eq!(l.validate(&mint(&l, &bonder, 14, 206, 1), &StubExecutor), Err(TxError::FaucetDisabled));
+    }
+
+    /// The activation table: chain 22's row names chain 22's genesis hash (the one
+    /// `deploy/genesis-chain22.json` hashes to — held there by the node's `constraint_set` tests),
+    /// and nothing else is activated.
+    #[test]
+    fn the_open_mint_table_names_chain_22_only() {
+        assert_eq!(
+            open_mint_activation("29d67542941f2eb6f2c1bb68c759926f5d814c9e2c7a934292806a2d98b7e9c0"),
+            Some(CHAIN_22_OPEN_MINT_HEIGHT)
+        );
+        assert_eq!(open_mint_activation("ca76c2766ed6090ac6ba5dad86b724dd5d2b80c0edfaed287cd8b129e663ca9a"), None, "chain 21");
+        assert_eq!(open_mint_activation(&crate::Hash::ZERO.to_hex()), None);
+        assert_eq!(OPEN_MINT_ACTIVATIONS.len(), 1);
     }
 
     /// A ledger at height 1 of ten-block epochs under a `staking` section, holding `entries`.
