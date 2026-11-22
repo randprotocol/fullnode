@@ -12,9 +12,13 @@ stopped at v0.4 until 2026-09-30, when the entries v0.5 to v0.6.7 were written f
 
 ## Unreleased
 
-- **Chain 22: open validator mint, height-activated** (v0.8.8 draft, [`docs/releases/v0.8.8.md`](docs/releases/v0.8.8.md)). This is a consensus rule change on the live chain and needs a flag-day roll. From `staking::CHAIN_22_OPEN_MINT_HEIGHT`, a faucet `Mint` is no longer held to `staking.faucet_recipients` or `staking.faucet_minters`. Any registered validator mints to anyone, under the same 100-RAND cap and 10 000-RAND epoch budget. The genesis does not change. The height is a placeholder (`u64::MAX`) until the roll is scheduled.
+Nothing yet.
 
-## v0.8.7 — PLACEHOLDER-TAG-DATE (chain 22, **a chain cut**: constraint set 11; a set-11 node refuses every chain 14–21 genesis, so this release is never rolled onto chain 21)
+## v0.8.8 — 2026-11-22 (chain 22, **fork at block 140 000**: open validator mint; same genesis, rolled host by host before the height)
+
+- **Chain 22: open validator mint, height-activated** (v0.8.8 draft, [`docs/releases/v0.8.8.md`](docs/releases/v0.8.8.md)). This is a consensus rule change on the live chain and needs a flag-day roll. From `staking::CHAIN_22_OPEN_MINT_HEIGHT`, a faucet `Mint` is no longer held to `staking.faucet_recipients` or `staking.faucet_minters`. Any registered validator mints to anyone, under the same 100-RAND cap and 10 000-RAND epoch budget. The genesis does not change. The fork height is chain 22 block **140 000**.
+
+## v0.8.7 — 2026-11-20 (chain 22, **a chain cut**: constraint set 11; a set-11 node refuses every chain 14–21 genesis, so this release is never rolled onto chain 21)
 
 The release notes — the set-11 gas change as a governance record, the chain-22 cut, the operator
 upgrade steps and the rollback — are [`docs/releases/v0.8.7.md`](docs/releases/v0.8.7.md).

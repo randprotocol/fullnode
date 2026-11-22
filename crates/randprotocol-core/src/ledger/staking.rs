@@ -97,18 +97,14 @@ pub struct ValidatorEntry {
     pub activation_epoch: u64,
 }
 
-/// Chain 22's open-mint activation height — **a placeholder until the release that carries it is
-/// scheduled.**
+/// Chain 22's open-mint activation height: **block 140 000** (set 2026-11-22 for v0.8.8, owner's
+/// decision; tip 73 774 at 02:54Z, ~0.866 blocks/s, so expected ~2026-11-23 00:08Z).
 ///
-/// TODO(operator): set this to the chain-22 height the open-mint rule takes effect at, once the
-/// release is ready to roll, and before it is tagged. It must be far enough ahead of the tip at
-/// tag time for the whole fleet (25 validators and observers, one host at a time) to be on the new
-/// build first: a node still on the old build at `H` refuses the first unlisted mint its peers
-/// apply, and forks off. At ~1 block/s, 1 day is ~86 400 blocks; budget the roll plus a margin.
-///
-/// `u64::MAX` is "not scheduled": no height reaches it, so a build carrying the placeholder runs
-/// chain 22 exactly as v0.8.7 does.
-pub const CHAIN_22_OPEN_MINT_HEIGHT: u64 = u64::MAX;
+/// From this height on, both faucet allow-lists are lifted for chain 22's genesis hash. Every
+/// host must run v0.8.8 before the chain reaches it: a node still on v0.8.7 at `H` refuses the
+/// first unlisted mint its peers apply, and forks off. Before `H` both builds agree on every block,
+/// so the roll goes one host at a time.
+pub const CHAIN_22_OPEN_MINT_HEIGHT: u64 = 140_000;
 
 /// Height-activated rule changes on running chains, by genesis hash (hex): `(chain id, genesis
 /// hash, height)`. From `height` on — the block at `height` included — a faucet `Mint` is no

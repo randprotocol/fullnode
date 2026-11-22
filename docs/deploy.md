@@ -16,7 +16,7 @@ and describe the chain they were written for (14 to 17). What runs now, from
 | guests | `hc_bundle` = bundle guest v3, `hc_auth` = the auth guest (split authorisation, since chain 17); `hardening_v6`; `consensus_domain` 1 |
 | gas | `gas_price` 100, `byte_price` 800, `bundle_gas_limit` 20 479, `metering: "circuit"`, `dynamic` {`target_block_bytes` 10 485 760, `target_block_gas` 262 144, `adjust_bps` 1 250, floors 100 / 800} |
 | note envelopes | `envelope_bytes: 1860` — every note envelope is exactly 1 860 bytes and carries the encrypted memo field |
-| faucet | on, for an allow-list: 16 `faucet_recipients`, 18 `faucet_minters`, 10 000 RAND per 1 000-block epoch. From `CHAIN_22_OPEN_MINT_HEIGHT` (v0.8.8, not scheduled yet) both lists are lifted: any registered validator mints, to anyone, under the same cap and budget (`docs/staking.md` §2) |
+| faucet | on, for an allow-list: 16 `faucet_recipients`, 18 `faucet_minters`, 10 000 RAND per 1 000-block epoch. From block 140 000 (`CHAIN_22_OPEN_MINT_HEIGHT`, v0.8.8) both lists are lifted: any registered validator mints, to anyone, under the same cap and budget (`docs/staking.md` §2) |
 | bridge | guardian set 1, rules v2: 100 000 zUSD per backing and 4 000 zUSD across all backings per rolling 24 h |
 | aggregation | off: no genesis carries the section and the node refuses one |
 
@@ -1085,8 +1085,7 @@ same section, and sets `"faucet": true` at the top level:
 - **Chain 22's open-mint height (v0.8.8)**: `staking::CHAIN_22_OPEN_MINT_HEIGHT` in
   `crates/randprotocol-core/src/ledger/staking.rs`. It is a build constant, not a genesis field, so
   chain 22's file and hash stay as they are. From that height on, both lists above are lifted for
-  chain 22's genesis hash only. The constant is `u64::MAX` (not scheduled) until the release that
-  sets it. **Setting it is a flag day**: choose a height far enough past the tip that all 25 hosts
+  chain 22's genesis hash only. v0.8.8 sets it to **140 000** (2026-11-22). **It is a flag day**: choose a height far enough past the tip that all 25 hosts
   are rolled to the build before the chain reaches it. At about 1 block/s, a day is about 86 400
   blocks. A host still on the old build at that height refuses the first unlisted mint its peers
   apply, and forks off.
