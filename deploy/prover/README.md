@@ -130,6 +130,8 @@ wallet would then seal its viewing key (never its spend key) to them.
 3. Publish the update notice (below) where wallet users are: the release page of the current
    wallet, the site, and the stores' "what's new".
 4. Re-run `install-web.sh` so the web droplet carries the retired locations and `PROVER_RETIRED`.
+   **Done 2026-11-25** (`deploy/roll-records/v0.8.8-vk9-prover-router-20261125T015721Z.record`):
+   the router is the v0.8.8 file and the three names answer 410.
 
 **The notice.**
 
