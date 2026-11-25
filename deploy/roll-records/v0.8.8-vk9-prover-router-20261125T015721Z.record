@@ -1,0 +1,69 @@
+# Roll record — VK-9 (monorepo#18, #187): the prover pool's router on the web droplet, to the
+# v0.8.8 file. One host, one script; no node, no member host and no key was touched.
+#
+# Written by hand from the commands' output; output blocks are verbatim except where marked cut.
+# Names only: the fleet's addresses are the operator's (the private configuration repository),
+# so <web>, <a> and <b> stand for them.
+
+release: v0.8.8 (abef4490); deploy/prover at origin/main 9dd2f3bae92e94d336be64704ee0a5d63cf37b18 is the same five files as at the tag
+date: 2026-11-25
+tool: deploy/prover/install-web.sh sha256 441fb52704386da646cd05d670ce8feab6c5fb4403518786b135b9b4a6928fdf
+command: WEB=root@<web> PUBLIC_DIR=~/rand-prover-trusted/public deploy/prover/install-web.sh a:8611=<a> b:8612=<b>
+started: 2026-11-25T01:57:21Z
+finished: 2026-11-25T01:57:40Z
+exit: 0
+output:
+    nginx: the configuration file /etc/nginx/nginx.conf syntax is ok
+    nginx: configuration file /etc/nginx/nginx.conf test is successful
+    active
+    active
+    active
+    descriptor: ~/rand-prover-trusted/public/pool.json (2 members)
+result: complete — router at the tag's file, both members answer as before, the three retired names answer 410
+
+# What the roll brings (router.py 4969f15b → b8f844c9): the retired-member refusal (VK-9, #187),
+# submits metered per IPv6 /64 and the equal split (VK-10, #178), job pinning (#170).
+
+# Before (read 2026-11-25T01:44Z–01:57Z) and after (read 2026-11-25T01:57:56Z), sha256 on the web droplet.
+changed: /opt/rand-prover-pool/router.py 4969f15b5d84a4bb7596d8f5fd58102eb199f3d33b59f6f8f641239ef89c9d2a → b8f844c95f0408a67e8ca86b362edb9453408b619f6367290614806d42e37e1f (the tag's)
+changed: /etc/rand-prover-pool/router.env fdf6d6138f4b2570f6a75329d1bc8e5de1a263d1428e9f4254ffb504c7c3f4ee → 08760e507134030a81b67f1d23d2887c3b1a03096625cdf0221b7ca2b18d4daa (one line added: PROVER_RETIRED=archive2,nyc3,sfo3)
+changed: /etc/nginx/snippets/prover-members.conf 09842dfef34ca397e8931be51c553b0da0e3088977f08e7dd3adddc912c3e9a5 → a4fd351ed8098dcbc46ad04a3d75fafddb9546300c6eb465603f47f041fb634a (locations /m/a /m/b → /m/a /m/b /m/archive2 /m/nyc3 /m/sfo3, all to the router)
+rewritten-same: /etc/nginx/sites-available/prover-randprotocol d8520ef8f35c1ddbae4650c4a8e8ab49f58bd70c7009a2a929d8c45ed3af03bd
+rewritten-same: /etc/nginx/conf.d/prover.conf 1efa2e477b6e1a0e97539be2252521bab5a4c2f5d18771396303b67b02131283
+rewritten-same: /etc/systemd/system/rand-prover-router.service eab8a9fcd739f37010ebb611232fc09b09bbc2240353d08b4c3b62826cdbddb7
+rewritten-same: /etc/systemd/system/prover-tunnel@.service 8ac838e623de0eb0d947545fd44dcdcd8f0f3fea86130ee9ab7fd3bb09e79649
+rewritten-same: /etc/rand-prover-pool/8611.env e3a52c9e34484367141a97ca353293795cf2efefe6f622898b3c66ad21f8c9ac
+rewritten-same: /etc/rand-prover-pool/8612.env bc3960cc6967518a604a775de8c7870f1b55bfc553769677d77da44d48377ee1
+rewritten-same: /var/www/prover/.well-known/rand-prover.json 6ac9f0acbc609fba4c745742a68e3dfb3f577e32a39aed5fa392e6fd8ee00164
+rewritten-same: /var/www/prover/.well-known/rand-prover-pool.json 41e9738f37926984e3d65cae55789f9aaee4f9faf0981679cc8b5282df97bfde (the descriptor clients pin: regenerated from the members' live fingerprints, byte-identical; the same hash served at https://prover.randprotocol.org/.well-known/ before and after)
+untouched: /etc/rand-prover-pool/known_hosts eed7482ba6b865b6f4ca12c811dbbd4a3b92b238d126a48ed5118ac3745e1c60; the tunnel key; the certificate (it existed, so the certbot branch did not run); every other nginx file
+backup: /root/prover-pool-backup-2026-11-25/ on the web droplet, made 2026-11-25T01:44Z before the roll — router.py, router.env, prover-randprotocol, prover-members.conf, prover.conf, both units, 8611.env, 8612.env, known_hosts, well-known/. Not used. Rollback: copy those back, `nginx -t && systemctl reload nginx`, `systemctl restart rand-prover-router`.
+
+# Services. The script restarts the router and both tunnels and reloads nginx (all vhosts) after
+# `nginx -t`. Before the run `nginx -t` passed and no file under /etc/nginx was newer than nginx's
+# last reload (2026-11-22T16:16:49Z), so the reload brought in nothing but the snippet.
+service: rand-prover-router active since 2026-11-25T01:57:33Z (was 2026-11-14T06:36:10Z); journal: "routing 0 shared-key prover(s) and 2 member(s) on 127.0.0.1:8650"
+service: prover-tunnel@8611 active since 2026-11-25T01:57:32Z (was 2026-11-14T06:36:10Z), listening on 127.0.0.1:8611
+service: prover-tunnel@8612 active since 2026-11-25T01:57:33Z (was 2026-11-14T06:36:10Z), listening on 127.0.0.1:8612
+service: nginx reloaded, not restarted (active since 2026-11-21T06:30:43Z); `nginx -t` ok after
+service: not touched — sale, rpc-tunnel-e (active since 2026-11-22T05:25:59Z and 2026-11-14T06:36:10Z, as before); the members' rand-prover services (both idle before the run: queue depth 0, proving 0)
+
+# Verification. Each line is one POST of {"jsonrpc":"2.0","id":1,"method":"prover_info","params":[]}
+# unless it says otherwise; "local" is http://127.0.0.1:8650 on the web droplet, "public" is
+# https://prover.randprotocol.org from the operator's machine.
+before: local /m/a 200 result; /m/b 200 result; /m/archive2 /m/nyc3 /m/sfo3 404 (empty); / 503 "no prover in the pool answered"
+before: public /m/a 200 kem_fingerprint 4SK4-P64N-XWEN-ZSZZ version 0.8.7; /m/b 200 kem_fingerprint 0XZX-NZ1J-SPMB-GWZN version 0.8.7; /m/archive2 /m/nyc3 /m/sfo3 404 (nginx's page); / 503
+after: local /m/a 200 result; /m/b 200 result; / 503 "no prover in the pool answered" (the retired shared pool, as before)
+after: public /m/a 200, the same ten result keys, kem_fingerprint 4SK4-P64N-XWEN-ZSZZ version 0.8.7 queue depth 0 max 1 proving 0
+after: public /m/b 200, the same ten result keys, kem_fingerprint 0XZX-NZ1J-SPMB-GWZN version 0.8.7 queue depth 0 max 1 proving 0
+after: public and local /m/archive2 /m/nyc3 /m/sfo3 — HTTP 410 each, body (archive2's; the others differ in the name only):
+    {"jsonrpc": "2.0", "id": 1, "error": {"code": -32010, "message": "the RandProtocol prover 'archive2' was retired and its key is no longer used: update Rand Wallet (or rand) to the current release, which pins the current provers, or pair your own prover", "data": {"retired": "archive2"}}}
+after: public prover_status ["00000000000000000000000000000000"] on /m/a and /m/b — 200 {"error":{"code":-32001,"message":"unknown job"},"id":7,"jsonrpc":"2.0"}: a wallet's poll reaches the member and comes back
+after: public OPTIONS /m/a with an extension Origin — 204
+after: public / — 503 "no prover in the pool answered", as before
+tests: deploy/prover/test_router.py at this tree, on the operator's machine (Python 3.15.2) before the roll — Ran 34 tests, OK
+
+# Not done: no proving job was submitted (prover_submit is metered and costs a member's slot), so
+# the /64 metering and job pinning are covered by test_router.py here, not by a live job.
+# Still the owner's (deploy/prover/README.md "What is the owner's"): items 1–3; item 4, re-running
+# install-web.sh, is this record.

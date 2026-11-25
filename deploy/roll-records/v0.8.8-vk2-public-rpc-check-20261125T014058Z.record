@@ -1,0 +1,89 @@
+# Check record — VK-2 (monorepo#17): the public RPC hop ends at the node's own public listener.
+#
+# Not a roll: nothing was installed, restarted or changed. This is the stored run of
+# deploy/check-public-rpc.sh that deploy/caddy/README.md step 4 asks for, on the fleet as it ran
+# v0.8.8 on chain 22. Written by hand from the commands' output; every output block below is
+# verbatim. Names only: the fleet's addresses are the operator's (the private configuration
+# repository), so <web> and <e> stand for them here and addresses inside unit lines are cut.
+
+release: v0.8.8 (abef4490), chain 22; the hosts answered build 0.8.8 abef4490
+date: 2026-11-25
+tool: deploy/check-public-rpc.sh sha256 90925276dbb9ae53add8bb4c85e3ae864a44faf6c60851848e912d2429e08682, last changed in 1b26ffddf5eb6716d19275ffebbc050f082a998a; run from origin/main 9dd2f3bae92e94d336be64704ee0a5d63cf37b18 (the same file as at tag v0.8.8)
+read-only: JSON-RPC POSTs, and with --local one `systemctl show`
+result: ok — four runs, four exit 0
+
+check: 1 of 4 — on the web droplet, against the tunnel's local end (the run that shows where the public hop ends)
+command: ssh -o BatchMode=yes -o ConnectTimeout=8 root@<web> 'bash -s -- --url http://127.0.0.1:18545' < deploy/check-public-rpc.sh
+output:
+    public-rpc: checked 2026-11-25T01:40:58Z url http://127.0.0.1:18545
+    rand_chainId: 22
+    build: 0.8.8 abef4490
+    rand_getPeers: refused, gate: node
+    rand_mint: refused, gate: node
+    rand_importViewingKey: refused, gate: node
+    rand_getViewingNotes: refused, gate: node
+    rand_removeViewingKey: refused, gate: node
+    batch: refused
+    public-rpc: ok
+exit: 0
+
+check: 2 of 4 — on node e, the unit and its listener
+command: ssh -o BatchMode=yes -o ConnectTimeout=8 root@<e> 'bash -s -- --local' < deploy/check-public-rpc.sh
+output:
+    public-rpc: checked 2026-11-25T01:40:59Z url http://127.0.0.1:8546
+    unit: rand-node turns it on with --public-rpc in ExecStart
+    rand_chainId: 22
+    build: 0.8.8 abef4490
+    rand_getPeers: refused, gate: node
+    rand_mint: refused, gate: node
+    rand_importViewingKey: refused, gate: node
+    rand_getViewingNotes: refused, gate: node
+    rand_removeViewingKey: refused, gate: node
+    batch: refused
+    public-rpc: ok
+exit: 0
+
+check: 3 of 4 — from the operator's machine, through the public name (shows the proxy's list only)
+command: bash deploy/check-public-rpc.sh --behind-proxy --url https://rpc.randprotocol.org
+output:
+    public-rpc: checked 2026-11-25T01:40:59Z url https://rpc.randprotocol.org (behind a proxy)
+    rand_chainId: 22
+    build: 0.8.8 abef4490
+    rand_getPeers: refused, gate: proxy
+    rand_mint: refused, gate: proxy
+    rand_importViewingKey: refused, gate: proxy
+    rand_getViewingNotes: refused, gate: proxy
+    rand_removeViewingKey: refused, gate: proxy
+    batch: refused
+    public-rpc: ok
+exit: 0
+
+check: 4 of 4 — from the operator's machine, through the site's own route to the same proxy
+command: bash deploy/check-public-rpc.sh --behind-proxy --url https://randprotocol.org/api/rpc
+output:
+    public-rpc: checked 2026-11-25T01:41:01Z url https://randprotocol.org/api/rpc (behind a proxy)
+    rand_chainId: 22
+    build: 0.8.8 abef4490
+    rand_getPeers: refused, gate: proxy
+    rand_mint: refused, gate: proxy
+    rand_importViewingKey: refused, gate: proxy
+    rand_getViewingNotes: refused, gate: proxy
+    rand_removeViewingKey: refused, gate: proxy
+    batch: refused
+    public-rpc: ok
+exit: 0
+
+# Topology, read over SSH at 2026-11-25T01:41Z–01:46Z (systemctl is-enabled / is-active / show,
+# ss -ltn, grep, pgrep; nothing written).
+topology: web droplet — rpc-tunnel-e.service enabled, active since 2026-11-14T06:36:10Z; ExecStart: ssh -N … -L 127.0.0.1:18545:127.0.0.1:8546 rpctunnel@<e>
+topology: web droplet — 127.0.0.1:18545 is held by that ssh; the sale service's SALE_RPC_UPSTREAM=http://127.0.0.1:18545
+topology: e — rand-node ExecStart carries --rpc 127.0.0.1:8545 and --public-rpc 127.0.0.1:8546; both bind loopback only
+topology: e — rpctunnel's shell is /usr/sbin/nologin and its key carries permitopen="127.0.0.1:8546"
+topology: only e runs the public listener — of the inventory's 26 hosts, 25 answered (a b c d e f lon1 sfo3 tor1 blr1 syd1 atl1 ams3 nyc1 nyc2 sfo2 mkc1 mem1 obs1 g1 g2 g3 g4 g5 g6): e has --public-rpc in its running rand-node, one listener on :8546 and one unit file naming it; each of the other 24 has no --public-rpc in the process, no RAND_NODE_PUBLIC_RPC in its environment, nothing listening on :8546 and no unit file naming either
+topology: not read — archive2 (ssh timed out; the old account's host, not on chain 22)
+
+# Open hazard (seen, not changed).
+hazard: rpc-tunnel-obs1.service is still on the web droplet — disabled, inactive, never started since boot — and its ExecStart is still `-L 127.0.0.1:18545:127.0.0.1:8545 rpctunnel@<an address>`: the operator listener (--rpc, every viewing-key method answers a loopback caller), not :8546. The address is not obs1's in today's inventory; the unit and its pinned known_hosts name the one obs1 had before the 2026-10-22 rebuild. It binds the same local port as rpc-tunnel-e, so enabling it in e's place would put the public hop back on an operator listener with the sale proxy as the only gate (check 1 would then fail, naming the methods) — or on whoever holds that address. Repoint it to :8546 and obs1's current address (with permitopen="127.0.0.1:8546" and a public listener on obs1), or remove the unit, before it is ever enabled. obs1 has no public listener today.
+
+# What this does not show: per-caller metering through the proxy, and the sale binary's commit
+# (deploy/caddy/README.md "Which layer gates which method") — neither is part of this check.
