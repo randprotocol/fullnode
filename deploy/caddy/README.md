@@ -77,13 +77,27 @@ It serves a fixed method set (`rpc::PUBLIC_METHODS`: no viewing-key methods, no 
 caller as loopback — so the method gate and the meter are the node's, not only the sale proxy's
 `RPC_ALLOWED` in another repository.
 
-**State: the operator's statement, no stored check.** The operator reports (monorepo#17) that on
-2026-10-28 the hop was moved to the node's public listener: `deploy/enable-public-rpc.sh` with
-`RESTART=1` on the node that serves it, the `rpctunnel` key's `permitopen` and the web droplet's
-tunnel unit both changed to `:8546`, and `rand_getPeers` and `rand_importViewingKey` then answered
-"not served on this node's public listener" through the tunnel. No check output is stored in any
-repository, so audit v12 counted VK-2 as not running. What closes that is a stored run of
-`deploy/check-public-rpc.sh` (below), not this paragraph.
+**State: checked and stored, 2026-11-25.**
+`deploy/roll-records/v0.8.8-vk2-public-rpc-check-20261125T014058Z.record` holds four runs of
+`deploy/check-public-rpc.sh` (below) on the fleet at v0.8.8, chain 22, each ending
+`public-rpc: ok`, exit 0: on the web droplet against the tunnel's local end (every refusal
+`gate: node` — the hop ends at a public listener), on the node with `--local`, and through
+`https://rpc.randprotocol.org` and `https://randprotocol.org/api/rpc` with `--behind-proxy`
+(`gate: proxy`). The same record holds what was read beside them: the hop is
+`rpc-tunnel-e.service` on the web droplet (enabled, active, `-L 127.0.0.1:18545:127.0.0.1:8546`)
+to E, whose unit carries `--public-rpc 127.0.0.1:8546` and whose `rpctunnel` key is
+`permitopen="127.0.0.1:8546"`; no other inventory host that answered runs a public listener. So
+the diagram at the top of this file (obs1, `:8545`) is the 2026-09-27 state, not today's. Before
+this record the move was only the operator's statement (monorepo#17: 2026-10-28,
+`deploy/enable-public-rpc.sh` with `RESTART=1`), and audit v12 counted VK-2 as not running for
+want of a stored check. Run the check again, and add a record, after any change to the tunnel, the
+node's unit or the proxy.
+
+**Open hazard (in the same record).** `rpc-tunnel-obs1.service` is still on the web droplet,
+disabled and inactive, and still forwards `127.0.0.1:18545` to `:8545` — the operator listener —
+at the address obs1 had before the 2026-10-22 rebuild. Repoint it (obs1's current address, `:8546`,
+a public listener on obs1 and `permitopen="127.0.0.1:8546"` there) or remove it before it is ever
+enabled; started in E's place it would undo VK-2.
 
 **The committed unit** (monorepo#17). `deploy/systemd/rand-node.service.d/60-public-rpc.conf` is
 the drop-in that turns the listener on: one line, `Environment=RAND_NODE_PUBLIC_RPC=127.0.0.1:8546`,
@@ -116,7 +130,7 @@ The check is tested against a real node's two listeners
 (`crates/randprotocol-node/tests/public_rpc_check.rs`): it passes on the public one and fails on
 the operator one.
 
-Until a check is stored, read the section below as describing either state.
+The stored check (above) shows the second state: the tunnel ends at `:8546` and both gates apply.
 
 ## Which layer gates which method
 
